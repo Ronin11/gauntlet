@@ -2937,6 +2937,10 @@ impl Game {
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
         let mut floor_fx: Vec<(usize, i32, Vec3)> = Vec::new();
         let mut fallen: Vec<usize> = Vec::new();
+        let legend_forced: Vec<_> = (0..self.players.len())
+            .map(|i| self.legend_forced_action(i))
+            .collect();
+        let mut legend_fired = false;
         let in_tower = self.wave == Some(gdl_formats::wdata::TOWER_WAVE);
         let pu_rate = if self.boss.as_ref().is_some_and(|b| b.active && !b.dead) {
             3.0
@@ -3239,14 +3243,34 @@ impl Game {
             if let Some(m) = p.act.request(ms, &ctx) {
                 posts.push((m, i));
             }
+            // The legend-weapon holder plays the throw (restarted unless it
+            // already is).
+            let forced = legend_forced[i];
+            if let Some((a, b)) = forced {
+                // (A class without the animation throws at once.)
+                if self.action_seqs[p.model]
+                    .slots
+                    .get(a as usize)
+                    .is_none_or(|s| s.is_none())
+                {
+                    legend_fired = true;
+                } else if p.act.cur != a && p.act.cur != b {
+                    p.act.cur = 0;
+                    p.act.next = a;
+                }
+            }
             // A step swing turns by the stick, not the target.
             if p.act.next == pa::STEP {
                 ctx.melee_yaw = ctx.stick_yaw;
             }
             p.act.do_action(&self.action_seqs[p.model], &ctx, dt);
 
-            // The bits the action fired.
-            let bits_now = std::mem::take(&mut p.act.act_bits);
+            // The bits the action fired; the holder's go to the legend weapon.
+            let mut bits_now = std::mem::take(&mut p.act.act_bits);
+            if forced.is_some() && bits_now & !1 != 0 {
+                bits_now = 0;
+                legend_fired = true;
+            }
             if bits_now & 0xFE != 0 {
                 let (mult, knock) = if bits_now & 0xF0 != 0 {
                     // Power swings: x3 and knockdown; the move's turbo is paid.
@@ -3429,6 +3453,11 @@ impl Game {
         }
         for pi in fallen {
             self.get_player_pos(pi);
+        }
+        if legend_fired {
+            if let Some(b) = self.boss.as_mut() {
+                b.holder_fired = true;
+            }
         }
         self.update_combos();
         // Players don't overlap each other.

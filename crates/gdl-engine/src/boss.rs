@@ -121,6 +121,8 @@ pub struct Boss {
     pub legend_holder: Option<usize>,
     pub holder_step: u8,
     pub holder_timer: f32,
+    /// The holder's forced throw fired its act bits (pmotion.c:2203).
+    pub holder_fired: bool,
     pub meters: Vec<Meter>,
     pub meters_hidden: bool,
     /// The BOSSKEY effect: where it is, and when it was started.
@@ -1365,14 +1367,16 @@ impl Game {
                     self.sfx.push("S_PICKUPMAGIC".into());
                 }
             }
-            // The holder throws after its 60-tick wind-up (the throw runs on
-            // its own clock, quest_state, even if the ROAR ends first).
+            // After its 60-tick wind-up (quest_state 3) the holder is made to
+            // play the throw (quest_state 4, see Game::legend_forced_action);
+            // the weapon flies when that animation fires (the throw runs on
+            // its own clock, even if the ROAR ends first).
             3..=5 if (2..=3).contains(&b.holder_step) => {
                 if b.holder_step == 2 && now >= b.holder_timer {
                     b.holder_step = 3;
-                    b.holder_timer = now + 0.5;
+                    b.holder_fired = false;
                     self.sfx.push(format!("S_{letter}LEGWTHROW"));
-                } else if b.holder_step == 3 && now >= b.holder_timer {
+                } else if b.holder_step == 3 && b.holder_fired {
                     b.holder_step = 4;
                     self.sfx.push(format!("S_{letter}LEGWFLY"));
                     self.legend_throw();
@@ -1454,6 +1458,21 @@ impl Game {
     /// Chimera, Genie and Plague Fiend get a projectile (FX 93) flying at
     /// 20 units/s that hits on arrival; the rest take the hit at once, with
     /// FX 93 shown at the boss.
+    /// pmotion.c:2150: the action the legend-weapon holder is made to play at
+    /// quest_state 4, and its follow-on, by boss.
+    pub(crate) fn legend_forced_action(&self, pi: usize) -> Option<(u16, u16)> {
+        use crate::paction::p as s;
+        let b = self.boss.as_ref()?;
+        if b.legend_holder != Some(pi) || b.holder_step != 3 {
+            return None;
+        }
+        Some(match b.boss_type {
+            36 | 37 => (s::SSHOT, s::SSHOT),
+            34 | 35 | 38 | 39 => (s::PWRA_THROW, s::PWRA_THROW_R),
+            _ => (s::USE_MAGIC, s::MAGIC_RELEASE),
+        })
+    }
+
     fn legend_throw(&mut self) {
         let Some(b) = self.boss.as_ref() else { return };
         let t = b.boss_type;
@@ -2644,9 +2663,13 @@ mod tests {
         face_boss(&mut g, 25.0);
         let mut swapped = false;
         let mut shot = false;
+        let mut threw = false;
         for _ in 0..1800 {
             g.players[0].health = 500.0;
             g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            // The javelin goes with the holder's forced PWRA_THROW (boss 38).
+            threw |= g.players[0].act.cur == crate::paction::p::PWRA_THROW;
+            assert!(!shot || threw);
             shot |= g.boss.as_ref().unwrap().legend_shot.is_some();
             swapped |= g
                 .boss_critter()
