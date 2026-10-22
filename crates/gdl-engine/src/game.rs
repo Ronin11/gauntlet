@@ -661,6 +661,8 @@ pub enum Kind {
         reload: f32,
         /// Death: health drained so far; IT and the rest: unused.
         drained: f32,
+        /// The Warlock's blink: seconds left seen (> 0) or unseen (< 0).
+        blink: f32,
     },
     Generator {
         class: usize,
@@ -859,6 +861,8 @@ pub struct Game {
     pub world_changed: bool,
     /// A camera set from outside (the attract flyby): eye and look-at.
     pub fixed_camera: Option<(Vec3, Vec3)>,
+    /// Placed monsters not yet in view.
+    pending_enemies: Vec<PendingEnemy>,
     /// The party's boss shards (bit = world order 1..11, as Progress::runes).
     pub runes: u16,
     /// Players who died in this level (inactivate_player outside the tower).
@@ -926,6 +930,17 @@ pub struct Game {
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
     pub(crate) hit_from: Option<Vec3>,
+}
+
+/// A placed monster waiting to come into view (an ENE item before
+/// fn_80060114 turns it into an enemy).
+struct PendingEnemy {
+    kind: Kind,
+    model: Option<usize>,
+    pos: Vec3,
+    yaw: f32,
+    /// The item's visibility radius.
+    visrad: f32,
 }
 
 /// Parsed objects/textures/anim files shared by several models.
@@ -1275,6 +1290,7 @@ impl Game {
             barrier_touches: Vec::new(),
             world_changed: false,
             fixed_camera: None,
+            pending_enemies: Vec::new(),
             runes: 0,
             deaths: 0,
             roster: Default::default(),
@@ -1559,6 +1575,26 @@ impl Game {
         }
     }
 
+    /// fn_80060114: a placed monster appears when a sphere four times its
+    /// visibility radius is on screen and it is within 50 of the camera's
+    /// look-at point (never in the attract flyby).
+    fn spawn_placed_enemies(&mut self) {
+        if self.fixed_camera.is_some() || self.pending_enemies.is_empty() {
+            return;
+        }
+        let (_, at, _) = self.camera_view();
+        let ready: Vec<usize> = (0..self.pending_enemies.len())
+            .filter(|&i| {
+                let p = &self.pending_enemies[i];
+                (p.pos - at).length() <= 50.0 && self.on_screen(p.pos, 4.0 * p.visrad)
+            })
+            .collect();
+        for i in ready.into_iter().rev() {
+            let p = self.pending_enemies.remove(i);
+            self.spawn(p.kind, p.model, p.pos, p.yaw);
+        }
+    }
+
     /// generate_enemy: place a generator's monster in front of it (or around it,
     /// for small monsters) where there's floor and no wall in the way.
     fn spawn_from_generator(&mut self, sp: Spawn) {
@@ -1653,6 +1689,7 @@ impl Game {
             target: None,
             reload: 0.0,
             drained: 0.0,
+            blink: 0.0,
         }
     }
 
@@ -1887,7 +1924,14 @@ impl Game {
                             // A half-second freeze as it appears.
                             *cooldown = if strength < 4 { 0.5 } else { 0.0 };
                         }
-                        self.spawn(kind, model, pos, yaw);
+                        // fn_80060114: it appears once it comes into view.
+                        self.pending_enemies.push(PendingEnemy {
+                            kind,
+                            model,
+                            pos,
+                            yaw,
+                            visrad: info.radius.max(1.0),
+                        });
                     }
                 }
                 // SetItem case 3: tier, max alive and interval (with the level's
@@ -2321,6 +2365,7 @@ impl Game {
         self.update_players(dt, &inputs);
         self.legend_face_boss();
         self.update_rings(dt);
+        self.spawn_placed_enemies();
         self.update_entities(dt);
         self.update_critters(dt);
         self.update_waves(dt);
@@ -3604,6 +3649,14 @@ impl Game {
     }
 
     fn update_entities(&mut self, dt: f32) {
+        // Where each monster stood before this frame's move (do_enemy_move
+        // reverts a move that runs into another monster or a hero).
+        let before: HashMap<u64, Vec3> = self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Enemy { .. }))
+            .map(|e| (e.id, e.pos))
+            .collect();
         let player_pos: Vec<(Vec3, bool)> = self
             .players
             .iter()
@@ -3765,6 +3818,7 @@ impl Game {
                     target,
                     reload,
                     drained,
+                    blink,
                     ..
                 } => {
                     let Some(model) = e.model else { continue };
@@ -3773,6 +3827,35 @@ impl Game {
                     };
                     let skel = &self.models[model].skeleton;
                     let ty = &crate::enemies::TYPES[(*etype).min(33)];
+                    // fn_8004D958: the Warlock blinks while standing or walking,
+                    // 1-2 s seen then 1-2 s unseen, fading 16/255 a tick; any
+                    // other action fades it back in.
+                    if *etype == 24 {
+                        let calm = matches!(state, EnemyState::Idle | EnemyState::Chase);
+                        let mut hide = false;
+                        if calm {
+                            if *blink == 0.0 {
+                                *blink = self.rng.range(1.0, 2.0);
+                            } else if *blink > 0.0 {
+                                *blink -= dt;
+                                if *blink <= 0.0 {
+                                    *blink = -self.rng.range(1.0, 2.0);
+                                }
+                            } else {
+                                *blink += dt;
+                                if *blink >= 0.0 {
+                                    *blink = self.rng.range(1.0, 2.0);
+                                }
+                            }
+                            hide = *blink < 0.0;
+                        }
+                        let step = 16.0 / 255.0 * dt * 60.0;
+                        e.fade = if hide {
+                            (e.fade - step).max(0.0)
+                        } else {
+                            (e.fade + step).min(1.0)
+                        };
+                    }
                     // Recognize a player within sight; chase from then on.
                     if !*recognized && near.is_some_and(|(_, d)| d <= sight) {
                         *recognized = true;
@@ -4336,34 +4419,48 @@ impl Game {
             self.entities[i].pos = p;
         }
 
-        // Keep monsters from stacking on top of each other (and on players).
+        // do_enemy_move: a monster's move is undone if it brings it into
+        // another monster (their radii touching) or into a hero (radius + 0.5 +
+        // the hero's 1.5); moving apart is always allowed.
         let enemy_idx: Vec<usize> = (0..self.entities.len())
             .filter(|&i| {
                 self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. })
             })
             .collect();
-        for a in 0..enemy_idx.len() {
-            for b in (a + 1)..enemy_idx.len() {
-                let (ia, ib) = (enemy_idx[a], enemy_idx[b]);
-                let d = Vec2::new(
-                    self.entities[ib].pos.x - self.entities[ia].pos.x,
-                    self.entities[ib].pos.z - self.entities[ia].pos.z,
-                );
-                let len = d.length();
-                if len < 1.6 && len > 1e-4 {
-                    let push = d / len * (1.6 - len) * 0.5;
-                    self.entities[ia].pos -= Vec3::new(push.x, 0.0, push.y);
-                    self.entities[ib].pos += Vec3::new(push.x, 0.0, push.y);
-                }
+        let size = |e: &Entity| match &e.kind {
+            Kind::Enemy { etype, .. } => {
+                let t = &crate::enemies::TYPES[(*etype).min(33)];
+                (t.radius, t.height * 0.5)
             }
-            for (pp, alive) in &player_pos {
-                let e = &mut self.entities[enemy_idx[a]];
-                let d = Vec2::new(e.pos.x - pp.x, e.pos.z - pp.z);
-                let len = d.length();
-                if *alive && len < 1.8 && len > 1e-4 {
-                    let push = d / len * (1.8 - len);
-                    e.pos += Vec3::new(push.x, 0.0, push.y);
+            _ => (1.5, 3.0),
+        };
+        for &i in &enemy_idx {
+            let Some(&old) = before.get(&self.entities[i].id) else {
+                continue;
+            };
+            let new = self.entities[i].pos;
+            if new == old {
+                continue;
+            }
+            let (ri, hi) = size(&self.entities[i]);
+            let flat = |a: Vec3, b: Vec3| Vec2::new(a.x - b.x, a.z - b.z).length();
+            let into = |other: Vec3, reach: f32, height: f32| {
+                (new.y - other.y).abs() < height
+                    && flat(new, other) < reach
+                    && flat(new, other) < flat(old, other) - 1e-4
+            };
+            let mut blocked = enemy_idx.iter().any(|&j| {
+                if j == i {
+                    return false;
                 }
+                let (rj, hj) = size(&self.entities[j]);
+                into(self.entities[j].pos, ri + rj, hi + hj)
+            });
+            blocked |= player_pos
+                .iter()
+                .any(|(pp, alive)| *alive && into(*pp, ri + 0.5 + PLAYER_RADIUS, hi + 2.5));
+            if blocked {
+                self.entities[i].pos = old;
             }
         }
 
@@ -5272,8 +5369,9 @@ mod tests {
         let Some(fs) = data() else { return };
         for level in ["levelA3", "levelB4", "levelC4", "levelJ3"] {
             let mut g = Game::new(&fs, level, &[("WAR", "RED")]).unwrap();
+            // Placed monsters wait to come into view.
             let Some(archer) = g
-                .entities
+                .pending_enemies
                 .iter()
                 .find(|e| {
                     matches!(
