@@ -39,9 +39,6 @@ const TURBO_C_COST: f32 = 100.0;
 pub fn max_health(level: u32) -> f32 {
     (100.0 * (level.max(1) - 1) as f32 + 500.0).min(9999.0)
 }
-const ENEMY_ACTIVATE_DIST: f32 = 60.0;
-const GENERATOR_ACTIVATE_DIST: f32 = 40.0;
-const MAX_ENEMIES: usize = 48;
 /// How far in front of the camera focus (towards the camera) geometry is kept.
 const CUTAWAY_DEPTH: f32 = 12.0;
 /// Thrown weapons fly until they hit something; this only bounds strays.
@@ -240,13 +237,25 @@ pub struct Ring {
     hit: Vec<u64>,
 }
 
+/// A generator's request for a monster.
+#[derive(Clone, Copy, Debug)]
+struct Spawn {
+    class: usize,
+    strength: usize,
+    pos: Vec3,
+    yaw: f32,
+    generator: u64,
+    /// Every slot is taken: recycle the farthest monster off screen.
+    recycle: bool,
+}
+
 /// What one hit did.
 #[derive(Clone, Copy, Debug, Default)]
 struct HitResult {
     hit: bool,
     killed: bool,
     generator: bool,
-    /// The monster's (or generator's) tier, 1..3.
+    /// The monster's (or generator's) type, for experience.
     tier: usize,
     /// A breakable broke: where, and its content.
     drop: Option<(Vec3, Option<usize>)>,
@@ -364,22 +373,25 @@ impl PlayerSeqs {
 pub struct MonsterSeqs {
     ready: Option<usize>,
     walk: Option<usize>,
-    attack: Vec<usize>,
+    /// ATTACK1 / ATTACK1R (normal swing and recovery), ATTACK3 / ATTACK3R (power).
+    attack: Option<(usize, Option<usize>)>,
+    power: Option<(usize, Option<usize>)>,
     hit: Option<usize>,
+    death: Option<usize>,
     start: Option<usize>,
 }
 
 impl MonsterSeqs {
     fn find(m: &Model) -> MonsterSeqs {
         let s = |n: &str| m.sequence(n);
+        let pair = |a: &str, r: &str| s(a).map(|a| (a, s(r)));
         MonsterSeqs {
             ready: s("READY"),
-            walk: s("WALK").or(s("RUN")).or(s("WALK1")),
-            attack: ["ATTACK1", "ATTACK2", "ATTACK3", "RUNATTACK1"]
-                .iter()
-                .filter_map(|n| s(n))
-                .collect(),
+            walk: s("WALK").or(s("WALK1")).or(s("RUN")),
+            attack: pair("ATTACK1", "ATTACK1R").or(pair("ATTACK2", "ATTACK2R")),
+            power: pair("ATTACK3", "ATTACK3R"),
             hit: s("HIT1").or(s("HIT2")),
+            death: s("DEATH").or(s("HIT2")),
             start: s("START"),
         }
     }
@@ -388,11 +400,23 @@ impl MonsterSeqs {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EnemyState {
     Spawning,
+    /// Not yet recognized a player: stands, or wanders on screen.
     Idle,
     Chase,
-    Attack { hit_done: bool },
-    Hurt { timer: f32 },
-    Dying { timer: f32 },
+    /// Winding up a swing at a player (the hit lands as the wind-up ends).
+    Attack {
+        hit_done: bool,
+    },
+    /// The swing's recovery.
+    Recover,
+    Hurt {
+        timer: f32,
+    },
+    Dying {
+        timer: f32,
+    },
+    /// Placed with strength 0: drawn but inert until hurt.
+    Asleep,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -586,20 +610,41 @@ pub fn crystals_met(crystals: &[i32; 9], c: usize) -> bool {
 pub enum Kind {
     Enemy {
         class: usize,
+        /// Tier 1-3 (placed 4-6: archer, bomber, suicide).
         strength: usize,
         hp: f32,
         state: EnemyState,
+        /// The spawn freeze left, in seconds.
         cooldown: f32,
+        /// Units per second.
         speed: f32,
+        /// e_e_tpye.
+        etype: usize,
+        /// Has seen a player: chases from then on.
+        recognized: bool,
+        /// Swings so far (every 8th is the power attack).
+        attacks: u32,
+        /// The player a swing was aimed at, and whether it is the power attack.
+        target: Option<(usize, bool)>,
     },
     Generator {
         class: usize,
+        /// The tier it spawns (drops as it is damaged).
         strength: usize,
         hp: f32,
+        /// Ticks until the next spawn.
         timer: f32,
+        /// The spawn interval (tenths of a second).
         interval: f32,
         max: usize,
         spawned: Vec<u64>,
+        etype: usize,
+        /// Grows 1/(2 max) a spawn and wraps: the delay is interval x (1..2).
+        genratio: f32,
+        /// Instance flag 1: spawns even off screen.
+        always: bool,
+        /// Temple / Hell SPECIAL generators: which list they cycle through.
+        special: Option<&'static [usize; 4]>,
     },
     Pickup {
         kind: PickupKind,
@@ -686,12 +731,19 @@ pub struct Entity {
 /// A monster type (`GRU`, `RAT`, ...) with a model per strength level.
 pub struct MonsterClass {
     pub name: String,
-    models: [Option<usize>; 4],
+    /// Tier models 0-3, then the A (archer), B (bomber) and S (suicide) trees.
+    models: [Option<usize>; 7],
     gen_models: [Option<usize>; 4],
+    pub etype: usize,
 }
 
 impl MonsterClass {
     fn model(&self, strength: usize) -> Option<usize> {
+        if (4..=6).contains(&strength) {
+            if let Some(m) = self.models[strength] {
+                return Some(m);
+            }
+        }
         let s = strength.clamp(1, 3);
         self.models[s]
             .or(self.models[1])
@@ -738,6 +790,14 @@ pub struct Game {
     pub scrolls: Vec<String>,
     /// A scroll being read: the game is paused until its player presses B.
     pub scroll_box: Option<ScrollBox>,
+    /// The level's monster types (realm ENMY + LEVL enemytype).
+    pub roster: crate::enemies::Roster,
+    /// The level's monster and generator tuning, normalized for the difficulty.
+    pub tuning: gdl_formats::wdata::EnemyTuning,
+    /// LEVL maxenemies: monsters alive at once.
+    pub max_enemies: usize,
+    /// Round-robin counter for the Temple / Hell SPECIAL generators.
+    special_counter: u32,
     /// Potion blasts spreading out.
     pub rings: Vec<Ring>,
     /// Lightning-shield strikes waiting out their second, by (player, monster).
@@ -1013,6 +1073,16 @@ impl Game {
     }
 
     pub fn new(fs: &GameFs, level_name: &str, classes: &[(&str, &str)]) -> Result<Game> {
+        Self::new_with(fs, level_name, classes, 1)
+    }
+
+    /// A level at a difficulty (0 Easy, 1 Medium, 2 Hard).
+    pub fn new_with(
+        fs: &GameFs,
+        level_name: &str,
+        classes: &[(&str, &str)],
+        difficulty: usize,
+    ) -> Result<Game> {
         let level = Level::load(fs, level_name)?;
         let collision = Collision::new(build_collision(&level));
 
@@ -1038,6 +1108,10 @@ impl Game {
             worlds: Default::default(),
             scrolls: Vec::new(),
             scroll_box: None,
+            roster: Default::default(),
+            tuning: gdl_formats::wdata::EnemyTuning::default().normalized(1),
+            max_enemies: 25,
+            special_counter: 0,
             rings: Vec::new(),
             shield_cooldown: HashMap::new(),
             item_models: HashMap::new(),
@@ -1079,6 +1153,24 @@ impl Game {
                 {
                     let t = l.wavetime as f32 + 0.99;
                     game.secret_timer = Some((t, t));
+                }
+                // GetEnemyTypes: the level's monsters, plus Death in every
+                // level without a boss except the tower.
+                if let Some(wave) = game.wave {
+                    if let (Some(r), Some(l)) = (w.realm(wave >> 8), w.level(wave)) {
+                        let mut loaded: Vec<(i32, i32)> = l
+                            .enemy_types
+                            .iter()
+                            .filter(|&&i| i >= 0)
+                            .filter_map(|&i| r.enemies.get(i as usize).copied())
+                            .collect();
+                        if l.boss < 0 && wave != gdl_formats::wdata::TOWER_WAVE {
+                            loaded.push((crate::enemies::DEATH as i32, 0));
+                        }
+                        game.roster = crate::enemies::Roster::new(&loaded);
+                        game.tuning = l.enemy.normalized(difficulty);
+                        game.max_enemies = (l.max_enemies.clamp(1, 25)) as usize;
+                    }
                 }
                 game.worlds = w;
             }
@@ -1178,24 +1270,28 @@ impl Game {
         self.models.len() - 1
     }
 
+    /// Load (once) the models of monster type `etype` from its MONSTERS
+    /// directory: tier trees `<DESC>0..3`, the A/B/S variants and the generators.
     fn monster_class(
         &mut self,
         fs: &GameFs,
         cache: &mut HashMap<String, Option<AssetFile>>,
-        name: &str,
+        etype: usize,
     ) -> Option<usize> {
-        if let Some(i) = self.classes.iter().position(|c| c.name == name) {
+        let dir = self.roster.dir(etype);
+        if let Some(i) = self.classes.iter().position(|c| c.name == dir) {
             return Some(i);
         }
-        let dir = format!("MONSTERS/{name}");
+        let desc = crate::enemies::TYPES.get(etype)?.desc.to_ascii_uppercase();
+        let path = format!("MONSTERS/{dir}");
         let asset = cache
-            .entry(dir.clone())
-            .or_insert_with(|| load_asset(fs, &dir))
+            .entry(path.clone())
+            .or_insert_with(|| load_asset(fs, &path))
             .as_ref()?;
         let anim = asset.anim.as_ref()?;
         let mut pending = Vec::new();
-        for s in 0..4 {
-            let tree = format!("{name}{s}");
+        for (slot, suffix) in ["0", "1", "2", "3", "A", "B", "S"].iter().enumerate() {
+            let tree = format!("{desc}{suffix}");
             if anim
                 .atrees
                 .iter()
@@ -1203,13 +1299,13 @@ impl Game {
             {
                 if let Ok(m) = Model::from_anim(&asset.objects, &asset.textures, anim, Some(&tree))
                 {
-                    pending.push((s, m));
+                    pending.push((slot, m));
                 }
             }
         }
         let mut gens = Vec::new();
         for s in 0..4 {
-            let names = [format!("GEN_{name}{s}L1"), format!("GEN_{name}{s}")];
+            let names = [format!("GEN_{desc}{s}L1"), format!("GEN_{desc}{s}")];
             if let Some(m) =
                 Model::from_objects(&asset.objects, &asset.textures, &[&names[0], &names[1]])
             {
@@ -1217,10 +1313,10 @@ impl Game {
             }
         }
         if pending.is_empty() {
-            log::warn!("monster {name}: no animation trees found");
+            log::warn!("monster {dir}: no animation trees found");
             return None;
         }
-        let mut models = [None; 4];
+        let mut models = [None; 7];
         for (s, m) in pending {
             let ms = MonsterSeqs::find(&m);
             let idx = self.add_model(m);
@@ -1232,11 +1328,118 @@ impl Game {
             gen_models[s] = Some(self.add_model(m));
         }
         self.classes.push(MonsterClass {
-            name: name.to_string(),
+            name: dir,
             models,
             gen_models,
+            etype,
         });
         Some(self.classes.len() - 1)
+    }
+
+    /// Whether a point is on the 4:3 screen, give or take `margin` units.
+    fn on_screen(&self, pos: Vec3, margin: f32) -> bool {
+        match crate::scene::project(self, pos) {
+            Some((x, y)) => {
+                let m = margin * 4.0;
+                (-m..512.0 + m).contains(&x) && (-m..384.0 + m).contains(&y)
+            }
+            None => false,
+        }
+    }
+
+    /// generate_enemy: place a generator's monster in front of it (or around it,
+    /// for small monsters) where there's floor and no wall in the way.
+    fn spawn_from_generator(&mut self, sp: Spawn) {
+        use crate::enemies::TYPES;
+        let etype = self.classes[sp.class].etype;
+        let t = &TYPES[etype.min(33)];
+        if sp.recycle {
+            // find_enemy_slot: the farthest monster, off screen ones first.
+            let focus = self.cam_focus;
+            let victim = self
+                .entities
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    e.alive && matches!(e.kind, Kind::Enemy { etype, .. } if etype != crate::enemies::IT)
+                })
+                .map(|(i, e)| {
+                    let mut score = (e.pos - focus).length();
+                    if !self.on_screen(e.pos, 15.0) {
+                        score += 10_000.0;
+                    }
+                    (i, score)
+                })
+                .filter(|(_, s)| *s >= 10_000.0)
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i);
+            match victim {
+                Some(i) => self.entities[i].alive = false,
+                None => return,
+            }
+        }
+        // Medium and large monsters only use front and +-45 degrees.
+        const OCTANTS: [f32; 8] = [0.0, 180.0, -90.0, 90.0, 45.0, -45.0, 135.0, -135.0];
+        let dirs: &[usize] = if crate::enemies::is_small(etype) {
+            &[0, 1, 2, 3, 4, 5, 6, 7]
+        } else {
+            &[0, 4, 5]
+        };
+        let dist = if etype == 17 { 0.0 } else { 5.0 + t.radius };
+        let start = self.rng.next_u32() as usize % dirs.len();
+        for k in 0..dirs.len() {
+            let a = sp.yaw + OCTANTS[dirs[(start + k) % dirs.len()]].to_radians();
+            let p = sp.pos + Vec3::new(a.sin(), 0.0, a.cos()) * dist;
+            let from = sp.pos + Vec3::Y * 2.0;
+            if dist > 0.0 && self.collision.raycast(from, p + Vec3::Y * 2.0).is_some() {
+                continue;
+            }
+            let Some(g) = self.collision.ground_height(p, sp.pos.y + 4.0) else {
+                continue;
+            };
+            if (g - sp.pos.y).abs() > 6.0 {
+                continue;
+            }
+            let model = self.classes[sp.class].model(sp.strength);
+            let kind = self.new_enemy(sp.class, sp.strength, EnemyState::Spawning);
+            let id = self.spawn(kind, model, Vec3::new(p.x, g, p.z), a);
+            if let Some(start) = model
+                .and_then(|m| self.monster_seqs.get(&m))
+                .and_then(|s| s.start)
+            {
+                if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+                    e.animator.restart(start);
+                    e.animator.force_loop = false;
+                }
+            }
+            if let Some(Kind::Generator { spawned, .. }) = self
+                .entities
+                .iter_mut()
+                .find(|e| e.id == sp.generator)
+                .map(|e| &mut e.kind)
+            {
+                spawned.push(id);
+            }
+            return;
+        }
+    }
+
+    /// A new monster of `class` at a tier, as init_enemy sets it up.
+    fn new_enemy(&self, class: usize, strength: usize, state: EnemyState) -> Kind {
+        let etype = self.classes[class].etype;
+        let t = &crate::enemies::TYPES[etype.min(33)];
+        Kind::Enemy {
+            class,
+            strength,
+            hp: crate::enemies::health(etype, strength as i32, self.tuning.health),
+            state,
+            cooldown: 0.0,
+            speed: t.speed * 60.0 * self.tuning.speed,
+            etype,
+            recognized: false,
+            attacks: 0,
+            target: None,
+        }
     }
 
     fn spawn(&mut self, kind: Kind, model: Option<usize>, pos: Vec3, yaw: f32) -> u64 {
@@ -1416,43 +1619,86 @@ impl Game {
             let p16 = |k: usize| i16::from_le_bytes([inst.params[k], inst.params[k + 1]]);
 
             match info.item_type {
+                // Placed monsters: generic names (GRU, KNI, ...) become the realm's
+                // monster; strength 0 sleeps, 1-3 is the tier, 4-6 the
+                // archer / bomber / suicide variants.
                 ItemType::Enemy => {
-                    let strength = (p16(0).clamp(0, 3) as usize).max(1);
-                    if let Some(c) = self.monster_class(fs, &mut cache, &info.name) {
-                        let model = self.classes[c].model(strength);
-                        let hp = 10.0 * strength as f32;
-                        self.spawn(
-                            Kind::Enemy {
-                                class: c,
-                                strength,
-                                hp,
-                                state: EnemyState::Idle,
-                                cooldown: 0.0,
-                                speed: 6.0 + strength as f32,
-                            },
-                            model,
-                            pos,
-                            yaw,
-                        );
+                    let strength = p16(0).clamp(0, 6) as usize;
+                    let Some(ty) = crate::enemies::type_of(&info.name) else {
+                        continue;
+                    };
+                    // IT only plays the tag game with company.
+                    if ty == crate::enemies::IT && num_players < 2 {
+                        continue;
+                    }
+                    let ty = self.roster.resolve(ty, strength as i32);
+                    if let Some(c) = self.monster_class(fs, &mut cache, ty) {
+                        let model = self.classes[c].model(strength.max(1));
+                        let state = if strength == 0 && ty != crate::enemies::DEATH {
+                            EnemyState::Asleep
+                        } else {
+                            EnemyState::Idle
+                        };
+                        let mut kind = self.new_enemy(c, strength.max(1), state);
+                        if let Kind::Enemy { cooldown, .. } = &mut kind {
+                            // A half-second freeze as it appears.
+                            *cooldown = if strength < 4 { 0.5 } else { 0.0 };
+                        }
+                        self.spawn(kind, model, pos, yaw);
                     }
                 }
+                // SetItem case 3: tier, max alive and interval (with the level's
+                // gen_max / gen_rate), 10 x tier x gen_health hit points.
                 ItemType::Generator => {
-                    let strength = p16(0).clamp(0, 3) as usize;
-                    let max = p16(4).clamp(1, 12) as usize;
-                    let interval = (p16(6).max(1) as f32) * 0.5;
-                    if let Some(c) = self.monster_class(fs, &mut cache, &info.name) {
+                    let strength = (p16(0).clamp(1, 3)) as usize;
+                    let special = if info.name.eq_ignore_ascii_case("SPECIAL") {
+                        match self.wave.map(|w| w >> 8) {
+                            Some(5) => Some(&crate::enemies::TEMPLE_SPECIAL),
+                            Some(6) => Some(&crate::enemies::HELL_SPECIAL),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let ty = match special {
+                        Some(list) => list[0],
+                        None => match crate::enemies::type_of(&info.name) {
+                            Some(t) => self.roster.resolve(t, 0),
+                            None => continue,
+                        },
+                    };
+                    let base_max = match p16(4) {
+                        m if m > 0 => m as f32,
+                        _ => [10.0, 5.0, 2.0][strength - 1],
+                    };
+                    let base_interval = match inst.params[6] {
+                        0 => [5.0, 10.0, 15.0][strength - 1],
+                        n => n as f32,
+                    };
+                    let max = ((base_max * self.tuning.gen_max) as i32).max(1) as usize;
+                    let interval = (base_interval * self.tuning.gen_rate).floor().max(1.0);
+                    if let Some(c) = self.monster_class(fs, &mut cache, ty) {
+                        // Temple / Hell monsters all come along.
+                        if let Some(list) = special {
+                            for &t in list.iter() {
+                                self.monster_class(fs, &mut cache, t);
+                            }
+                        }
                         let model = self.classes[c].gen_model(strength);
-                        let hp = 20.0 * strength.max(1) as f32;
-                        let timer = self.rng.range(0.0, interval);
+                        let hp = 10.0 * strength as f32 * self.tuning.gen_health;
                         let id = self.spawn(
                             Kind::Generator {
                                 class: c,
-                                strength: strength.max(1),
+                                strength,
                                 hp,
-                                timer,
+                                timer: 0.0,
                                 interval,
                                 max,
                                 spawned: Vec::new(),
+                                etype: ty,
+                                genratio: 0.0,
+                                always: inst.flags & 1 != 0,
+                                special,
                             },
                             model,
                             pos,
@@ -2409,12 +2655,79 @@ impl Game {
             .players
             .iter()
             .any(|p| p.fx.special & crate::powerups::S_SHRINK != 0);
-        let dmg = if shrunk && matches!(self.entities[t].kind, Kind::Enemy { .. }) {
-            dmg * 2.0
-        } else {
-            dmg
-        };
+        let is_enemy = matches!(self.entities[t].kind, Kind::Enemy { .. });
+        let is_gen = matches!(self.entities[t].kind, Kind::Generator { .. });
+        let mut dmg = dmg;
+        // damage_enemy / generators: the player's level against the level's
+        // plevel scales the hit (at least 1).
+        if is_enemy || is_gen {
+            let plevel = self
+                .wave
+                .and_then(|w| self.worlds.level(w))
+                .map_or(0.0, |l| l.player_level);
+            let lv = self.players[pi].level as f32;
+            if plevel > 0.0 {
+                if lv < plevel {
+                    dmg *= 1.0 - 0.01 * (plevel - lv);
+                } else if lv > plevel {
+                    dmg *= 1.0 + 0.1 * (lv - plevel);
+                }
+            }
+            dmg = dmg.max(1.0);
+        }
+        if shrunk && is_enemy {
+            dmg *= 2.0;
+        }
         let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+        // The monster staggers (HIT1) or dies (DEATH / HIT2).
+        if is_enemy && r.hit {
+            let e = &mut self.entities[t];
+            let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
+            if let (Some(seqs), Kind::Enemy { state, etype, .. }) = (seqs, &mut e.kind) {
+                if r.killed {
+                    let small = crate::enemies::is_small(*etype);
+                    *state = EnemyState::Dying {
+                        timer: if small { 0.25 } else { 0.7 },
+                    };
+                    if let Some(d) = seqs.death {
+                        e.animator.restart(d);
+                        e.animator.force_loop = false;
+                    }
+                } else if let Some(h) = seqs.hit {
+                    e.animator.restart(h);
+                    e.animator.force_loop = false;
+                }
+            }
+        }
+        // Generators drop a tier at 2/3 and 1/3 of their health: they then spawn
+        // the lower tier, allow twice as many alive, and change model.
+        if is_gen && !r.killed {
+            let thr = 10.0 * self.tuning.gen_health;
+            let e = &mut self.entities[t];
+            if let Kind::Generator {
+                hp,
+                strength,
+                max,
+                class,
+                ..
+            } = &mut e.kind
+            {
+                let tier = if *hp <= thr {
+                    1
+                } else if *hp <= 2.0 * thr {
+                    2
+                } else {
+                    3
+                };
+                if tier < *strength {
+                    *strength = tier;
+                    *max <<= 1;
+                    if let Some(m) = self.classes[*class].gen_model(tier) {
+                        e.model = Some(m);
+                    }
+                }
+            }
+        }
         let e = &self.entities[t];
         if let Some(snd) = self.hit_sound(e, Self::is_destroyed(e)) {
             self.sfx.push(snd);
@@ -2428,13 +2741,14 @@ impl Game {
             }
         }
         if r.hit {
-            // PlayerDamagedEnemy / Item: exp by the monster's tier, five times as
-            // much for generators, doubled for melee.
-            let base = r.tier.max(1) as f32 * if r.generator { 5.0 } else { 1.0 };
-            let amount = if melee && !r.generator {
-                base * 2.0
-            } else {
-                base
+            // PlayerDamagedEnemy / Item: exp by monster type, five times as much
+            // for generators; melee has its own (larger) values.
+            use crate::enemies::{exp_hit, exp_kill};
+            let amount = match (r.generator, r.killed) {
+                (true, false) => 5.0 * exp_hit(r.tier, false),
+                (true, true) => 5.0 * exp_kill(r.tier, false),
+                (false, false) => exp_hit(r.tier, melee),
+                (false, true) => exp_kill(r.tier, melee),
             };
             self.add_exp(pi, amount, melee);
         }
@@ -2617,16 +2931,17 @@ impl Game {
         let mut r = HitResult::default();
         match &mut e.kind {
             Kind::Enemy {
-                hp,
-                state,
-                strength,
-                ..
+                hp, state, etype, ..
             } => {
                 if matches!(state, EnemyState::Dying { .. }) {
                     return r;
                 }
+                // IT can't be hurt.
+                if *etype == crate::enemies::IT {
+                    return r;
+                }
                 r.hit = true;
-                r.tier = *strength;
+                r.tier = *etype;
                 *hp -= dmg.max(1.0);
                 if *hp <= 0.0 {
                     *state = EnemyState::Dying { timer: 0.5 };
@@ -2634,14 +2949,12 @@ impl Game {
                 } else {
                     *state = EnemyState::Hurt { timer: 0.3 };
                 }
-                // Knock back.
-                e.pos.x += push.x * 1.2;
-                e.pos.z += push.y * 1.2;
+                let _ = push;
             }
-            Kind::Generator { hp, strength, .. } => {
+            Kind::Generator { hp, etype, .. } => {
                 r.hit = true;
                 r.generator = true;
-                r.tier = *strength;
+                r.tier = *etype;
                 *hp -= dmg;
                 if *hp <= 0.0 {
                     e.alive = false;
@@ -2743,7 +3056,21 @@ impl Game {
             .iter()
             .filter(|e| e.alive && matches!(e.kind, Kind::Enemy { .. }))
             .count();
-        let mut spawns: Vec<(usize, usize, Vec3, u64)> = Vec::new();
+        // Generators spawn while on screen (or flagged always active); monsters
+        // freeze when off screen and out of sight.
+        let visible: Vec<bool> = self
+            .entities
+            .iter()
+            .map(|e| self.on_screen(e.pos, 40.0))
+            .collect();
+        let class_of: Vec<(usize, usize)> = self
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.etype, i))
+            .collect();
+        let sight = 30.0 * self.tuning.visrad;
+        let mut spawns: Vec<Spawn> = Vec::new();
         let mut damage: Vec<(usize, f32)> = Vec::new();
         // Monster melee hits: (monster, player, damage).
         let mut melee: Vec<(usize, usize, f32)> = Vec::new();
@@ -2772,16 +3099,45 @@ impl Game {
                     interval,
                     max,
                     spawned,
+                    genratio,
+                    always,
+                    special,
                     ..
                 } => {
-                    if let Some((_, d)) = near {
-                        if d <= GENERATOR_ACTIVATE_DIST {
-                            *timer -= dt;
-                            if *timer <= 0.0 {
-                                *timer = *interval;
-                                if spawned.len() < *max && enemy_count + spawns.len() < MAX_ENEMIES
-                                {
-                                    spawns.push((*class, *strength, pos, e.id));
+                    let on = visible[ei];
+                    if (*always || on) && spawned.len() < *max {
+                        if *timer > 0.0 {
+                            *timer -= dt * 60.0;
+                        } else {
+                            // With every monster slot taken only a generator on
+                            // screen may spawn, by recycling one off screen.
+                            let full = enemy_count + spawns.len() >= self.max_enemies;
+                            if !full || on {
+                                let class = match special {
+                                    Some(list) => {
+                                        let t = list[(self.special_counter as usize) & 3];
+                                        self.special_counter += 1;
+                                        class_of
+                                            .iter()
+                                            .find(|(ty, _)| *ty == t)
+                                            .map_or(*class, |c| c.1)
+                                    }
+                                    None => *class,
+                                };
+                                spawns.push(Spawn {
+                                    class,
+                                    strength: *strength,
+                                    pos,
+                                    yaw: e.yaw,
+                                    generator: e.id,
+                                    recycle: full,
+                                });
+                                // 0.1 s x interval x (1..2), growing over 2 x max
+                                // spawns and starting again.
+                                *timer = 6.0 * *interval * (1.0 + *genratio);
+                                *genratio += 1.0 / (2.0 * *max as f32);
+                                if *genratio > 1.0 {
+                                    *genratio = 0.0;
                                 }
                             }
                         }
@@ -2790,32 +3146,67 @@ impl Game {
                 Kind::Enemy { .. } if frozen => {}
                 Kind::Enemy {
                     strength,
+                    hp,
                     state,
                     cooldown,
                     speed,
+                    etype,
+                    recognized,
+                    attacks,
+                    target,
                     ..
                 } => {
-                    *cooldown = (*cooldown - dt).max(0.0);
                     let Some(model) = e.model else { continue };
                     let Some(seqs) = self.monster_seqs.get(&model).cloned() else {
                         continue;
                     };
                     let skel = &self.models[model].skeleton;
+                    let ty = &crate::enemies::TYPES[(*etype).min(33)];
+                    // Recognize a player within sight; chase from then on.
+                    if !*recognized && near.is_some_and(|(_, d)| d <= sight) {
+                        *recognized = true;
+                    }
+                    // fn_8004D958: out of sight and off screen, nothing moves.
+                    let in_sight = near.is_some_and(|(_, d)| d <= sight);
+                    if !in_sight && !visible[ei] && !matches!(state, EnemyState::Dying { .. }) {
+                        continue;
+                    }
+                    if *cooldown > 0.0 && !matches!(state, EnemyState::Dying { .. }) {
+                        *cooldown -= dt;
+                        e.animator.update(skel, dt);
+                        continue;
+                    }
+                    // do_enemy_move: touching the player (radius + 0.5 + the
+                    // player's 1.5) requests a swing.
+                    let contact = near.and_then(|(pi, _)| {
+                        let pp = player_pos[pi].0;
+                        let d = Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length();
+                        (d < ty.radius + 0.5 + PLAYER_RADIUS && (pp.y - e.pos.y).abs() < ty.height)
+                            .then_some(pi)
+                    });
+                    let play_loop = |a: &mut Animator, s: Option<usize>| {
+                        if let Some(s) = s {
+                            a.play(s);
+                            a.force_loop = true;
+                        }
+                    };
                     match state {
                         EnemyState::Dying { timer } => {
+                            // The death (or HIT2) animation, then gone: at once for
+                            // small monsters, after the 0.7 s burn for the rest.
                             *timer -= dt;
-                            e.pos.y -= dt * 3.0;
                             if *timer <= 0.0 {
                                 e.alive = false;
                             }
+                            e.animator.update(skel, dt);
                             continue;
                         }
-                        EnemyState::Hurt { timer } => {
-                            *timer -= dt;
-                            if let Some(h) = seqs.hit {
-                                e.animator.play(h);
-                            }
-                            if *timer <= 0.0 {
+                        EnemyState::Asleep => {
+                            e.animator.update(skel, dt);
+                            continue;
+                        }
+                        EnemyState::Hurt { .. } => {
+                            if e.animator.finished {
                                 *state = EnemyState::Chase;
                             }
                         }
@@ -2825,65 +3216,88 @@ impl Game {
                             }
                         }
                         EnemyState::Idle => {
-                            if near.is_some_and(|(_, d)| d < ENEMY_ACTIVATE_DIST) {
+                            if *recognized {
                                 *state = EnemyState::Chase;
-                            } else if let Some(r) = seqs.ready {
-                                e.animator.play(r);
-                                e.animator.force_loop = true;
+                            } else {
+                                play_loop(&mut e.animator, seqs.ready);
                             }
                         }
                         EnemyState::Chase => match near {
-                            Some((pi, d)) if d <= ENEMY_ACTIVATE_DIST * 1.5 => {
+                            Some((pi, _)) => {
+                                // turn_enemy_ang: 0.049 rad a tick toward the target.
                                 let to = player_pos[pi].0 - e.pos;
-                                e.yaw = to.x.atan2(to.z);
-                                if d < 2.6 && *cooldown <= 0.0 && !seqs.attack.is_empty() {
+                                let want = to.x.atan2(to.z);
+                                let mut d = want - e.yaw;
+                                while d > std::f32::consts::PI {
+                                    d -= std::f32::consts::TAU;
+                                }
+                                while d < -std::f32::consts::PI {
+                                    d += std::f32::consts::TAU;
+                                }
+                                let turn = 0.0491 * 60.0 * dt;
+                                e.yaw += d.clamp(-turn, turn);
+                                if let (Some(pi), Some((swing, _))) = (contact, seqs.attack) {
+                                    // Every 8th swing is the power attack.
+                                    let power = *attacks & 7 == 7 && seqs.power.is_some();
+                                    let a = if power { seqs.power.unwrap().0 } else { swing };
                                     *state = EnemyState::Attack { hit_done: false };
-                                    let a = seqs.attack[(e.id as usize) % seqs.attack.len()];
+                                    *target = Some((pi, power));
                                     e.animator.restart(a);
                                     e.animator.force_loop = false;
-                                } else if d > 2.0 {
+                                } else {
                                     let dir = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
                                     e.pos += dir * *speed * dt;
-                                    if let Some(w) = seqs.walk {
-                                        e.animator.play(w);
-                                        e.animator.force_loop = true;
-                                    }
-                                } else if let Some(r) = seqs.ready {
-                                    e.animator.play(r);
-                                    e.animator.force_loop = true;
+                                    play_loop(&mut e.animator, seqs.walk);
                                 }
                             }
-                            _ => *state = EnemyState::Idle,
+                            None => play_loop(&mut e.animator, seqs.ready),
                         },
                         EnemyState::Attack { hit_done } => {
-                            let frames = skel
-                                .sequences
-                                .get(e.animator.seq)
-                                .map(|s| s.frame_count.max(1))
-                                .unwrap_or(1) as f32;
-                            if !*hit_done && e.animator.frame >= frames * 0.5 {
+                            // The hit lands as the wind-up ends, wherever the
+                            // player is now.
+                            if !*hit_done && e.animator.finished {
                                 *hit_done = true;
-                                if let Some((pi, d)) = near {
-                                    if d < 3.5 {
-                                        // get_enemy_fight: 12 / 15 / 18 by the
-                                        // monster's tier (x the level's enemy
-                                        // damage, 1.0 here).
-                                        melee.push((
-                                            ei,
-                                            pi,
-                                            [12.0, 15.0, 18.0][(*strength).clamp(1, 3) - 1],
-                                        ));
+                                if let Some((pi, power)) = target.take() {
+                                    let mut f = crate::enemies::fight(
+                                        *etype,
+                                        *hp,
+                                        self.tuning.health,
+                                        self.tuning.damage,
+                                    );
+                                    if power {
+                                        f *= 1.5;
                                     }
+                                    melee.push((ei, pi, f));
+                                }
+                                *attacks += 1;
+                                let recover = if *attacks & 7 == 0 {
+                                    seqs.power.and_then(|p| p.1)
+                                } else {
+                                    seqs.attack.and_then(|a| a.1)
+                                };
+                                match recover {
+                                    Some(r) => {
+                                        e.animator.restart(r);
+                                        *state = EnemyState::Recover;
+                                    }
+                                    None => *state = EnemyState::Chase,
                                 }
                             }
+                        }
+                        EnemyState::Recover => {
                             if e.animator.finished {
                                 *state = EnemyState::Chase;
-                                *cooldown = 0.6;
                             }
                         }
                     }
+                    let _ = strength;
                     // Monsters collide with the world like players do.
-                    e.pos = self.collision.resolve_walls(e.pos, 0.9, 3.5, STEP_HEIGHT);
+                    e.pos = self.collision.resolve_walls(
+                        e.pos,
+                        ty.radius.min(1.5),
+                        ty.height * 0.75,
+                        STEP_HEIGHT,
+                    );
                     if let Some(g) = self.collision.ground_height(e.pos, e.pos.y + STEP_HEIGHT) {
                         if e.pos.y - g < 3.0 {
                             e.pos.y = g;
@@ -3301,30 +3715,8 @@ impl Game {
         for (pi, dmg) in poisoned {
             self.damage_player(pi, dmg, DmgType::POISON_GAS);
         }
-        for (class, strength, pos, gen_id) in spawns {
-            let model = self.classes[class].model(strength);
-            let offset = Vec3::new(self.rng.range(-2.5, 2.5), 0.0, self.rng.range(-2.5, 2.5));
-            let id = self.spawn(
-                Kind::Enemy {
-                    class,
-                    strength,
-                    hp: 10.0 * strength as f32,
-                    state: EnemyState::Spawning,
-                    cooldown: 0.5,
-                    speed: 6.0 + strength as f32,
-                },
-                model,
-                pos + offset,
-                0.0,
-            );
-            if let Some(Kind::Generator { spawned, .. }) = self
-                .entities
-                .iter_mut()
-                .find(|e| e.id == gen_id)
-                .map(|e| &mut e.kind)
-            {
-                spawned.push(id);
-            }
+        for sp in spawns {
+            self.spawn_from_generator(sp);
         }
         // Forget dead spawns so generators can replace them.
         let alive_ids: std::collections::HashSet<u64> = self
@@ -3482,21 +3874,21 @@ mod tests {
             .classes
             .iter()
             .position(|c| c.name == "GRU")
-            .expect("grunts loaded");
+            .unwrap_or_else(|| {
+                let names: Vec<&str> = g.classes.iter().map(|c| c.name.as_str()).collect();
+                panic!("grunts not loaded: {names:?}")
+            });
         let model = g.classes[class].model(1);
-        let id = g.spawn(
-            Kind::Enemy {
-                class,
-                strength: 1,
-                hp: 10.0,
-                state: EnemyState::Idle,
-                cooldown: 99.0,
-                speed: 0.0,
-            },
-            model,
-            p + Vec3::new(0.0, 0.0, 12.0),
-            0.0,
-        );
+        let mut kind = g.new_enemy(class, 1, EnemyState::Idle);
+        if let Kind::Enemy {
+            cooldown, speed, ..
+        } = &mut kind
+        {
+            // Hold still for the test.
+            *cooldown = 99.0;
+            *speed = 0.0;
+        }
+        let id = g.spawn(kind, model, p + Vec3::new(0.0, 0.0, 12.0), 0.0);
         let fire = PlayerInput {
             stick: Vec2::new(0.0, 0.4),
             attack: true,
@@ -3785,6 +4177,21 @@ mod tests {
         assert_eq!(g.level_end, Some(LevelEnd::Secret(0xC02)));
         let s = Game::new(&fs, "levelS3", &[("WAR", "RED")]).unwrap();
         assert_eq!(s.secret_timer.map(|t| t.0), Some(45.99));
+    }
+
+    #[test]
+    fn realms_have_their_own_monsters() {
+        let Some(fs) = data() else { return };
+        let names = |level: &str| -> Vec<String> {
+            let g = Game::new(&fs, level, &[("WAR", "RED")]).unwrap();
+            g.classes.iter().map(|c| c.name.clone()).collect()
+        };
+        let b1 = names("levelB1");
+        assert!(b1.contains(&"TRO".to_string()), "{b1:?}");
+        assert!(!b1.contains(&"GRU".to_string()), "{b1:?}");
+        // Big levels: the generators make the large monster.
+        let b4 = names("levelB4");
+        assert!(b4.contains(&"DEM".to_string()), "{b4:?}");
     }
 
     #[test]

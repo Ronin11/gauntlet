@@ -343,7 +343,7 @@ impl App {
         } = &mut r.screen
         {
             let (level, panels) = (level.clone(), panels.clone());
-            match start_game(fs, &r.gpu, &level, panels) {
+            match start_game(fs, &r.gpu, &level, panels, r.prefs.difficulty) {
                 Ok(mut p) => {
                     if let Some(carry) = &r.carry {
                         for (a, info) in p.game.players.iter_mut().zip(&p.panels) {
@@ -963,7 +963,13 @@ fn panels_for(players: &[(String, String)]) -> Vec<PanelInfo> {
         .collect()
 }
 
-fn start_game(fs: &GameFs, gpu: &Gpu, level: &str, panels: Vec<PanelInfo>) -> Result<Playing> {
+fn start_game(
+    fs: &GameFs,
+    gpu: &Gpu,
+    level: &str,
+    panels: Vec<PanelInfo>,
+    difficulty: usize,
+) -> Result<Playing> {
     // Sumner plays with the Wizard's model.
     let classes: Vec<(&str, &str)> = panels
         .iter()
@@ -978,7 +984,7 @@ fn start_game(fs: &GameFs, gpu: &Gpu, level: &str, panels: Vec<PanelInfo>) -> Re
             )
         })
         .collect();
-    let game = Game::new(fs, level, &classes)?;
+    let game = Game::new_with(fs, level, &classes, difficulty)?;
     let scene = Scene::new(gpu, &game)?;
     Ok(Playing {
         game,

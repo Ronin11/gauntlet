@@ -57,6 +57,83 @@ pub struct LevelDef {
     pub difficulty: f32,
     /// The tally's pile scales: max gold, kills and experience.
     pub shop_max: [i32; 3],
+    /// ENMY indices of the monster types this level loads.
+    pub enemy_types: [i16; 6],
+    /// Monster and generator tuning (raw; 0 means "use difficulty").
+    pub enemy: EnemyTuning,
+}
+
+/// The LEVL enemy and generator fields (0xA8..0xDC).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EnemyTuning {
+    pub difficulty: f32,
+    pub health: f32,
+    pub speed: f32,
+    pub visrad: f32,
+    pub attack: f32,
+    pub damage: f32,
+    pub mrate: f32,
+    pub mspeed: f32,
+    pub macc: f32,
+    pub gen_health: f32,
+    pub gen_rate: f32,
+    pub gen_max: f32,
+    pub trap_rate: f32,
+    pub trap_damage: f32,
+}
+
+impl EnemyTuning {
+    /// ResolveWorldDataPointers: zero fields take the difficulty (missile speed
+    /// takes 1), the option's gain {0.667, 1, 1.5} scales speed, sight, missile
+    /// rate and accuracy, generator rate and max and the traps, and attack,
+    /// accuracy, missile rate and trap rate are inverted.
+    pub fn normalized(&self, option: usize) -> EnemyTuning {
+        let gain = [0.667, 1.0, 1.5][option.min(2)];
+        let mut t = *self;
+        if t.difficulty == 0.0 {
+            t.difficulty = 1.0;
+        }
+        let d = t.difficulty;
+        for f in [
+            &mut t.health,
+            &mut t.speed,
+            &mut t.visrad,
+            &mut t.attack,
+            &mut t.damage,
+            &mut t.mrate,
+            &mut t.macc,
+            &mut t.gen_health,
+            &mut t.gen_rate,
+            &mut t.gen_max,
+            &mut t.trap_rate,
+            &mut t.trap_damage,
+        ] {
+            if *f == 0.0 {
+                *f = d;
+            }
+        }
+        if t.mspeed == 0.0 {
+            t.mspeed = 1.0;
+        }
+        t.difficulty *= gain;
+        for f in [
+            &mut t.speed,
+            &mut t.visrad,
+            &mut t.attack,
+            &mut t.mrate,
+            &mut t.macc,
+            &mut t.gen_rate,
+            &mut t.gen_max,
+            &mut t.trap_rate,
+            &mut t.trap_damage,
+        ] {
+            *f *= gain;
+        }
+        for f in [&mut t.attack, &mut t.macc, &mut t.mrate, &mut t.trap_rate] {
+            *f = 1.0 / *f;
+        }
+        t
+    }
 }
 
 /// One MAPS record (0x48 bytes, the level_data `mapdata` the map screen draws):
@@ -124,6 +201,23 @@ pub struct Realm {
     pub audio: Vec<AudioDef>,
     /// MAPS records, indexed by [`LevelDef::map_index`].
     pub maps: Vec<MapDef>,
+    /// ENMY: (monster type, subtype) records the levels' enemy_types index.
+    pub enemies: Vec<(i32, i32)>,
+}
+
+/// The record count a WAD directory entry gives for `tag`.
+fn dir_count(d: &[u8], tag: &str) -> Option<usize> {
+    let mut i = d.len().checked_sub(16)?;
+    loop {
+        let t: String = d[i..i + 4].iter().rev().map(|&c| c as char).collect();
+        if !t.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        if t == tag {
+            return Some(u32::from_le_bytes(d[i + 8..i + 12].try_into().ok()?) as usize);
+        }
+        i = i.checked_sub(16)?;
+    }
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -187,6 +281,23 @@ impl Realm {
                 damage: f32_at(o + 0xA4),
                 difficulty: f32_at(o + 0xA8),
                 shop_max: [i32_at(o + 0xE0), i32_at(o + 0xE4), i32_at(o + 0xE8)],
+                enemy_types: std::array::from_fn(|j| i16_at(o + 0x4C + 2 * j)),
+                enemy: EnemyTuning {
+                    difficulty: f32_at(o + 0xA8),
+                    health: f32_at(o + 0xAC),
+                    speed: f32_at(o + 0xB0),
+                    visrad: f32_at(o + 0xB4),
+                    attack: f32_at(o + 0xB8),
+                    damage: f32_at(o + 0xBC),
+                    mrate: f32_at(o + 0xC0),
+                    mspeed: f32_at(o + 0xC4),
+                    macc: f32_at(o + 0xC8),
+                    gen_health: f32_at(o + 0xCC),
+                    gen_rate: f32_at(o + 0xD0),
+                    gen_max: f32_at(o + 0xD4),
+                    trap_rate: f32_at(o + 0xD8),
+                    trap_damage: f32_at(o + 0xDC),
+                },
             });
         }
         let mut audio = Vec::new();
@@ -227,12 +338,24 @@ impl Realm {
                 });
             }
         }
+        let mut enemies = Vec::new();
+        if let Some(eo) = find("ENMY") {
+            let n = dir_count(d, "ENMY").unwrap_or(0);
+            for k in 0..n {
+                let o = eo + k * 0x18;
+                if o + 8 > d.len() {
+                    break;
+                }
+                enemies.push((i32_at(o), i32_at(o + 4)));
+            }
+        }
         Ok(Realm {
             realm_type,
             letter,
             levels,
             audio,
             maps,
+            enemies,
         })
     }
 }
@@ -357,5 +480,35 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod enemy_tests {
+    use super::*;
+
+    #[test]
+    fn castle_and_mountain_monsters() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data/files/Gauntlet");
+        let Ok(w) = Worlds::load(|p| Ok(std::fs::read(root.join(p))?)) else {
+            return;
+        };
+        let loaded = |wave: u32| -> Vec<(i32, i32)> {
+            let r = w.realm(wave >> 8).unwrap();
+            let l = &r.levels[(wave & 0xFF) as usize];
+            l.enemy_types
+                .iter()
+                .filter(|&&i| i >= 0)
+                .filter_map(|&i| r.enemies.get(i as usize).copied())
+                .collect()
+        };
+        // A1: grunt (medium) and rat (small) first.
+        assert_eq!(&loaded(0x100)[..2], &[(4, 2), (3, 1)]);
+        // B1: troll and scorpion.
+        assert_eq!(&loaded(0x200)[..2], &[(1, 2), (0, 1)]);
+        let a1 = w.level(0x100).unwrap().enemy.normalized(1);
+        assert!((a1.health - 0.85).abs() < 1e-4);
+        assert!((a1.macc - 1.0 / 0.7).abs() < 1e-3);
     }
 }
