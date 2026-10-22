@@ -59,6 +59,29 @@ pub struct LevelDef {
     pub shop_max: [i32; 3],
 }
 
+/// One MAPS record (0x48 bytes, the level_data `mapdata` the map screen draws):
+/// where the route glow sits and the dashes of the path to the level, in the
+/// 512x384 virtual screen. Unused dash slots hold x = -1.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MapDef {
+    /// Top-left of the `map_<name>glow` blit; the glow exists only when x >= 0.
+    pub offset: [f32; 2],
+    /// Top-left of each `dash_<name>_<i+1>` blit.
+    pub dash: [[f32; 2]; 8],
+}
+
+impl MapDef {
+    /// The dashes the map screen draws: do_mapscreen stops at the first x < 0.
+    pub fn dots(&self) -> impl Iterator<Item = [f32; 2]> + '_ {
+        self.dash.iter().copied().take_while(|d| d[0] >= 0.0)
+    }
+
+    /// Does the route glow exist (init_mapscreen: `offset.x >= 0`)?
+    pub fn has_glow(&self) -> bool {
+        self.offset[0] >= 0.0
+    }
+}
+
 /// One AUDS record (audio_data, 60 bytes): the level's sound bank and music.
 #[derive(Clone, Debug, Default)]
 pub struct AudioDef {
@@ -99,6 +122,8 @@ pub struct Realm {
     pub letter: char,
     pub levels: Vec<LevelDef>,
     pub audio: Vec<AudioDef>,
+    /// MAPS records, indexed by [`LevelDef::map_index`].
+    pub maps: Vec<MapDef>,
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -122,13 +147,13 @@ impl Realm {
             if !tag.chars().all(|c| c.is_ascii_alphanumeric()) {
                 break;
             }
-            dir.push((tag, u32_at(i + 4)? as usize));
+            dir.push((tag, u32_at(i + 4)? as usize, u32_at(i + 8)? as usize));
             if i < 16 {
                 break;
             }
             i -= 16;
         }
-        let find = |t: &str| dir.iter().find(|(n, _)| n == t).map(|(_, o)| *o);
+        let find = |t: &str| dir.iter().find(|(n, _, _)| n == t).map(|(_, o, _)| *o);
         let (Some(w), Some(lo)) = (find("WRLD"), find("LEVL")) else {
             bail!("WAD has no WRLD/LEVL chunks");
         };
@@ -168,7 +193,7 @@ impl Realm {
         if let Some(ao) = find("AUDS") {
             let n = dir
                 .iter()
-                .find(|(t, _)| t == "AUDS")
+                .find(|(t, _, _)| t == "AUDS")
                 .map_or(0, |_| levels.len().max(1));
             for k in 0..n {
                 let o = ao + k * 60;
@@ -188,11 +213,26 @@ impl Realm {
                 });
             }
         }
+        let mut maps = Vec::new();
+        if let Some(&(_, mo, n)) = dir.iter().find(|(t, _, _)| t == "MAPS") {
+            for k in 0..n {
+                let o = mo + k * 0x48;
+                if o + 0x48 > d.len() {
+                    bail!("MAPS record {k} past end of WAD");
+                }
+                let xy = |j: usize| [f32_at(o + j * 8), f32_at(o + j * 8 + 4)];
+                maps.push(MapDef {
+                    offset: xy(0),
+                    dash: std::array::from_fn(|j| xy(j + 1)),
+                });
+            }
+        }
         Ok(Realm {
             realm_type,
             letter,
             levels,
             audio,
+            maps,
         })
     }
 }
@@ -260,8 +300,62 @@ impl Worlds {
             .unwrap_or_default()
     }
 
+    /// The map-screen record of a wave's level (level_data.mapdata), if it has one.
+    pub fn map(&self, wave: u32) -> Option<&MapDef> {
+        let realm = self.realm(wave >> 8)?;
+        let level = realm.levels.get((wave & 0xFF) as usize)?;
+        realm.maps.get(usize::try_from(level.map_index).ok()?)
+    }
+
     /// The level directory for a wave ("levelA6").
     pub fn dir(&self, wave: u32) -> Option<String> {
         Some(format!("level{}", self.level(wave)?.name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worlds() -> Option<Worlds> {
+        let root = std::env::var_os("GDL_GAME_DATA").map_or_else(
+            || std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data"),
+            std::path::PathBuf::from,
+        );
+        let dir = root.join("files/Gauntlet");
+        if !dir.join("WDATA").is_dir() {
+            eprintln!("skipping: no {}", dir.display());
+            return None;
+        }
+        Some(Worlds::load(|p| Ok(std::fs::read(dir.join(p))?)).unwrap())
+    }
+
+    #[test]
+    fn maps_records() {
+        let Some(w) = worlds() else { return };
+        // Castle index 1 is A6 (Dungeon): glow at (127,171), four dashes.
+        assert_eq!(w.level(0x101).unwrap().name, "A6");
+        let a6 = w.map(0x101).expect("A6 has mapdata");
+        assert_eq!(a6.offset, [127.0, 171.0]);
+        let dots: Vec<_> = a6.dots().collect();
+        assert_eq!(
+            dots,
+            [[56.0, 197.0], [58.0, 228.0], [84.0, 231.0], [113.0, 231.0]]
+        );
+        // A1 has a glow but no path.
+        let a1 = w.map(0x100).unwrap();
+        assert!(a1.has_glow());
+        assert_eq!(a1.dots().count(), 0);
+        // Secret levels have no map.
+        assert!(w.realm(12).unwrap().maps.is_empty());
+        assert!((0..9).all(|i| w.map(0xC00 | i).is_none()));
+        for r in &w.realms {
+            for m in &r.maps {
+                assert!(m.has_glow());
+                for d in m.dots() {
+                    assert!(d[0] < 512.0 && d[1] >= 0.0 && d[1] < 384.0, "{d:?}");
+                }
+            }
+        }
     }
 }

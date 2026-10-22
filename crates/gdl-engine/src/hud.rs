@@ -1,10 +1,13 @@
 //! 2D overlay drawn after the 3D scene: textured quads (the disc's menu art and
 //! fonts, see [`crate::ui`]), solid rectangles, and an 8x8 fallback font.
 
+use crate::fs::GameFs;
 use crate::game::{Game, PlayerState};
 use crate::screen::Scr;
 use crate::ui::{Font, Tex, UiAssets};
 use bytemuck::{Pod, Zeroable};
+use gdl_formats::texture::Image;
+use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -31,9 +34,70 @@ struct VsOut {
 }
 "#;
 
+/// Textures uploaded at runtime from one model directory, by upper-cased name.
+#[derive(Debug, Default)]
+pub struct TexBank {
+    pub textures: HashMap<String, Tex>,
+}
+
+impl TexBank {
+    /// Texture by bitmap-def name (case-insensitive, as MBOX_FindTexture).
+    pub fn get(&self, name: &str) -> Option<Tex> {
+        self.textures.get(&name.to_ascii_uppercase()).copied()
+    }
+}
+
+/// Upload an RGBA picture as an overlay texture.
+fn upload_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> wgpu::BindGroup {
+    let t = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("hud tex"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        rgba,
+    );
+    let view = t.create_view(&Default::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hud tex"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
 pub struct Hud {
     pipeline: wgpu::RenderPipeline,
     textures: Vec<wgpu::BindGroup>,
+    /// Slots of textures released by [`Hud::free_texture`], for reuse.
+    free: Vec<u32>,
     /// A texture rewritten every frame (movies): the texture and its overlay id.
     stream: Option<(wgpu::Texture, Tex)>,
     bgl: wgpu::BindGroupLayout,
@@ -640,42 +704,8 @@ impl Hud {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let upload = |w: u32, h: u32, rgba: &[u8]| {
-            let t = device.create_texture_with_data(
-                queue,
-                &wgpu::TextureDescriptor {
-                    label: Some("hud tex"),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                },
-                wgpu::util::TextureDataOrder::LayerMajor,
-                rgba,
-            );
-            let view = t.create_view(&Default::default());
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("hud tex"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            })
-        };
+        let upload =
+            |w: u32, h: u32, rgba: &[u8]| upload_texture(device, queue, &bgl, &sampler, w, h, rgba);
         let mut textures = vec![upload(1, 1, &[255; 4])];
         for img in ui.images.drain(..) {
             textures.push(upload(img.width, img.height, &img.rgba));
@@ -717,10 +747,76 @@ impl Hud {
         Hud {
             pipeline,
             textures,
+            free: Vec::new(),
             stream: None,
             bgl,
             sampler,
             ui,
+        }
+    }
+
+    /// Upload a picture at runtime and return its overlay handle. Slots released
+    /// with [`Hud::free_texture`] are reused.
+    pub fn add_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, img: &Image) -> Tex {
+        let bg = upload_texture(
+            device,
+            queue,
+            &self.bgl,
+            &self.sampler,
+            img.width,
+            img.height,
+            &img.rgba,
+        );
+        let id = match self.free.pop() {
+            Some(id) => {
+                self.textures[id as usize] = bg;
+                id
+            }
+            None => {
+                self.textures.push(bg);
+                self.textures.len() as u32 - 1
+            }
+        };
+        Tex {
+            id,
+            w: img.width,
+            h: img.height,
+        }
+    }
+
+    /// Release a texture from [`Hud::add_texture`]; drawing it afterwards draws white.
+    pub fn free_texture(&mut self, t: Tex) {
+        if t.id == 0 || t.id as usize >= self.textures.len() || self.free.contains(&t.id) {
+            return;
+        }
+        if self.stream.as_ref().is_some_and(|(_, s)| s.id == t.id) {
+            return;
+        }
+        // Dropping the bind group releases the GPU texture.
+        self.textures[t.id as usize] = self.textures[0].clone();
+        self.free.push(t.id);
+    }
+
+    /// Load and upload a model directory's named textures (e.g. `MAPS/levelA6`).
+    pub fn load_bank(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fs: &GameFs,
+        dir: &str,
+    ) -> anyhow::Result<TexBank> {
+        let mut bank = TexBank::default();
+        for (name, img) in crate::ui::load_bank_images(fs, dir)? {
+            let t = self.add_texture(device, queue, &img);
+            bank.textures.insert(name, t);
+        }
+        Ok(bank)
+    }
+
+    /// Release every texture of a bank from [`Hud::load_bank`].
+    pub fn free_bank(&mut self, bank: TexBank) {
+        for t in bank.textures.into_values() {
+            self.free_texture(t);
         }
     }
 

@@ -1,5 +1,5 @@
 use gdl_engine::{
-    app, audio, character, fs, game, gpu, hud, input, menu, scene, screen, select, ui,
+    app, audio, character, fs, game, gpu, hud, input, mapscreen, menu, scene, screen, select, ui,
 };
 
 use anyhow::{Context, Result};
@@ -53,6 +53,8 @@ Controls: left stick / WASD move, A / J attack, X / Shift turbo,
 
 Testing:
   --snapshot <png>      Render one frame headless and exit
+  --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
+                        map:<level>[:ticks] (e.g. map:A6:300)
   --simulate <frames>   Simulate N 60 Hz frames before the snapshot
   --hold <x,y>          Stick input held during simulation
   --attack-at <frame>   Press attack on that frame
@@ -284,12 +286,37 @@ fn snapshot_game(args: &Args) -> Result<()> {
         let proj = Mat4::perspective_rh(50f32.to_radians(), w as f32 / h as f32, 0.5, 2000.0);
         globals = gpu::globals(proj * view, m.transform_point3(eye), [0.0; 3], 0.0);
     }
-    let hud = hud::Hud::new(
+    let mut hud = hud::Hud::new(
         &gpu.device,
         &gpu.queue,
         gpu.color_format,
         ui::UiAssets::load(&fs),
     );
+    // --screen map:<level code>[:ticks]: the map screen after that many ticks.
+    let map_screen = match args.screen.as_deref().and_then(|s| s.strip_prefix("map:")) {
+        Some(spec) => {
+            let (code, ticks) = spec.split_once(':').unwrap_or((spec, "300"));
+            let ticks: u32 = ticks.parse().context("--screen map:<code>:<ticks>")?;
+            let wave = g
+                .worlds
+                .wave_of_dir(code)
+                .with_context(|| format!("no level {code} in the realm tables"))?;
+            let mut m = mapscreen::MapScreen::new(&fs, &gpu, &mut hud, &g.worlds, wave);
+            println!("map screen {code} (wave {wave:#x}), music {:?}", m.music);
+            for t in 1..=ticks {
+                let done = m.update();
+                for s in m.sfx.drain(..) {
+                    println!("tick {t}: sfx {s}");
+                }
+                if done {
+                    println!("tick {t}: finished");
+                    break;
+                }
+            }
+            Some((m, ticks))
+        }
+        None => None,
+    };
     let panels: Vec<hud::PanelInfo> = players
         .iter()
         .enumerate()
@@ -328,6 +355,11 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 select::Select::demo().draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
             }
             Some("loading") => menu::draw_loading(&mut screen::Scr::new(&mut canvas, &hud.ui, 40)),
+            Some(s) if s.starts_with("map:") => {
+                if let Some((m, ticks)) = &map_screen {
+                    m.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, *ticks));
+                }
+            }
             Some("pause") => {
                 hud::build(
                     &mut screen::Scr::new(&mut canvas, &hud.ui, 100),

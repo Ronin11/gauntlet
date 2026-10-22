@@ -97,6 +97,29 @@ pub const FONT_8HI: usize = 1;
 pub const FONT_32: usize = 6;
 pub const FONT_INITIALS: usize = 7;
 
+/// Decode a model directory's named textures (`<dir>/objects.ngc` + `textures.ngc`),
+/// for banks loaded on demand (the map screen's `MAPS/level<name>`). Names are
+/// upper-cased bitmap-def names; the first def of a name wins.
+pub fn load_bank_images(fs: &GameFs, dir: &str) -> anyhow::Result<Vec<(String, Image)>> {
+    let objs = Objects::parse(&fs.read(&format!("{dir}/objects.ngc"))?)?;
+    let tex = fs.read(&format!("{dir}/textures.ngc"))?;
+    let mut out: Vec<(String, Image)> = Vec::new();
+    for d in &objs.bitmap_defs {
+        let name = d.name.to_ascii_uppercase();
+        if name.is_empty() || out.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        let Some(b) = objs.bitmaps.get(d.tex_index as usize) else {
+            continue;
+        };
+        match texture::decode_ngc(b, &tex) {
+            Ok(img) => out.push((name, img)),
+            Err(e) => log::warn!("{dir}: {name}: {e:#}"),
+        }
+    }
+    Ok(out)
+}
+
 /// Texture banks loaded for the front end, in lookup order.
 const BANKS: [&str; 5] = ["STATIC", "SELECT", "TITLE", "SONY", "GROUP1"];
 

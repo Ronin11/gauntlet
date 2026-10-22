@@ -12,6 +12,7 @@ pub mod gpu;
 pub mod hud;
 pub mod input;
 pub mod level;
+pub mod mapscreen;
 pub mod menu;
 pub mod mesh;
 pub mod movie;
