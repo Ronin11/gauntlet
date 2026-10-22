@@ -6,6 +6,7 @@
 pub mod anim;
 pub mod audio;
 pub mod bin;
+pub mod critter;
 pub mod dol;
 pub mod mesh;
 pub mod movie;

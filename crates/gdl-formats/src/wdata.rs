@@ -49,6 +49,8 @@ pub struct LevelDef {
     /// Index into the realm's AUDS table.
     pub audio_index: i16,
     pub max_enemies: i16,
+    /// Index into the realm's BCAM table (boss camera), or -1.
+    pub boss_cam: i16,
     pub rune: i16,
     pub legend: i16,
     pub player_level: f32,
@@ -203,6 +205,33 @@ pub struct Realm {
     pub maps: Vec<MapDef>,
     /// ENMY: (monster type, subtype) records the levels' enemy_types index.
     pub enemies: Vec<(i32, i32)>,
+    /// Each ENMY record's variant string (+0x10): the gargoyle kind ("eagl",
+    /// "lion", "serp") or a golem model directory override ("levelB").
+    pub enemy_variants: Vec<String>,
+    /// BCAM: boss camera parameters, indexed by [`LevelDef::boss_cam`].
+    pub boss_cams: Vec<BossCamDef>,
+}
+
+/// One BCAM record (`bosscam_data`, 0x54 bytes).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BossCamDef {
+    /// 1 TRACKBOSS, 2 STAYINFRONT, 4 STAYINBACK, 8 WATCHBOSS, 0x10 TRACKALL,
+    /// 0x20 WATCHMODE2.
+    pub flags: u32,
+    pub maxyaw: f32,
+    pub cosmaxyaw: f32,
+    pub mindist: f32,
+    pub minpdist: f32,
+    pub maxdist: f32,
+    /// 0 means maxdist.
+    pub maxpdist: f32,
+    pub minpitch: f32,
+    pub maxpitch: f32,
+    pub minattn: [f32; 3],
+    /// y >= 999998 means "same as minattn".
+    pub maxattn: [f32; 3],
+    pub keyattn: [f32; 3],
+    pub wizattn: [f32; 3],
 }
 
 /// The record count a WAD directory entry gives for `tag`.
@@ -274,6 +303,7 @@ impl Realm {
                 map_index: i16_at(o + 0x5C),
                 audio_index: i16_at(o + 0x5A),
                 max_enemies: i16_at(o + 0x8E),
+                boss_cam: i16_at(o + 0x8C),
                 rune: i16_at(o + 0x90),
                 legend: i16_at(o + 0x92),
                 player_level: f32_at(o + 0x9C),
@@ -339,6 +369,7 @@ impl Realm {
             }
         }
         let mut enemies = Vec::new();
+        let mut enemy_variants = Vec::new();
         if let Some(eo) = find("ENMY") {
             let n = dir_count(d, "ENMY").unwrap_or(0);
             for k in 0..n {
@@ -347,6 +378,36 @@ impl Realm {
                     break;
                 }
                 enemies.push((i32_at(o), i32_at(o + 4)));
+                enemy_variants.push(if o + 0x18 <= d.len() {
+                    cstr(&d[o + 0x10..o + 0x18])
+                } else {
+                    String::new()
+                });
+            }
+        }
+        let mut boss_cams = Vec::new();
+        if let Some(&(_, bo, n)) = dir.iter().find(|(t, _, _)| t == "BCAM") {
+            for k in 0..n {
+                let o = bo + k * 0x54;
+                if o + 0x54 > d.len() {
+                    bail!("BCAM record {k} past end of WAD");
+                }
+                let v3 = |j: usize| [f32_at(o + j), f32_at(o + j + 4), f32_at(o + j + 8)];
+                boss_cams.push(BossCamDef {
+                    flags: i32_at(o) as u32,
+                    maxyaw: f32_at(o + 4),
+                    cosmaxyaw: f32_at(o + 8),
+                    mindist: f32_at(o + 0xC),
+                    minpdist: f32_at(o + 0x10),
+                    maxdist: f32_at(o + 0x14),
+                    maxpdist: f32_at(o + 0x18),
+                    minpitch: f32_at(o + 0x1C),
+                    maxpitch: f32_at(o + 0x20),
+                    minattn: v3(0x24),
+                    maxattn: v3(0x30),
+                    keyattn: v3(0x3C),
+                    wizattn: v3(0x48),
+                });
             }
         }
         Ok(Realm {
@@ -356,6 +417,8 @@ impl Realm {
             audio,
             maps,
             enemies,
+            enemy_variants,
+            boss_cams,
         })
     }
 }
@@ -428,6 +491,13 @@ impl Worlds {
         let realm = self.realm(wave >> 8)?;
         let level = realm.levels.get((wave & 0xFF) as usize)?;
         realm.maps.get(usize::try_from(level.map_index).ok()?)
+    }
+
+    /// The boss camera of a wave's level, if it has one.
+    pub fn boss_cam(&self, wave: u32) -> Option<&BossCamDef> {
+        let realm = self.realm(wave >> 8)?;
+        let level = realm.levels.get((wave & 0xFF) as usize)?;
+        realm.boss_cams.get(usize::try_from(level.boss_cam).ok()?)
     }
 
     /// The level directory for a wave ("levelA6").
@@ -510,5 +580,18 @@ mod enemy_tests {
         let a1 = w.level(0x100).unwrap().enemy.normalized(1);
         assert!((a1.health - 0.85).abs() < 1e-4);
         assert!((a1.macc - 1.0 / 0.7).abs() < 1e-3);
+        // Boss cameras: A5 Chimera tracks the boss, 20 degrees, 56..135.
+        let a5 = w.wave_of_dir("levelA5").unwrap();
+        let c = w.boss_cam(a5).expect("A5 has a boss camera");
+        assert_eq!(c.flags, 1);
+        assert_eq!((c.mindist, c.maxdist), (56.0, 135.0));
+        assert!((c.maxyaw.to_degrees() - 20.0).abs() < 0.1);
+        let d5 = w.wave_of_dir("levelD5").unwrap();
+        assert_eq!(w.boss_cam(d5).unwrap().flags, 0x10);
+        assert!(w.boss_cam(0x100).is_none());
+        // The castle's gargoyle is the eagle.
+        let castle = w.realm(1).unwrap();
+        let k = castle.enemies.iter().position(|e| e.0 == 32).unwrap();
+        assert_eq!(castle.enemy_variants[k], "eagl");
     }
 }
