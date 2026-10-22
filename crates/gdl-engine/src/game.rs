@@ -888,6 +888,11 @@ pub struct Game {
     pending_enemies: Vec<PendingEnemy>,
     /// Where the next damage_player hit comes from (for its push).
     pub damage_from: Option<Vec3>,
+    /// The music area asked for (sMusicSubIndex) and how to change to it
+    /// (sMusicSubState: 1 fade out first, 2 at once); and the sound items
+    /// that select areas: (position, radius, area, fade).
+    pub music_area: (usize, i16),
+    music_items: Vec<(Vec3, f32, usize, i16)>,
     /// The party's boss shards (bit = world order 1..11, as Progress::runes).
     pub runes: u16,
     /// Players who died in this level (inactivate_player outside the tower).
@@ -1317,6 +1322,8 @@ impl Game {
             fixed_camera: None,
             pending_enemies: Vec::new(),
             damage_from: None,
+            music_area: (0, 0),
+            music_items: Vec::new(),
             runes: 0,
             deaths: 0,
             roster: Default::default(),
@@ -1607,6 +1614,28 @@ impl Game {
                 (-m..512.0 + m).contains(&x) && (-m..384.0 + m).contains(&y)
             }
             None => false,
+        }
+    }
+
+    /// items.c case 0xD: the highest music area whose sound item has a hero
+    /// within its radius is asked for.
+    fn update_music_area(&mut self) {
+        let mut best: Option<(usize, i16)> = None;
+        for &(pos, radius, area, fade) in &self.music_items {
+            let near = self
+                .players
+                .iter()
+                .filter(|p| p.state.active())
+                .map(|p| (p.pos - pos).length())
+                .fold(f32::MAX, f32::min);
+            if near < radius && best.is_none_or(|b| area > b.0) {
+                best = Some((area, fade));
+            }
+        }
+        if let Some((area, fade)) = best {
+            if area != self.music_area.0 {
+                self.music_area = (area, fade);
+            }
         }
     }
 
@@ -2175,6 +2204,17 @@ impl Game {
                         yaw,
                     );
                 }
+                // SetItem case 13: a sound item with a music area selects it
+                // while a hero is within its radius.
+                ItemType::Sound => {
+                    let radius = f32::from_le_bytes(inst.params[0..4].try_into().unwrap());
+                    let area = i32::from_le_bytes(inst.params[4..8].try_into().unwrap());
+                    let fade = i16::from_le_bytes(inst.params[8..10].try_into().unwrap());
+                    if area > 0 {
+                        self.music_items
+                            .push((pos, radius, area as usize - 1, fade));
+                    }
+                }
                 ItemType::Transporter | ItemType::Rotator => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     if model.is_some() {
@@ -2398,6 +2438,7 @@ impl Game {
         }
         let inputs = self.legend_freeze_inputs(inputs);
         self.update_players(dt, &inputs);
+        self.update_music_area();
         self.legend_face_boss();
         self.update_rings(dt);
         self.spawn_placed_enemies();
@@ -5550,6 +5591,43 @@ mod tests {
             g.players[1].grab_partner.is_none(),
             "free again after the throw"
         );
+    }
+
+    #[test]
+    fn music_areas_exist_and_have_streams() {
+        let Some(fs) = data() else { return };
+        let wd = gdl_formats::wdata::Worlds::load(|p| fs.read(p)).unwrap();
+        let mut with_items = 0;
+        for d in std::fs::read_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../game-data/files/Gauntlet/LEVELS"),
+        )
+        .unwrap()
+        {
+            let name = d.unwrap().file_name().into_string().unwrap();
+            // (The unused test levels name streams that aren't on the disc.)
+            if name.starts_with("levelT") {
+                continue;
+            }
+            let Some(w) = wd.wave_of_dir(&name) else {
+                continue;
+            };
+            let (_, n) = wd.music_area(w, 0);
+            for a in 0..n {
+                for s in wd.music_area(w, a).0 {
+                    assert!(
+                        fs.read(&format!("STREAMS/{s}.ads")).is_ok(),
+                        "{name} area {a}: {s}"
+                    );
+                }
+            }
+            let g = Game::new(&fs, &name, &[("WAR", "RED")]).unwrap();
+            if !g.music_items.is_empty() {
+                // (An area past the music's last is ignored, as in the game.)
+                with_items += 1;
+            }
+        }
+        assert!(with_items > 0, "some levels switch music by area");
     }
 
     #[test]

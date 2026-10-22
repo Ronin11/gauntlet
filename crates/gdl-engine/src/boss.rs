@@ -611,6 +611,8 @@ impl Game {
             if !b.active {
                 b.active = true;
                 b.targeted = true;
+                // sMusicSubIndex = sMusicSubState = 1: the boss part, faded in.
+                self.music_area = (1, 1);
             }
         }
     }

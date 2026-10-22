@@ -126,6 +126,9 @@ pub struct Audio {
     tx: Option<mpsc::Sender<Cmd>>,
     /// Sound-effect volume from the options (1.0 = the default 128).
     sfx_vol: f32,
+    /// Music volume from the options, and the fade applied on top of it.
+    music_vol: f32,
+    music_fade: f32,
     current: String,
     lib: Option<SoundLib>,
 }
@@ -135,6 +138,8 @@ impl Audio {
         if muted {
             return Audio {
                 sfx_vol: 1.0,
+                music_vol: 1.0,
+                music_fade: 1.0,
                 tx: None,
                 current: String::new(),
                 lib: None,
@@ -234,6 +239,8 @@ impl Audio {
             });
         Audio {
             sfx_vol: 1.0,
+            music_vol: 1.0,
+            music_fade: 1.0,
             tx: spawned.ok().map(|_| tx),
             current: String::new(),
             lib: None,
@@ -419,8 +426,21 @@ impl Audio {
     /// Apply the Audio options: music and sfx volumes (128 is the default).
     pub fn set_volumes(&mut self, prefs: &crate::options::Prefs) {
         self.sfx_vol = prefs.sfx_vol as f32 / 128.0;
+        self.music_vol = prefs.music_vol as f32 / 128.0;
+        self.send_music_volume();
+    }
+
+    /// AudioMusicVolUpdate's fade (1.0 = full), on top of the music volume.
+    pub fn set_music_fade(&mut self, f: f32) {
+        if (f - self.music_fade).abs() > 1e-4 {
+            self.music_fade = f;
+            self.send_music_volume();
+        }
+    }
+
+    fn send_music_volume(&self) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Cmd::MusicVolume(prefs.music_vol as f32 / 128.0));
+            let _ = tx.send(Cmd::MusicVolume(self.music_vol * self.music_fade));
         }
     }
 
