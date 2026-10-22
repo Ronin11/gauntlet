@@ -158,9 +158,9 @@ impl Attract {
             Some(Show::Screen2D { ticks, .. }) => {
                 // attract_check_input: Start or a face button goes to the title.
                 if self.started
-                    && inputs
-                        .iter()
-                        .any(|i| i.start_pressed || i.attack_pressed || i.magic_pressed)
+                    && inputs.iter().any(|i| {
+                        i.start_pressed || i.attack_pressed || i.b_pressed || i.magic_pressed
+                    })
                 {
                     self.show = None;
                     return Event::Title;

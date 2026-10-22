@@ -56,9 +56,14 @@ impl Movie {
 
     /// Advance by `dt` seconds. Returns true once the movie has ended.
     pub fn update(&mut self, dt: f32, inputs: &[PlayerInput]) -> bool {
-        let pressed = inputs
-            .iter()
-            .any(|i| i.attack || i.attack_pressed || i.magic_pressed || i.start_pressed || i.turbo);
+        let pressed = inputs.iter().any(|i| {
+            i.attack
+                || i.attack_pressed
+                || i.magic_pressed
+                || i.b_pressed
+                || i.start_pressed
+                || i.turbo
+        });
         if pressed && !self.held && self.stopping.is_none() {
             self.stopping = Some(3);
         }

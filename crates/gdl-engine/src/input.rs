@@ -11,10 +11,17 @@ use winit::keyboard::KeyCode;
 pub struct PlayerInput {
     /// Left stick / WASD, x = right, y = up (screen relative), magnitude 0..1.
     pub stick: Vec2,
+    /// A: attack (held and newly pressed).
     pub attack: bool,
     pub attack_pressed: bool,
+    /// X: magic (use a potion).
     pub magic_pressed: bool,
+    /// B held: turbo / block (they share a button on GameCube).
     pub turbo: bool,
+    /// B newly pressed: back in menus, "Quit Game" when dead.
+    pub b_pressed: bool,
+    /// Y: slow attack.
+    pub slow_pressed: bool,
     pub start_pressed: bool,
 }
 
@@ -191,8 +198,11 @@ impl Input {
                     attack: self.held(KeyCode::KeyJ) || self.held(KeyCode::Space),
                     attack_pressed: self.just_pressed(KeyCode::KeyJ)
                         || self.just_pressed(KeyCode::Space),
-                    magic_pressed: self.just_pressed(KeyCode::KeyK),
-                    turbo: self.held(KeyCode::KeyL) || self.held(KeyCode::ShiftLeft),
+                    magic_pressed: self.just_pressed(KeyCode::KeyL),
+                    turbo: self.held(KeyCode::KeyK) || self.held(KeyCode::ShiftLeft),
+                    b_pressed: self.just_pressed(KeyCode::KeyK)
+                        || self.just_pressed(KeyCode::Backspace),
+                    slow_pressed: self.just_pressed(KeyCode::KeyI),
                     start_pressed: self.just_pressed(KeyCode::Enter),
                 }
             }
@@ -219,8 +229,10 @@ impl Input {
                     stick: v.normalize_or_zero(),
                     attack: h(BUTTON_A) || h(DPAD_CENTER),
                     attack_pressed: p(BUTTON_A) || p(DPAD_CENTER),
-                    magic_pressed: p(BUTTON_B) || p(BUTTON_Y),
-                    turbo: h(BUTTON_X) || h(BUTTON_R1) || h(BUTTON_R2),
+                    magic_pressed: p(BUTTON_X),
+                    turbo: h(BUTTON_B),
+                    b_pressed: p(BUTTON_B),
+                    slow_pressed: p(BUTTON_Y),
                     start_pressed: p(BUTTON_START),
                 }
             }
@@ -256,8 +268,10 @@ impl Input {
                     stick: v,
                     attack: pad.is_pressed(Button::South),
                     attack_pressed: pressed(Button::South),
-                    magic_pressed: pressed(Button::East),
-                    turbo: pad.is_pressed(Button::West) || pad.is_pressed(Button::RightTrigger2),
+                    magic_pressed: pressed(Button::West),
+                    turbo: pad.is_pressed(Button::East),
+                    b_pressed: pressed(Button::East),
+                    slow_pressed: pressed(Button::North),
                     start_pressed: pressed(Button::Start),
                 }
             }

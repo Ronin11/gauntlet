@@ -161,7 +161,7 @@ impl OptMenu {
                 Event::Refused
             };
         }
-        if input.magic_pressed {
+        if input.b_pressed {
             return Event::Back;
         }
         if dx < 0 {

@@ -440,7 +440,7 @@ impl Select {
                     p.class = DEFAULT_CLASS;
                     p.state = State::Selecting(Motion::Class);
                     p.entered_class = false;
-                } else if p.name_timer == 0 && inp.magic_pressed && p.name.is_empty() {
+                } else if p.name_timer == 0 && inp.b_pressed && p.name.is_empty() {
                     // B with nothing typed goes back to New / Load.
                     p.state = State::Selecting(p.motion_save);
                     p.center_menu();
@@ -467,7 +467,7 @@ impl Select {
                 }
                 let known_class = known_of(p.class, progress);
                 p.update_class_spec(known_class);
-                if inp.magic_pressed {
+                if inp.b_pressed {
                     self.sfx.push("S_OPTMENUEXIT".into());
                     p.slots[SlotId::Portrait as usize].hidden = true;
                     p.state = State::Selecting(p.motion_save);
@@ -777,7 +777,7 @@ impl Player {
             self.cursor = CYCLE.as_bytes()[next] as char;
             sfx.push("S_OPTMENUMOVVRT".into());
         }
-        let delete = dx < 0 || (inp.magic_pressed && !self.name.is_empty());
+        let delete = dx < 0 || (inp.b_pressed && !self.name.is_empty());
         let accept = inp.attack_pressed || dx > 0;
         let mut done = false;
         if delete && !self.name.is_empty() {

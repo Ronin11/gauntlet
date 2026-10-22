@@ -47,7 +47,7 @@ struct Playing {
 
 /// Health, score, keys and potions carried from one level to the next.
 /// Indexed by slot (column), so players keep their stats whoever joins.
-type Carry = [Option<(f32, u32, u32, u32)>; 4];
+type Carry = [Option<crate::game::Carried>; 4];
 
 enum Screen {
     /// The licence screen shown at power-on, for this many more ticks.
@@ -342,9 +342,8 @@ impl App {
                 Ok(mut p) => {
                     if let Some(carry) = &r.carry {
                         for (a, info) in p.game.players.iter_mut().zip(&p.panels) {
-                            if let Some(b) = carry[info.slot % 4] {
-                                a.health = b.0;
-                                (a.score, a.keys, a.potions) = (b.1, b.2, b.3);
+                            if let Some(b) = &carry[info.slot % 4] {
+                                a.restore(b);
                             }
                         }
                     }
@@ -487,12 +486,11 @@ impl App {
                         let old = r.carry.take().unwrap_or_default();
                         let mut carry: Carry = Default::default();
                         for info in &panels {
-                            carry[info.slot % 4] = Some(old[info.slot % 4].unwrap_or((
-                                crate::game::max_health(1),
-                                0,
-                                0,
-                                0,
-                            )));
+                            carry[info.slot % 4] = Some(
+                                old[info.slot % 4]
+                                    .clone()
+                                    .unwrap_or_else(crate::game::Carried::new_character),
+                            );
                         }
                         r.carry = Some(carry);
                         // Player select always leads into the tower.
@@ -764,9 +762,9 @@ impl App {
                 let mut carry: Carry = Default::default();
                 for (p, info) in play.game.players.iter().zip(&play.panels) {
                     let slot = info.slot % 4;
-                    carry[slot] = match (p.state, checkpoint[slot]) {
-                        (PlayerState::InTower, Some(c)) => Some(c),
-                        _ => Some((p.health.max(1.0), p.score, p.keys, p.potions)),
+                    carry[slot] = match (p.state, &checkpoint[slot]) {
+                        (PlayerState::InTower, Some(c)) => Some(c.clone()),
+                        _ => Some(p.carried()),
                     };
                 }
                 r.carry = Some(carry);

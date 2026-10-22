@@ -247,11 +247,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
         if f % 600 == 0 {
             let p = &g.players[0];
             println!(
-                "t={:4}s hp {:4.0} score {:5} keys {} | {}",
+                "t={:4}s hp {:4.0} gold {:5} keys {} lv {} exp {} turbo {:.0} | {}",
                 f / 60,
                 p.health,
-                p.score,
+                p.gold,
                 p.keys,
+                p.level,
+                p.exp,
+                p.power,
                 g.stats()
             );
         }

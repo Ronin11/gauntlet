@@ -18,20 +18,24 @@ cargo build --release
 extracted with `gdl extract`. If you omit it, the game looks for `$GDL_DATA`, a
 `game-data/` folder, or an `.iso` next to the executable. `./run.sh` does the same.
 
-Press **Start** on the title screen. On the hero select screen each controller presses
-**Start** (or **A**) to join, picks a hero with **left/right**, and presses **A** to ready
-up. The keyboard counts as a controller (Enter). **Start** (or Esc) pauses the game; the
-pause menu can change heroes, go back to the title, or quit. The title, hero select,
-loading screen, pause menu and HUD use the original game's art and fonts from the disc.
+The game follows the GameCube original, rebuilt from its decompiled code: licence screen
+and movies, the title (Start / Options), player select, the tower hub with a portal per
+level, the map screen and intro movie, the level, then back to the tower.
 
-| Action | Controller | Keyboard |
-|---|---|---|
-| Move | Left stick / D-pad | WASD / arrows |
-| Attack | A (South) | J / Space |
-| Turbo | X (West) / RT | L / Shift |
-| Potion / back | B | K |
-| Pause | Start | Enter / Esc |
-| Fullscreen | | F11 |
+On player select each controller presses **Start** to join, chooses **New**, types a
+name, picks a class (left/right) and colour (up/down), and presses **A**. The keyboard
+counts as a controller (Enter). In the tower, a new controller can join with Start.
+**Start** during play opens the Game Menu (Tower Menu in the tower).
+
+| Action | GameCube | Controller | Keyboard |
+|---|---|---|---|
+| Move (run past 3/4 of the stick) | stick | Left stick / D-pad | WASD / arrows |
+| Attack (melee in reach, else throw) | A | A (South) | J / Space |
+| Turbo attack (hold, then A) / block | B | B (East) | K / Shift |
+| Magic (use a potion) | X | X (West) | L |
+| Back in menus | B | B | K / Backspace |
+| Menu | Start | Start | Enter / Esc |
+| Fullscreen | | | F11 |
 
 Other options: `--level levelB1` to start elsewhere, `--players WAR,VAL/BLU` to skip the
 join screen, `--mute`. See `gauntlet --help`.
@@ -62,15 +66,19 @@ in `~/.android/gauntlet-rs.keystore`.
   decoding and rotation matrices taken from the decompilation).
 - **Monsters**: skeletal and mesh-swap animated (grunts, rats, ghosts, Death, ...), spawned
   by generators that can be destroyed. They chase and attack players.
-- **Items**: food, keys, gold, gems, potions, barrels and chests (breakable), locked gates
-  (open with a key), exit portals (load the next level), damage tiles.
+- **Items** as in items.c: food heals its value (spoiled food poisons; it stays put at full
+  health), gold adds its value, keys and potions (coloured) stop at 9, chests open with a
+  key, barrels break, gates take a key, scrolls show the level's hints, crystals open the
+  tower's barriers.
 - **Levers and pressure pads**: walk into a lever or onto a pad to raise elevators, sink
   spiked barricades and reveal bridges, with the original's latch/toggle/hold rules.
-- **Up to 4 players** on gamepads and keyboard, a Gauntlet-style HUD, health drain,
-  kid-friendly respawning, a follow camera that keeps the party together.
-- **Combat**: melee when something is in reach, otherwise a thrown weapon, at the original
-  animation speeds (wind-up, release, recovery; quick-attack combos); potions (B/K) blast
-  every monster nearby.
+- **Up to 4 players** on gamepads and keyboard, with the original's status panels. No
+  health drain (the GameCube version has none); dead players wait in the tower.
+- **Combat** from the decompiled rules: speed, damage, armour and magic come from each
+  class's stats and level; experience and level-ups (+100 health, +5 stats); single-target
+  melee within reach of the aim cone, otherwise a throw; potions spread a ring as wide as
+  the magic stat; the turbo meter fills over time and with melee, and B+A spends it on a
+  turbo attack; holding B blocks.
 - **Music**: each world's soundtrack, decoded from the disc's DSP-ADPCM streams.
 - **Sound effects and announcer**: weapon hits, monster deaths, pickups, gates, hero pain
   and death voices, and "Red Warrior needs food, badly!", decoded from the `.VBK` banks

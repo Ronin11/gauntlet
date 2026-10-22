@@ -556,7 +556,7 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
                 s.blit(t, x, 357.0, 20.0, 20.0, 0);
             }
         }
-        let gold = p.score.min(99999).to_string();
+        let gold = p.gold.min(99999).to_string();
         let w = s.text_width(FONT_SCORE, 1.0, &gold);
         s.text(1.0, x0 + 60.0 - w, 359.0, FONT_SCORE, pal, 0, &gold);
         let health = (p.health.max(0.0) as u32).min(9999).to_string();

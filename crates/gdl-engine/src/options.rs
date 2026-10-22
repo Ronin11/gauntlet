@@ -826,7 +826,7 @@ impl Options {
                 'l' => i.stick.x = -1.0,
                 'r' => i.stick.x = 1.0,
                 'a' => i.attack_pressed = true,
-                'b' => i.magic_pressed = true,
+                'b' => i.b_pressed = true,
                 's' => i.start_pressed = true,
                 _ => {}
             }
@@ -1182,7 +1182,7 @@ impl Options {
             }
             return (OPT_NONE, Some("S_NO"));
         }
-        if input.magic_pressed {
+        if input.b_pressed {
             return (OPT_ABORT, None);
         }
         if dx < 0 {
@@ -1574,7 +1574,7 @@ mod tests {
     }
     fn b() -> PlayerInput {
         PlayerInput {
-            magic_pressed: true,
+            b_pressed: true,
             ..idle()
         }
     }
