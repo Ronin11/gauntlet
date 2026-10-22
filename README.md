@@ -87,8 +87,18 @@ in `~/.android/gauntlet-rs.keystore`.
 - **Sound effects and announcer**: weapon hits, monster deaths, pickups, gates, hero pain
   and death voices, and "Red Warrior needs food, badly!", decoded from the `.VBK` banks
   using the sound names in `AUDATPS2.ROM`.
-- **Camera** follows each area's original camera heading and cuts away roofs and walls
-  between it and the players.
+- **Camera**: the GameCube's NEWCAM gameplay camera (each area's camera locator, framing
+  every player, holding the party inside the view), the boss cameras, camera shakes, and
+  the attract-mode level flybys.
+- **Bosses**: all eleven Guardians with their attacks, health meters, safe rocks, Items of
+  Legend (the holder's throw and the Guardian's weakened phase), the boss key and the good
+  wizard; golems, gargoyles and generals as critters.
+- **World hazards**: lava and fire floors and walls, damage tiles, falling and sinking
+  rocks, and heroes who fall out of the world come back beside a partner.
+- **Thrown weapons** fly like the original's: per-class weight and arc, 3-way and 5-way
+  fans, launch-time wall checks, wall-hit sounds.
+- **Texture animation**: lava, water, torches, skies and glowing models.
+- **Save games** on a virtual memory card, with the original's load/save screens.
 - **Power-ups** wait in each player's inventory until switched on from the D-pad, as on
   GameCube; the name shows over the player's panel, glowing while it is on.
 - **Sumner** in the tower: the welcome story, his speeches and the stained-glass and
@@ -98,10 +108,8 @@ in `~/.android/gauntlet-rs.keystore`.
 
 ## Not done yet (roadmap)
 
-- Bosses and their arenas (in progress), attract-mode level flybys
-- Texture animations (flowing water, flames), particle effects
-- Save games (load game)
-- Android touch controls
+- Particle effects and most hit/burst effect models
+- Android touch controls (Bluetooth controllers work)
 
 ## Layout
 
@@ -124,6 +132,11 @@ gdl dol main.dol 0x80347B10:f32         # read constants out of the executable
 
 gauntlet --snapshot out.png --simulate 600 --bot   # headless test run + screenshot
 ```
+
+Headless test hooks (environment variables): `GDL_MUTE=1` (no audio), `GDL_FUZZ=seed`
+(random inputs), `GDL_LEGEND=1` (the party holds the realm's Item of Legend), `GDL_INV=1`
+(power-up inventory), `GDL_SUMNER=welcome|runes=..|shards=..|exp=N`, `GDL_FLYBY=1`,
+`GDL_NO_BOSS_CAMERA=1`, `GDL_DEBUG_CAM=1`.
 
 ## Credits and references
 
