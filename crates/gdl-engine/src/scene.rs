@@ -37,7 +37,7 @@ pub fn project(game: &Game, pos: Vec3) -> Option<(f32, f32)> {
     let (eye, at, near) = game.camera_view();
     let m = mirror();
     let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
-    let proj = Mat4::perspective_rh(45f32.to_radians(), 4.0 / 3.0, near, 1500.0);
+    let proj = crate::camera::projection(4.0 / 3.0, near, 1500.0);
     let c = proj * view * m.transform_point3(pos).extend(1.0);
     if c.w <= 0.0 {
         return None;
@@ -235,7 +235,7 @@ impl Scene {
         let (eye, at, near) = game.camera_view();
         let m = mirror();
         let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
-        let proj = Mat4::perspective_rh(45f32.to_radians(), aspect, near, 1500.0);
+        let proj = crate::camera::projection(aspect, near, 1500.0);
         gpu::globals(
             proj * view,
             m.transform_point3(eye),

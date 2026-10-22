@@ -1055,12 +1055,12 @@ impl Game {
     }
 
     /// CameraLimitPlayerDpos / CamLimitPlayerDpos: while the boss camera
-    /// runs, a player's move that would take them (a 1.9375 x col_height
-    /// sphere) further out of the frame is clipped in view space: across a
-    /// side plane the sideways part goes, across top or bottom the vertical
-    /// part, and toward or away from the camera as the code's plane masks
-    /// say; a corner or the near plane stops the move. The move is the
-    /// change since last frame (players move before the boss is updated).
+    /// runs, a player's move is clipped by the view frustum of a camera
+    /// `view_scale` back from the boss camera's attention point (lbl_80343C5C
+    /// is set on the GameCube, so this is NEWCAM's CalcFrustrumNormals +
+    /// fn_8006DC64; see camera.rs). view_scale is 0.85 of maxdist in the
+    /// fight, of 1.9375 maxpdist before it. The move is the change since last
+    /// frame (players move before the boss is updated).
     fn limit_players_to_camera(&mut self) {
         let Some(b) = self.boss.as_ref() else { return };
         let Some(cam) = b.cam.filter(|c| c.started) else {
@@ -1081,50 +1081,27 @@ impl Game {
             })
         };
         let free = (b.dead || b.dying) && matches!(b.boss_type, 36 | 37 | 41) && gold_left();
-        let slide = cam.dist <= cam.def.maxdist;
-        let fwd = cam_forward(cam.yaw, cam.pitch);
-        let eye = cam.attn - fwd * cam.dist;
-        let (right, up) = view_basis(fwd);
+        let def = cam.def;
+        let view_scale = 0.85
+            * if b.active {
+                def.maxdist
+            } else if def.maxpdist > 0.0 {
+                1.9375 * def.maxpdist
+            } else {
+                1.9375 * def.maxdist
+            };
+        let f = Game::boss_frustum(cam.attn, cam_forward(cam.yaw, cam.pitch), view_scale);
         let prev = b.player_prev.clone();
         let mut now = Vec::new();
-        for (i, p) in self.players.iter_mut().enumerate() {
-            let cur = p.pos;
+        for i in 0..self.players.len() {
+            let cur = self.players[i].pos;
             let old = prev.get(i).copied().flatten();
-            if let (Some(old), true, false) = (old, p.state.active(), free) {
-                let dpos = cur - old;
-                let moved = Vec2::new(dpos.x, dpos.z).length();
-                if moved > 1e-4 && moved < 5.0 {
-                    let col = |at: Vec3| at + Vec3::Y * 2.5;
-                    let r = 1.9375 * 2.5;
-                    let (d0, _) = point_view_clip(eye, fwd, col(old), r);
-                    let (d1, flags) = point_view_clip(eye, fwd, col(cur), r);
-                    if d1 < 0.0 && d1 < d0 {
-                        let lr = flags & 0x30;
-                        let tb = flags & 0x300;
-                        let new = if !slide || (lr != 0 && tb != 0) || flags & 1 != 0 {
-                            old
-                        } else {
-                            let v = dpos;
-                            let (mut dx, mut dy, mut dz) = (v.dot(right), v.dot(up), v.dot(fwd));
-                            if lr != 0 {
-                                dx = 0.0;
-                            } else if tb != 0 {
-                                dy = 0.0;
-                            }
-                            if dz < 0.0 && flags & 0x230 != 0 {
-                                dz = 0.0;
-                            } else if dz > 0.0 && flags & 0x130 != 0 {
-                                dz = 0.0;
-                            }
-                            let w = right * dx + up * dy + fwd * dz;
-                            // dpos.y is kept as the player's own.
-                            Vec3::new(old.x + w.x, cur.y, old.z + w.z)
-                        };
-                        p.pos = Vec3::new(new.x, cur.y, new.z);
-                    }
+            if let (Some(old), true, false) = (old, self.players[i].state.active(), free) {
+                if let Some(new) = self.clip_player(&f, old, cur) {
+                    self.players[i].pos = new;
                 }
             }
-            now.push(Some(p.pos));
+            now.push(Some(self.players[i].pos));
         }
         if let Some(b) = self.boss.as_mut() {
             b.player_prev = now;
