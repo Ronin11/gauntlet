@@ -435,6 +435,17 @@ impl Model {
         (parts, hidden)
     }
 
+    /// A skeleton node's model-space matrix at a frame of a sequence.
+    pub fn node_matrix(&self, seq: usize, frame: f32, name: &str) -> Option<Mat4> {
+        let i = self
+            .skeleton
+            .nodes
+            .iter()
+            .position(|n| n.name.eq_ignore_ascii_case(name))?;
+        let poses = self.skeleton.sample(seq, frame);
+        self.node_transforms(&poses).get(i).copied()
+    }
+
     fn node_transforms(&self, poses: &[Pose]) -> Vec<Mat4> {
         let nodes = &self.skeleton.nodes;
         let mut world: Vec<Mat4> = Vec::with_capacity(nodes.len());

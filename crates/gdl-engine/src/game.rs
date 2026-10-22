@@ -372,6 +372,14 @@ pub struct Player {
     hit_flags: u32,
     hit_force: Vec3,
     knock_vel: Vec3,
+    /// Two-player combos: the linked partner, the one about to be linked, the
+    /// combo timer (timer_1FA, ticks), the place before being picked up, and
+    /// whose DUMMY node this hero rides while grabbed (hud 0x20).
+    pub grab_partner: Option<usize>,
+    grab_pending: Option<usize>,
+    combo_timer: i32,
+    saved_pos: Vec3,
+    attached_to: Option<usize>,
 }
 
 /// Animation sequence indices for a player model.
@@ -1459,6 +1467,11 @@ impl Game {
                 hit_flags: 0,
                 hit_force: Vec3::ZERO,
                 knock_vel: Vec3::ZERO,
+                grab_partner: None,
+                grab_pending: None,
+                combo_timer: 0,
+                saved_pos: Vec3::ZERO,
+                attached_to: None,
             });
         }
         // Ranged-attack projectile: the class's throw model, else its weapon.
@@ -2490,6 +2503,18 @@ impl Game {
                 ));
             }
         }
+        // fn_80088EF4's candidates: who could be grabbed for a combo.
+        let combo_info: Vec<(Vec3, bool, u8)> = self
+            .players
+            .iter()
+            .map(|p| {
+                let free = p.state.active()
+                    && p.grab_partner.is_none()
+                    && p.grab_pending.is_none()
+                    && p.fx.special & 0x400 == 0;
+                (p.pos, free, (p.class_id % 8) as u8)
+            })
+            .collect();
         for (i, p) in self.players.iter_mut().enumerate() {
             let mut inp = inputs.get(i).copied().unwrap_or_default();
             // The d-pad runs the mini-inventory; only the stick walks.
@@ -2623,12 +2648,42 @@ impl Game {
                 shield: p.fx.armor,
                 stat_armor: p.derived.armor,
                 char_type: ct,
-                // (Two-player combos need the partner's side; not yet.)
-                partner: false,
+                partner_ct: p.grab_partner.and_then(|g| combo_info.get(g)).map(|c| c.2),
                 ..Default::default()
             };
+            // A combo partner: the nearest free hero within 5 in a 45 degree
+            // cone ahead, at about the same height.
+            let facing = Vec2::new(p.yaw.sin(), p.yaw.cos());
+            let candidate = if p.grab_partner.is_none()
+                && p.grab_pending.is_none()
+                && p.fx.special & 0x400 == 0
+            {
+                combo_info
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, (pos, free, _))| {
+                        let d = Vec2::new(pos.x - p.pos.x, pos.z - p.pos.z);
+                        j != i
+                            && *free
+                            && d.length() <= 5.0
+                            && (pos.y - p.pos.y).abs() <= 3.0
+                            && d.normalize_or_zero().dot(facing) >= 0.707
+                    })
+                    .min_by(|a, b| {
+                        let da = (a.1 .0 - p.pos).length();
+                        let db = (b.1 .0 - p.pos).length();
+                        da.total_cmp(&db)
+                    })
+                    .map(|(j, _)| j)
+            } else {
+                None
+            };
+            ctx.partner = candidate.is_some();
             let ms = p.act.motion_state(levels, edges, &ctx);
             p.act.tick_idle(1);
+            if ms == 0x16 {
+                p.grab_pending = candidate;
+            }
             // PlayerKnockback: this frame's hits push and pick a reaction, unless
             // the hero is in an untouchable move.
             let mut reaction = 0u8;
@@ -2761,6 +2816,8 @@ impl Game {
                 pa::PWRA_THROW => vec![rows.turbo_a_throw],
                 pa::PWRB => vec![rows.turbo_b],
                 pa::PWRC => vec![rows.turbo_c1, rows.turbo_c2],
+                pa::COMBO_ACTIVE1 if p.grab_partner.is_some() => vec![rows.combo1],
+                pa::COMBO_ACTIVE3 if p.grab_partner.is_some() => vec![rows.combo2],
                 _ => vec![],
             };
             let (t0, t1) = (p.act.prev_frame, frame);
@@ -2794,6 +2851,17 @@ impl Game {
             let a = &p.act;
             let mut movement = joymag * a.stick_scale;
             let mut mdir = joyang;
+            // The hero carrying the Dwarf runs where the Dwarf steers.
+            if a.cur == pa::COMBO_DWF2 {
+                if let Some(g) = p.grab_partner {
+                    let gi = inputs.get(g).copied().unwrap_or_default();
+                    let gw = fwd * gi.stick.y + right * gi.stick.x;
+                    if gw.length() > 0.0 {
+                        movement = gw.length().min(1.0);
+                        mdir = gw.x.atan2(gw.y);
+                    }
+                }
+            }
             if a.cur == pa::SHOVE {
                 movement = 1.0;
                 if joymag < 0.25 {
@@ -2818,7 +2886,8 @@ impl Game {
             let turn = 15.707_963 * dt * a.turn_scale;
             p.yaw += wrap_angle(head - p.yaw).clamp(-turn, turn);
             let speed = a.move_scale * p.derived.speed * movement;
-            let moving = speed > 0.0;
+            let grabbed = a.hud & 0x20 != 0;
+            let moving = speed > 0.0 && !grabbed;
             if moving {
                 let dir = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
                 let target = p.pos + dir * speed * dt;
@@ -2833,13 +2902,15 @@ impl Game {
             if p.act.action >= 11 {
                 p.knock_vel = Vec3::ZERO;
             }
-            p.pos += p.knock_vel * dt;
-            p.knock_vel *= 0.667f32.powf(dt * 30.0);
-            p.pos = self
-                .collision
-                .resolve_walls(p.pos, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT);
-            p.pos = Self::resolve_solids(&self.entities, p.pos, PLAYER_RADIUS, 0);
-            p.on_ground = Self::snap_to_ground(&self.collision, &mut p.pos, &mut p.vy, dt);
+            if !grabbed {
+                p.pos += p.knock_vel * dt;
+                p.knock_vel *= 0.667f32.powf(dt * 30.0);
+                p.pos =
+                    self.collision
+                        .resolve_walls(p.pos, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT);
+                p.pos = Self::resolve_solids(&self.entities, p.pos, PLAYER_RADIUS, 0);
+                p.on_ground = Self::snap_to_ground(&self.collision, &mut p.pos, &mut p.vy, dt);
+            }
             if p.pos.y < self.level.worlds.min_bounds[1] - 50.0 {
                 p.pos = self.cam_focus + Vec3::Y * 2.0;
                 p.vy = 0.0;
@@ -2853,6 +2924,7 @@ impl Game {
                 p.animator.frame = p.act.anim.frame;
             }
         }
+        self.update_combos();
         // Players don't overlap each other.
         for a in 0..self.players.len() {
             for b in (a + 1)..self.players.len() {
@@ -3078,6 +3150,201 @@ impl Game {
 
     /// A melee swing (PlayerMotion_DamageTarget): one target, the nearest in the
     /// forward cone within reach of its surface, takes the player's damage.
+    /// PlayerMotion's combo block (pmotion.c:2938-3120): link the partner as
+    /// COMBOACT1 starts (paying the turbo), hold or ride them by class, the
+    /// Warrior's throw and the Dwarf's ride, then let go; heroes held follow
+    /// the other's DUMMY node.
+    fn update_combos(&mut self) {
+        use crate::paction::p as pa;
+        let n = self.players.len();
+        let grab = |g: &mut Game, x: usize, onto: usize| {
+            let p = &mut g.players[x];
+            p.saved_pos = p.pos;
+            p.act.hud |= 0x20;
+            p.attached_to = Some(onto);
+        };
+        let release = |g: &mut Game, x: usize, restore: bool| {
+            let p = &mut g.players[x];
+            if restore {
+                p.pos = p.saved_pos;
+            }
+            p.act.hud &= !0x20;
+            p.attached_to = None;
+        };
+        let unlink = |g: &mut Game, i: usize, partner: usize| {
+            g.players[partner].grab_partner = None;
+            g.players[i].grab_partner = None;
+        };
+        for i in 0..n {
+            let cur = self.players[i].act.cur;
+            let combo_anim = matches!(cur, pa::COMBO_ACTIVE1 | pa::COMBO_ACTIVE2);
+            self.players[i].combo_timer -= 1;
+            if combo_anim {
+                if let Some(t) = self.players[i].grab_pending.take() {
+                    if t < n {
+                        let p = &mut self.players[i];
+                        p.grab_partner = Some(t);
+                        p.power = (p.power - p.act.coll_score).max(0.0);
+                        p.act.coll_score = 0.0;
+                        self.players[t].act.hud |= 0x10;
+                        self.players[t].grab_partner = Some(i);
+                    }
+                }
+            } else {
+                self.players[i].grab_pending = None;
+            }
+            let pojo = self.players[i].fx.special & 0x400 != 0;
+            let Some(partner) = self.players[i].grab_partner else {
+                continue;
+            };
+            // Only the hero who started the combo runs it.
+            if self.players[partner].act.hud & 0x50 == 0 && self.players[i].act.hud & 0x50 != 0 {
+                continue;
+            }
+            let kind = if pojo {
+                99
+            } else {
+                (self.players[i].class_id % 8) as u8
+            };
+            let ph = self.players[partner].act.hud;
+            match kind {
+                // Wizard, Knight, Sorceress, Jester: hold the partner on the
+                // DUMMY node (the Jester lets go again at once).
+                2 | 5 | 6 | 7 => {
+                    if combo_anim {
+                        if ph & 0x20 == 0 {
+                            grab(self, partner, i);
+                            continue;
+                        }
+                        if kind != 7 {
+                            continue;
+                        }
+                    }
+                    if ph & 0x10 != 0 {
+                        if ph & 0x20 != 0 {
+                            release(self, partner, true);
+                        }
+                        self.players[partner].act.hud &= !0x10;
+                        unlink(self, i, partner);
+                    }
+                }
+                // Valkyrie, Archer: ride the partner, who turns to face them.
+                1 | 3 => {
+                    if combo_anim {
+                        if self.players[i].act.hud & 0x20 == 0 {
+                            let d = self.players[i].pos - self.players[partner].pos;
+                            self.players[partner].yaw = d.x.atan2(d.z);
+                            grab(self, i, partner);
+                        }
+                    } else if ph & 0x10 != 0 {
+                        if self.players[i].act.hud & 0x20 != 0 {
+                            release(self, i, true);
+                        }
+                        self.players[partner].act.hud &= !0x10;
+                        unlink(self, i, partner);
+                    }
+                }
+                // Warrior: lift the partner for 30 frames, then throw them; they
+                // fly as COMBOWAR2 for 240 ticks.
+                0 => {
+                    let lifting = cur == pa::COMBO_ACTIVE1 && self.players[i].act.anim.frame < 30.0;
+                    if lifting {
+                        if ph & 0x20 == 0 {
+                            grab(self, partner, i);
+                        }
+                    } else {
+                        if ph & 0x10 != 0 {
+                            if ph & 0x20 != 0 {
+                                release(self, partner, false);
+                            }
+                            let h = &mut self.players[partner].act.hud;
+                            *h = (*h & !0x10) | 0x40;
+                            self.players[i].combo_timer = 240;
+                        }
+                        if self.players[partner].act.hud & 0x40 != 0
+                            && self.players[i].combo_timer <= 0
+                        {
+                            self.players[partner].act.hud &= !0x40;
+                            self.players[i].act.hud &= !0x80;
+                            unlink(self, i, partner);
+                        }
+                    }
+                }
+                // Dwarf: climb on the partner, who then runs with him (steered
+                // by the Dwarf) for 240 ticks.
+                4 => {
+                    if cur == pa::COMBO_ACTIVE1 {
+                        if self.players[i].act.hud & 0x20 == 0 {
+                            let d = self.players[i].pos - self.players[partner].pos;
+                            self.players[partner].yaw = d.x.atan2(d.z);
+                            grab(self, i, partner);
+                            self.players[i].act.hud |= 0x80;
+                        }
+                        self.players[i].combo_timer = 240;
+                    } else if ph & 0x10 != 0 {
+                        let h = &mut self.players[partner].act.hud;
+                        *h = (*h & !0x10) | 0x40;
+                    } else if ph & 0x40 != 0 && self.players[i].combo_timer <= 0 {
+                        if self.players[i].act.hud & 0x20 != 0 {
+                            release(self, i, false);
+                        }
+                        self.players[partner].act.hud &= !0x40;
+                        self.players[i].act.hud &= !0x80;
+                        unlink(self, i, partner);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Held heroes ride the other's DUMMY node.
+        for x in 0..n {
+            let Some(y) = self.players[x].attached_to else {
+                continue;
+            };
+            let (pos, yaw, model, seq, frame) = {
+                let h = &self.players[y];
+                (h.pos, h.yaw, h.model, h.animator.seq, h.animator.frame)
+            };
+            let node = self.models[model]
+                .node_matrix(seq, frame, "DUMMY")
+                .map_or(Vec3::Y * 3.0, |m| m.w_axis.truncate());
+            let p = &mut self.players[x];
+            p.pos = pos + glam::Quat::from_rotation_y(yaw) * node;
+            p.yaw = yaw;
+        }
+        // The thrown Warrior's partner and the Dwarf's carrier knock down what
+        // they run into (50 and 10).
+        for pi in 0..n {
+            let cur = self.players[pi].act.cur;
+            let dmg = match cur {
+                pa::COMBO_WAR2 => 50.0,
+                pa::COMBO_DWF2 => 10.0,
+                _ => continue,
+            };
+            let pos = self.players[pi].pos;
+            let hits: Vec<(usize, Vec2)> = self
+                .entities
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    e.alive
+                        && matches!(e.kind, Kind::Enemy { .. } | Kind::Critter(_))
+                        && !self.damg_cooldown.contains_key(&(pi, e.id))
+                })
+                .filter_map(|(i, e)| {
+                    let d = Vec2::new(e.pos.x - pos.x, e.pos.z - pos.z);
+                    (d.length() < PLAYER_RADIUS + 2.0 && (e.pos.y - pos.y).abs() < 4.0)
+                        .then_some((i, d.normalize_or_zero()))
+                })
+                .collect();
+            for (i, push) in hits {
+                let id = self.entities[i].id;
+                self.damg_cooldown.insert((pi, id), 0.5);
+                self.hit_entity(pi, i, dmg, push, true);
+            }
+        }
+    }
+
     /// A swing lands (pmotion.c:2621): the one target in the facing cone within
     /// 3.5, for the melee damage times `mult` (x2 slow / step, x3 power).
     fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, _knock: bool) {
@@ -3447,8 +3714,9 @@ impl Game {
                 return;
             }
         }
-        // Turbo moves, combos and the like (action >= 11) can't be hurt.
-        if p.act.action >= 11 {
+        // Turbo moves, combos and the like (action >= 11), and both heroes of a
+        // two-player combo, can't be hurt.
+        if p.act.action >= 11 || p.act.hud & 0x10 != 0 || p.grab_partner.is_some() {
             return;
         }
         let mut dmg = dmg;
@@ -5200,6 +5468,88 @@ mod tests {
             "{seen:?}"
         );
         assert!(g.players[0].pos.z > p0.z + 0.5, "pushed forward");
+    }
+
+    #[test]
+    fn wizard_combo_holds_the_partner() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WIZ", "BLU"), ("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        g.pending_enemies.clear();
+        let idle = [PlayerInput::default(), PlayerInput::default()];
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &idle);
+        }
+        // The Wizard faces +z with the Warrior 3 ahead.
+        let base = g.players[0].pos;
+        g.players[0].yaw = 0.0;
+        g.players[1].pos = base + Vec3::Z * 3.0;
+        g.players[0].power = 60.0;
+        let z = [
+            PlayerInput {
+                combo: true,
+                ..Default::default()
+            },
+            PlayerInput::default(),
+        ];
+        use crate::paction::p as pa;
+        let mut partner_anims = vec![];
+        let mut linked = false;
+        for _ in 0..240 {
+            g.update(1.0 / 60.0, &z);
+            linked |= g.players[1].grab_partner == Some(0);
+            let c = g.players[1].act.cur;
+            if partner_anims.last() != Some(&c) {
+                partner_anims.push(c);
+            }
+        }
+        assert!(linked, "the combo linked");
+        assert!(partner_anims.contains(&pa::COMBO_WIZ), "{partner_anims:?}");
+        assert!(g.players[0].power < 20.0, "turbo paid");
+        assert!(
+            g.players[1].grab_partner.is_none() && g.players[1].act.hud & 0x30 == 0,
+            "let go"
+        );
+    }
+
+    #[test]
+    fn warrior_combo_throws_the_partner() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
+        g.entities.clear();
+        g.pending_enemies.clear();
+        let idle = [PlayerInput::default(), PlayerInput::default()];
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &idle);
+        }
+        let base = g.players[0].pos;
+        g.players[0].yaw = 0.0;
+        g.players[1].pos = base + Vec3::Z * 3.0;
+        g.players[0].power = 60.0;
+        let z = [
+            PlayerInput {
+                combo: true,
+                ..Default::default()
+            },
+            PlayerInput::default(),
+        ];
+        use crate::paction::p as pa;
+        let mut seen = vec![];
+        for _ in 0..600 {
+            g.update(1.0 / 60.0, &z);
+            let c = g.players[1].act.cur;
+            if seen.last() != Some(&c) {
+                seen.push(c);
+            }
+        }
+        assert!(
+            seen.contains(&pa::COMBO_WAR1) && seen.contains(&pa::COMBO_WAR2),
+            "{seen:?}"
+        );
+        assert!(
+            g.players[1].grab_partner.is_none(),
+            "free again after the throw"
+        );
     }
 
     #[test]
