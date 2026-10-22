@@ -149,6 +149,6 @@ mod tests {
         assert_eq!(close.dmgtype, 0x21);
         let b = &pd.damage[pd.rows.turbo_b as usize];
         assert_eq!((b.amount, b.radius), (50.0, 12.0));
-        let c = pd.chain(pd.rows.turbo_c1);
+        assert!(!pd.chain(pd.rows.turbo_c1).is_empty());
     }
 }
