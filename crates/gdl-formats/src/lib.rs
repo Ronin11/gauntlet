@@ -10,6 +10,7 @@ pub mod mesh;
 pub mod movie;
 pub mod objects;
 pub mod sequence;
+pub mod text;
 pub mod texture;
 pub mod wdata;
 pub mod worlds;

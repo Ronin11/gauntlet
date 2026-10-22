@@ -503,8 +503,14 @@ impl App {
                     } else {
                         let inputs: Vec<PlayerInput> =
                             r.sources.iter().map(|s| r.input.read(*s)).collect();
-                        // Start (or Esc) on any player's controller pauses.
-                        if escape || inputs.iter().any(|i| i.start_pressed) {
+                        // A scroll being read stops the game until its reader presses B.
+                        if let Some(b) = &mut play.game.scroll_box {
+                            let inp = inputs.get(b.player).copied().unwrap_or_default();
+                            if b.update(&inp) {
+                                play.game.scroll_box = None;
+                            }
+                        } else if escape || inputs.iter().any(|i| i.start_pressed) {
+                            // Start (or Esc) on any player's controller pauses.
                             *pause = Some(Pause::default());
                         } else {
                             play.game.update(TICK, &inputs);
@@ -596,6 +602,9 @@ impl App {
                 let fade = menu::loading_fade(p.intro);
                 if fade < 255 {
                     menu::transition(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), fade);
+                }
+                if let Some(b) = &p.game.scroll_box {
+                    menu::draw_scroll(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), &b.text);
                 }
                 if let Some(menu) = pause {
                     menu.draw(&mut canvas, &style, time);

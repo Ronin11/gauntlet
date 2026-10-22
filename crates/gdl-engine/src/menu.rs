@@ -254,3 +254,34 @@ impl Pause {
         }
     }
 }
+
+/// ControllerMessageBox: a scroll's text on parchment, centred on (256, 160),
+/// with "Press [B] Button when done." under it.
+pub fn draw_scroll(s: &mut Scr, text: &str) {
+    use crate::ui::FONT_32;
+    const PROMPT: &str = "Press     Button when done.";
+    let scale = 0.5;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let lh = s.font_height(FONT_32, scale) + 4.0;
+    let tw = lines
+        .iter()
+        .map(|l| s.text_width(FONT_32, scale, l))
+        .fold(0.0, f32::max);
+    let min_w = s.text_width(FONT_32, scale, PROMPT) + 32.0;
+    let w = (tw + 96.0).clamp(min_w, 512.0);
+    let h = lines.len() as f32 * lh + 96.0;
+    let (left, top) = (256.0 - w / 2.0, 160.0 - h / 2.0);
+    if let Some(t) = s.ui.get("SCROLL_A") {
+        s.blit(t, left, top, w, h, 0);
+    }
+    let mut y = top + 32.0;
+    for l in &lines {
+        s.text(scale, -256.0, y, FONT_32, 0x160C03, 0, l);
+        y += lh;
+    }
+    let py = y + 8.0;
+    s.glow_text(scale, -256.0, py, PROMPT);
+    if let Some(t) = s.ui.get("BUTTON_TRI") {
+        s.blit(t, 190.0, py - 2.0, 20.0, 20.0, 0);
+    }
+}

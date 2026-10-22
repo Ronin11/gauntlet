@@ -100,6 +100,24 @@ impl PlayerState {
     }
 }
 
+/// A scroll's text on screen (ControllerMessageBox).
+#[derive(Clone, Debug)]
+pub struct ScrollBox {
+    /// The player who picked it up; only their B closes it.
+    pub player: usize,
+    pub text: String,
+    /// Ticks shown; input is ignored for the first 15.
+    pub ticks: u32,
+}
+
+impl ScrollBox {
+    /// One tick; true when the player closes it with B.
+    pub fn update(&mut self, input: &PlayerInput) -> bool {
+        self.ticks += 1;
+        self.ticks > 15 && input.magic_pressed
+    }
+}
+
 /// How a level finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LevelEnd {
@@ -220,6 +238,8 @@ pub enum PickupKind {
     Potion,
     /// A GEM<colour> crystal: its colour index (crystal_order position).
     Crystal(usize),
+    /// A scroll: the line of the level's SCROLLS message it shows.
+    Scroll(usize),
     Other(u32),
 }
 
@@ -377,6 +397,10 @@ pub struct Game {
     /// The level's wave, when a realm table lists it.
     pub wave: Option<u32>,
     pub worlds: gdl_formats::wdata::Worlds,
+    /// This level's scroll texts (SCROLL_E.ROM "SCROLLS<level>"), by line.
+    pub scrolls: Vec<String>,
+    /// A scroll being read: the game is paused until its player presses B.
+    pub scroll_box: Option<ScrollBox>,
     /// Crystals found per colour; -1 once a colour has opened its barrier.
     pub crystals: [i32; 9],
     /// The crystal count to show on the HUD (colour, seconds left).
@@ -611,6 +635,8 @@ impl Game {
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             wave: None,
             worlds: Default::default(),
+            scrolls: Vec::new(),
+            scroll_box: None,
             crystals: [0; 9],
             crystal_shown: None,
             hidden: HashSet::new(),
@@ -618,6 +644,15 @@ impl Game {
             messages: Vec::new(),
             sfx: vec!["S_ENTRANCE".into()],
         };
+        // SetScrollLevelMsgList: the scroll texts named after the level.
+        if let Ok(rom) = fs.read("TEXT/SCROLL_E.ROM") {
+            if let Ok(rom) = gdl_formats::text::TextRom::parse(&rom) {
+                let code = level_name.trim_start_matches("level");
+                if let Some(m) = rom.named(&format!("SCROLLS{code}")) {
+                    game.scrolls = m.lines.clone();
+                }
+            }
+        }
         match gdl_formats::wdata::Worlds::load(|p| fs.read(p)) {
             Ok(w) => {
                 game.wave = w.wave_of_dir(level_name);
@@ -1000,6 +1035,10 @@ impl Game {
                             100
                         }),
                         "potion" => PickupKind::Potion,
+                        "scroll" => PickupKind::Scroll(
+                            (i32::from_le_bytes(inst.params[4..8].try_into().unwrap()) - 1).max(0)
+                                as usize,
+                        ),
                         "crystal" => match CRYSTAL_COLOURS.iter().position(|c| {
                             !c.is_empty() && info.name.eq_ignore_ascii_case(&format!("GEM{c}"))
                         }) {
@@ -2161,6 +2200,7 @@ impl Game {
                 PickupKind::Gold(_) => "S_PICKUPCRYST".into(),
                 PickupKind::Potion => "S_PICKUPMAGIC".into(),
                 PickupKind::Crystal(_) => "S_PICKUPCRYST".into(),
+                PickupKind::Scroll(_) => "S_PICKUPSPECIAL".into(),
                 PickupKind::Other(_) => "S_PICKUPSPECIAL".into(),
             });
             match kind {
@@ -2183,6 +2223,16 @@ impl Game {
                         if *n == CRYSTALS_NEEDED[c] {
                             *n = -1;
                         }
+                    }
+                }
+                // ControllerMessageBox: the game stops until the box is closed.
+                PickupKind::Scroll(line) => {
+                    if let Some(text) = self.scrolls.get(line) {
+                        self.scroll_box = Some(ScrollBox {
+                            player: pi,
+                            text: text.clone(),
+                            ticks: 0,
+                        });
                     }
                 }
                 PickupKind::Other(v) => p.score += v,
