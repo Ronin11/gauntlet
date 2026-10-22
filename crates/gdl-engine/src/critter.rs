@@ -1449,13 +1449,10 @@ impl Game {
                 self.rotate(ei, c, pi, &m, players, dt);
             }
         }
-        // Floor snap.
-        let e = &mut self.entities[ei];
+        // Floor snap (FloorCollide: a radius-5 sphere from 4 above, down).
         let t0 = &w.types[c.parts[0].ty];
-        if let Some(g) = self.collision.ground_height(e.pos, e.pos.y + 5.0) {
-            if e.pos.y - g < 40.0 {
-                e.pos.y = g + t0.y_offset;
-            }
+        if let Some(g) = self.critter_floor(self.entities[ei].pos) {
+            self.entities[ei].pos.y = g + t0.y_offset;
         }
         // Held players ride on the move node.
         self.carry_grabbed(c, ei);
@@ -2442,6 +2439,29 @@ pub struct Wave {
 }
 
 impl Game {
+    /// The critter floor probe (`FloorCollide(5.0, 4.0, -1000.0, pos)`, a
+    /// sphere of radius 5 swept down from 4 above `pos`): the highest floor
+    /// it touches. A floor edge within 5 units counts, as the sphere rests on
+    /// it (the Dragon stands at the lip of its ledge this way).
+    pub(crate) fn critter_floor(&self, pos: Vec3) -> Option<f32> {
+        const R: f32 = 5.0;
+        let top = pos.y + 4.0;
+        let mut best: Option<f32> = None;
+        let mut probe = |p: Vec3| {
+            if let Some(g) = self.collision.ground_height(p, top) {
+                best = Some(best.map_or(g, |b: f32| b.max(g)));
+            }
+        };
+        probe(pos);
+        for ring in [0.5 * R, R] {
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                probe(pos + Vec3::new(a.sin(), 0.0, a.cos()) * ring);
+            }
+        }
+        best
+    }
+
     /// Spread the ground waves; each player it passes over (on the ground,
     /// not levitating) takes its damage once.
     pub(crate) fn update_waves(&mut self, dt: f32) {
