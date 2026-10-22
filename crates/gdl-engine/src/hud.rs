@@ -507,6 +507,25 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
                 &p.keys.to_string(),
             );
         }
+        // show_crystals: the colour just picked up, as found / needed.
+        if let Some((c, _)) = game.crystal_shown {
+            let need = crate::game::CRYSTALS_NEEDED[c];
+            let n = game.crystals[c];
+            let n = if n < 0 { need } else { n };
+            let icon = format!("SM_CRYSTAL_{}", &crate::game::CRYSTAL_COLOURS[c][..3]);
+            if let Some(t) = s.ui.get(&icon) {
+                s.blit(t, x0 + 28.0, 288.0, 16.0, 16.0, 0);
+            }
+            s.text(
+                1.5,
+                x0 + 48.0,
+                292.0,
+                FONT_8HI,
+                0xFFFFFF,
+                0,
+                &format!("{n}/{need}"),
+            );
+        }
         if p.potions > 0 {
             let icon = POTION_ICONS[((p.potions - 1) & 3) as usize];
             if let Some(t) = s.ui.get(&format!("POTION_ICON_{icon}")) {

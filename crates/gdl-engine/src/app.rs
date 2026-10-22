@@ -322,10 +322,12 @@ impl App {
                         }
                     }
                     r.checkpoint = r.carry.clone();
+                    p.game.crystals = r.progress.crystals;
                     match p.game.wave {
                         Some(TOWER_WAVE) => {
                             let progress = r.progress.clone();
                             p.game.close_portals(|w| progress.portal_open(w));
+                            p.game.enter_tower();
                             p.game.set_start(progress.tower_start());
                             // Closed portals' glows are hidden from the world mesh.
                             p.scene = Scene::new(&r.gpu, &p.game).unwrap_or(p.scene);
@@ -616,6 +618,8 @@ impl App {
         // movie); a level leads back to the tower through player select.
         if let Screen::Playing { play, .. } = &mut r.screen {
             if let Some(end) = play.game.level_end.take() {
+                // Crystals are kept whether or not the level was finished.
+                r.progress.crystals = play.game.crystals;
                 let checkpoint = r.checkpoint.clone().unwrap_or_default();
                 // Players who died in the level get back what they had at its start.
                 let carry: Carry = play

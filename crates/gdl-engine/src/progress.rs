@@ -14,6 +14,8 @@ pub struct Progress {
     /// Boss runes (bit = position in CRYSTAL_ORDER) and the 13 shards.
     pub runes: u16,
     pub shards: u16,
+    /// Crystals found per colour, -1 once a colour is done.
+    pub crystals: [i32; 9],
     /// The last realm other than the tower that was played (lbl_803448C8).
     pub last_realm: Option<u32>,
 }

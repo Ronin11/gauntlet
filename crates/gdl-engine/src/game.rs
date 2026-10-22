@@ -218,7 +218,22 @@ pub enum PickupKind {
     Key,
     Gold(u32),
     Potion,
+    /// A GEM<colour> crystal: its colour index (crystal_order position).
+    Crystal(usize),
     Other(u32),
+}
+
+/// Crystal colours by index (SM_CRYSTAL_<colour>, GEM<colour>), and how many of
+/// each open the next realm's barrier (lbl_80124C70).
+pub const CRYSTAL_COLOURS: [&str; 9] = [
+    "", "ORANGE", "RED", "PURPLE", "BLUE", "GREEN", "YELLOW", "WHITE", "BLACK",
+];
+pub const CRYSTALS_NEEDED: [i32; 9] = [0, 15, 100, 125, 150, 175, 200, 225, 250];
+
+/// towerAllPlayersMetBossReq: enough of a colour found, or that colour done (-1).
+pub fn crystals_met(crystals: &[i32; 9], c: usize) -> bool {
+    let n = crystals.get(c).copied().unwrap_or(0);
+    n < 0 || n >= CRYSTALS_NEEDED.get(c).copied().unwrap_or(0)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -281,6 +296,8 @@ pub enum Kind {
         pressed: bool,
         /// Struck by an attack this frame.
         hit: bool,
+        /// A tower crystal barrier: the crystal colour it needs.
+        gate: Option<usize>,
     },
     Prop,
 }
@@ -360,6 +377,10 @@ pub struct Game {
     /// The level's wave, when a realm table lists it.
     pub wave: Option<u32>,
     pub worlds: gdl_formats::wdata::Worlds,
+    /// Crystals found per colour; -1 once a colour has opened its barrier.
+    pub crystals: [i32; 9],
+    /// The crystal count to show on the HUD (colour, seconds left).
+    pub crystal_shown: Option<(usize, f32)>,
     /// World objects hidden for good (closed tower portals).
     pub hidden: HashSet<usize>,
     /// Set once every player has left or died.
@@ -485,6 +506,33 @@ impl Game {
         }
     }
 
+    /// EnterTower: barriers whose crystals are done start open, and the tower's
+    /// orange crystals are gone once orange is done.
+    pub fn enter_tower(&mut self) {
+        let crystals = self.crystals;
+        let mut open = Vec::new();
+        for e in &mut self.entities {
+            match &e.kind {
+                Kind::Trigger {
+                    gate: Some(c),
+                    mover: Some(m),
+                    ..
+                } if crystals[*c] < 0 => open.push(*m),
+                Kind::Pickup {
+                    kind: PickupKind::Crystal(1),
+                    ..
+                } if crystals[1] < 0 => e.alive = false,
+                _ => {}
+            }
+        }
+        self.entities.retain(|e| e.alive);
+        for m in open {
+            if let Some(m) = self.movers.get_mut(m) {
+                m.active = true;
+            }
+        }
+    }
+
     /// Hide a world object (and its children) by name; false if there is none.
     pub fn hide_object(&mut self, name: &str) -> bool {
         let objs = &self.level.worlds.world_objects;
@@ -563,6 +611,8 @@ impl Game {
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             wave: None,
             worlds: Default::default(),
+            crystals: [0; 9],
+            crystal_shown: None,
             hidden: HashSet::new(),
             level_end: None,
             messages: Vec::new(),
@@ -950,7 +1000,12 @@ impl Game {
                             100
                         }),
                         "potion" => PickupKind::Potion,
-                        "crystal" => PickupKind::Gold(250),
+                        "crystal" => match CRYSTAL_COLOURS.iter().position(|c| {
+                            !c.is_empty() && info.name.eq_ignore_ascii_case(&format!("GEM{c}"))
+                        }) {
+                            Some(c) => PickupKind::Crystal(c),
+                            None => PickupKind::Gold(250),
+                        },
                         _ => PickupKind::Other(50),
                     };
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
@@ -1060,6 +1115,11 @@ impl Game {
                             shoot: info.subtype_name() == "shoot_trigger",
                             pressed: false,
                             hit: false,
+                            // Tower crystal barriers: flag 0x40, id = colour.
+                            gate: (p16(2) & 0x40 != 0
+                                && inst.params[6] < 100
+                                && inst.params[6] > 0)
+                                .then_some(inst.params[6] as usize),
                         },
                         model,
                         pos,
@@ -1177,6 +1237,12 @@ impl Game {
 
     pub fn update(&mut self, dt: f32, inputs: &[PlayerInput]) {
         self.time += dt;
+        if let Some((_, t)) = &mut self.crystal_shown {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.crystal_shown = None;
+            }
+        }
         self.messages.retain_mut(|(_, t)| {
             *t -= dt;
             *t > 0.0
@@ -1865,18 +1931,22 @@ impl Game {
                     shoot,
                     pressed,
                     hit,
+                    gate,
                 } => {
                     *idle -= dt;
+                    // A crystal barrier only works once enough crystals are found.
+                    let locked = gate.is_some_and(|c| !crystals_met(&self.crystals, c));
                     // Walking into a lever or onto a pad sets it off; wall levers sit in
                     // the wall, so allow for the player's own radius.
-                    let touched = *hit
-                        || (!*shoot
-                            && player_pos.iter().any(|(pp, alive)| {
-                                *alive
-                                    && Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
-                                        < *radius + PLAYER_RADIUS + 0.6
-                                    && (pp.y - pos.y).abs() < 4.0
-                            }));
+                    let touched = !locked
+                        && (*hit
+                            || (!*shoot
+                                && player_pos.iter().any(|(pp, alive)| {
+                                    *alive
+                                        && Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
+                                            < *radius + PLAYER_RADIUS + 0.6
+                                        && (pp.y - pos.y).abs() < 4.0
+                                })));
                     *hit = false;
                     let mut on = touched;
                     if let Some(m) = mover.and_then(|m| self.movers.get_mut(m)) {
@@ -2090,6 +2160,7 @@ impl Game {
                 PickupKind::Key => "S_PICKUPKEY".into(),
                 PickupKind::Gold(_) => "S_PICKUPCRYST".into(),
                 PickupKind::Potion => "S_PICKUPMAGIC".into(),
+                PickupKind::Crystal(_) => "S_PICKUPCRYST".into(),
                 PickupKind::Other(_) => "S_PICKUPSPECIAL".into(),
             });
             match kind {
@@ -2102,6 +2173,18 @@ impl Game {
                 PickupKind::Key => p.keys += 1,
                 PickupKind::Gold(v) => p.score += v,
                 PickupKind::Potion => p.potions += 1,
+                // towerAdvanceBossRecord: +1 for the party, up to the requirement;
+                // reaching it opens that colour's barrier for good.
+                PickupKind::Crystal(c) => {
+                    let n = &mut self.crystals[c];
+                    if *n >= 0 {
+                        *n = (*n + 1).min(CRYSTALS_NEEDED[c]);
+                        self.crystal_shown = Some((c, 3.0));
+                        if *n == CRYSTALS_NEEDED[c] {
+                            *n = -1;
+                        }
+                    }
+                }
                 PickupKind::Other(v) => p.score += v,
             }
         }
@@ -2482,6 +2565,26 @@ mod tests {
             "{open:x?}"
         );
         assert!(!g.hidden.is_empty(), "closed portals hide their glow");
+        let orange = g
+            .entities
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    Kind::Pickup {
+                        kind: PickupKind::Crystal(1),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(orange, 15, "the tower holds 15 orange crystals");
+        let barriers = g
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Trigger { gate: Some(_), .. }))
+            .count();
+        assert_eq!(barriers, 8, "one crystal barrier per crystal realm");
     }
 
     #[test]
