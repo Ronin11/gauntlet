@@ -893,6 +893,8 @@ pub struct Game {
     /// that select areas: (position, radius, area, fade).
     pub music_area: (usize, i16),
     music_items: Vec<(Vec3, f32, usize, i16)>,
+    /// Ambient sound items: (position, radius, sound name).
+    ambient_items: Vec<(Vec3, f32, String)>,
     /// The party's boss shards (bit = world order 1..11, as Progress::runes).
     pub runes: u16,
     /// Players who died in this level (inactivate_player outside the tower).
@@ -1324,6 +1326,7 @@ impl Game {
             damage_from: None,
             music_area: (0, 0),
             music_items: Vec::new(),
+            ambient_items: Vec::new(),
             runes: 0,
             deaths: 0,
             roster: Default::default(),
@@ -1615,6 +1618,39 @@ impl Game {
             }
             None => false,
         }
+    }
+
+    /// items.c case 0xD / AudioSecretProc: each ambient sound's volume (0..1),
+    /// full within its radius and fading out by 1.5x the radius from the
+    /// nearest hero; quiet (16/127) during Sumner's speeches and trigger cameras.
+    pub fn ambient_levels(&self) -> Vec<(u64, &str, f32)> {
+        let hushed = self
+            .sumner
+            .as_ref()
+            .is_some_and(|s| s.cam.is_some() || s.controls_locked());
+        self.ambient_items
+            .iter()
+            .enumerate()
+            .map(|(i, (pos, range, name))| {
+                let d = self
+                    .players
+                    .iter()
+                    .filter(|p| p.state.active())
+                    .map(|p| (p.pos - *pos).length())
+                    .fold(f32::MAX, f32::min);
+                let mut vol = if d == f32::MAX {
+                    0.0
+                } else if d < *range || *range <= 2.0 {
+                    1.0
+                } else {
+                    (2.0 * (1.5 * range - d) / range).clamp(0.0, 1.0)
+                };
+                if hushed && vol > 0.0 {
+                    vol = 16.0 / 127.0;
+                }
+                (i as u64, name.as_str(), vol)
+            })
+            .collect()
     }
 
     /// items.c case 0xD: the highest music area whose sound item has a hero
@@ -2213,6 +2249,10 @@ impl Game {
                     if area > 0 {
                         self.music_items
                             .push((pos, radius, area as usize - 1, fade));
+                    } else if !inst.name.is_empty() {
+                        // Otherwise it loops its sound (named by the instance).
+                        self.ambient_items
+                            .push((pos, radius, inst.name.to_ascii_uppercase()));
                     }
                 }
                 ItemType::Transporter | ItemType::Rotator => {
@@ -5628,6 +5668,26 @@ mod tests {
             }
         }
         assert!(with_items > 0, "some levels switch music by area");
+    }
+
+    #[test]
+    fn ambient_sounds_resolve() {
+        let Some(fs) = data() else { return };
+        let mut names = Vec::new();
+        for l in ["levelA1", "levelG1", "levelI1", "levelD1", "levelL1"] {
+            let g = Game::new(&fs, l, &[("WAR", "RED")]).unwrap();
+            names.extend(g.ambient_items.iter().map(|a| a.2.clone()));
+        }
+        names.sort();
+        names.dedup();
+        let found = crate::audio::check_sounds(&fs, &names);
+        let missing: Vec<_> = found
+            .iter()
+            .filter(|(_, f)| f.is_none())
+            .map(|(n, _)| n)
+            .collect();
+        println!("{} ambient sounds, missing {missing:?}", names.len());
+        assert!(missing.len() * 4 < names.len(), "{missing:?}");
     }
 
     #[test]

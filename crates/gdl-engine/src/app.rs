@@ -904,6 +904,9 @@ impl App {
                             r.music_fade = (r.music_fade + 8.0 / 127.0).min(1.0);
                         }
                         r.audio.set_music_fade(r.music_fade);
+                        for (id, name, vol) in play.game.ambient_levels() {
+                            r.audio.ambient(fs, id, name, vol);
+                        }
                         // Sumner's lectern: HintMenu.
                         if let Some(pi) = play
                             .game
@@ -951,6 +954,8 @@ impl App {
                 r.music_fade = 1.0;
                 r.audio.set_music_fade(1.0);
             }
+            // A new screen starts with no ambient sounds.
+            r.audio.ambient_clear();
             if matches!(s, Screen::Title(_) | Screen::Select(_)) {
                 r.audio.play_select_music(fs);
             }
