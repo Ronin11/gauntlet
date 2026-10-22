@@ -29,10 +29,12 @@ counts as a controller (Enter). In the tower, a new controller can join with Sta
 
 | Action | GameCube | Controller | Keyboard |
 |---|---|---|---|
-| Move (run past 3/4 of the stick) | stick | Left stick / D-pad | WASD / arrows |
+| Move (run past 3/4 of the stick) | stick | Left stick | WASD / arrows |
 | Attack (melee in reach, else throw) | A | A (South) | J / Space |
 | Turbo attack (hold, then A) / block | B | B (East) | K / Shift |
 | Magic (use a potion) | X | X (West) | L |
+| Power-up inventory: open / switch on-off | D-pad up | D-pad up | Tab |
+| Inventory: previous / next / close | D-pad left / right / down | D-pad | Q / E / R |
 | Back in menus | B | B | K / Backspace |
 | Menu | Start | Start | Enter / Esc |
 | Fullscreen | | | F11 |
@@ -52,8 +54,8 @@ adb push game.iso /sdcard/Android/data/com.gauntletrs.game/files/game.iso
 
 Tested in the Android 15 tablet emulator: the join screen, joining with a gamepad's A
 button, and gameplay all work. Bluetooth controllers report their D-pad and buttons as key
-events per device, so several controllers can play at once. Analog sticks, sound and touch
-controls are not hooked up on Android yet. The APK is signed with a personal key created
+events per device, so several controllers can play at once; their left sticks are read from
+the joystick motion events, and sound plays through AAudio. Touch controls are not done. The APK is signed with a personal key created
 in `~/.android/gauntlet-rs.keystore`.
 
 ## What works
@@ -85,15 +87,21 @@ in `~/.android/gauntlet-rs.keystore`.
   using the sound names in `AUDATPS2.ROM`.
 - **Camera** follows each area's original camera heading and cuts away roofs and walls
   between it and the players.
+- **Power-ups** wait in each player's inventory until switched on from the D-pad, as on
+  GameCube; the name shows over the player's panel, glowing while it is on.
+- **Sumner** in the tower: the welcome story, his speeches and the stained-glass and
+  runestone scenes when shards and runestones are brought back, level-up congratulations,
+  the crystal and gargoyle-gate messages, and his hint menu at the lectern.
+- **Shop** after each level and from the Tower Menu; **map screen** and intro movies.
 
 ## Not done yet (roadmap)
 
-- Class-specific combos and special moves, power-ups (only basic pickups work so far)
-- Scripted cameras for boss arenas, and some dark arena/boss levels
-- Bosses, moving platforms and elevators, triggers, teleporters, secret areas
+- The full melee chain (slow attack, step and 360 attacks, power-A moves), charge, strafe
+  and two-player combos
+- Bosses and their arenas (in progress), attract-mode level flybys
 - Texture animations (flowing water, flames), particle effects
-- Save games, the main menu (new/load game, options), shops
-- Android: analog sticks (D-pad and buttons work), audio, touch controls
+- Save games (load game)
+- Android touch controls
 
 ## Layout
 
