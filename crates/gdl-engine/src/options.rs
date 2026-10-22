@@ -105,9 +105,12 @@ pub enum MenuId {
     Rumble,
     AutoAim,
     AutoAttack,
+    /// Sumner's "How Can I Help You?" and the hint shown from it.
+    Hint,
+    HintDisplay,
 }
 
-const MENU_COUNT: usize = 17;
+const MENU_COUNT: usize = 19;
 
 /// One OPTITEM: text, code, dy, text2.
 type ItemDef = (&'static str, i32, i32, Option<&'static str>);
@@ -402,6 +405,35 @@ static MENUS: [Def; MENU_COUNT] = [
         true,
         &[("On", OPT_ON, 0, None), ("Off", OPT_OFF, 0, None)],
     ),
+    // 0x8011F804
+    def(
+        MenuId::Hint,
+        "How Can I Help You?",
+        128,
+        -1,
+        0x4F3,
+        1.0,
+        FULL,
+        false,
+        &[
+            ("General Hints", crate::hints::GENERAL, 0, None),
+            ("Guardians", crate::hints::BOSS, 0, None),
+            ("Items of Legend", crate::hints::LEGEND, 0, None),
+            ("Runestones", crate::hints::RUNE, 0, None),
+        ],
+    ),
+    // 0x8011F910: its title is the hint's, set when it opens.
+    def(
+        MenuId::HintDisplay,
+        "",
+        192,
+        -1,
+        0x71,
+        0.667,
+        FULL,
+        false,
+        &[],
+    ),
 ];
 
 fn menu_def(id: MenuId) -> &'static Def {
@@ -491,6 +523,7 @@ enum Kind {
     Title,
     Game,
     Tower,
+    Hints,
 }
 
 #[derive(Clone, Debug)]
@@ -506,6 +539,8 @@ struct ItemState {
 #[derive(Clone, Debug)]
 struct Menu {
     def: &'static Def,
+    /// The title drawn (the hint display's is set when it opens).
+    title: String,
     items: Vec<ItemState>,
     sel: usize,
     /// Menu clock (m->time).
@@ -574,6 +609,7 @@ impl Menu {
         let by = if by < 0 { 192 - bh / 2 } else { by };
         let mut m = Menu {
             def,
+            title: def.title.into(),
             items,
             sel: 0,
             time: 0,
@@ -682,6 +718,8 @@ pub struct Options {
     music_val: i32,
     sfx_val: i32,
     rep: Repeat,
+    /// Sumner's hint pickers, while his menu is up.
+    hints: Option<crate::hints::Hints>,
     /// Sound names to play, drained by the caller.
     pub sfx: Vec<String>,
 }
@@ -705,6 +743,7 @@ impl Options {
             music_val: 0,
             sfx_val: 0,
             rep: Repeat::default(),
+            hints: None,
             // OptionsStart / the title menu's "Options": AudioCursorSelect.
             sfx: vec!["S_OPTMENUSEL".into()],
         }
@@ -723,6 +762,19 @@ impl Options {
     /// The tower's "Tower Menu" opened by `player`'s START.
     pub fn tower(player: usize) -> Options {
         Options::new(Kind::Tower, player, MenuId::Tower)
+    }
+
+    /// HintMenu: Sumner's menu for `player`.
+    pub fn hint_menu(player: usize, hints: crate::hints::Hints) -> Options {
+        let mut o = Options::new(Kind::Hints, player, MenuId::Hint);
+        o.hints = Some(hints);
+        o.sfx.clear();
+        o
+    }
+
+    /// The hint pickers, to keep their places for the next visit.
+    pub fn hints(&self) -> Option<&crate::hints::Hints> {
+        self.hints.as_ref()
     }
 
     /// OptionsStart greys out "Quit Level" (value -1) when sMusicTrackHi == 0xC.
@@ -811,12 +863,18 @@ impl Options {
     /// `a`/`b`/`s` A/B/START, `.` idle.
     pub fn demo(screen: &str, ticks: u32) -> Option<Options> {
         let (root, path) = screen.split_once(':').unwrap_or((screen, ""));
-        let mut o = match root {
+        let o = match root {
             "options" => Options::title(0),
             "gamemenu" => Options::game(0),
             "towermenu" => Options::tower(0),
             _ => return None,
         };
+        Some(o.drive(path, ticks))
+    }
+
+    /// Run a menu through a path of presses (d/u/l/r/a/b/s), then `ticks` idle.
+    pub fn drive(mut self, path: &str, ticks: u32) -> Options {
+        let o = &mut self;
         let mut prefs = Prefs::default();
         for c in path.chars() {
             let mut i = PlayerInput::default();
@@ -837,7 +895,7 @@ impl Options {
             o.update(&PlayerInput::default(), &mut prefs);
         }
         o.sfx.clear();
-        Some(o)
+        self
     }
 
     fn play(&mut self, name: &str) {
@@ -895,7 +953,14 @@ impl Options {
         let mut skip_back_sound = false;
         let id = self.stack.last().unwrap().id();
         let sel = self.stack.last().unwrap().sel;
-        let item_code = self.stack.last().unwrap().def.items[sel].1;
+        let item_code = self
+            .stack
+            .last()
+            .unwrap()
+            .def
+            .items
+            .get(sel)
+            .map_or(OPT_NONE, |i| i.1);
         let p = self.player;
         match id {
             MenuId::Tower => match choice {
@@ -1070,6 +1135,24 @@ impl Options {
                     self.play("S_CHOOSESELSFX");
                 }
             }
+            MenuId::Hint => {
+                if matches!(
+                    choice,
+                    crate::hints::GENERAL
+                        | crate::hints::BOSS
+                        | crate::hints::LEGEND
+                        | crate::hints::RUNE
+                ) {
+                    let title = self
+                        .hints
+                        .as_mut()
+                        .map(|h| h.pick(choice))
+                        .unwrap_or_default();
+                    self.push(MenuId::HintDisplay, prefs);
+                    self.top().title = title;
+                }
+            }
+            MenuId::HintDisplay => {}
             MenuId::AutoAim | MenuId::AutoAttack => {
                 if matches!(choice, OPT_OFF | OPT_ON) {
                     if id == MenuId::AutoAim {
@@ -1174,6 +1257,10 @@ impl Options {
         if nochoice {
             return (OPT_ABORTALL, None);
         }
+        if n == 0 {
+            // A menu without items (the hint display) only goes back.
+            return (if input.b_pressed { OPT_ABORT } else { OPT_NONE }, None);
+        }
         if input.attack_pressed {
             let (value, code) = (m.items[m.sel].value, m.def.items[m.sel].1);
             if value >= 0 {
@@ -1223,7 +1310,7 @@ impl Options {
         // stack[level + 1] is overwritten: a popped menu stops being served.
         self.popped = None;
         let mut m = Menu::new(id);
-        m.sel = prefs.menu_sel[id as usize].min(m.items.len() - 1);
+        m.sel = prefs.menu_sel[id as usize].min(m.items.len().saturating_sub(1));
         m.icon_y = m.icon_target();
         self.stack.push(m);
         self.refresh(prefs);
@@ -1360,14 +1447,20 @@ impl Options {
         if m.backdrop {
             let tex = parch.or(normal);
             if let Some(t) = tex {
+                // The hint display's title is smaller (tscale 0.8).
+                let tscale = if m.id() == MenuId::HintDisplay {
+                    0.8
+                } else {
+                    1.2
+                };
                 s.text_tex(
                     t,
-                    1.2,
+                    tscale,
                     -(bx + (bw as i32 / 2) as f32),
                     by + MARGIN_TITLE,
                     RGB_TEXT,
                     0,
-                    m.def.title,
+                    &m.title,
                 );
             }
         }
@@ -1466,6 +1559,30 @@ impl Options {
                     };
                     let y = m.draw_y(i) + fh;
                     slider(s, val, m.def.x as f32, y, i != m.sel);
+                }
+            }
+            // The hint: HINTS_E text, centred, in the menu's brown at 0.667 x
+            // the message's scale.
+            MenuId::HintDisplay => {
+                if let Some(h) = &self.hints {
+                    let (blocks, gap, msg_scale) = h.body();
+                    let scale = m.def.scale * msg_scale;
+                    let lh = s.font_height(FONT_32, scale);
+                    let height = |b: &str| b.split('\n').count() as f32 * lh;
+                    // A general hint is centred on the screen; the others
+                    // start at y 0x70.
+                    let mut y = if h.sub == crate::hints::GENERAL {
+                        192.0 - blocks.iter().map(|b| height(b)).sum::<f32>() / 2.0
+                    } else {
+                        112.0
+                    };
+                    for b in &blocks {
+                        for l in b.split('\n') {
+                            s.text(scale, -256.0, y, FONT_32, RGB_OFF, 0, l);
+                            y += lh;
+                        }
+                        y += gap;
+                    }
                 }
             }
             MenuId::ControlStyle => {

@@ -518,6 +518,30 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     o.draw(&mut s);
                 }
             }
+            // hintmenu[:path]: Sumner's menu with the town open (GDL_HINT_FACTS
+            // = boss attempts, e.g. 0x80,0x80 for two deaths at the Lich).
+            Some(name) if name.starts_with("hintmenu") => {
+                let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
+                hud::build(&mut s, &g, &panels);
+                let mut facts = gdl_engine::hints::HintFacts::default();
+                facts.world_open[13] = true;
+                facts.world_open[7] = true;
+                if let Ok(v) = std::env::var("GDL_HINT_FACTS") {
+                    for (i, b) in v.split(',').take(2).enumerate() {
+                        facts.boss_attempts[i] =
+                            u16::from_str_radix(b.trim_start_matches("0x"), 16).unwrap_or(0);
+                    }
+                }
+                let rom = fs
+                    .read("TEXT/HINTS_E.ROM")
+                    .ok()
+                    .and_then(|d| gdl_formats::text::TextRom::parse(&d).ok());
+                let h = gdl_engine::hints::Hints::new(Default::default(), facts, rom);
+                let path = name.split_once(':').map_or("", |p| p.1);
+                options::Options::hint_menu(0, h)
+                    .drive(path, demo_ticks)
+                    .draw(&mut s);
+            }
             Some(name) if name.starts_with("options") => {
                 let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
                 s.bars(1.0);
@@ -559,15 +583,20 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
     };
     let img = match args.screen.as_deref() {
-        Some(name) if name.starts_with("gamemenu") || name.starts_with("towermenu") => gpu
-            .render_to_image(
+        Some(name)
+            if name.starts_with("gamemenu")
+                || name.starts_with("towermenu")
+                || name.starts_with("hintmenu") =>
+        {
+            gpu.render_to_image(
                 w,
                 h,
                 &globals,
                 scene::CLEAR,
                 &sc.draws(&g),
                 Some(&draw_screen),
-            )?,
+            )?
+        }
         Some(_) => gpu.render_to_image(w, h, &globals, scene::CLEAR, &[], Some(&draw_screen))?,
         None => {
             gpu.render_to_image(w, h, &globals, scene::CLEAR, &sc.draws(&g), Some(&draw_hud))?

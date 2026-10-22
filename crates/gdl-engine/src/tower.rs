@@ -194,8 +194,8 @@ pub struct Sumner {
     /// The lectern: its 0x10 latch, and when the hint menu opens (C58).
     latch: bool,
     hint_at: Option<f32>,
-    /// Set when the hint menu should open (HintMenu).
-    pub hint_request: bool,
+    /// The player the hint menu should open for (HintMenu).
+    pub hint_request: Option<usize>,
     english: Option<TextRom>,
 }
 
@@ -237,7 +237,7 @@ impl Sumner {
             need_time: [f32::MIN; 12],
             latch: false,
             hint_at: None,
-            hint_request: false,
+            hint_request: None,
             english,
         };
         // GWIZ stands at waypoint 0 (FindLookoutParam(0)), behind the lectern.
@@ -874,17 +874,23 @@ impl Sumner {
 
     /// SumnerAnimate: a player on the lectern gets a WELCOME, then the hint menu.
     fn lectern(&mut self, g: &mut Game) {
-        let on = g.entities.iter().any(|e| {
-            matches!(e.kind, Kind::Trigger { id: LECTERN, radius, .. }
-                if g.players.iter().any(|p| p.state.active()
+        let on = g.entities.iter().find_map(|e| match e.kind {
+            Kind::Trigger {
+                id: LECTERN,
+                radius,
+                ..
+            } => g.players.iter().position(|p| {
+                p.state.active()
                     && glam::Vec2::new(p.pos.x - e.pos.x, p.pos.z - e.pos.z).length() < radius + 1.5
-                    && (p.pos.y - e.pos.y).abs() < 4.0))
+                    && (p.pos.y - e.pos.y).abs() < 4.0
+            }),
+            _ => None,
         });
-        if !on {
+        let Some(player) = on else {
             self.latch = false;
             self.hint_at = None;
             return;
-        }
+        };
         if self.latch || self.controls_locked() {
             return;
         }
@@ -897,7 +903,7 @@ impl Sumner {
             Some(t) if g.time >= t => {
                 self.hint_at = None;
                 self.latch = true;
-                self.hint_request = true;
+                self.hint_request = Some(player);
             }
             _ => {}
         }
@@ -991,6 +997,27 @@ mod tests {
         assert!(g
             .model_named("SHARD1")
             .is_some_and(|m| g.entities.iter().any(|e| e.model == Some(m) && e.alive)));
+    }
+
+    #[test]
+    fn the_lectern_opens_the_hint_menu() {
+        let Some((fs, mut g)) = tower() else { return };
+        let s = Sumner::new(&fs, &mut g, Entry::default());
+        g.sumner = Some(Box::new(s));
+        let pad = g
+            .entities
+            .iter()
+            .find(|e| matches!(e.kind, Kind::Trigger { id: LECTERN, .. }))
+            .map(|e| e.pos)
+            .unwrap();
+        g.players[0].pos = pad;
+        run(&mut g, 30);
+        assert_eq!(g.sumner.as_ref().unwrap().gwiz_seq, 3, "WELCOME");
+        run(&mut g, 100);
+        assert_eq!(g.sumner.as_mut().unwrap().hint_request.take(), Some(0));
+        // Once only, until the player steps off.
+        run(&mut g, 200);
+        assert_eq!(g.sumner.as_ref().unwrap().hint_request, None);
     }
 
     #[test]

@@ -364,6 +364,7 @@ impl App {
                     p.game.garg_items = r.progress.garg_items;
                     p.game.shards = r.progress.shards;
                     p.game.runes = r.progress.runes;
+                    p.game.legend_items = r.progress.legend_items;
                     match p.game.wave {
                         Some(TOWER_WAVE) => {
                             let progress = r.progress.clone();
@@ -646,7 +647,17 @@ impl App {
                             r.audio.play(fs, &snd);
                         }
                         match action {
-                            OptionsAction::Closed => *pause = None,
+                            OptionsAction::Closed => {
+                                // Leaving Sumner's menu: he waves the party off.
+                                if let Some(h) = pause.as_ref().and_then(|m| m.hints()) {
+                                    r.progress.hints = h.state;
+                                    if let Some(mut sm) = play.game.sumner.take() {
+                                        sm.hints_closed(&mut play.game);
+                                        play.game.sumner = Some(sm);
+                                    }
+                                }
+                                *pause = None
+                            }
                             OptionsAction::VolumeChanged => r.audio.set_volumes(&r.prefs),
                             // "Abort Level?" Yes: everyone is put out of the level
                             // and the party goes back to the tower.
@@ -736,6 +747,22 @@ impl App {
                     } else {
                         play.game.update(TICK, &inputs);
                         play.intro += TICK;
+                        // Sumner's lectern: HintMenu.
+                        if let Some(pi) = play
+                            .game
+                            .sumner
+                            .as_mut()
+                            .and_then(|s| s.hint_request.take())
+                        {
+                            let hints = crate::hints::Hints::new(
+                                r.progress.hints,
+                                hint_facts(&r.progress, &play.game),
+                                fs.read("TEXT/HINTS_E.ROM")
+                                    .ok()
+                                    .and_then(|d| gdl_formats::text::TextRom::parse(&d).ok()),
+                            );
+                            *pause = Some(Options::hint_menu(pi, hints));
+                        }
                         if std::mem::take(&mut play.game.world_changed) {
                             if let Ok(sc) = Scene::new(&r.gpu, &play.game) {
                                 play.scene = sc;
@@ -956,6 +983,21 @@ impl App {
                 r.progress.garg_items = play.game.garg_items;
                 r.progress.shards = play.game.shards;
                 r.progress.runes |= play.game.runes;
+                r.progress.legend_items |= play.game.legend_items;
+                // A death on a Guardian's level counts as an attempt at it (more
+                // of its hint unlocks).
+                if let Some(w) = play.game.wave.filter(|&w| w != TOWER_WAVE) {
+                    let last = play
+                        .game
+                        .worlds
+                        .realm(w >> 8)
+                        .map_or(0, |r| r.levels.len().saturating_sub(1));
+                    if (w & 0xFF) as usize == last {
+                        for _ in 0..play.game.deaths {
+                            r.progress.record_boss_death(w >> 8);
+                        }
+                    }
+                }
                 if let Some(sm) = &play.game.sumner {
                     (r.progress.banked_runes, r.progress.banked_shards) = sm.banked();
                     r.progress.last_beaten = sm.last_beaten();
@@ -1029,7 +1071,9 @@ impl App {
                     },
                     (w, LevelEnd::Exit(dest)) => {
                         if let Some(w) = w {
-                            r.progress.record_beaten(w);
+                            let (rune, legend) =
+                                worlds.level(w).map_or((0, 0), |l| (l.rune, l.legend));
+                            r.progress.record_beaten(w, rune, legend);
                         }
                         match dest.and_then(|d| Some((d, worlds.dir(d)?))) {
                             // E1 -> E2 and F1 -> F2 chain straight on, through the
@@ -1216,5 +1260,28 @@ fn intro_or_level(
             panels: panels.to_vec(),
             shown: false,
         },
+    }
+}
+
+/// What Sumner's hint pickers ask about the party.
+fn hint_facts(
+    progress: &crate::progress::Progress,
+    game: &crate::game::Game,
+) -> crate::hints::HintFacts {
+    let mut world_open = [false; 16];
+    for (r, o) in world_open.iter_mut().enumerate() {
+        *o = progress.world_open_any(r as u32, &game.crystals);
+    }
+    let banked = game.sumner.as_ref().map_or((0, 0), |s| s.banked());
+    crate::hints::HintFacts {
+        world_open,
+        runes: progress.runes | game.runes | banked.0,
+        shards: progress.shards | game.shards | banked.1,
+        boss_attempts: progress.boss_attempts,
+        level_masks: progress.level_masks,
+        legend_held: progress.legend_items | game.legend_items,
+        sections: std::array::from_fn(|j| {
+            game.garg_items[j] < 0 || game.garg_items[j] >= crate::game::GARG_NEEDED[j]
+        }),
     }
 }

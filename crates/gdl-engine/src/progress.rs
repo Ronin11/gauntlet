@@ -29,7 +29,20 @@ pub struct Progress {
     pub banked_shards: u16,
     /// EnterTower has run this session (lbl_80344C4C).
     pub entered_tower: bool,
+    /// boss_attempt1/2: realms (bit = realm type) whose Guardian has killed a
+    /// player once / twice.
+    pub boss_attempts: [u16; 2],
+    /// level_masks: Runestone levels beaten once / twice (bit = rune - 1) and
+    /// legend-item levels beaten once / twice (bit = the item's realm).
+    pub level_masks: [u16; 4],
+    /// Items of Legend held (bit = realm).
+    pub legend_items: u16,
+    /// Sumner's hint pickers.
+    pub hints: crate::hints::HintState,
 }
+
+/// lbl_80124D4C: the crystal colour that opens each realm type (0 = none).
+const REALM_CRYSTAL: [usize; 16] = [0, 3, 2, 6, 5, 0, 0, 1, 0, 7, 8, 4, 0, 0, 0, 0];
 
 impl Progress {
     /// WorldOpen for the realms gated by runes and shards.
@@ -56,10 +69,46 @@ impl Progress {
         }
     }
 
-    pub fn record_beaten(&mut self, wave: u32) {
-        if wave != TOWER_WAVE {
-            self.beaten[(wave >> 8) as usize & 15] |= 1 << (wave & 0xFF);
-            self.last_beaten = Some(wave);
+    /// WorldOpen for any realm: the rune realms by runes and shards, the rest
+    /// by their crystal colour (used by the hints).
+    pub fn world_open_any(&self, realm: u32, crystals: &[i32; 9]) -> bool {
+        match realm {
+            5 | 6 | 8 => self.world_open(realm),
+            13 => true,
+            r => crate::game::crystals_met(crystals, REALM_CRYSTAL[r as usize & 15]),
+        }
+    }
+
+    /// towerRecordLevelBeaten: the level's bit, and its Runestone / legend-item
+    /// masks (a second win sets the "twice" mask).
+    pub fn record_beaten(&mut self, wave: u32, rune: i16, legend: i16) {
+        if wave == TOWER_WAVE {
+            return;
+        }
+        self.beaten[(wave >> 8) as usize & 15] |= 1 << (wave & 0xFF);
+        self.last_beaten = Some(wave);
+        let twice = |masks: &mut [u16], bit: u16| {
+            if masks[0] & bit != 0 {
+                masks[1] |= bit;
+            } else {
+                masks[0] |= bit;
+            }
+        };
+        if (1..=13).contains(&rune) {
+            twice(&mut self.level_masks[0..2], 1 << (rune - 1));
+        }
+        if (1..=15).contains(&legend) {
+            twice(&mut self.level_masks[2..4], 1 << legend);
+        }
+    }
+
+    /// playerGiveGargItem on a boss level: a death there is an attempt.
+    pub fn record_boss_death(&mut self, realm: u32) {
+        let bit = 1 << (realm & 15);
+        if self.boss_attempts[0] & bit != 0 {
+            self.boss_attempts[1] |= bit;
+        } else {
+            self.boss_attempts[0] |= bit;
         }
     }
 
@@ -80,7 +129,7 @@ mod tests {
         let mut p = Progress::default();
         assert!(p.portal_open(0x100));
         assert!(!p.portal_open(0x101));
-        p.record_beaten(0x100);
+        p.record_beaten(0x100, 0, 0);
         assert!(p.portal_open(0x101));
         assert!(!p.portal_open(0x500), "the temple needs the 8 boss runes");
         p.runes = 0x1FE;

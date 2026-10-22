@@ -901,6 +901,10 @@ pub struct Game {
     pub world_changed: bool,
     /// The party's boss shards (bit = world order 1..11, as Progress::runes).
     pub runes: u16,
+    /// Items of Legend picked up (bit = the realm whose Guardian each is for).
+    pub legend_items: u16,
+    /// Players who died in this level (inactivate_player outside the tower).
+    pub deaths: u32,
     /// The level's monster types (realm ENMY + LEVL enemytype).
     pub roster: crate::enemies::Roster,
     /// The level's monster and generator tuning, normalized for the difficulty.
@@ -1286,6 +1290,8 @@ impl Game {
             barrier_touches: Vec::new(),
             world_changed: false,
             runes: 0,
+            legend_items: 0,
+            deaths: 0,
             roster: Default::default(),
             tuning: gdl_formats::wdata::EnemyTuning::default().normalized(1),
             max_enemies: 25,
@@ -2356,6 +2362,7 @@ impl Game {
                     it_cleared = true;
                 }
                 p.state = PlayerState::Dead { timer: 4.0 };
+                self.deaths += 1;
                 self.sfx.push(format!("S_{}DIE1", p.class));
                 if let Some(d) = seqs.death {
                     p.animator.restart(d);
@@ -4154,7 +4161,8 @@ impl Game {
                     self.shards |= 1 << bit;
                     self.welcome = 300;
                 }
-                PickupKind::Legend(_) => {}
+                // The item's value is the realm whose Guardian it is for.
+                PickupKind::Legend(v) => self.legend_items |= 1 << v.min(15),
                 // towerAdvanceLevelRecord.
                 PickupKind::Gargoyle(i) => {
                     if self.garg_items[i] >= 0 {
