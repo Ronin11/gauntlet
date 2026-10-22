@@ -509,6 +509,12 @@ impl App {
                         r.audio.set_volumes(&r.prefs);
                     }
                     if let Some(src) = picked {
+                        // A new game from the title: a new party with nothing done
+                        // (there are no saves to load yet).
+                        r.progress = Progress::default();
+                        r.carry = None;
+                        r.checkpoint = None;
+                        r.suspended = None;
                         next = Some(Screen::Select(Select::with_first(src)));
                     } else if t.timed_out {
                         r.audio.stop();
