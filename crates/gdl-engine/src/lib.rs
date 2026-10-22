@@ -13,6 +13,7 @@ pub mod input;
 pub mod level;
 pub mod menu;
 pub mod mesh;
+pub mod options;
 pub mod optmenu;
 pub mod scene;
 pub mod screen;
