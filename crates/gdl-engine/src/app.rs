@@ -33,8 +33,8 @@ struct Playing {
     players: Vec<(String, String)>,
 }
 
+// Field order is drop order: the surface must go before the window it draws to.
 struct Running {
-    window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     gpu: Gpu,
@@ -47,6 +47,7 @@ struct Running {
     sources: Vec<Source>,
     last: Instant,
     acc: f32,
+    window: Arc<Window>,
 }
 
 struct App {
@@ -65,7 +66,16 @@ impl App {
                     .with_inner_size(winit::dpi::LogicalSize::new(1280, 720)),
             )?,
         );
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // Vulkan/Metal/DX12 on desktop; GL only where nothing else exists (Android emulators).
+        let backends = if cfg!(target_os = "android") {
+            wgpu::Backends::all()
+        } else {
+            wgpu::Backends::PRIMARY
+        };
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::from_env().unwrap_or(backends),
+            ..Default::default()
+        });
         let surface = instance.create_surface(window.clone())?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -296,6 +306,15 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Tear down GPU and audio while the window system connection is still open;
+    /// dropping them after the event loop returns crashes inside the EGL/Wayland driver.
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        if let Some(r) = self.run.take() {
+            let _ = r.gpu.device.poll(wgpu::PollType::Wait);
+            drop(r);
         }
     }
 
