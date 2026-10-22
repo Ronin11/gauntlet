@@ -1,4 +1,5 @@
 mod app;
+mod audio;
 mod character;
 mod collision;
 mod fs;
@@ -30,6 +31,7 @@ struct Args {
     hold: Vec2,
     attack_at: Option<u32>,
     bot: bool,
+    mute: bool,
 }
 
 fn parse_vec3(s: &str) -> Result<Vec3> {
@@ -49,6 +51,7 @@ USAGE: gauntlet [OPTIONS]
   --data <ISO|DIR>      Game disc image or extracted folder (default: auto-detect,
                         or $GDL_DATA)
   --level <name>        Level to start in (default levelA1)
+  --mute                No music or sound (also: GDL_MUTE=1)
   --players <list>      Comma list of CLASS[/COLOR], e.g. WAR,VAL/BLU (default WAR)
                         Classes: WAR VAL WIZ ARC (and unlockables)
 
@@ -81,6 +84,7 @@ fn parse_args() -> Result<Args> {
         hold: Vec2::ZERO,
         attack_at: None,
         bot: false,
+        mute: std::env::var_os("GDL_MUTE").is_some(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -105,6 +109,7 @@ fn parse_args() -> Result<Args> {
             "--simulate" => a.simulate = val()?.parse()?,
             "--attack-at" => a.attack_at = Some(val()?.parse()?),
             "--bot" => a.bot = true,
+            "--mute" => a.mute = true,
             "--hold" => {
                 let v = val()?;
                 let (x, y) = v.split_once(',').context("--hold x,y")?;
@@ -278,5 +283,6 @@ fn main() -> Result<()> {
         fs,
         level: args.level,
         players: args.players,
+        mute: args.mute,
     })
 }

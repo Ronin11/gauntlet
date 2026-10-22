@@ -1,5 +1,6 @@
 //! Windowed game: winit event loop, wgpu surface, fixed-timestep simulation.
 
+use crate::audio::Audio;
 use crate::fs::GameFs;
 use crate::game::Game;
 use crate::gpu::Gpu;
@@ -21,6 +22,7 @@ pub struct Config {
     pub fs: GameFs,
     pub level: String,
     pub players: Vec<(String, String)>,
+    pub mute: bool,
 }
 
 struct Running {
@@ -32,6 +34,7 @@ struct Running {
     game: Game,
     scene: Scene,
     hud: Hud,
+    audio: Audio,
     input: Input,
     sources: Vec<Source>,
     last: Instant,
@@ -87,6 +90,8 @@ impl App {
         let game = Game::new(&self.cfg.fs, &self.cfg.level, &classes)?;
         let scene = Scene::new(&gpu, &game)?;
         let hud = Hud::new(&gpu.device, config.format);
+        let mut audio = Audio::new(self.cfg.mute);
+        audio.play_level_music(&self.cfg.fs, &self.cfg.level);
         let input = Input::new();
         let mut sources: Vec<Source> = input.pads().into_iter().map(Source::Pad).collect();
         sources.truncate(game.players.len());
@@ -103,6 +108,7 @@ impl App {
             game,
             scene,
             hud,
+            audio,
             input,
             sources,
             last: Instant::now(),
@@ -219,6 +225,7 @@ impl ApplicationHandler for App {
                             match Scene::new(&r.gpu, &g) {
                                 Ok(sc) => {
                                     log::info!("entering {next}");
+                                    r.audio.play_level_music(&self.cfg.fs, &next);
                                     r.game = g;
                                     r.scene = sc;
                                 }
