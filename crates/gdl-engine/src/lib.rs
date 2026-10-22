@@ -10,6 +10,7 @@ pub mod collision;
 pub mod critter;
 pub mod cursor;
 pub mod enemies;
+pub mod flyby;
 pub mod fs;
 pub mod game;
 pub mod gpu;
