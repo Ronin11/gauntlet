@@ -152,6 +152,13 @@ pub struct Boss {
     /// The legend weapon's held model (FX 92, LEGENDHLD) and projectile
     /// (FX 93, LEGENDPRJ) from the level's item file, and their entities.
     pub legend_models: (Option<usize>, Option<usize>),
+    /// LEGENDFX and LEGENDFX2 (FX_LEGEND1 / FX_LEGEND2).
+    pub legend_fx: (Option<usize>, Option<usize>),
+    /// Effects to change into another when they end (SfxSetMorph): the
+    /// effect, where it is, the model it becomes and for how long (s).
+    pub morphs: Vec<(u64, Vec3, Option<usize>, f32)>,
+    /// The LEGENDFX riding on the Djinn (lbl_80344890), and until when.
+    pub legend_aura: Option<(u64, f32)>,
     pub legend_hold: Option<u64>,
     pub legend_shot: Option<u64>,
     /// The safe rock's model (SAFEROCK0 in the realm's item file).
@@ -486,6 +493,10 @@ impl Game {
             self.item_model_pub(fs, &mut cache, &mut known, &dirs, "LEGENDHLD"),
             self.item_model_pub(fs, &mut cache, &mut known, &dirs, "LEGENDPRJ"),
         );
+        let legend_fx = (
+            self.item_model_pub(fs, &mut cache, &mut known, &dirs, "LEGENDFX"),
+            self.item_model_pub(fs, &mut cache, &mut known, &dirs, "LEGENDFX2"),
+        );
         for n in ["BGNTR_IC", "BMASK_IC", "BHORN_IC", "BGNTL_IC"] {
             if level.boss == 42 {
                 self.item_model_pub(fs, &mut cache, &mut known, &dirs, n);
@@ -502,6 +513,7 @@ impl Game {
             b.key_model = key;
             b.key2_model = key2;
             b.legend_models = legend_models;
+            b.legend_fx = legend_fx;
             b.safe_rock_model = safe_rock_model;
         }
         // Skorne's altar: the floor pieces his stages throw up (obstacles of
@@ -1216,6 +1228,62 @@ impl Game {
         }
     }
 
+    /// An effect playing its model's first sequence once.
+    fn spawn_effect_once(&mut self, m: usize, at: Vec3) -> u64 {
+        let life = self.models[m].skeleton.sequences.first().map_or(1.0, |s| {
+            s.frame_count.max(1) as f32 * s.frame_rate.max(1) as f32 / 900.0
+        });
+        self.spawn(Kind::Effect { life }, Some(m), at, 0.0)
+    }
+
+    /// SfxSetMorph: an ended effect becomes its next one; the legend effects
+    /// fade over their last 3 s (gauntworld.c:1333); the Djinn's LEGENDFX
+    /// rides on him.
+    fn update_morphs(&mut self) {
+        let Some(b) = self.boss.as_mut() else { return };
+        let morphs = std::mem::take(&mut b.morphs);
+        let aura = b.legend_aura;
+        let mut keep = Vec::new();
+        for (id, pos, next, time) in morphs {
+            if self.entities.iter().any(|e| e.id == id && e.alive) {
+                keep.push((id, pos, next, time));
+            } else if let Some(m) = next {
+                self.spawn(Kind::Effect { life: time }, Some(m), pos, 0.0);
+            }
+        }
+        if let Some(b) = self.boss.as_mut() {
+            b.morphs = keep;
+        }
+        for e in self.entities.iter_mut() {
+            if let Kind::Effect { life } = e.kind {
+                if life < 3.0
+                    && self.boss.as_ref().is_some_and(|b| {
+                        e.model.is_some() && (e.model == b.legend_fx.0 || e.model == b.legend_fx.1)
+                    })
+                {
+                    e.fade = (life / 3.0).clamp(0.0, 1.0);
+                }
+            }
+        }
+        if let Some((id, until)) = aura {
+            let at = self.boss_critter().map(|(e, _)| e.pos + Vec3::Y * 6.0);
+            let now = self.time;
+            if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+                if let Some(at) = at {
+                    e.pos = at;
+                }
+                if let Kind::Effect { life } = &mut e.kind {
+                    *life = (until - now).max(0.0);
+                }
+            }
+            if now >= until {
+                if let Some(b) = self.boss.as_mut() {
+                    b.legend_aura = None;
+                }
+            }
+        }
+    }
+
     /// The BOSSKEY effect's morph into BOSSKEY2 once it has played.
     fn update_boss_key(&mut self) {
         let Some(b) = self.boss.as_ref() else { return };
@@ -1362,6 +1430,7 @@ impl Game {
         self.update_meters(dt);
         self.update_fallers(dt);
         self.update_boss_key();
+        self.update_morphs();
         self.limit_players_to_camera();
         self.update_legend(dt);
         self.update_wizard(dt);
@@ -1528,6 +1597,7 @@ impl Game {
         let Some(b) = self.boss.as_ref() else { return };
         let t = b.boss_type;
         let (hold, prj) = (b.legend_hold, b.legend_models.1);
+        let ((fx1, fx2), home) = (b.legend_fx, b.home);
         let from = self.legend_hand();
         if (34..=39).contains(&t) || t == 41 {
             if let Some(id) = hold {
@@ -1550,21 +1620,28 @@ impl Game {
             self.legend_hit();
             return;
         }
-        // FX 93 at the boss (offsets from the holder sequence), then the hit.
-        if let (Some(m), Some((e, _))) = (prj, self.boss_critter()) {
-            let off = match t {
-                37 => Vec3::new(0.0, 0.0, 5.0),
-                39 => Vec3::new(0.0, 10.0, 0.0),
-                40 => Vec3::new(0.0, -5.0, 10.0),
-                42 => Vec3::new(0.0, 17.0, 3.0),
-                _ => Vec3::ZERO,
-            };
-            let at = if t == 37 {
-                from + off
-            } else {
-                e.pos + glam::Mat4::from_rotation_y(e.yaw).transform_vector3(off)
-            };
-            self.spawn(Kind::Effect { life: 3.0 }, Some(m), at, 0.0);
+        // pmotion.c:2283-2360: an effect at the boss's home spot that changes
+        // into LEGENDFX (or LEGENDFX2) when it ends: 41 FX 93 -> 90 for 5 s;
+        // 39 FX 90 -> 91, 40 and 42 FX 93 -> 90, for 30 s.
+        let plan = match t {
+            41 => Some((prj, Vec3::ZERO, fx1, 5.0)),
+            39 => Some((fx1, Vec3::new(-7.0, -5.0, 85.0), fx2, 30.0)),
+            40 => Some((prj, Vec3::new(0.0, -5.0, 10.0), fx1, 30.0)),
+            42 => Some((prj, Vec3::new(0.0, 17.0, 3.0), fx1, 30.0)),
+            _ => None,
+        };
+        if let Some((Some(m), off, next, time)) = plan {
+            let id = self.spawn_effect_once(m, home + off);
+            if let Some(b) = self.boss.as_mut() {
+                b.morphs.push((id, home + off, next, time));
+            }
+        } else if let (37, Some(m)) = (t, prj) {
+            self.spawn(
+                Kind::Effect { life: 3.0 },
+                Some(m),
+                from + Vec3::Z * 5.0,
+                0.0,
+            );
         }
         self.legend_hit();
     }
@@ -1645,7 +1722,18 @@ impl Game {
         };
         match t {
             34 => c.parts[0].freeze = 1200.0,
-            36 => c.parts[0].blind = 1800.0,
+            36 => {
+                c.parts[0].blind = 1800.0;
+                // sfx.c:3236: FX_LEGEND1 rides on him, 6 up, for 1800 ticks.
+                if let Some(m) = self.boss.as_ref().and_then(|b| b.legend_fx.0) {
+                    let at = self.entities[ei].pos + Vec3::Y * 6.0;
+                    let until = self.time + 30.0;
+                    let id = self.spawn(Kind::Effect { life: 30.0 }, Some(m), at, 0.0);
+                    if let Some(b) = self.boss.as_mut() {
+                        b.legend_aura = Some((id, until));
+                    }
+                }
+            }
             38 => {
                 c.parts[0].blind = 18000.0;
                 // The eye becomes PBOSSQEYEBALL until the weakness ends.
@@ -2492,6 +2580,39 @@ mod tests {
             seen2 |= g.entities.iter().any(|e| e.alive && e.model == k2);
         }
         assert!(seen2);
+    }
+
+    #[test]
+    fn legend_hits_leave_their_effects() {
+        let Some(fs) = data() else { return };
+        let mut checked = 0;
+        for l in [
+            "levelA5", "levelB6", "levelC5", "levelD5", "levelG5", "levelH4", "levelI5", "levelJ5",
+            "levelK5",
+        ] {
+            let mut g = Game::new(&fs, l, &[("WAR", "RED")]).unwrap();
+            let realm = g.wave.map_or(0, |w| w >> 8);
+            g.set_legend_held(1 << realm);
+            face_boss(&mut g, 25.0);
+            let (t, fx) = {
+                let b = g.boss.as_ref().unwrap();
+                (b.boss_type, b.legend_fx)
+            };
+            let mut seen = false;
+            for _ in 0..2400 {
+                g.players[0].health = 500.0;
+                g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                seen |= g
+                    .entities
+                    .iter()
+                    .any(|e| e.alive && e.model.is_some() && (e.model == fx.0 || e.model == fx.1));
+            }
+            if matches!(t, 36 | 39 | 40 | 41 | 42) && fx.0.is_some() {
+                assert!(seen, "{l}: boss {t}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
     }
 
     fn wake(g: &mut Game) {
