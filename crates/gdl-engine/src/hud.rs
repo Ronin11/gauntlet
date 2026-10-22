@@ -34,6 +34,10 @@ struct VsOut {
 pub struct Hud {
     pipeline: wgpu::RenderPipeline,
     textures: Vec<wgpu::BindGroup>,
+    /// A texture rewritten every frame (movies): the texture and its overlay id.
+    stream: Option<(wgpu::Texture, Tex)>,
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     /// Texture names, sizes and fonts for building canvases.
     pub ui: UiAssets,
 }
@@ -680,8 +684,83 @@ impl Hud {
         Hud {
             pipeline,
             textures,
+            stream: None,
+            bgl,
+            sampler,
             ui,
         }
+    }
+
+    /// Upload a w x h RGBA picture into the streaming texture (made, or remade,
+    /// when its size changes) and return it for drawing.
+    pub fn stream_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+    ) -> Tex {
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        if self.stream.as_ref().map(|(_, t)| (t.w, t.h)) != Some((w, h)) {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("hud stream"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = t.create_view(&Default::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hud stream"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            let id = match &self.stream {
+                Some((_, old)) => {
+                    self.textures[old.id as usize] = bg;
+                    old.id
+                }
+                None => {
+                    self.textures.push(bg);
+                    self.textures.len() as u32 - 1
+                }
+            };
+            self.stream = Some((t, Tex { id, w, h }));
+        }
+        let (t, tex) = self.stream.as_ref().unwrap();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: t,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            size,
+        );
+        *tex
     }
 
     pub fn draw(

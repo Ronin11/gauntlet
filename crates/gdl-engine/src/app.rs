@@ -1,6 +1,7 @@
 //! Windowed game: winit event loop, wgpu surface, fixed-timestep simulation, and the
 //! screens (title -> hero select -> loading -> playing, with a pause menu).
 
+use crate::attract::{self, Attract};
 use crate::audio::Audio;
 use crate::fs::GameFs;
 use crate::game::Game;
@@ -44,6 +45,10 @@ struct Playing {
 type Carry = Vec<(f32, u32, u32, u32)>;
 
 enum Screen {
+    /// The licence screen shown at power-on, for this many more ticks.
+    Legal(u32),
+    /// The attract loop (movies, group shots); its state is `Running::attract`.
+    Attract,
     Title(Title),
     Select(Select),
     /// The loading art is shown for one frame, then the level loads.
@@ -66,6 +71,10 @@ struct Running {
     gpu: Gpu,
     depth: wgpu::TextureView,
     screen: Screen,
+    /// The attract sequence, kept across visits to the title screen.
+    attract: Attract,
+    /// The current movie frame's texture.
+    movie_tex: Option<crate::ui::Tex>,
     hud: Hud,
     audio: Audio,
     input: Input,
@@ -138,8 +147,9 @@ impl App {
         audio.load_sounds(&self.cfg.fs);
         let input = Input::new();
         let (screen, sources) = if self.cfg.players.is_empty() {
-            audio.play_select_music(&self.cfg.fs);
-            (Screen::Title(Title::default()), Vec::new())
+            // TODO: the original shows the licence screen for as long as its
+            // start-up loading takes; two seconds stands in for that.
+            (Screen::Legal(120), Vec::new())
         } else {
             let n = self.cfg.players.len();
             let mut sources: Vec<Source> = input.pads().into_iter().map(Source::Pad).collect();
@@ -162,6 +172,8 @@ impl App {
             gpu,
             depth,
             screen,
+            attract: Attract::new(),
+            movie_tex: None,
             hud,
             audio,
             input,
@@ -337,12 +349,46 @@ impl App {
                 .map(|s| (s, r.input.read(s)))
                 .collect();
             match &mut r.screen {
+                Screen::Legal(t) => {
+                    *t = t.saturating_sub(1);
+                    if *t == 0 {
+                        next = Some(Screen::Attract);
+                    }
+                }
+                Screen::Attract => {
+                    let inputs: Vec<PlayerInput> = all.iter().map(|(_, i)| *i).collect();
+                    let ev = if escape {
+                        attract::Event::Title
+                    } else {
+                        r.attract.update(fs, &inputs)
+                    };
+                    match ev {
+                        attract::Event::MovieStarted => {
+                            if let Some(attract::Show::Movie(m)) = &mut r.attract.show {
+                                if let Some(a) = m.audio.take() {
+                                    r.audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
+                                }
+                            }
+                        }
+                        attract::Event::MovieEnded => r.audio.stop(),
+                        attract::Event::Title => {
+                            r.audio.stop();
+                            r.attract.show = None;
+                            next = Some(Screen::Title(Title::default()));
+                        }
+                        attract::Event::None => {}
+                    }
+                }
                 Screen::Title(t) => {
                     if escape {
                         el.exit();
                     }
                     if let Some(src) = t.update(&all) {
                         next = Some(Screen::Select(Select::with_first(src)));
+                    } else if t.timed_out {
+                        r.audio.stop();
+                        r.attract = std::mem::take(&mut r.attract).after_title();
+                        next = Some(Screen::Attract);
                     }
                     for snd in t.sfx.drain(..) {
                         r.audio.play(fs, snd);
@@ -413,6 +459,20 @@ impl App {
         let ticks = (time * 60.0) as u32;
         let mut in_game = false;
         match &mut r.screen {
+            Screen::Legal(_) => attract::draw_legal(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
+            Screen::Attract => {
+                if let Some(attract::Show::Movie(m)) = &mut r.attract.show {
+                    if m.dirty {
+                        m.dirty = false;
+                        let (w, h) = m.size();
+                        let rgba = m.rgba();
+                        r.movie_tex =
+                            Some(r.hud.stream_frame(&r.gpu.device, &r.gpu.queue, w, h, &rgba));
+                    }
+                }
+                r.attract
+                    .draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), r.movie_tex);
+            }
             Screen::Title(t) => t.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Select(sel) => sel.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Loading { shown, .. } => {

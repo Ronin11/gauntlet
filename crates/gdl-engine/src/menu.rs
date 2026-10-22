@@ -46,6 +46,10 @@ pub struct Title {
     starting: Option<i32>,
     /// Sounds to play, drained by the caller.
     pub sfx: Vec<&'static str>,
+    /// Idle ticks left before the attract loop resumes (lbl_80344260).
+    idle: i32,
+    /// The idle timer ran out: back to the attract loop.
+    pub timed_out: bool,
 }
 
 impl Default for Title {
@@ -64,6 +68,8 @@ impl Default for Title {
             open: false,
             starting: None,
             sfx: Vec::new(),
+            idle: 1800,
+            timed_out: false,
         }
     }
 }
@@ -85,6 +91,11 @@ impl Title {
         if let Some(t) = &mut self.starting {
             *t -= 1;
             return (*t <= 0).then_some(self.owner).flatten();
+        }
+        self.idle -= 1;
+        if self.idle <= 0 {
+            self.timed_out = true;
+            return None;
         }
         let Some(owner) = self.owner else {
             // new_start: a Start press assigns that pad, and the menu opens.
@@ -112,7 +123,10 @@ impl Title {
             }
             // TODO: the Options screens (options.c).
             Event::Chose(_) | Event::Refused => self.sfx.push("S_NO"),
-            Event::Moved => self.sfx.push("S_OPTMENUMOVVRT"),
+            Event::Moved => {
+                self.sfx.push("S_OPTMENUMOVVRT");
+                self.idle = 1800;
+            }
             Event::Back => {
                 // B closes the menu and gives up the pad.
                 self.open = false;
@@ -133,6 +147,9 @@ impl Title {
         };
         if let Some(t) = self.starting {
             fade = 255 - (t * 60) / 30;
+        } else if self.idle < 30 {
+            // The glow fades out over the last half second before the attract loop.
+            fade = 255 - (self.idle.max(0) * 255) / 30;
         }
         if let Some(t) = s.ui.frame("GLOWCROP_00", (self.ticks as usize >> 2) % 10) {
             s.blit(t, 192.0, 0.0, 128.0, 128.0, fade);

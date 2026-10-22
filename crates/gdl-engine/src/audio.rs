@@ -41,6 +41,8 @@ type Pcm = Arc<Vec<i16>>;
 
 enum Cmd {
     Music(Vec<i16>, u16, u32),
+    /// Played once on the music channel (a movie soundtrack).
+    MusicOnce(Vec<i16>, u16, u32),
     StopMusic,
     /// Clips played back to back, at a sample rate and volume.
     Sfx(Vec<(Pcm, u32)>, f32),
@@ -161,6 +163,12 @@ impl Audio {
                                     rodio::buffer::SamplesBuffer::new(ch, rate, pcm)
                                         .repeat_infinite(),
                                 );
+                                _music = Some(s);
+                            }
+                        }
+                        Cmd::MusicOnce(pcm, ch, rate) => {
+                            if let Ok(s) = rodio::Sink::try_new(&handle) {
+                                s.append(rodio::buffer::SamplesBuffer::new(ch, rate, pcm));
                                 _music = Some(s);
                             }
                         }
@@ -287,6 +295,14 @@ impl Audio {
     /// the tower stream stands in for it.
     pub fn play_select_music(&mut self, fs: &GameFs) {
         self.play_music(fs, &["tower".into()]);
+    }
+
+    /// Play interleaved PCM once on the music channel, replacing the music.
+    pub fn play_once(&mut self, pcm: Vec<i16>, channels: u16, rate: u32) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Cmd::MusicOnce(pcm, channels, rate));
+        }
+        self.current = "<movie>".into();
     }
 
     pub fn stop(&mut self) {
