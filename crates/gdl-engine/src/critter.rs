@@ -603,7 +603,7 @@ impl Critter {
                 }
                 // Exhausted nodes are skipped by the collision queries.
                 let (d, max) = p.node_damage[ci];
-                if max > 0.0 && d >= max && cn.flags & 2 != 0 {
+                if max > 0.0 && d >= max {
                     continue;
                 }
                 let c = self.nodes[node].transform_point3(Vec3::from(cn.offset));
@@ -613,22 +613,18 @@ impl Critter {
         v
     }
 
-    /// The horizontal distance from `from` to the critter's surface, and the
-    /// node it is nearest (CritterLineCollide / CritterExpCollide): colnodes
-    /// when the type uses them (flags & 2), else the body cylinder.
+    /// The distance from `from` to the critter's surface, and the node it is
+    /// nearest (CritterLineCollide / CritterExpCollide): colnode spheres when
+    /// the type uses them (flags & 2, or child parts), else the body cylinder.
     pub fn surface(&self, from: Vec3, pos: Vec3, yaw: f32) -> (f32, Option<(usize, usize)>) {
         let t = &self.wad.types[self.parts[0].ty];
         let c = self.coll_pos(0, pos, yaw);
-        let mut best = (
-            Vec2::new(from.x - c.x, from.z - c.z).length() - t.rad,
-            None,
-        );
+        let horiz = Vec2::new(from.x - c.x, from.z - c.z).length() - t.rad;
+        let vert = (from.y - c.y).abs() - t.hht.max(1.0);
+        let mut best = (horiz.max(vert), None);
         if t.flags & 2 != 0 || self.parts.len() > 1 {
             for (pi, ci, p, r) in self.colliders() {
-                if (p.y - from.y).abs() > r + 8.0 {
-                    continue;
-                }
-                let d = Vec2::new(from.x - p.x, from.z - p.z).length() - r;
+                let d = (from - p).length() - r;
                 if d < best.0 {
                     best = (d, Some((pi, ci)));
                 }
@@ -2393,5 +2389,96 @@ mod tests {
             Vec3::new(0.0, 0.0, 10.0),
         );
         assert!((score - 10.0).abs() < 1e-4);
+    }
+
+    fn data() -> Option<crate::fs::GameFs> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        crate::fs::GameFs::open(&root).ok()
+    }
+
+    /// A placed golem, general or gargoyle: it attacks a player in front of it
+    /// for its DAMG damage, takes hits through its armour, and dies; the
+    /// gargoyle leaves its GARG item.
+    #[test]
+    fn placed_critters_fight_and_die() {
+        let Some(fs) = data() else { return };
+        let mut seen = std::collections::BTreeSet::new();
+        for lvl in ["levelA1", "levelB2", "levelC1", "levelD1", "levelF1", "levelI1"] {
+            let mut g = Game::new(&fs, lvl, &[("WAR", "RED")]).unwrap();
+            let crits: Vec<(u64, i16)> = g
+                .entities
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    Kind::Critter(c) => Some((e.id, c.etype)),
+                    _ => None,
+                })
+                .collect();
+            for (id, etype) in crits {
+                if seen.contains(&(etype, lvl.as_bytes()[5])) {
+                    continue;
+                }
+                let i = g.entities.iter().position(|e| e.id == id).unwrap();
+                let (pos, yaw) = (g.entities[i].pos, g.entities[i].yaw);
+                // Stand in front of it.
+                g.players[0].pos = pos + yaw_dir(yaw) * 5.0;
+                g.cam_focus = g.players[0].pos;
+                let mut hurt = 0.0;
+                let mut moves = std::collections::BTreeSet::new();
+                g.players[0].state = PlayerState::Normal;
+                for _ in 0..600 {
+                    g.players[0].health = 500.0;
+                    if let Some(e) = g.entities.iter().find(|e| e.id == id) {
+                        g.players[0].pos = e.pos + yaw_dir(e.yaw) * 5.0;
+                    }
+                    g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                    hurt += 500.0 - g.players[0].health;
+                    if let Some(Kind::Critter(c)) = g.entities.iter().find(|e| e.id == id).map(|e| &e.kind) {
+                        let p = &c.parts[0];
+                        if let Some(m) = p.moves(&c.wad).get(p.cur.max(0) as usize) {
+                            moves.insert(m.name.clone());
+                        }
+                    }
+                }
+                eprintln!("{lvl} etype {etype}: took {hurt:.0}, moves {moves:?}");
+                assert!(hurt > 0.0, "{lvl} etype {etype} never hurt the player");
+                // Beat it to death.
+                let hp = |g: &Game| match g.entities.iter().find(|e| e.id == id).map(|e| &e.kind) {
+                    Some(Kind::Critter(c)) => c.parts[0].health,
+                    _ => -1.0,
+                };
+                let before = hp(&g);
+                // At or above the level's plevel a player deals full damage.
+                g.players[0].level = 99;
+                let i = g.entities.iter().position(|e| e.id == id).unwrap();
+                g.hit_entity(0, i, 50.0, Vec2::ZERO, true);
+                assert!(hp(&g) < before, "{lvl} etype {etype}: no damage");
+                for _ in 0..40 {
+                    if let Some(i) = g.entities.iter().position(|e| e.id == id) {
+                        g.hit_entity(0, i, 100.0, Vec2::ZERO, true);
+                    }
+                }
+                let garg_before = g
+                    .entities
+                    .iter()
+                    .filter(|e| matches!(e.kind, Kind::Pickup { kind: crate::game::PickupKind::Gargoyle(_), .. }))
+                    .count();
+                for _ in 0..600 {
+                    g.players[0].health = 500.0;
+                    g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                }
+                assert!(g.entities.iter().all(|e| e.id != id), "{lvl} etype {etype} didn't go");
+                if etype == ET_GARGOYLE {
+                    let after = g
+                        .entities
+                        .iter()
+                        .filter(|e| matches!(e.kind, Kind::Pickup { kind: crate::game::PickupKind::Gargoyle(_), .. }))
+                        .count();
+                    assert_eq!(after, garg_before + 1, "{lvl}: no GARG item");
+                }
+                seen.insert((etype, lvl.as_bytes()[5]));
+            }
+        }
+        let kinds: std::collections::BTreeSet<i16> = seen.iter().map(|s| s.0).collect();
+        assert!(kinds.contains(&ET_GOLEM) && kinds.contains(&ET_GENERAL) && kinds.contains(&ET_GARGOYLE), "{seen:?}");
     }
 }

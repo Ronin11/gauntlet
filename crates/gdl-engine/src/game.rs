@@ -920,7 +920,7 @@ pub struct Game {
     /// The good wizard's model (atree WIZARD in the level's item file).
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
-    hit_from: Option<Vec3>,
+    pub(crate) hit_from: Option<Vec3>,
 }
 
 /// Parsed objects/textures/anim files shared by several models.
@@ -2915,7 +2915,7 @@ impl Game {
 
     /// Damage entity `t` on player `pi`'s behalf: sounds, experience (more for
     /// melee, which also charges the turbo meter) and anything it drops.
-    fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
+    pub(crate) fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
         if matches!(self.entities[t].kind, Kind::Critter(_)) {
             self.hit_critter(pi, t, dmg, push, melee);
             return;
@@ -4575,7 +4575,12 @@ impl Game {
             .iter()
             .filter(|e| matches!(e.kind, Kind::Pickup { .. }))
             .count();
-        format!("enemies {enemies} generators {gens} pickups {pick}")
+        let critters = self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Critter(_)))
+            .count();
+        format!("enemies {enemies} generators {gens} pickups {pick} critters {critters}")
     }
 }
 

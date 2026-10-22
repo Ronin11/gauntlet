@@ -986,9 +986,10 @@ impl Game {
         if w.state >= 9 && !gold_left {
             w.exit_timer = w.exit_timer.min(120);
         }
-        if w.exit_timer >= 0 && w.state >= 9 {
-            w.exit_timer -= ticks as i32;
-            if w.exit_timer <= 0 {
+        if w.state >= 9 {
+            if w.exit_timer > 0 {
+                w.exit_timer -= ticks as i32;
+            } else {
                 // lbl_80344808: once everyone has stood idle 6 ticks the level
                 // is done; it goes back to the tower through the shop.
                 w.idle += ticks;
@@ -1410,5 +1411,121 @@ mod tests {
             assert!(g.boss.as_ref().unwrap().active, "{lvl}: never woke");
             assert!(moves.len() >= 3, "{lvl}: only {moves:?}");
         }
+    }
+
+    fn wake(g: &mut Game) {
+        for _ in 0..1200 {
+            if g.boss.as_ref().is_some_and(|b| b.active) {
+                return;
+            }
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        }
+        panic!("the boss never woke");
+    }
+
+    fn boss_index(g: &Game) -> usize {
+        let id = g.boss.as_ref().unwrap().entity.unwrap();
+        g.entities.iter().position(|e| e.id == id).unwrap()
+    }
+
+    fn boss_health(g: &Game) -> f32 {
+        g.boss_critter().map_or(0.0, |(_, c)| c.parts[0].health)
+    }
+
+    /// Hits take health off (armour first, x1 for one player), a dead boss
+    /// spews its coins, gives the rune, and the good wizard ends the level.
+    #[test]
+    fn dragon_dies_and_the_wizard_ends_the_level() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelB6", &[("WAR", "RED")]).unwrap();
+        face_boss(&mut g, 25.0);
+        let t = boss_index(&g);
+        // Asleep, it can't be hurt.
+        let hp0 = boss_health(&g);
+        g.hit_entity(0, t, 100.0, Vec2::ZERO, true);
+        assert_eq!(boss_health(&g), hp0);
+        wake(&mut g);
+        let exp0 = g.players[0].exp;
+        let t = boss_index(&g);
+        g.hit_entity(0, t, 101.0, Vec2::ZERO, true);
+        // Dragon armour 1: 100 off its 2000.
+        assert!((hp0 - boss_health(&g) - 100.0).abs() < 1e-3, "{}", boss_health(&g));
+        assert!(g.players[0].exp > exp0, "exp for the hit");
+        // Two players: a boss takes half of every hit.
+        while boss_health(&g) > 0.0 {
+            let t = boss_index(&g);
+            g.hit_entity(0, t, 500.0, Vec2::ZERO, true);
+        }
+        assert!(g.boss.as_ref().unwrap().dying);
+        let mut coins = 0;
+        let mut caption = false;
+        for _ in 0..6000 {
+            g.players[0].health = 500.0;
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            coins = coins.max(
+                g.entities
+                    .iter()
+                    .filter(|e| matches!(e.kind, Kind::Pickup { kind: PickupKind::Gold(_), .. }))
+                    .count(),
+            );
+            if let Some(c) = g.wizard_caption() {
+                caption |= c.contains("Dragon");
+            }
+            if g.level_end.is_some() {
+                break;
+            }
+        }
+        assert!(g.boss_critter().is_none(), "the boss is gone");
+        assert_eq!(coins, 5, "the mountain's five silver coins");
+        assert!(caption, "the wizard's DRAGON_SPEECH");
+        assert_eq!(g.level_end, Some(LevelEnd::Exit(None)));
+        // The mountain is crystal_order position 2 (world order: Mountain Kingdom).
+        assert_eq!(g.boss_runes, 1 << 2);
+    }
+
+    /// The Chimera's heads have their own health: a head hit also hurts the
+    /// body, a body hit is shared among the heads, and the legend weapon
+    /// (the Scimitar) kills a head outright.
+    #[test]
+    fn chimera_heads_and_the_scimitar() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA5", &[("WAR", "RED")]).unwrap();
+        g.set_legend_held(1 << 1);
+        assert_eq!(g.boss.as_ref().unwrap().legend_state, 1);
+        face_boss(&mut g, 25.0);
+        wake(&mut g);
+        let (heads, root) = {
+            let (_, c) = g.boss_critter().unwrap();
+            (c.parts.len() - 1, c.parts[0].health)
+        };
+        assert_eq!(heads, 3);
+        // A hit landing on the eagle's head.
+        let at = {
+            let (_, c) = g.boss_critter().unwrap();
+            c.colliders().into_iter().find(|x| x.0 == 1).unwrap().2
+        };
+        g.hit_from = Some(at);
+        let t = boss_index(&g);
+        {
+            let (e, c) = g.boss_critter().unwrap();
+            eprintln!("at {at:?} surface {:?} colliders {:?}", c.surface(at, e.pos, e.yaw), c.colliders());
+        }
+        g.hit_entity(0, t, 102.0, Vec2::ZERO, false);
+        let (_, c) = g.boss_critter().unwrap();
+        // During the legend sequence (states 1-4) there is no player scaling;
+        // armour 2.
+        assert!((c.parts[1].health - (900.0 - 100.0)).abs() < 1e-2, "{}", c.parts[1].health);
+        assert!((c.parts[0].health - (root - 100.0)).abs() < 1e-2);
+        // The legend sequence: the START ends the intro, the cutscene, the
+        // throw, and the hit kills the second head.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..1800 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            seen.insert(g.legend_state());
+        }
+        assert!(seen.contains(&2) && seen.contains(&3) && seen.contains(&5), "{seen:?}");
+        let (_, c) = g.boss_critter().unwrap();
+        assert!(c.parts[2].health <= 0.0, "the lion's head: {}", c.parts[2].health);
+        assert_eq!(g.legend_held & 2, 0, "the scimitar is used up");
     }
 }
