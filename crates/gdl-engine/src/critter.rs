@@ -1688,7 +1688,10 @@ impl Game {
     /// Play SFXX `i` (its sound, and its effect model once) at `at`.
     fn critter_sfx(&mut self, c: &Critter, i: usize, at: Vec3) {
         let Some(s) = c.wad.sfx.get(i) else { return };
-        // CritterDoSfx: flag 0x20 runs SafeRockSetup.
+        // CritterDoSfx: flag 2 shakes the camera, 0x20 runs SafeRockSetup.
+        if s.flags & 2 != 0 {
+            self.shake.start(0, 0, 90, 0.1, 100);
+        }
         if s.flags & 0x20 != 0 {
             self.safe_rock_setup();
         }

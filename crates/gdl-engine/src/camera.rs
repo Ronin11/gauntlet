@@ -875,6 +875,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shakes_circle_the_look_at_point_and_run_out() {
+        let mut s = Shake::default();
+        s.start(0, 0, 30, 0.3, 200);
+        // A weaker one doesn't replace it.
+        s.start(0, 0, 90, 0.1, 100);
+        let (mut eye, mut at) = (Vec3::ZERO, Vec3::ZERO);
+        s.age(1);
+        s.apply(&mut eye, &mut at);
+        assert_eq!(eye, Vec3::ZERO);
+        assert!((at.length() - 0.3).abs() < 1e-5 && at.y == 0.0);
+        for _ in 0..30 {
+            s.age(1);
+        }
+        assert!(!s.shaking);
+    }
+
+    #[test]
     fn view_angles() {
         let (th, tv) = half_tans();
         assert!((th - 0.577_35).abs() < 1e-4);
@@ -1080,5 +1097,68 @@ mod tests {
         let v = View::of(&cam);
         let p = Vec3::new(3.0, 1.0, 4.0);
         assert!((v.unproject(v.project(p)) - p).length() < 1e-3);
+    }
+}
+
+/// camera.c's shake (ShakeCamera / DoShake): the camera's look-at point
+/// (type 0), eye (1) or both (2) circle horizontally by `rad`, the angle
+/// 38 degrees a tick of what is left, until `delay` ticks run out; nothing
+/// shows until `count` ticks have passed. A shake of lower priority doesn't
+/// replace a running one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Shake {
+    pub shaking: bool,
+    kind: u8,
+    count: i32,
+    delay: i32,
+    rad: f32,
+    priority: i32,
+}
+
+/// SHAKE_FREQ (lbl_80346028).
+const SHAKE_FREQ: f32 = 0.663_225_1;
+
+impl Shake {
+    /// ShakeCamera.
+    pub fn start(&mut self, kind: u8, count: i32, delay: i32, rad: f32, priority: i32) {
+        if self.shaking && priority < self.priority {
+            return;
+        }
+        *self = Shake {
+            shaking: true,
+            kind,
+            count,
+            delay,
+            rad,
+            priority,
+        };
+    }
+
+    /// DoShake's countdown, `ticks` 60 Hz ticks a frame.
+    pub fn age(&mut self, ticks: i32) {
+        if !self.shaking {
+            return;
+        }
+        self.delay -= ticks;
+        if self.delay < 0 {
+            self.shaking = false;
+            self.priority = 0;
+        }
+        self.count = (self.count - ticks).max(0);
+    }
+
+    /// DoShake's offset applied to (eye, look-at).
+    pub fn apply(&self, eye: &mut Vec3, at: &mut Vec3) {
+        if !self.shaking || self.count > 0 {
+            return;
+        }
+        let a = SHAKE_FREQ * self.delay as f32;
+        let d = Vec3::new(self.rad * a.cos(), 0.0, self.rad * a.sin());
+        if self.kind != 1 {
+            *at += d;
+        }
+        if self.kind >= 1 {
+            *eye += d;
+        }
     }
 }

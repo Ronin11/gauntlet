@@ -931,6 +931,8 @@ pub struct Game {
     pub cam_pitch: f32,
     /// The gameplay camera (NEWCAM's standard camera, camera.rs).
     pub camera: crate::camera::GameCamera,
+    /// ShakeCamera's state, applied by DoShake to the game and boss cameras.
+    pub shake: crate::camera::Shake,
     /// The player start the party was put at (SetPlayerStart).
     pub start_index: u16,
     pub time: f32,
@@ -1498,6 +1500,7 @@ impl Game {
             cam_yaw: std::f32::consts::PI,
             cam_pitch: 60f32.to_radians(),
             camera: Default::default(),
+            shake: Default::default(),
             start_index: 0,
             time: 0.0,
             frame: 0,
@@ -2870,6 +2873,7 @@ impl Game {
 
     pub fn update(&mut self, dt: f32, inputs: &[PlayerInput]) {
         self.time += dt;
+        self.shake.age(1);
         if let Some((_, t)) = &mut self.crystal_shown {
             *t -= dt;
             if *t <= 0.0 {
@@ -3474,6 +3478,7 @@ impl Game {
                 .use_one(crate::powerups::WEAPON, crate::powerups::W_HAMMER)
             {
                 self.sfx.push("S_HAMMER|S_EXPLODE1".into());
+                self.shake.start(0, 0, 30, 0.3, 200);
                 let pos = self.players[pi].pos;
                 self.area_hit(pi, pos, 35.0, 100.0);
             }
@@ -5876,10 +5881,11 @@ impl Game {
         if let Some(c) = self.sumner.as_ref().and_then(|s| s.cam) {
             return (c.eye, c.eye + c.dir * 30.0, 0.5);
         }
-        if let Some(v) = self.boss_camera_view() {
-            return v;
-        }
-        self.camera_view_normal()
+        let (mut eye, mut at, f) = self
+            .boss_camera_view()
+            .unwrap_or_else(|| self.camera_view_normal());
+        self.shake.apply(&mut eye, &mut at);
+        (eye, at, f)
     }
 }
 
