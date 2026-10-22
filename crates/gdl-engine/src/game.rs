@@ -1443,7 +1443,12 @@ impl Game {
                 })
                 .map(|d| d.name.clone());
             if let Some(name) = throw {
-                if let Some(m) = Model::from_objects(&asset.objects, &asset.textures, &[&name]) {
+                if let Some(m) = Model::from_objects_anim(
+                    &asset.objects,
+                    &asset.textures,
+                    asset.anim.as_ref(),
+                    &[&name],
+                ) {
                     game.players[i].proj_model = Some(game.add_model(m));
                 }
             }
@@ -1501,9 +1506,12 @@ impl Game {
         let mut gens = Vec::new();
         for s in 0..4 {
             let names = [format!("GEN_{desc}{s}L1"), format!("GEN_{desc}{s}")];
-            if let Some(m) =
-                Model::from_objects(&asset.objects, &asset.textures, &[&names[0], &names[1]])
-            {
+            if let Some(m) = Model::from_objects_anim(
+                &asset.objects,
+                &asset.textures,
+                Some(anim),
+                &[&names[0], &names[1]],
+            ) {
                 gens.push((s, m));
             }
         }
@@ -1532,7 +1540,7 @@ impl Game {
             {
                 Model::from_anim(&asset.objects, &asset.textures, anim, Some(&tree)).ok()
             } else {
-                Model::from_objects(&asset.objects, &asset.textures, &[&tree])
+                Model::from_objects_anim(&asset.objects, &asset.textures, Some(anim), &[&tree])
             };
             missiles[i] = m
                 .filter(|m| !m.mesh.indices.is_empty())
@@ -1784,7 +1792,12 @@ impl Game {
                     }
                 }
             }
-            if let Some(m) = Model::from_objects(&asset.objects, &asset.textures, &[name]) {
+            if let Some(m) = Model::from_objects_anim(
+                &asset.objects,
+                &asset.textures,
+                asset.anim.as_ref(),
+                &[name],
+            ) {
                 found = Some(m);
                 break;
             }

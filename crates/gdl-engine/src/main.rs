@@ -188,6 +188,15 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
             .map(|(d, t)| (d, Some(t)))
             .unwrap_or((color, None));
         character::Model::load_monster(&fs, dir, tree)?
+    } else if class.eq_ignore_ascii_case("bank") {
+        // bank/<DIR>:<TREE>, e.g. bank/ITEMS/levelC5:COIN_GOLD (the rest of
+        // the spec after the first '/').
+        let rest = &spec[class.len() + 1..];
+        let (dir, tree) = rest.split_once(':').context("bank/<dir>:<tree>")?;
+        let objects = gdl_formats::Objects::parse(&fs.read(&format!("{dir}/objects.ngc"))?)?;
+        let textures = fs.read(&format!("{dir}/textures.ngc"))?;
+        let anim = gdl_formats::anim::Anim::parse(&fs.read(&format!("{dir}/ANIM.PS2"))?)?;
+        character::Model::from_anim(&objects, &textures, &anim, Some(tree))?
     } else {
         character::Model::load_player(&fs, class, color)?
     };
@@ -199,13 +208,16 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
         .collect();
     log::info!("sequences: {}", names.join(" "));
     let gpu = headless_gpu()?;
-    let gm = gpu.upload_mesh(&cm.mesh)?;
+    let mut gm = gpu.upload_mesh(&cm.mesh)?;
+    // --simulate N: the global texture animations after N game frames.
+    gm.animate_textures(args.simulate);
     let mut inst = gpu.new_instance(&gm);
     inst.transform = mirror();
     let seq = cm
         .sequence(&args.seq)
         .with_context(|| format!("no sequence {}", args.seq))?;
     (inst.parts, inst.hidden) = cm.evaluate(seq, args.frame);
+    inst.part_fx = cm.texmod_fx(seq, args.frame);
 
     let at = args.at.unwrap_or(Vec3::new(0.0, 2.5, 0.0));
     let eye = args.eye.unwrap_or(Vec3::new(0.0, 3.0, 9.0));

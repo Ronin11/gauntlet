@@ -84,8 +84,16 @@ impl Scene {
     }
 
     pub fn sync(&mut self, gpu: &Gpu, game: &Game) {
+        // Global texmods (DoWorldAnimation / enemy_update / ... -> DoTexMods)
+        // advance once per game frame.
+        let inf_frame = game.frame;
+        self.world.animate_textures(inf_frame);
+        for m in &mut self.models {
+            m.animate_textures(inf_frame);
+        }
         for (slot, m) in self.movers.iter_mut().zip(&game.movers) {
-            if let Some((_, inst)) = slot {
+            if let Some((mesh, inst)) = slot {
+                mesh.animate_textures(inf_frame);
                 inst.transform = mirror() * Mat4::from_translation(Vec3::Y * m.offset);
                 inst.visible = m.shown;
             }
@@ -95,6 +103,7 @@ impl Scene {
             inst.transform =
                 mirror() * Mat4::from_translation(p.pos) * Mat4::from_rotation_y(p.yaw);
             (inst.parts, inst.hidden) = model.evaluate(p.animator.seq, p.animator.frame);
+            inst.part_fx = model.texmod_fx(p.animator.seq, p.animator.frame);
             let flash = p.hurt_flash;
             inst.tint = Vec4::new(1.0 + flash, 1.0 - flash * 0.5, 1.0 - flash * 0.5, 1.0);
             inst.visible = match p.state {
@@ -133,6 +142,7 @@ impl Scene {
                 let r = &c.parts[0];
                 (inst.parts, inst.hidden) =
                     model.evaluate_nodes(r.anim.seq, r.anim.frame, &world, &hidden, &c.swapped);
+                inst.part_fx = model.texmod_fx(r.anim.seq, r.anim.frame);
                 let flash = c.parts.iter().map(|p| p.flash).fold(0.0f32, f32::max);
                 inst.tint = if r.freeze > 0.0 {
                     // Frozen (pausecnt): blinking blue-white.
@@ -145,6 +155,7 @@ impl Scene {
                 continue;
             }
             (inst.parts, inst.hidden) = model.evaluate(e.animator.seq, e.animator.frame);
+            inst.part_fx = model.texmod_fx(e.animator.seq, e.animator.frame);
             if let Some(w) = game
                 .boss
                 .as_ref()

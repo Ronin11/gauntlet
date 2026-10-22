@@ -181,7 +181,22 @@ fn main() -> Result<()> {
         }
         Cmd::Anim { path } => {
             let a = gdl_formats::anim::Anim::parse(&std::fs::read(&path)?)?;
-            println!("version {} atrees {}", a.version, a.atrees.len());
+            println!(
+                "version {} atrees {} texmods {}",
+                a.version,
+                a.atrees.len(),
+                a.texmods.len()
+            );
+            let tm_line = |t: &gdl_formats::anim::TexMod| {
+                format!(
+                    "atree {:3} seq {:3} {:20} <- {:20} tex {:4} src {:4} frames {:5} start {:3} rate {:2} frame {}",
+                    t.atree, t.seq, t.name, t.source_name, t.tex, t.source, t.frames,
+                    t.start_frame, t.rate, t.frame
+                )
+            };
+            for t in &a.texmods {
+                println!("texmod {}", tm_line(t));
+            }
             for t in &a.atrees {
                 println!(
                     "atree {} prefix {:?}: {} nodes, {} seqs",
@@ -196,12 +211,18 @@ fn main() -> Result<()> {
                         "  node {i:2} {:20} type {} parent {:3} pos {:?} mb {:#x} tracks {ntracks}",
                         n.name, n.anim_type, n.parent, n.init_pos, n.mb_flags
                     );
+                    if let Some(tm) = &n.texmod {
+                        println!("    node texmod {}", tm_line(tm));
+                    }
                 }
                 for s in &t.sequences {
                     println!(
                         "  seq {:20} frames {:4} rate {:3} repeat {} flags {:#x}",
                         s.name, s.frame_count, s.frame_rate, s.repeat, s.flags
                     );
+                    for tm in &s.texmods {
+                        println!("    seq texmod {}", tm_line(tm));
+                    }
                 }
                 if let Some(si) = t.sequence_index("WALK1").or(Some(0)) {
                     for (i, tr) in t.tracks.iter().enumerate().take(6) {
