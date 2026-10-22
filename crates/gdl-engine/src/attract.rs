@@ -90,6 +90,15 @@ impl Attract {
         }
     }
 
+    /// After "Quit Game" or a game over (MG_OVER): the "fail" movie plays next.
+    pub fn game_over(mut self) -> Attract {
+        self.game_over = true;
+        self.started = true;
+        self.index = 10;
+        self.show = None;
+        self
+    }
+
     /// Back into the loop after the title timed out (the entry after the title).
     pub fn after_title(mut self) -> Attract {
         self.index = 4;

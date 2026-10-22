@@ -1,36 +1,9 @@
 //! Title screen, loading screen and pause menu, drawn in the game's own style
 //! (see [`crate::hud::Style`]).
 
-use crate::hud::{Canvas, Style, DIM, GOLD};
 use crate::input::{PlayerInput, Source};
 use crate::optmenu::{Event, Item, OptMenu};
 use crate::screen::Scr;
-
-/// Up/down navigation shared by the menus: one step per stick push.
-#[derive(Default)]
-struct Nav {
-    last_y: f32,
-}
-
-impl Nav {
-    /// -1 (up), +1 (down) or 0 for this tick.
-    fn step(&mut self, inputs: &[(Source, PlayerInput)]) -> i32 {
-        let y = inputs
-            .iter()
-            .map(|(_, i)| i.stick.y)
-            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-            .unwrap_or(0.0);
-        let s = if y > 0.5 && self.last_y <= 0.5 {
-            -1
-        } else if y < -0.5 && self.last_y >= -0.5 {
-            1
-        } else {
-            0
-        };
-        self.last_y = y;
-        s
-    }
-}
 
 /// The title screen (attract.c do_titlescreen): TITLE00-03 with the animated
 /// GLOWCROP glow, "Press Start", then the Start / Options title menu for the pad
@@ -46,6 +19,11 @@ pub struct Title {
     starting: Option<i32>,
     /// Sounds to play, drained by the caller.
     pub sfx: Vec<&'static str>,
+    /// The Options screens, opened from the title menu.
+    pub options: Option<crate::options::Options>,
+    /// Their sounds, and whether a volume changed, for the caller.
+    pub option_sfx: Vec<String>,
+    pub volume_changed: bool,
     /// Idle ticks left before the attract loop resumes (lbl_80344260).
     idle: i32,
     /// The idle timer ran out: back to the attract loop.
@@ -68,6 +46,9 @@ impl Default for Title {
             open: false,
             starting: None,
             sfx: Vec::new(),
+            options: None,
+            option_sfx: Vec::new(),
+            volume_changed: false,
             idle: 1800,
             timed_out: false,
         }
@@ -86,8 +67,30 @@ impl Title {
     }
 
     /// One 60 Hz tick. Returns the pad that chose Start once the glow has faded.
-    pub fn update(&mut self, inputs: &[(Source, PlayerInput)]) -> Option<Source> {
+    pub fn update(
+        &mut self,
+        inputs: &[(Source, PlayerInput)],
+        prefs: &mut crate::options::Prefs,
+    ) -> Option<Source> {
         self.ticks += 1;
+        // The Options screens take over the owner's input while open; the idle
+        // timer doesn't run under them.
+        if let Some(o) = &mut self.options {
+            let input = inputs
+                .iter()
+                .find(|(s, _)| Some(*s) == self.owner)
+                .map(|(_, i)| *i)
+                .unwrap_or_default();
+            let action = o.update(&input, prefs);
+            self.option_sfx.extend(o.sfx.drain(..));
+            if action == crate::options::OptionsAction::VolumeChanged {
+                self.volume_changed = true;
+            }
+            if !o.is_drawing() {
+                self.options = None;
+            }
+            return None;
+        }
         if let Some(t) = &mut self.starting {
             *t -= 1;
             return (*t <= 0).then_some(self.owner).flatten();
@@ -121,7 +124,10 @@ impl Title {
                 self.starting = Some(30);
                 self.sfx.push("S_CHOOSESELSFX");
             }
-            // TODO: the Options screens (options.c).
+            Event::Chose(12) => {
+                self.sfx.push("S_OPTMENUSEL");
+                self.options = Some(crate::options::Options::title(0));
+            }
             Event::Chose(_) | Event::Refused => self.sfx.push("S_NO"),
             Event::Moved => {
                 self.sfx.push("S_OPTMENUMOVVRT");
@@ -150,6 +156,10 @@ impl Title {
         } else if self.idle < 30 {
             // The glow fades out over the last half second before the attract loop.
             fade = 255 - (self.idle.max(0) * 255) / 30;
+        }
+        if let Some(o) = &self.options {
+            o.draw(s);
+            return;
         }
         if let Some(t) = s.ui.frame("GLOWCROP_00", (self.ticks as usize >> 2) % 10) {
             s.blit(t, 192.0, 0.0, 128.0, 128.0, fade);
@@ -184,75 +194,6 @@ pub fn transition(s: &mut Scr, fade: i32) {
 /// fades it out as 255 * (1 - t / 2) over the first two seconds.
 pub fn loading_fade(t: f32) -> i32 {
     255 - (255.0 * (1.0 - 0.5 * t)).clamp(0.0, 255.0) as i32
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PauseAction {
-    Resume,
-    ChangeHeroes,
-    QuitToTitle,
-    Quit,
-}
-
-const PAUSE_ITEMS: [(&str, PauseAction); 4] = [
-    ("Continue", PauseAction::Resume),
-    ("Change Heroes", PauseAction::ChangeHeroes),
-    ("Quit to Title", PauseAction::QuitToTitle),
-    ("Quit Game", PauseAction::Quit),
-];
-
-/// In-game pause menu.
-#[derive(Default)]
-pub struct Pause {
-    sel: usize,
-    nav: Nav,
-    time: f32,
-}
-
-impl Pause {
-    pub fn update(&mut self, inputs: &[(Source, PlayerInput)], dt: f32) -> Option<PauseAction> {
-        self.time += dt;
-        let n = PAUSE_ITEMS.len();
-        match self.nav.step(inputs) {
-            -1 => self.sel = (self.sel + n - 1) % n,
-            1 => self.sel = (self.sel + 1) % n,
-            _ => {}
-        }
-        if self.time < 0.2 {
-            return None;
-        }
-        if inputs
-            .iter()
-            .any(|(_, i)| i.magic_pressed || i.start_pressed)
-        {
-            return Some(PauseAction::Resume);
-        }
-        if inputs.iter().any(|(_, i)| i.attack_pressed) {
-            return Some(PAUSE_ITEMS[self.sel].1);
-        }
-        None
-    }
-
-    pub fn draw(&self, c: &mut Canvas, st: &Style, time: f32) {
-        let (w, h) = (c.width(), c.height());
-        let u = (h / 720.0).min(w / 1120.0);
-        c.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.55]);
-        let pw = 520.0 * u;
-        let ph = 400.0 * u;
-        let (px, py) = ((w - pw) * 0.5, (h - ph) * 0.5);
-        st.panel(c, px, py, pw, ph, [1.0; 4]);
-        st.centered(c, w * 0.5, py + 34.0 * u, 56.0 * u, GOLD, "Paused");
-        for (k, (label, _)) in PAUSE_ITEMS.iter().enumerate() {
-            let y = py + 128.0 * u + k as f32 * 58.0 * u;
-            let on = k == self.sel;
-            let tw = st.width(label, 40.0 * u);
-            let x = (w - tw) * 0.5;
-            st.text(c, x, y, 40.0 * u, if on { GOLD } else { DIM }, label);
-            if on {
-                st.marker(c, x - 52.0 * u, y + 2.0 * u, 36.0 * u, time);
-            }
-        }
-    }
 }
 
 /// ControllerMessageBox: a scroll's text on parchment, centred on (256, 160),

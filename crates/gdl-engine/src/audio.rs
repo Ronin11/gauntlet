@@ -43,6 +43,8 @@ enum Cmd {
     Music(Vec<i16>, u16, u32),
     /// Streams played in order, the last one looping (a level's music parts).
     MusicParts(Vec<(Vec<i16>, u16, u32)>),
+    /// Music volume (1.0 = the game's default setting).
+    MusicVolume(f32),
     /// Stereo PCM played once, then looped from a frame index.
     MusicLoop(Vec<i16>, u32, Option<usize>),
     /// Played once on the music channel (a movie soundtrack).
@@ -122,6 +124,8 @@ impl SoundLib {
 /// Owns the audio thread. Dropping it stops playback.
 pub struct Audio {
     tx: Option<mpsc::Sender<Cmd>>,
+    /// Sound-effect volume from the options (1.0 = the default 128).
+    sfx_vol: f32,
     current: String,
     lib: Option<SoundLib>,
 }
@@ -131,6 +135,7 @@ impl Audio {
         // Android audio output isn't wired up yet.
         if muted || cfg!(target_os = "android") {
             return Audio {
+                sfx_vol: 1.0,
                 tx: None,
                 current: String::new(),
                 lib: None,
@@ -157,12 +162,13 @@ impl Audio {
                 };
                 // Keep the current music sink alive; replacing it stops the previous track.
                 let mut _music: Option<rodio::Sink> = None;
+                let mut music_vol = 1.0f32;
                 let voice = rodio::Sink::try_new(&handle).ok();
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         Cmd::Music(pcm, ch, rate) => {
                             if let Ok(s) = rodio::Sink::try_new(&handle) {
-                                s.set_volume(0.5);
+                                s.set_volume(0.5 * music_vol);
                                 s.append(
                                     rodio::buffer::SamplesBuffer::new(ch, rate, pcm)
                                         .repeat_infinite(),
@@ -178,7 +184,7 @@ impl Audio {
                         }
                         Cmd::MusicLoop(pcm, rate, loop_start) => {
                             if let Ok(s) = rodio::Sink::try_new(&handle) {
-                                s.set_volume(0.5);
+                                s.set_volume(0.5 * music_vol);
                                 let split =
                                     loop_start.map_or(pcm.len(), |f| (2 * f).min(pcm.len()));
                                 let (intro, body) = pcm.split_at(split);
@@ -200,7 +206,7 @@ impl Audio {
                         }
                         Cmd::MusicParts(parts) => {
                             if let Ok(s) = rodio::Sink::try_new(&handle) {
-                                s.set_volume(0.5);
+                                s.set_volume(0.5 * music_vol);
                                 let n = parts.len();
                                 for (i, (pcm, ch, rate)) in parts.into_iter().enumerate() {
                                     let b = rodio::buffer::SamplesBuffer::new(ch, rate, pcm);
@@ -211,6 +217,12 @@ impl Audio {
                                     }
                                 }
                                 _music = Some(s);
+                            }
+                        }
+                        Cmd::MusicVolume(v) => {
+                            music_vol = v;
+                            if let Some(s) = &_music {
+                                s.set_volume(0.5 * v);
                             }
                         }
                         Cmd::StopMusic => _music = None,
@@ -238,6 +250,7 @@ impl Audio {
                 }
             });
         Audio {
+            sfx_vol: 1.0,
             tx: spawned.ok().map(|_| tx),
             current: String::new(),
             lib: None,
@@ -286,7 +299,7 @@ impl Audio {
         let _ = tx.send(if voice {
             Cmd::Voice(all, vol)
         } else {
-            Cmd::Sfx(all, vol * 0.8)
+            Cmd::Sfx(all, vol * 0.8 * self.sfx_vol)
         });
     }
 
@@ -418,6 +431,14 @@ impl Audio {
             let _ = tx.send(Cmd::MusicOnce(pcm, channels, rate));
         }
         self.current = "<movie>".into();
+    }
+
+    /// Apply the Audio options: music and sfx volumes (128 is the default).
+    pub fn set_volumes(&mut self, prefs: &crate::options::Prefs) {
+        self.sfx_vol = prefs.sfx_vol as f32 / 128.0;
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Cmd::MusicVolume(prefs.music_vol as f32 / 128.0));
+        }
     }
 
     pub fn stop(&mut self) {

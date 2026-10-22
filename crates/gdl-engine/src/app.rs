@@ -8,9 +8,10 @@ use crate::game::Game;
 use crate::game::{LevelEnd, PlayerState};
 use crate::gpu::Gpu;
 use crate::hud::PanelInfo;
-use crate::hud::{self, Hud, Style};
+use crate::hud::{self, Hud};
 use crate::input::{Input, PlayerInput, Source};
-use crate::menu::{self, Pause, PauseAction, Title};
+use crate::menu::{self, Title};
+use crate::options::{Options, OptionsAction, Prefs};
 use crate::progress::Progress;
 use crate::scene::{Scene, CLEAR};
 use crate::screen::Scr;
@@ -68,7 +69,8 @@ enum Screen {
     },
     Playing {
         play: Box<Playing>,
-        pause: Option<Pause>,
+        /// The Game Menu / Tower Menu, while open (the game is frozen).
+        pause: Option<Options>,
     },
 }
 
@@ -83,6 +85,8 @@ struct Running {
     attract: Attract,
     /// The party's realm progress.
     progress: Progress,
+    /// Options settings (volumes, difficulty, controls).
+    prefs: Prefs,
     /// Each player's health, gold, keys and potions now, and as they were when
     /// the current level started (restored for players who die in it).
     carry: Option<Carry>,
@@ -187,6 +191,7 @@ impl App {
             screen,
             attract: Attract::new(),
             progress: Progress::default(),
+            prefs: Prefs::default(),
             carry: None,
             checkpoint: None,
             movie_tex: None,
@@ -419,7 +424,14 @@ impl App {
                     if escape {
                         el.exit();
                     }
-                    if let Some(src) = t.update(&all) {
+                    let picked = t.update(&all, &mut r.prefs);
+                    for snd in t.option_sfx.drain(..) {
+                        r.audio.play(fs, &snd);
+                    }
+                    if std::mem::take(&mut t.volume_changed) {
+                        r.audio.set_volumes(&r.prefs);
+                    }
+                    if let Some(src) = picked {
                         next = Some(Screen::Select(Select::with_first(src)));
                     } else if t.timed_out {
                         r.audio.stop();
@@ -480,42 +492,68 @@ impl App {
                     }
                 }
                 Screen::Playing { play, pause } => {
+                    let inputs: Vec<PlayerInput> =
+                        r.sources.iter().map(|s| r.input.read(*s)).collect();
                     if let Some(menu) = pause {
-                        let action = if escape {
-                            Some(PauseAction::Resume)
-                        } else {
-                            menu.update(&all, TICK)
-                        };
+                        // The menu's owner drives it; Esc acts as their Start.
+                        let owner = menu_owner(menu);
+                        let mut inp = inputs.get(owner).copied().unwrap_or_default();
+                        inp.start_pressed |= escape;
+                        let action = menu.update(&inp, &mut r.prefs);
+                        for snd in menu.sfx.drain(..) {
+                            r.audio.play(fs, &snd);
+                        }
                         match action {
-                            Some(PauseAction::Resume) => *pause = None,
-                            Some(PauseAction::ChangeHeroes) => {
+                            OptionsAction::Closed => *pause = None,
+                            OptionsAction::VolumeChanged => r.audio.set_volumes(&r.prefs),
+                            // "Abort Level?" Yes: everyone is put out of the level
+                            // and the party goes back to the tower.
+                            OptionsAction::QuitLevel => {
+                                *pause = None;
+                                for p in &mut play.game.players {
+                                    p.state = PlayerState::InTower;
+                                }
+                                play.game.level_end = Some(LevelEnd::AllDead);
+                            }
+                            OptionsAction::ManageCharacter => {
                                 next = Some(Screen::Select(Select::from_game(
                                     &play.panels,
                                     &r.sources,
                                 )));
                             }
-                            Some(PauseAction::QuitToTitle) => {
-                                next = Some(Screen::Title(Title::default()));
+                            // TODO: the shop and the inventory screen (shop.c).
+                            OptionsAction::Shop | OptionsAction::Inventory => *pause = None,
+                            OptionsAction::QuitGame => {
+                                r.audio.stop();
+                                r.attract = std::mem::take(&mut r.attract).game_over();
+                                next = Some(Screen::Attract);
                             }
-                            Some(PauseAction::Quit) => el.exit(),
-                            None => {}
+                            OptionsAction::None => {}
                         }
-                    } else {
-                        let inputs: Vec<PlayerInput> =
-                            r.sources.iter().map(|s| r.input.read(*s)).collect();
+                        if !menu_drawing(pause) {
+                            *pause = None;
+                        }
+                    } else if let Some(b) = &mut play.game.scroll_box {
                         // A scroll being read stops the game until its reader presses B.
-                        if let Some(b) = &mut play.game.scroll_box {
-                            let inp = inputs.get(b.player).copied().unwrap_or_default();
-                            if b.update(&inp) {
-                                play.game.scroll_box = None;
-                            }
-                        } else if escape || inputs.iter().any(|i| i.start_pressed) {
-                            // Start (or Esc) on any player's controller pauses.
-                            *pause = Some(Pause::default());
-                        } else {
-                            play.game.update(TICK, &inputs);
-                            play.intro += TICK;
+                        let inp = inputs.get(b.player).copied().unwrap_or_default();
+                        if b.update(&inp) {
+                            play.game.scroll_box = None;
                         }
+                    } else if let Some(owner) = (0..inputs.len())
+                        .find(|&i| inputs[i].start_pressed && play.game.players[i].state.active())
+                        .or(escape.then_some(0))
+                    {
+                        // OptionsStart: a playing player's Start opens the Game
+                        // Menu, or the Tower Menu in the tower.
+                        r.audio.play(fs, "S_OPTMENUSEL");
+                        *pause = Some(if play.game.wave == Some(TOWER_WAVE) {
+                            Options::tower(owner)
+                        } else {
+                            Options::game(owner)
+                        });
+                    } else {
+                        play.game.update(TICK, &inputs);
+                        play.intro += TICK;
                     }
                 }
             }
@@ -531,7 +569,6 @@ impl App {
         }
 
         // Draw.
-        let style = Style { ui: &r.hud.ui };
         let ticks = (time * 60.0) as u32;
         let mut in_game = false;
         match &mut r.screen {
@@ -607,7 +644,7 @@ impl App {
                     menu::draw_scroll(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), &b.text);
                 }
                 if let Some(menu) = pause {
-                    menu.draw(&mut canvas, &style, time);
+                    menu.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks));
                 }
             }
         }
@@ -770,4 +807,14 @@ fn run_with(cfg: Config, el: EventLoop<()>) -> Result<()> {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// The player a menu stack belongs to.
+fn menu_owner(menu: &Options) -> usize {
+    menu.player()
+}
+
+/// Is a closed menu still finishing its fade?
+fn menu_drawing(menu: &Option<Options>) -> bool {
+    menu.as_ref().is_some_and(|m| m.is_drawing())
 }

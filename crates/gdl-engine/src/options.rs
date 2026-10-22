@@ -708,6 +708,11 @@ impl Options {
     }
 
     /// The menus are up (options_state != OPTMENU_INACTIVE): the game is frozen.
+    /// The player the menus belong to.
+    pub fn player(&self) -> usize {
+        self.player
+    }
+
     pub fn is_open(&self) -> bool {
         self.open
     }

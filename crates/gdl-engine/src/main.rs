@@ -313,8 +313,6 @@ fn snapshot_game(args: &Args) -> Result<()> {
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
     };
     // Menu screens for checking their layout headlessly.
-    let t = 1.0;
-    let style = hud::Style { ui: &hud.ui };
     // Ticks the options screens have run (GDL_OPTIONS_TICKS overrides).
     let demo_ticks: u32 = std::env::var("GDL_OPTIONS_TICKS")
         .ok()
@@ -333,14 +331,6 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 select::Select::demo().draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
             }
             Some("loading") => menu::draw_loading(&mut screen::Scr::new(&mut canvas, &hud.ui, 40)),
-            Some("pause") => {
-                hud::build(
-                    &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
-                    &g,
-                    &panels,
-                );
-                menu::Pause::default().draw(&mut canvas, &style, t);
-            }
             Some(name) if name.starts_with("gamemenu") || name.starts_with("towermenu") => {
                 let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
                 hud::build(&mut s, &g, &panels);
@@ -361,18 +351,15 @@ fn snapshot_game(args: &Args) -> Result<()> {
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
     };
     let img = match args.screen.as_deref() {
-        Some(name)
-            if name == "pause" || name.starts_with("gamemenu") || name.starts_with("towermenu") =>
-        {
-            gpu.render_to_image(
+        Some(name) if name.starts_with("gamemenu") || name.starts_with("towermenu") => gpu
+            .render_to_image(
                 w,
                 h,
                 &globals,
                 scene::CLEAR,
                 &sc.draws(&g),
                 Some(&draw_screen),
-            )?
-        }
+            )?,
         Some(_) => gpu.render_to_image(w, h, &globals, scene::CLEAR, &[], Some(&draw_screen))?,
         None => {
             gpu.render_to_image(w, h, &globals, scene::CLEAR, &sc.draws(&g), Some(&draw_hud))?
