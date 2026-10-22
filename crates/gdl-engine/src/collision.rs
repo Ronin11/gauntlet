@@ -231,6 +231,21 @@ impl Collision {
 impl Collision {
     /// First hit of the segment `from -> to` against enabled triangles, as a fraction 0..1.
     pub fn raycast(&self, from: Vec3, to: Vec3) -> Option<f32> {
+        self.raycast_hit(from, to).map(|(t, _)| t)
+    }
+
+    /// The world hit of a sphere of radius `r` moving `from -> to`
+    /// (WeaponWallCollide, as a ray reaching `r` past the move): where its
+    /// centre stops, and the surface normal.
+    pub fn sweep(&self, from: Vec3, to: Vec3, r: f32) -> Option<(Vec3, Vec3)> {
+        let d = (to - from).normalize_or_zero();
+        let (t, n) = self.raycast_hit(from, to + d * r)?;
+        let len = (to - from).length() + r;
+        Some((from + d * (t * len - r).max(0.0), n))
+    }
+
+    /// raycast, also giving the hit triangle's normal.
+    pub fn raycast_hit(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
         let dir = to - from;
         let len = dir.length();
         if len < 1e-4 {
@@ -247,7 +262,7 @@ impl Collision {
                 }
             }
         }
-        let mut best: Option<f32> = None;
+        let mut best: Option<(f32, Vec3)> = None;
         for i in cands {
             let t = &self.tris[i as usize];
             // Moller-Trumbore, double-sided.
@@ -270,8 +285,8 @@ impl Collision {
                 continue;
             }
             let tt = e2.dot(q) * inv;
-            if (0.0..=1.0).contains(&tt) && best.is_none_or(|b| tt < b) {
-                best = Some(tt);
+            if (0.0..=1.0).contains(&tt) && best.is_none_or(|b| tt < b.0) {
+                best = Some((tt, t.n));
             }
         }
         best

@@ -155,7 +155,11 @@ impl Scene {
                 .entry(e.id)
                 .or_insert_with(|| gpu.new_instance(mesh));
             let yaw = e.yaw + e.spin;
-            inst.transform = mirror() * Mat4::from_translation(e.pos) * Mat4::from_rotation_y(yaw);
+            inst.transform = mirror()
+                * Mat4::from_translation(e.pos)
+                * Mat4::from_rotation_y(yaw)
+                * Mat4::from_rotation_x(e.pitch)
+                * Mat4::from_scale(Vec3::splat(e.scale));
             let model = &game.models[m];
             if let Kind::Critter(c) = &e.kind {
                 inst.transform = inst.transform * Mat4::from_scale(Vec3::splat(c.scale));
