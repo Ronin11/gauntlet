@@ -826,6 +826,20 @@ pub enum Kind {
     },
 }
 
+/// Sound ids by realm (sMusicTrackHi): lbl_80123AAC (fn_8009D91C, a rock
+/// falls), lbl_80123AE4 (fn_8009D8CC, one sinks), lbl_801240DC
+/// (AudioWorldHitPlyr).
+const ROCKFALL_SFX: [i32; 16] = [
+    -1, 0x250041, 0x260001, 0x270027, 0x280001, 0x370000, 0x38001E, 0x290034, 0x2A002C, 0x2B0049,
+    -1, -1, -1, 0, -1, -1,
+];
+const ROCKSINK_SFX: [i32; 16] = [
+    -1, -1, -1, -1, 0x280002, -1, -1, -1, -1, 0x2B004B, -1, -1, -1, 0, -1, 0x260002,
+];
+const WORLD_HIT_SFX: [i32; 16] = [
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, 0x2B0048, -1, -1, -1, 0, -1, 0x250034,
+];
+
 /// lbl_8011C904: the fallers' tumble multipliers.
 const FALLER_TUMBLE: [f32; 8] = [-4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0];
 
@@ -2657,6 +2671,21 @@ impl Game {
             })
     }
 
+    /// A realm sound table's entry for this level (sMusicTrackHi = realm).
+    fn realm_sound(&self, table: &[i32; 16]) -> i32 {
+        self.wave
+            .and_then(|w| table.get((w >> 8) as usize))
+            .copied()
+            .unwrap_or(-1)
+    }
+
+    /// Play a sound by its id (sndid.h; bank << 16 | index), if any.
+    pub(crate) fn sfx_id(&mut self, id: i32) {
+        if id >= 0 {
+            self.sfx.push(format!("#{id:x}"));
+        }
+    }
+
     /// WorldObjGetAllFlags of a collision triangle's owner when it hurts: a
     /// 0xF0000 material, and for 0x2000000 objects only while they move.
     pub(crate) fn hurting_surface(&self, owner: i32) -> Option<u32> {
@@ -2697,13 +2726,9 @@ impl Game {
         self.damage_from = (knock != 0).then_some(self.players[pi].pos - dv);
         self.damage_player(pi, dmg, knock);
         self.damage_from = None;
-        // AudioWorldHitPlyr (lbl_801240DC by realm).
         if knock == DmgType::KNOCKDOWN {
-            match self.wave.map(|w| w >> 8) {
-                Some(9) => self.sfx.push("S_MINECARPHIT".into()),
-                Some(15) => self.sfx.push("S_GENKILLA".into()),
-                _ => {}
-            }
+            let id = self.realm_sound(&WORLD_HIT_SFX);
+            self.sfx_id(id);
         }
     }
 
@@ -5324,35 +5349,14 @@ impl Game {
             }
         }
         // fn_8009D8CC (sinking) / fn_8009D91C (falling): the realm's sound.
-        let realm = self.wave.map_or(-1, |w| (w >> 8) as i32);
         for (sub, _) in fallers_started {
-            let name = if sub == 0x31 {
-                match realm {
-                    4 => Some("S_LEAFBREAK"),
-                    9 => Some("S_WOODBREAKI"),
-                    15 => Some("S_ROCKROTATE"),
-                    _ => None,
-                }
-            } else {
-                let lo = self.wave.map_or(-1, |w| (w & 0xFF) as i32);
-                match realm {
-                    6 if lo == 1 => Some("S_ROCKBREAKF2"),
-                    9 if lo == 4 => Some("S_ICEBREAKY"),
-                    1 => Some("S_FALLAWAY"),
-                    2 => Some("S_ROCKBREAK"),
-                    3 => Some("S_LIMBBREAKC"),
-                    4 => Some("S_LIMBBREAK"),
-                    5 => Some("S_ROCKBREAKE"),
-                    6 => Some("S_ROCKBREAKF"),
-                    7 => Some("S_ROCKBREAKG"),
-                    8 => Some("S_LIMBBREAKH"),
-                    9 => Some("S_ICEBREAK"),
-                    _ => None,
-                }
+            let id = match self.wave {
+                Some(0x601) if sub != 0x31 => 0x390000, // S_ROCKBREAKF2
+                Some(0x904) if sub != 0x31 => 0x32000D, // S_ICEBREAKY
+                _ if sub == 0x31 => self.realm_sound(&ROCKSINK_SFX),
+                _ => self.realm_sound(&ROCKFALL_SFX),
             };
-            if let Some(n) = name {
-                self.sfx.push(n.into());
-            }
+            self.sfx_id(id);
         }
         // Each hero is hurt by a tile at most once per what is left of its
         // cycle (fxhittime); a knocking tile pushes back along its facing.

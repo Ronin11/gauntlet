@@ -286,3 +286,19 @@ pub fn parse_sound_names(rom: &[u8]) -> std::collections::HashMap<String, (usize
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sound_ids_are_bank_and_index() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../game-data/files/Gauntlet/AUDIO/AUDATPS2.ROM");
+        let Ok(rom) = std::fs::read(p) else { return };
+        let n = parse_sound_names(&rom);
+        // sndid.h: S_ROCKBREAKF2 = 0x390000, S_MINECARPHIT = 0x2B0048.
+        assert_eq!(n["S_ROCKBREAKF2"].0 << 16 | n["S_ROCKBREAKF2"].1, 0x390000);
+        assert_eq!(n["S_MINECARPHIT"].0 << 16 | n["S_MINECARPHIT"].1, 0x2B0048);
+    }
+}

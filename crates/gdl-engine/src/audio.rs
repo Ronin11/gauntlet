@@ -72,8 +72,14 @@ struct SoundLib {
 impl SoundLib {
     fn load(fs: &GameFs) -> Option<Self> {
         let rom = fs.read("AUDIO/AUDATPS2.ROM").ok()?;
-        let names = parse_sound_names(&rom);
+        let mut names = parse_sound_names(&rom);
         log::info!("sound effects: {} names", names.len());
+        // Sound ids (sndid.h) are bank << 16 | index: `#2b0048` plays one.
+        let ids: Vec<_> = names
+            .values()
+            .map(|&v| (format!("#{:x}", v.0 << 16 | v.1), v))
+            .collect();
+        names.extend(ids);
         Some(SoundLib {
             names,
             banks: HashMap::new(),
@@ -336,7 +342,7 @@ impl Audio {
         self.lib.as_ref().is_some_and(|l| l.has(name))
     }
 
-    /// Play a named sound effect (`S_PICKUPKEY`); `A|B` tries alternatives in order. Names prefixed with `VOICE:` (or a
+    /// Play a named sound effect (`S_PICKUPKEY`, or by id: `#2b0048`); `A|B` tries alternatives in order. Names prefixed with `VOICE:` (or a
     /// `+`-joined list, e.g. `VOICE:S_REDWAR1+S_NEEDSFOOD+S_BADLY`) queue as announcements.
     pub fn play(&mut self, fs: &GameFs, name: &str) {
         let (Some(tx), Some(lib)) = (&self.tx, &mut self.lib) else {
@@ -552,4 +558,21 @@ pub fn check_sounds(fs: &GameFs, requests: &[String]) -> Vec<(String, Option<(St
             (req.clone(), found)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod id_tests {
+    #[test]
+    fn sounds_play_by_id() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        let Ok(fs) = crate::fs::GameFs::open(&root) else {
+            return;
+        };
+        // S_MINECARPHIT, S_ROCKBREAKE.
+        let r = super::check_sounds(&fs, &["#2b0048".into(), "#370000".into()]);
+        assert!(
+            r.iter().all(|(_, f)| f.as_ref().is_some_and(|f| f.1 > 0.0)),
+            "{r:?}"
+        );
+    }
 }
