@@ -12,6 +12,7 @@ struct Args {
     snapshot: Option<PathBuf>,
     eye: Option<Vec3>,
     at: Option<Vec3>,
+    spawn: Option<Vec3>,
     size: (u32, u32),
     character: Option<String>,
     seq: String,
@@ -65,6 +66,7 @@ fn parse_args() -> Result<Args> {
         snapshot: None,
         eye: None,
         at: None,
+        spawn: None,
         size: (1280, 720),
         character: None,
         seq: "READY".into(),
@@ -106,6 +108,7 @@ fn parse_args() -> Result<Args> {
             }
             "--eye" => a.eye = Some(parse_vec3(&val()?)?),
             "--at" => a.at = Some(parse_vec3(&val()?)?),
+            "--spawn" => a.spawn = Some(parse_vec3(&val()?)?),
             "--size" => {
                 let v = val()?;
                 let (w, h) = v.split_once('x').context("--size WxH")?;
@@ -209,13 +212,17 @@ fn snapshot_game(args: &Args) -> Result<()> {
     let mut g = game::Game::new(&fs, &args.level, &classes)?;
     if std::env::var("GDL_DEBUG_DOORS").is_ok() {
         for e in &g.entities {
-            if let game::Kind::Door { .. } = e.kind {
+            if let game::Kind::Door { .. } | game::Kind::Trigger { .. } = e.kind {
                 println!(
-                    "door {} pos {:?} yaw {:.2} solid {:?} model {:?}",
-                    e.id, e.pos, e.yaw, e.solid, e.model
+                    "{:?} {} pos {:?} yaw {:.2} solid {:?} model {:?}",
+                    e.kind, e.id, e.pos, e.yaw, e.solid, e.model
                 );
             }
         }
+    }
+    if let Some(p) = args.spawn {
+        g.players[0].pos = p;
+        g.cam_focus = p;
     }
     let mut sfx_seen: Vec<String> = Vec::new();
     for f in 0..args.simulate {

@@ -5,6 +5,7 @@ use crate::mesh::{MeshBuilder, MeshData};
 use anyhow::{Context, Result};
 use gdl_formats::{Objects, Worlds};
 use glam::{Mat4, Vec3};
+use std::collections::HashSet;
 
 pub struct Level {
     pub name: String,
@@ -33,24 +34,56 @@ impl Level {
         })
     }
 
-    /// Static world geometry: every world object that names a model in the level's objects file.
-    pub fn world_mesh(&self) -> MeshData {
-        let mut b = MeshBuilder::new(&self.objects, &self.textures_file);
-        let mut placed = 0;
-        for (wo, pos) in self.worlds.world_objects.iter().zip(&self.world_pos) {
-            if let Some(obj) = self.objects.object_by_name(&wo.name) {
-                b.additive = wo.mb_flags & (1 << 23) != 0;
-                b.add_object(obj, Mat4::from_translation(Vec3::from(*pos)));
-                placed += 1;
-            }
-        }
+    /// Static world geometry: every world object that names a model in the level's
+    /// objects file, except the moving ones in `skip`.
+    pub fn world_mesh(&self, skip: &HashSet<usize>) -> MeshData {
+        let (mesh, placed) = self.objects_mesh(|i| !skip.contains(&i));
         log::info!(
             "{}: placed {placed} of {} world objects ({} models in file)",
             self.name,
             self.worlds.world_objects.len(),
             self.objects.objects.len()
         );
-        b.finish()
+        mesh
+    }
+
+    /// Geometry of the world objects selected by `want`, and how many were placed.
+    pub fn objects_mesh(&self, want: impl Fn(usize) -> bool) -> (MeshData, usize) {
+        let mut b = MeshBuilder::new(&self.objects, &self.textures_file);
+        let mut placed = 0;
+        for (i, (wo, pos)) in self
+            .worlds
+            .world_objects
+            .iter()
+            .zip(&self.world_pos)
+            .enumerate()
+        {
+            if !want(i) {
+                continue;
+            }
+            if let Some(obj) = self.objects.object_by_name(&wo.name) {
+                b.additive = wo.mb_flags & (1 << 23) != 0;
+                b.add_object(obj, Mat4::from_translation(Vec3::from(*pos)));
+                placed += 1;
+            }
+        }
+        (b.finish(), placed)
+    }
+
+    /// A world object and all of its descendants.
+    pub fn subtree(&self, root: usize) -> Vec<usize> {
+        let objs = &self.worlds.world_objects;
+        let mut out = vec![root];
+        let mut i = 0;
+        while i < out.len() {
+            let mut c = objs[out[i]].child_index;
+            while c >= 0 && (c as usize) < objs.len() && !out.contains(&(c as usize)) {
+                out.push(c as usize);
+                c = objs[c as usize].next_index;
+            }
+            i += 1;
+        }
+        out
     }
 
     /// Player start positions (locators of type Start), falling back to the world centre.

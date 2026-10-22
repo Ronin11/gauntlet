@@ -5,6 +5,7 @@ use crate::collision::{Collision, Tri};
 use crate::fs::GameFs;
 use crate::input::PlayerInput;
 use crate::level::Level;
+use crate::triggers::{trigger_flags, Mover, TriggerMode};
 use anyhow::Result;
 use gdl_formats::anim::Anim;
 use gdl_formats::worlds::ItemType;
@@ -237,6 +238,20 @@ pub enum Kind {
         life: f32,
         damage: f32,
     },
+    /// Lever or pressure pad driving `Game::movers[mover]`.
+    Trigger {
+        mover: Option<usize>,
+        mode: TriggerMode,
+        radius: f32,
+        /// Toggle cooldown.
+        idle: f32,
+        /// Only hits set it off (shoot_trigger).
+        shoot: bool,
+        /// Touched last frame (lever pulled).
+        pressed: bool,
+        /// Struck by an attack this frame.
+        hit: bool,
+    },
     Prop,
 }
 
@@ -298,6 +313,8 @@ pub struct Game {
     pub classes: Vec<MonsterClass>,
     pub players: Vec<Player>,
     pub entities: Vec<Entity>,
+    /// World geometry moved by levers and pads.
+    pub movers: Vec<Mover>,
     next_id: u64,
     pub cam_focus: Vec3,
     /// Camera heading (game yaw convention; pi looks along +z) and pitch, smoothed
@@ -434,6 +451,7 @@ impl Game {
             classes: Vec::new(),
             players: Vec::new(),
             entities: Vec::new(),
+            movers: Vec::new(),
             next_id: 1,
             cam_focus: Vec3::ZERO,
             cam_yaw: std::f32::consts::PI,
@@ -899,7 +917,48 @@ impl Game {
                         yaw,
                     );
                 }
-                ItemType::Trigger | ItemType::Transporter | ItemType::Rotator => {
+                ItemType::Trigger => {
+                    let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
+                    let (mode, flags8) = trigger_flags(info.subtype, p16(2) as u16);
+                    let target = p16(0);
+                    let mover = (target >= 0
+                        && (target as usize) < self.level.worlds.world_objects.len())
+                    .then(|| {
+                        let t = target as usize;
+                        // Several triggers can share a target (RegisterItemWobj).
+                        self.movers
+                            .iter()
+                            .position(|m| m.root == t)
+                            .unwrap_or_else(|| {
+                                let m = Mover::new(
+                                    &self.level,
+                                    &self.collision,
+                                    t,
+                                    flags8,
+                                    p16(8) as f32 * 0.1,
+                                    p16(10) as f32 * 0.1,
+                                );
+                                m.place(&mut self.collision);
+                                self.movers.push(m);
+                                self.movers.len() - 1
+                            })
+                    });
+                    self.spawn(
+                        Kind::Trigger {
+                            mover,
+                            mode,
+                            radius: info.radius.max(0.7),
+                            idle: 0.0,
+                            shoot: info.subtype_name() == "shoot_trigger",
+                            pressed: false,
+                            hit: false,
+                        },
+                        model,
+                        pos,
+                        yaw,
+                    );
+                }
+                ItemType::Transporter | ItemType::Rotator => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     if model.is_some() {
                         self.spawn(Kind::Prop, model, pos, yaw);
@@ -1312,6 +1371,10 @@ impl Game {
             if dist > 1.0 && d.normalize().dot(dir) < ATTACK_ARC_COS {
                 continue;
             }
+            if let Kind::Trigger { hit, .. } = &mut e.kind {
+                *hit = true;
+                continue;
+            }
             let push = if dist > 0.01 { d / dist } else { dir };
             let (sc, drop) = Self::apply_hit(e, dmg, push);
             score += sc;
@@ -1633,6 +1696,49 @@ impl Game {
                         }
                     }
                 }
+                Kind::Trigger {
+                    mover,
+                    mode,
+                    radius,
+                    idle,
+                    shoot,
+                    pressed,
+                    hit,
+                } => {
+                    *idle -= dt;
+                    // Walking into a lever or onto a pad sets it off; wall levers sit in
+                    // the wall, so allow for the player's own radius.
+                    let touched = *hit
+                        || (!*shoot
+                            && player_pos.iter().any(|(pp, alive)| {
+                                *alive
+                                    && Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
+                                        < *radius + PLAYER_RADIUS + 0.6
+                                    && (pp.y - pos.y).abs() < 4.0
+                            }));
+                    *hit = false;
+                    let mut on = touched;
+                    if let Some(m) = mover.and_then(|m| self.movers.get_mut(m)) {
+                        m.trigger(*mode, touched, idle);
+                        on |= m.active;
+                    }
+                    // Levers swing over (ONA) and back (OFFA), then rest in ON/OFF.
+                    if let Some(model) = e.model.map(|m| &self.models[m]) {
+                        let a = &mut e.animator;
+                        a.force_loop = false;
+                        let (go, rest) = if on { ("ONA", "ON") } else { ("OFFA", "OFF") };
+                        if on != *pressed {
+                            if let Some(s) = model.sequence(go) {
+                                a.restart(s);
+                            }
+                        } else if a.finished || a.seq == 0 && on {
+                            if let Some(s) = model.sequence(rest) {
+                                a.play(s);
+                            }
+                        }
+                    }
+                    *pressed = on;
+                }
                 Kind::Exit { radius, next } => {
                     if player_pos
                         .iter()
@@ -1765,6 +1871,17 @@ impl Game {
                     let push = d / len * (1.8 - len);
                     e.pos += Vec3::new(push.x, 0.0, push.y);
                 }
+            }
+        }
+
+        let w = self.world_letter();
+        for m in &mut self.movers {
+            let (started, stopped) = m.update(&mut self.collision, dt);
+            if started {
+                self.sfx.push(format!("S_ELVSTONE{w}|S_STONEGATE"));
+            }
+            if stopped {
+                self.sfx.push(format!("S_ELVSTONESTP{w}|S_STONEGATESTOP"));
             }
         }
 
@@ -2031,6 +2148,73 @@ mod tests {
         // Wind-up + release at native speed is ~0.54 s: about 9 throws in 5 s
         // (the old double-speed release-only loop threw ~80).
         assert!((7..=11).contains(&throws), "{throws} throws in 5 s");
+    }
+
+    #[test]
+    fn lever_lowers_trap_wall() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let wall = g
+            .movers
+            .iter()
+            .position(|m| g.level.worlds.world_objects[m.root].name == "A1TRAPW2")
+            .expect("door switch target registered");
+        let lever = g
+            .entities
+            .iter()
+            .find(|e| matches!(e.kind, Kind::Trigger { mover: Some(m), .. } if m == wall))
+            .unwrap()
+            .pos;
+        let tri = g
+            .collision
+            .tris
+            .iter()
+            .position(|t| t.owner == g.movers[wall].root as i32)
+            .expect("wall has collision");
+        let y0 = g.collision.tris[tri].v[0].y;
+        assert_eq!(g.movers[wall].offset, 0.0);
+        // Run into the lever.
+        g.players[0].pos = lever + Vec3::new(0.0, 0.5, 1.2);
+        for _ in 0..10 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        assert!(g.movers[wall].active, "lever pulled");
+        g.players[0].pos = lever + Vec3::new(0.0, 0.5, 30.0);
+        for _ in 0..120 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        // door_switch latches: the wall sinks 4 units and stays down.
+        assert!(
+            (g.movers[wall].offset + 4.0).abs() < 0.01,
+            "{}",
+            g.movers[wall].offset
+        );
+        assert!((g.collision.tris[tri].v[0].y - (y0 - 4.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn wall_lever_flips_when_pulled() {
+        let Some(fs) = data() else { return };
+        let g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let m = g
+            .entities
+            .iter()
+            .find_map(|e| match e.kind {
+                Kind::Trigger { .. } if g.models[e.model?].sequence("ONA").is_some() => e.model,
+                _ => None,
+            })
+            .expect("an animated lever");
+        let model = &g.models[m];
+        let shown = |seq: &str| {
+            let (_, hidden) = model.evaluate(model.sequence(seq).unwrap(), 0.0);
+            hidden
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| !**h)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(shown("OFF"), shown("ON"), "lever looks different when on");
     }
 
     #[test]

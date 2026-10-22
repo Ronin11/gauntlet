@@ -14,3 +14,4 @@ pub mod level;
 pub mod mesh;
 pub mod scene;
 pub mod select;
+pub mod triggers;

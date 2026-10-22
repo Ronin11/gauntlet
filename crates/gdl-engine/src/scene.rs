@@ -19,6 +19,8 @@ const DRAW_DIST: f32 = 90.0;
 pub struct Scene {
     world: GpuMesh,
     world_inst: Instance,
+    /// Geometry moved by triggers, by index into `Game::movers`.
+    movers: Vec<Option<(GpuMesh, Instance)>>,
     models: Vec<GpuMesh>,
     players: Vec<Instance>,
     entities: HashMap<u64, Instance>,
@@ -26,9 +28,25 @@ pub struct Scene {
 
 impl Scene {
     pub fn new(gpu: &Gpu, game: &Game) -> Result<Scene> {
-        let world = gpu.upload_mesh(&game.level.world_mesh())?;
+        let moving: std::collections::HashSet<usize> = game
+            .movers
+            .iter()
+            .flat_map(|m| m.objects.iter().copied())
+            .collect();
+        let world = gpu.upload_mesh(&game.level.world_mesh(&moving))?;
         let mut world_inst = gpu.new_instance(&world);
         world_inst.transform = mirror();
+        let mut movers = Vec::new();
+        for m in &game.movers {
+            let (mesh, placed) = game.level.objects_mesh(|i| m.objects.contains(&i));
+            movers.push(if placed > 0 {
+                let mesh = gpu.upload_mesh(&mesh)?;
+                let inst = gpu.new_instance(&mesh);
+                Some((mesh, inst))
+            } else {
+                None
+            });
+        }
         let models = game
             .models
             .iter()
@@ -42,6 +60,7 @@ impl Scene {
         Ok(Scene {
             world,
             world_inst,
+            movers,
             models,
             players,
             entities: HashMap::new(),
@@ -49,6 +68,12 @@ impl Scene {
     }
 
     pub fn sync(&mut self, gpu: &Gpu, game: &Game) {
+        for (slot, m) in self.movers.iter_mut().zip(&game.movers) {
+            if let Some((_, inst)) = slot {
+                inst.transform = mirror() * Mat4::from_translation(Vec3::Y * m.offset);
+                inst.visible = m.shown;
+            }
+        }
         for (inst, p) in self.players.iter_mut().zip(&game.players) {
             let model = &game.models[p.model];
             inst.transform =
@@ -105,6 +130,7 @@ impl Scene {
 
     pub fn draws<'a>(&'a self, game: &Game) -> Vec<(&'a GpuMesh, &'a Instance)> {
         let mut d = vec![(&self.world, &self.world_inst)];
+        d.extend(self.movers.iter().flatten().map(|(m, i)| (m, i)));
         for (inst, p) in self.players.iter().zip(&game.players) {
             d.push((&self.models[p.model], inst));
         }
