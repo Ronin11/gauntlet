@@ -349,6 +349,10 @@ impl Game {
                 ..Default::default()
             }
         });
+        // Debugging aid: GDL_NO_BOSS_CAMERA keeps the level camera.
+        if std::env::var_os("GDL_NO_BOSS_CAMERA").is_some() {
+            boss.cam = None;
+        }
         self.boss = Some(boss);
         let id = self.spawn_critter(fs, wad, None, pos, yaw, num_players);
         if let Some(b) = self.boss.as_mut() {
@@ -501,9 +505,9 @@ impl Game {
         c.visrad = 0.0;
         let midx = self.add_model_pub(model);
         c.model = Some(midx);
-        // Placed on the floor (CritterInitGeo).
+        // Placed on the floor (CritterInitGeo, the same probe as every frame).
         let mut p = pos;
-        if let Some(g) = self.collision.ground_height(pos, pos.y + 4.0) {
+        if let Some(g) = self.critter_floor(pos) {
             p.y = g + wad.types[root].y_offset;
         }
         let etype = c.etype;
@@ -1756,6 +1760,34 @@ mod tests {
             c.parts[2].health
         );
         assert_eq!(g.legend_held & 2, 0, "the scimitar is used up");
+    }
+
+    /// The Dragon's floor probe (a radius-5 sphere) finds the lip of the
+    /// ledge, so it stands at ledge height + 18.5 rather than hanging over
+    /// the lava with no floor; the boss camera then settles above the
+    /// players' ledge, framing the hero and the Dragon.
+    #[test]
+    fn dragon_stands_at_the_ledge_and_the_camera_frames_it() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelB6", &[("WAR", "RED")]).unwrap();
+        let bp = g.boss_critter().unwrap().0.pos;
+        assert!((bp.y - (29.65 + 18.5)).abs() < 0.5, "dragon at {bp:?}");
+        for _ in 0..600 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        }
+        let (eye, at, _) = g.camera_view();
+        let p = g.players[0].pos;
+        assert!(
+            eye.y > p.y + 5.0,
+            "eye {eye:?} below the ledge (player {p:?})"
+        );
+        let c = g.boss.as_ref().unwrap().cam.unwrap();
+        let fwd = cam_forward(c.yaw, c.pitch);
+        assert!(
+            point_view_dist(eye, fwd, p + Vec3::Y * 2.5, 2.5) >= 0.0,
+            "hero off screen"
+        );
+        assert!((at - bp).length() < 30.0);
     }
 
     /// Garm's armour plates take at most their share of its health, then

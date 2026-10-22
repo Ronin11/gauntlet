@@ -4647,7 +4647,13 @@ impl Game {
             .sequences
             .first()
             .map_or(1.0, |s| {
-                (s.frame_count.max(1) as f32 / s.frame_rate.max(1) as f32).clamp(0.2, 10.0)
+                // A frame lasts rate/900 s (Animator::update).
+                let rate = if s.frame_rate > 0 {
+                    s.frame_rate as f32
+                } else {
+                    30.0
+                };
+                (s.frame_count.max(1) as f32 * rate / 900.0).clamp(0.2, 10.0)
             });
         if self
             .entities

@@ -340,6 +340,19 @@ fn snapshot_game(args: &Args) -> Result<()> {
             );
         }
     }
+    // Debugging aid: GDL_HIDE=OBJ1,OBJ2 leaves world objects out of the render.
+    if let Ok(list) = std::env::var("GDL_HIDE") {
+        for name in list.split(',') {
+            g.hide_object(name);
+        }
+    }
+    if std::env::var_os("GDL_DEBUG_CAM").is_some() {
+        let (eye, at, near) = g.camera_view();
+        println!("camera eye {eye:?} at {at:?} near {near:.1}");
+        if let Some(c) = g.boss.as_ref().and_then(|b| b.cam) {
+            println!("boss cam {c:?}");
+        }
+    }
     for (i, p) in g.players.iter().enumerate() {
         println!(
             "player {i}: pos {:?} yaw {:.2} ground {} seq {} frame {:.1}",
