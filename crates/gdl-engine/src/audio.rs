@@ -41,6 +41,8 @@ type Pcm = Arc<Vec<i16>>;
 
 enum Cmd {
     Music(Vec<i16>, u16, u32),
+    /// Stereo PCM played once, then looped from a frame index.
+    MusicLoop(Vec<i16>, u32, Option<usize>),
     /// Played once on the music channel (a movie soundtrack).
     MusicOnce(Vec<i16>, u16, u32),
     StopMusic,
@@ -172,6 +174,23 @@ impl Audio {
                                 _music = Some(s);
                             }
                         }
+                        Cmd::MusicLoop(pcm, rate, loop_start) => {
+                            if let Ok(s) = rodio::Sink::try_new(&handle) {
+                                s.set_volume(0.5);
+                                let split = loop_start.map_or(pcm.len(), |f| (2 * f).min(pcm.len()));
+                                let (intro, body) = pcm.split_at(split);
+                                if !intro.is_empty() {
+                                    s.append(rodio::buffer::SamplesBuffer::new(2, rate, intro.to_vec()));
+                                }
+                                if !body.is_empty() {
+                                    s.append(
+                                        rodio::buffer::SamplesBuffer::new(2, rate, body.to_vec())
+                                            .repeat_infinite(),
+                                    );
+                                }
+                                _music = Some(s);
+                            }
+                        }
                         Cmd::StopMusic => _music = None,
                         Cmd::Sfx(c, vol) => {
                             if let Ok(s) = rodio::Sink::try_new(&handle) {
@@ -290,11 +309,42 @@ impl Audio {
         false
     }
 
-    /// The title / select music. The original plays S_SELECTMUS, a sequenced
-    /// track in SELECT.VBK that needs the game's sequencer (not yet decoded), so
-    /// the tower stream stands in for it.
+    /// The title / select music: S_SELECTMUS, a looping chain of SELECT.VBK
+    /// samples played by the DCS driver.
     pub fn play_select_music(&mut self, fs: &GameFs) {
-        self.play_music(fs, &["tower".into()]);
+        self.play_bank_music(fs, "S_SELECTMUS");
+    }
+
+    /// Render a sound-bank call (DCS sample chain) and loop it as the music; no-op
+    /// if it is already playing.
+    pub fn play_bank_music(&mut self, fs: &GameFs, name: &str) {
+        let (Some(tx), Some(lib)) = (&self.tx, &self.lib) else {
+            return;
+        };
+        if self.current == name {
+            return;
+        }
+        let Some(&(bank, idx, _)) = lib.names.get(name) else {
+            log::warn!("no music sound {name}");
+            return;
+        };
+        let Some(file) = BANKS.get(bank) else { return };
+        let Ok(bytes) = fs.read(&format!("AUDIO/{file}.VBK")) else {
+            return;
+        };
+        self.current = name.to_string();
+        let (tx, name) = (tx.clone(), name.to_string());
+        std::thread::spawn(move || {
+            use gdl_formats::sequence::{render_call, DcsBank, PlayParams};
+            let r = DcsBank::parse(&bytes)
+                .and_then(|b| render_call(&b, &bytes, idx, &PlayParams::default()));
+            match r {
+                Ok(r) => {
+                    let _ = tx.send(Cmd::MusicLoop(r.pcm, r.sample_rate, r.loop_start));
+                }
+                Err(e) => log::warn!("music {name}: {e:#}"),
+            }
+        });
     }
 
     /// Play interleaved PCM once on the music channel, replacing the music.
