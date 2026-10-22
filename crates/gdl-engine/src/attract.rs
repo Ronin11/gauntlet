@@ -14,7 +14,7 @@ enum Entry {
     /// A Screen2D slot: 0 is the one-frame prefs-load step, 1 and 2 the group shot.
     Screen2D(usize),
     Title,
-    /// TODO: level flybys (MA_FLYBY) are not implemented; the entry is skipped.
+    /// A level flyby (MA_FLYBY).
     Flyby,
     /// TODO: the credits roll (MA_CREDITS, every 16th loop) is not implemented.
     Credits,
@@ -70,6 +70,8 @@ pub enum Event {
     MovieEnded,
     /// The credits started: play castle2b.
     Credits,
+    /// A flyby of this level directory: load it and fly through (MA_FLYBY).
+    Flyby(String),
 }
 
 pub struct Attract {
@@ -83,6 +85,9 @@ pub struct Attract {
     /// Set after a game over so the "fail" movie plays.
     pub game_over: bool,
     pub show: Option<Show>,
+    /// NextAttractWave's cursor and the realm tables it walks.
+    waves: crate::flyby::WaveCursor,
+    worlds: Option<gdl_formats::wdata::Worlds>,
 }
 
 impl Attract {
@@ -95,7 +100,15 @@ impl Attract {
             started: false,
             game_over: false,
             show: None,
+            waves: Default::default(),
+            worlds: None,
         }
+    }
+
+    /// The flyby has ended (or couldn't run): on to the next entry.
+    pub fn flyby_over(&mut self, fs: &GameFs) -> Event {
+        self.show = None;
+        self.advance(fs)
     }
 
     /// The credits roll `scroll` pixels in, for snapshots.
@@ -176,7 +189,18 @@ impl Attract {
                     }
                     None => continue,
                 },
-                Entry::Title | Entry::Flyby | Entry::Credits => continue,
+                Entry::Flyby => {
+                    if self.worlds.is_none() {
+                        self.worlds = gdl_formats::wdata::Worlds::load(|p| fs.read(p)).ok();
+                    }
+                    let Some(w) = &self.worlds else { continue };
+                    let wave = self.waves.next(w);
+                    match w.dir(wave) {
+                        Some(dir) => return Event::Flyby(dir),
+                        None => continue,
+                    }
+                }
+                Entry::Title | Entry::Credits => continue,
             }
         }
     }

@@ -300,8 +300,29 @@ fn snapshot_game(args: &Args) -> Result<()> {
         let realm = g.wave.map_or(0, |w| w >> 8);
         g.set_legend_held(1 << realm);
     }
+    // GDL_FLYBY=1: the attract flyby of --level (no heroes, flyby camera).
+    let mut flyby = std::env::var_os("GDL_FLYBY").and_then(|_| {
+        for p in &mut g.players {
+            p.state = game::PlayerState::Exited;
+        }
+        gdl_engine::flyby::FlybyCam::new(&g.level.worlds)
+    });
     let mut sfx_seen: Vec<String> = Vec::new();
     for f in 0..args.simulate {
+        if let Some(cam) = &mut flyby {
+            if f % 2 == 1 {
+                cam.update(2);
+            }
+            let (eye, at) = cam.view();
+            g.fixed_camera = Some((eye, at));
+            g.update(1.0 / 60.0, &[input::PlayerInput::default()]);
+            g.cam_focus = at;
+            g.sfx.clear();
+            if f % 300 == 0 {
+                println!("flyby t={f} eye {eye:?} done {}", cam.done);
+            }
+            continue;
+        }
         if args.kill_boss_at == Some(f) {
             g.kill_boss();
         }

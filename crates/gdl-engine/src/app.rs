@@ -100,6 +100,13 @@ enum Screen {
     Legal(u32),
     /// The attract loop (movies, group shots); its state is `Running::attract`.
     Attract,
+    /// An attract-mode level flyby (MA_FLYBY): the level with no heroes, seen
+    /// from the flyby camera, for this many ticks so far.
+    Flyby {
+        play: Box<Playing>,
+        cam: Box<crate::flyby::FlybyCam>,
+        ticks: u32,
+    },
     /// MG_OVER: "GAME OVER" typed out for 240 ticks, then the attract loop.
     GameOver {
         ticks: i32,
@@ -535,24 +542,40 @@ impl App {
                     } else {
                         r.attract.update(fs, &inputs)
                     };
-                    match ev {
-                        attract::Event::MovieStarted => {
-                            if let Some(attract::Show::Movie(m)) = &mut r.attract.show {
-                                if let Some(a) = m.audio.take() {
-                                    r.audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
-                                }
-                            }
-                        }
-                        attract::Event::MovieEnded => r.audio.stop(),
-                        attract::Event::Credits => {
-                            r.audio.play_streams(fs, &["castle2b".into()]);
-                        }
-                        attract::Event::Title => {
-                            r.audio.stop();
-                            r.attract.show = None;
-                            next = Some(Screen::Title(Title::default()));
-                        }
-                        attract::Event::None => {}
+                    next = attract_event(fs, &r.gpu, &mut r.audio, &mut r.attract, ev);
+                }
+                Screen::Flyby { play, cam, ticks } => {
+                    // do_flyby: the camera at the retail 30 frames a second (2
+                    // ticks a frame), the world and monsters running, no heroes,
+                    // no sound; done 30 ticks after the path ends, or at 60 s.
+                    *ticks += 1;
+                    if *ticks % 2 == 0 {
+                        cam.update(2);
+                    }
+                    let (eye, at) = cam.view();
+                    play.game.fixed_camera = Some((eye, at));
+                    play.game.update(TICK, &[PlayerInput::default()]);
+                    play.game.cam_focus = at;
+                    play.game.sfx.clear();
+                    // attract_check_input: Start goes to the title; after a
+                    // second, the face buttons skip to the next screen.
+                    let start = escape || all.iter().any(|(_, i)| i.start_pressed);
+                    let skip = *ticks > 60
+                        && all
+                            .iter()
+                            .any(|(_, i)| i.attack_pressed || i.b_pressed || i.magic_pressed);
+                    if start {
+                        next = attract_event(
+                            fs,
+                            &r.gpu,
+                            &mut r.audio,
+                            &mut r.attract,
+                            attract::Event::Title,
+                        );
+                    } else if cam.done > 30 || *ticks > 3600 || skip {
+                        let ev = r.attract.flyby_over(fs);
+                        next = attract_event(fs, &r.gpu, &mut r.audio, &mut r.attract, ev)
+                            .or(Some(Screen::Attract));
                     }
                 }
                 Screen::Title(t) => {
@@ -923,6 +946,31 @@ impl App {
                 }
                 r.attract
                     .draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), r.movie_tex);
+            }
+            Screen::Flyby { play, .. } => {
+                in_game = true;
+                play.scene.sync(&r.gpu, &play.game);
+                let (w, h) = (r.config.width as f32, r.config.height as f32);
+                let k = (w / 512.0).min(h / 384.0);
+                let vp = [
+                    (w - 512.0 * k) / 2.0,
+                    (h - 384.0 * k) / 2.0,
+                    512.0 * k,
+                    384.0 * k,
+                ];
+                let g = play.scene.globals(&play.game, 4.0 / 3.0);
+                r.gpu.render_viewport(
+                    &view,
+                    &r.depth,
+                    &g,
+                    CLEAR,
+                    &play.scene.draws(&play.game),
+                    Some(vp),
+                );
+                let mut s = Scr::new(&mut canvas, &r.hud.ui, ticks);
+                s.bars(1.0);
+                // (LOGO_B is placed at (368, -304), off the top of the screen.)
+                s.glow_text(1.0, -256.0, 320.0, "Press Start");
             }
             Screen::Map { map, .. } => map.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Shop { shop, .. } => shop.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
@@ -1428,5 +1476,75 @@ fn hint_facts(
         sections: std::array::from_fn(|j| {
             game.garg_items[j] < 0 || game.garg_items[j] >= crate::game::GARG_NEEDED[j]
         }),
+    }
+}
+
+/// What the attract loop's event means for the app: sound, and the next screen
+/// (the title, a flyby), if it changes.
+fn attract_event(
+    fs: &GameFs,
+    gpu: &Gpu,
+    audio: &mut Audio,
+    attract: &mut Attract,
+    ev: attract::Event,
+) -> Option<Screen> {
+    match ev {
+        attract::Event::MovieStarted => {
+            if let Some(attract::Show::Movie(m)) = &mut attract.show {
+                if let Some(a) = m.audio.take() {
+                    audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
+                }
+            }
+            None
+        }
+        attract::Event::MovieEnded => {
+            audio.stop();
+            None
+        }
+        attract::Event::Credits => {
+            audio.play_streams(fs, &["castle2b".into()]);
+            None
+        }
+        attract::Event::Title => {
+            audio.stop();
+            attract.show = None;
+            Some(Screen::Title(Title::default()))
+        }
+        attract::Event::Flyby(level) => {
+            // The flyby is silent (AudioReset, no music); its level loads with
+            // one hero who stays out of play.
+            audio.stop();
+            let flyby = (|| -> Result<Screen> {
+                let mut game = Game::new_with(fs, &level, &[("WAR", "RED")], 1)?;
+                for p in &mut game.players {
+                    p.state = PlayerState::Exited;
+                }
+                let cam =
+                    crate::flyby::FlybyCam::new(&game.level.worlds).context("no attract camera")?;
+                game.fixed_camera = Some(cam.view());
+                game.cam_focus = cam.view().1;
+                let scene = Scene::new(gpu, &game)?;
+                Ok(Screen::Flyby {
+                    play: Box::new(Playing {
+                        game,
+                        scene,
+                        panels: Vec::new(),
+                        intro: 0.0,
+                        boss_bank: None,
+                    }),
+                    cam: Box::new(cam),
+                    ticks: 0,
+                })
+            })();
+            match flyby {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("flyby {level}: {e:#}");
+                    let ev = attract.flyby_over(fs);
+                    attract_event(fs, gpu, audio, attract, ev).or(Some(Screen::Attract))
+                }
+            }
+        }
+        attract::Event::None => None,
     }
 }

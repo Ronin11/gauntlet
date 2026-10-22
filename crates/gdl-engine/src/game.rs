@@ -857,6 +857,8 @@ pub struct Game {
     pub barrier_touches: Vec<usize>,
     /// World objects were hidden or shown: the scene's world mesh must be rebuilt.
     pub world_changed: bool,
+    /// A camera set from outside (the attract flyby): eye and look-at.
+    pub fixed_camera: Option<(Vec3, Vec3)>,
     /// The party's boss shards (bit = world order 1..11, as Progress::runes).
     pub runes: u16,
     /// Players who died in this level (inactivate_player outside the tower).
@@ -1272,6 +1274,7 @@ impl Game {
             sumner: None,
             barrier_touches: Vec::new(),
             world_changed: false,
+            fixed_camera: None,
             runes: 0,
             deaths: 0,
             roster: Default::default(),
@@ -4604,6 +4607,9 @@ impl Game {
     /// Camera eye, target and near-plane distance. The near plane is pushed out to just
     /// in front of the players so roofs and walls between them and the camera are cut away.
     pub fn camera_view(&self) -> (Vec3, Vec3, f32) {
+        if let Some((eye, at)) = self.fixed_camera {
+            return (eye, at, 0.5);
+        }
         if let Some(c) = self.sumner.as_ref().and_then(|s| s.cam) {
             return (c.eye, c.eye + c.dir * 30.0, 0.5);
         }
