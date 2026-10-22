@@ -370,6 +370,8 @@ pub struct Player {
     /// direction; and the knock velocity they give.
     hit_damage: f32,
     hit_flags: u32,
+    /// When a damage tile may hurt this hero again (fxhittime).
+    fxhittime: f32,
     hit_force: Vec3,
     knock_vel: Vec3,
     /// Two-player combos: the linked partner, the one about to be linked, the
@@ -727,9 +729,14 @@ pub enum Kind {
         dest: Option<u32>,
         open: bool,
     },
+    /// A damage tile (spikes, flames, force fields, saw blades, tentacles):
+    /// it hurts only while its cycle is in sequence 2 or 4.
     Hazard {
         radius: f32,
         damage: f32,
+        /// The tile's properties (element / knock flags), with STUN.
+        flags: u32,
+        cycle: Box<ItemCycle>,
     },
     /// A SECRET_ICON: touching it takes the party to a secret level, once.
     Secret {
@@ -965,6 +972,115 @@ pub struct Game {
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
     pub(crate) hit_from: Option<Vec3>,
+}
+
+/// items.c's animated-item cycle (an item with an atree and active & 1): it
+/// steps through its sequences, holding each for active_on (sequences after
+/// the first) or active_off (the first; x trap_rate for tiles) x 2 ticks —
+/// random in [n/2, 1.5n) when negative — or the sequence's own length.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemCycle {
+    pub anim: crate::paction::AnimInfo,
+    slots: Vec<crate::paction::SlotSeq>,
+    /// Sequence shown (action) and wanted (daction).
+    pub action: usize,
+    daction: usize,
+    /// Ticks left in this part of the cycle.
+    activetime: i32,
+    /// iteminfo activetype (bit 1 cycling, 2 stop at the end, 4 advance, 0x40
+    /// update off screen, 0x400 no hold times).
+    active: i16,
+    on: i16,
+    off: i16,
+    /// trap_rate applies to the off time (damage tiles).
+    rate: f32,
+}
+
+impl ItemCycle {
+    fn new(model: &Model, active: i16, on: i16, off: i16, rate: f32, rng: &mut Rng) -> ItemCycle {
+        let slots = model
+            .skeleton
+            .sequences
+            .iter()
+            .enumerate()
+            .map(|(i, s)| crate::paction::SlotSeq {
+                seq: i,
+                frames: s.frame_count as u16,
+                rate: s.frame_rate,
+            })
+            .collect();
+        let mut c = ItemCycle {
+            anim: Default::default(),
+            slots,
+            action: 0,
+            daction: 0,
+            activetime: 0,
+            active,
+            on,
+            off,
+            rate,
+        };
+        // SetItem case 8: the first off time, random when negative.
+        let mut t = off as i32 * 2;
+        if t < 0 {
+            t = (-t >> 1) + (rng.next_u32() % (-t) as u32) as i32;
+        }
+        c.activetime = (t as f32 * rate) as i32;
+        c
+    }
+
+    /// One tick; `visible` is whether it is on screen.
+    fn update(&mut self, dt: f32, visible: bool, rng: &mut Rng) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let a = self.active;
+        if a & 0x40 == 0 && !visible && !(a & 4 != 0 && self.action > 0) {
+            return;
+        }
+        if self.activetime > 0 {
+            self.activetime -= 1;
+        }
+        if a & 1 == 0 {
+            return;
+        }
+        if self.activetime <= 0 && a & 4 != 0 {
+            self.daction += 1;
+            if self.daction >= self.slots.len() {
+                if a & 2 != 0 {
+                    self.daction -= 1;
+                } else {
+                    self.daction = 0;
+                }
+            }
+        }
+        let mode = if self.action == self.daction { 0 } else { 2 };
+        let s = self.slots[self.daction];
+        if self.anim.animate_slot(dt, s, mode) & 3 == 0 {
+            return;
+        }
+        if a & 0x400 == 0 {
+            let t = if self.daction != 0 {
+                self.on as i32 * 2
+            } else {
+                (self.off as f32 * 2.0 * self.rate) as i32
+            };
+            let mut w = self.anim.length_ticks();
+            let mut t = t;
+            if self.slots.len() > 4 && t < 0 {
+                t = 0;
+                w = 0;
+            }
+            self.activetime = if t > 0 {
+                t
+            } else if t < 0 {
+                (-t >> 1) + (rng.next_u32() % (-t) as u32) as i32
+            } else {
+                w
+            };
+        }
+        self.action = self.daction;
+    }
 }
 
 /// A placed monster waiting to come into view (an ENE item before
@@ -1479,6 +1595,7 @@ impl Game {
                 act: crate::paction::Action::new(),
                 hit_damage: 0.0,
                 hit_flags: 0,
+                fxhittime: 0.0,
                 hit_force: Vec3::ZERO,
                 knock_vel: Vec3::ZERO,
                 grab_partner: None,
@@ -2185,12 +2302,51 @@ impl Game {
                         yaw,
                     );
                 }
+                // SetItem case 8: damage = the placed value (or the item's) x
+                // trap_damage; a placed delay sets the off time to -3 x it.
                 ItemType::DamageTile | ItemType::Trap => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
+                    let placed = p16(0);
+                    let damage = if placed != 0 {
+                        placed as f32
+                    } else {
+                        info.value as f32
+                    } * self.tuning.trap_damage;
+                    let off = match p16(2) {
+                        0 => info.active_off,
+                        d => -d * 3,
+                    };
+                    let mut active = info.active_type;
+                    if inst.flags & 1 != 0 {
+                        active |= 0x40;
+                    }
+                    let cycle = match model {
+                        Some(m) => ItemCycle::new(
+                            &self.models[m],
+                            active,
+                            info.active_on,
+                            off,
+                            self.tuning.trap_rate,
+                            &mut self.rng,
+                        ),
+                        None => ItemCycle {
+                            anim: Default::default(),
+                            slots: Vec::new(),
+                            action: 2,
+                            daction: 2,
+                            activetime: 0,
+                            active: 1,
+                            on: 0,
+                            off: 0,
+                            rate: 1.0,
+                        },
+                    };
                     self.spawn(
                         Kind::Hazard {
                             radius: info.radius.max(1.0),
-                            damage: 20.0,
+                            damage,
+                            flags: info.properties | DmgType::STUN,
+                            cycle: Box::new(cycle),
                         },
                         model,
                         pos,
@@ -4124,6 +4280,14 @@ impl Game {
             .it_holder
             .filter(|&pi| player_pos.get(pi).is_some_and(|p| p.1));
         let mut barrier_touches = Vec::new();
+        let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32)> = Vec::new();
+        // Which damage tiles are on screen (off-screen ones pause their cycle).
+        let hazard_vis: HashSet<u64> = self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Hazard { .. }) && self.on_screen(e.pos, 8.0))
+            .map(|e| e.id)
+            .collect();
         let nearest = |pos: Vec3| -> Option<(usize, f32)> {
             // Every monster goes after the player who is IT, at any range.
             if let Some(pi) = it {
@@ -4778,21 +4942,36 @@ impl Game {
                 Kind::Hazard {
                     radius,
                     damage: dmg,
+                    flags,
+                    cycle,
                 } => {
-                    for (pi, (pp, alive)) in player_pos.iter().enumerate() {
-                        if *alive
-                            && (*pp - e.pos).length() < *radius
-                            && (self.time * 2.0).fract() < dt * 2.0
-                        {
-                            if !levitating[pi] {
-                                damage.push((pi, *dmg, 0));
+                    cycle.update(dt, hazard_vis.contains(&e.id), &mut self.rng);
+                    if !cycle.slots.is_empty() {
+                        e.animator.seq = cycle.anim.seq;
+                        e.animator.frame = cycle.anim.frame;
+                    }
+                    // fn_8005D730 case 8: only while the cycle is in sequence 2
+                    // or 4; levitation floats over it.
+                    if cycle.active & 1 != 0 && matches!(cycle.action, 2 | 4) {
+                        for (pi, (pp, alive)) in player_pos.iter().enumerate() {
+                            if *alive
+                                && !levitating[pi]
+                                && Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length()
+                                    < *radius + PLAYER_RADIUS
+                                && (pp.y - e.pos.y).abs() < 4.0
+                            {
+                                let fwd = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
+                                trap_hits.push((pi, *dmg, *flags, *pp + fwd, cycle.activetime));
                             }
                         }
                     }
                 }
                 _ => {}
             }
-            if !matches!(e.kind, Kind::Enemy { .. } | Kind::Critter(_)) {
+            if !matches!(
+                e.kind,
+                Kind::Enemy { .. } | Kind::Critter(_) | Kind::Hazard { .. }
+            ) {
                 if let Some(m) = e.model {
                     e.animator.update(&self.models[m].skeleton, dt);
                 }
@@ -4800,6 +4979,18 @@ impl Game {
         }
 
         self.barrier_touches = barrier_touches;
+        // Each hero is hurt by a tile at most once per what is left of its
+        // cycle (fxhittime); a knocking tile pushes back along its facing.
+        for (pi, dmg, flags, from, activetime) in trap_hits {
+            if self.time < self.players[pi].fxhittime {
+                continue;
+            }
+            self.players[pi].fxhittime = self.time + (activetime + 1) as f32 / 30.0;
+            self.damage_from = (flags & 0x30 != 0).then_some(from);
+            self.damage_player(pi, dmg, flags);
+            self.damage_from = None;
+            self.post(21, Some(pi), &[]);
+        }
 
         // Projectiles hit the first damageable thing they touch.
         for (pidx, owner, dmg, dir) in proj_hits {
@@ -5714,6 +5905,58 @@ mod tests {
             .collect();
         println!("{} ambient sounds, missing {missing:?}", names.len());
         assert!(missing.len() * 4 < names.len(), "{missing:?}");
+    }
+
+    #[test]
+    fn damage_tiles_cycle_and_hurt_only_when_up() {
+        let Some(fs) = data() else { return };
+        let mut checked = 0;
+        for l in [
+            "levelA1", "levelA3", "levelB2", "levelC2", "levelG2", "levelI3",
+        ] {
+            let mut g = Game::new(&fs, l, &[("WAR", "RED")]).unwrap();
+            let Some((id, pos, n)) = g.entities.iter().find_map(|e| match &e.kind {
+                Kind::Hazard { cycle, .. } if cycle.slots.len() >= 3 && cycle.active & 1 != 0 => {
+                    Some((e.id, e.pos, cycle.slots.len()))
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            g.pending_enemies.clear();
+            g.entities
+                .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
+            // Stand on it (with the camera looking at it) for 20 s.
+            g.players[0].pos = pos + Vec3::Y;
+            g.players[0].health = 100_000.0;
+            g.cam_focus = pos;
+            let mut actions = std::collections::BTreeSet::new();
+            let mut hits = 0;
+            let mut last = g.players[0].health;
+            for _ in 0..1200 {
+                g.players[0].pos.x = pos.x;
+                g.players[0].pos.z = pos.z;
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                if let Some(Kind::Hazard { cycle, .. }) =
+                    g.entities.iter().find(|e| e.id == id).map(|e| &e.kind)
+                {
+                    actions.insert(cycle.action);
+                }
+                if g.players[0].health < last {
+                    hits += 1;
+                }
+                last = g.players[0].health;
+            }
+            println!("{l}: {n} seqs, actions {actions:?}, {hits} hits in 20 s");
+            // (A tile without the advance bit waits to be switched on.)
+            if actions.len() == 1 {
+                assert_eq!(hits, 0, "{l}: a resting tile doesn't hurt");
+                continue;
+            }
+            assert!(hits < 300, "{l}: not every tick");
+            checked += 1;
+        }
+        assert!(checked > 0);
     }
 
     #[test]

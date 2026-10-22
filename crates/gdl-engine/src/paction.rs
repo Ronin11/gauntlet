@@ -402,7 +402,7 @@ fn strafe_alternate(d: u16, next: u16, base: u16) -> u16 {
 }
 
 /// One animation slot of a model: its sequence, frame count and rate.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SlotSeq {
     pub seq: usize,
     pub frames: u16,
@@ -455,7 +455,7 @@ impl ActionSeqs {
 }
 
 /// An animinfo on the game clock (anim.c InitAnim / CalcAnimInfo).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnimInfo {
     pub seq: usize,
     /// The (fractional) frame shown.
@@ -542,6 +542,17 @@ impl AnimInfo {
 
     pub fn done(&self) -> bool {
         self.done
+    }
+
+    /// The sequence's length in 60 Hz ticks: (0.5 + frames x seqscale) x 2.
+    pub fn length_ticks(&self) -> i32 {
+        ((0.5 + self.frames as f32 * self.spf * 30.0) as i32) << 1
+    }
+
+    /// AnimateATree for things other than heroes (items): advance, and restart
+    /// into `s` as `mode` says; nonzero when it restarted or finished.
+    pub fn animate_slot(&mut self, dt: f32, s: SlotSeq, mode: u8) -> u32 {
+        self.animate(dt, 0.0, s, 0, mode)
     }
 
     /// AnimateTree: advance, then restart into `s` if `mode` says so. Nonzero
