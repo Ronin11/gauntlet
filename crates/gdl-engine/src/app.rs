@@ -86,11 +86,13 @@ enum Screen {
         panels: Vec<PanelInfo>,
         from_menu: bool,
     },
-    /// A level's intro movie (init_gamemovie), then the level.
+    /// A level's intro movie (init_gamemovie), then the level; or an ending
+    /// movie ("garm", "victory"), then `after` (the shop).
     Intro {
         movie: Box<crate::movie::Movie>,
         level: String,
         panels: Vec<PanelInfo>,
+        after: Option<Box<Screen>>,
     },
     Playing {
         play: Box<Playing>,
@@ -574,14 +576,25 @@ impl App {
                     movie,
                     level,
                     panels,
+                    after,
                 } => {
                     let inputs: Vec<PlayerInput> = all.iter().map(|(_, i)| *i).collect();
                     if escape || movie.update(TICK, &inputs) {
                         r.audio.stop();
-                        next = Some(Screen::Loading {
-                            level: level.clone(),
-                            panels: panels.clone(),
-                            shown: false,
+                        next = Some(match after.take() {
+                            Some(s) => {
+                                if let Screen::Shop { shop, .. } = &*s {
+                                    if let Some(m) = shop.music() {
+                                        r.audio.play_bank_music(fs, &m);
+                                    }
+                                }
+                                *s
+                            }
+                            None => Screen::Loading {
+                                level: level.clone(),
+                                panels: panels.clone(),
+                                shown: false,
+                            },
                         });
                     }
                 }
@@ -1060,14 +1073,44 @@ impl App {
                                     crate::shop::ShopMode::AfterLevel,
                                     w == Some(0x803),
                                 );
-                                match shop.music() {
-                                    Some(m) => r.audio.play_bank_music(fs, &m),
-                                    None => r.audio.stop(),
-                                }
-                                Screen::Shop {
-                                    shop: Box::new(shop),
-                                    panels,
-                                    from_menu: false,
+                                let ending = match w {
+                                    Some(0x601) => "garm",
+                                    Some(0x803) => "victory",
+                                    _ => "",
+                                };
+                                let movie = (!ending.is_empty())
+                                    .then(|| crate::movie::Movie::open(fs, ending).ok())
+                                    .flatten();
+                                match movie {
+                                    // After Skorne in the Underworld, "garm"; after
+                                    // Garm, "victory"; then the shop (gamemain.c).
+                                    Some(mut m) => {
+                                        r.audio.stop();
+                                        if let Some(a) = m.audio.take() {
+                                            r.audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
+                                        }
+                                        Screen::Intro {
+                                            movie: Box::new(m),
+                                            level: String::new(),
+                                            panels: panels.clone(),
+                                            after: Some(Box::new(Screen::Shop {
+                                                shop: Box::new(shop),
+                                                panels,
+                                                from_menu: false,
+                                            })),
+                                        }
+                                    }
+                                    None => {
+                                        match shop.music() {
+                                            Some(m) => r.audio.play_bank_music(fs, &m),
+                                            None => r.audio.stop(),
+                                        }
+                                        Screen::Shop {
+                                            shop: Box::new(shop),
+                                            panels,
+                                            from_menu: false,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1193,6 +1236,7 @@ fn intro_or_level(
                 movie: Box::new(m),
                 level: level.to_string(),
                 panels: panels.to_vec(),
+                after: None,
             }
         }
         None => Screen::Loading {
