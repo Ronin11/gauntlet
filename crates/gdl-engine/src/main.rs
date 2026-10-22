@@ -1,5 +1,5 @@
 use gdl_engine::{
-    app, audio, character, fs, game, gpu, hud, input, menu, scene, screen, select, ui,
+    app, audio, character, fs, game, gpu, hud, input, menu, options, scene, screen, select, ui,
 };
 
 use anyhow::{Context, Result};
@@ -315,6 +315,11 @@ fn snapshot_game(args: &Args) -> Result<()> {
     // Menu screens for checking their layout headlessly.
     let t = 1.0;
     let style = hud::Style { ui: &hud.ui };
+    // Ticks the options screens have run (GDL_OPTIONS_TICKS overrides).
+    let demo_ticks: u32 = std::env::var("GDL_OPTIONS_TICKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
     let draw_screen = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
         match args.screen.as_deref() {
@@ -336,19 +341,38 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 );
                 menu::Pause::default().draw(&mut canvas, &style, t);
             }
+            Some(name) if name.starts_with("gamemenu") || name.starts_with("towermenu") => {
+                let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
+                hud::build(&mut s, &g, &panels);
+                if let Some(o) = options::Options::demo(name, demo_ticks) {
+                    o.draw(&mut s);
+                }
+            }
+            Some(name) if name.starts_with("options") => {
+                let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
+                s.bars(1.0);
+                s.quad_screen("TITLE", 0);
+                if let Some(o) = options::Options::demo(name, demo_ticks) {
+                    o.draw(&mut s);
+                }
+            }
             _ => {}
         }
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
     };
     let img = match args.screen.as_deref() {
-        Some("pause") => gpu.render_to_image(
-            w,
-            h,
-            &globals,
-            scene::CLEAR,
-            &sc.draws(&g),
-            Some(&draw_screen),
-        )?,
+        Some(name)
+            if name == "pause" || name.starts_with("gamemenu") || name.starts_with("towermenu") =>
+        {
+            gpu.render_to_image(
+                w,
+                h,
+                &globals,
+                scene::CLEAR,
+                &sc.draws(&g),
+                Some(&draw_screen),
+            )?
+        }
         Some(_) => gpu.render_to_image(w, h, &globals, scene::CLEAR, &[], Some(&draw_screen))?,
         None => {
             gpu.render_to_image(w, h, &globals, scene::CLEAR, &sc.draws(&g), Some(&draw_hud))?

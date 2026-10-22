@@ -15,6 +15,7 @@ pub mod level;
 pub mod menu;
 pub mod mesh;
 pub mod movie;
+pub mod options;
 pub mod optmenu;
 pub mod progress;
 pub mod scene;

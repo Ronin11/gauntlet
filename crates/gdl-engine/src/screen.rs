@@ -204,6 +204,26 @@ impl<'a> Scr<'a> {
         )
     }
 
+    /// FONT32 text whose glyphs come from another texture with FONT32's layout
+    /// (FONT32_PARCH, FONT32GAR0..5, ...): the game draws the message, then swaps
+    /// its texture (`txt + 0x26`). Same placement rules as [`Scr::text`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_tex(
+        &mut self,
+        tex: Tex,
+        scale: f32,
+        x: f32,
+        y: f32,
+        color: u32,
+        alpha: i32,
+        s: &str,
+    ) -> f32 {
+        let Some(f) = self.ui.font(FONT_32) else {
+            return 0.0;
+        };
+        self.draw_text(f, tex, scale, x, y, rgb(color, font_opacity(alpha)), 0.0, s)
+    }
+
     /// Lay out `s` as mb_font.c does; `pad` widens each glyph quad (glow passes).
     #[allow(clippy::too_many_arguments)]
     fn draw_text(
@@ -220,7 +240,9 @@ impl<'a> Scr<'a> {
         let w = self.text_width_font(f, scale, s);
         let mut x = if x < 0.0 { -x - (w * 0.5).floor() } else { x };
         let start = x;
-        let (tw, th) = (tex.w as f32, tex.h as f32);
+        // Glyph rectangles are in the font's own texture pixels; a swapped-in
+        // texture may be smaller (FONT32GAR0..5 are 128x128) with the same layout.
+        let (tw, th) = (f.tex.w as f32, f.tex.h as f32);
         let mut chars = s.chars().peekable();
         while let Some(ch) = chars.next() {
             if ch == '*' {
