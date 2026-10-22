@@ -27,6 +27,8 @@ enum Cmd {
     Survey { root: PathBuf },
     /// Summarise a WORLDS.PS2 level file
     World { path: PathBuf },
+    /// Summarise an ANIM.PS2 file
+    Anim { path: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -136,6 +138,27 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Survey { root } => survey(&root)?,
+        Cmd::Anim { path } => {
+            let a = gdl_formats::anim::Anim::parse(&std::fs::read(&path)?)?;
+            println!("version {} atrees {}", a.version, a.atrees.len());
+            for t in &a.atrees {
+                println!("atree {} prefix {:?}: {} nodes, {} seqs", t.name, t.prefix, t.nodes.len(), t.sequences.len());
+                for (i, n) in t.nodes.iter().enumerate() {
+                    let ntracks = t.tracks[i].iter().filter(|x| x.is_some()).count();
+                    println!("  node {i:2} {:20} type {} parent {:3} pos {:?} mb {:#x} tracks {ntracks}", n.name, n.anim_type, n.parent, n.init_pos, n.mb_flags);
+                }
+                for s in &t.sequences {
+                    println!("  seq {:20} frames {:4} rate {:3} repeat {} flags {:#x}", s.name, s.frame_count, s.frame_rate, s.repeat, s.flags);
+                }
+                if let Some(si) = t.sequence_index("WALK1").or(Some(0)) {
+                    for (i, tr) in t.tracks.iter().enumerate().take(6) {
+                        if let Some(Some(tr)) = tr.get(si) {
+                            println!("  seq{si} node{i} flags {:#x} keys {} first {:?} last {:?}", tr.flags, tr.keys.len(), tr.keys.first(), tr.keys.last());
+                        }
+                    }
+                }
+            }
+        }
         Cmd::World { path } => {
             let w = gdl_formats::Worlds::parse(&std::fs::read(&path)?)?;
             println!(

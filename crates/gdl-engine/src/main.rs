@@ -1,3 +1,4 @@
+mod character;
 mod fs;
 mod gpu;
 mod level;
@@ -14,6 +15,9 @@ struct Args {
     eye: Option<Vec3>,
     at: Option<Vec3>,
     size: (u32, u32),
+    character: Option<String>,
+    seq: String,
+    frame: f32,
 }
 
 fn parse_vec3(s: &str) -> Result<Vec3> {
@@ -33,6 +37,9 @@ fn parse_args() -> Result<Args> {
         eye: None,
         at: None,
         size: (1280, 720),
+        character: None,
+        seq: "READY".into(),
+        frame: 0.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -41,6 +48,9 @@ fn parse_args() -> Result<Args> {
             "--data" => a.data = Some(val()?.into()),
             "--level" => a.level = val()?,
             "--snapshot" => a.snapshot = Some(val()?.into()),
+            "--char" => a.character = Some(val()?),
+            "--seq" => a.seq = val()?,
+            "--frame" => a.frame = val()?.parse()?,
             "--eye" => a.eye = Some(parse_vec3(&val()?)?),
             "--at" => a.at = Some(parse_vec3(&val()?)?),
             "--size" => {
@@ -68,10 +78,22 @@ fn snapshot(args: &Args) -> Result<()> {
         Some(p) => fs::GameFs::open(p)?,
         None => fs::GameFs::discover()?,
     };
-    let level = level::Level::load(&fs, &args.level)?;
-    let mesh = level.world_mesh();
+    let mut char_model = None;
+    let mesh = if let Some(c) = &args.character {
+        let (class, color) = c.split_once('/').unwrap_or((c.as_str(), "RED"));
+        let cm = if class.eq_ignore_ascii_case("monster") {
+            character::CharacterModel::load_monster(&fs, color)?
+        } else {
+            character::CharacterModel::load_player(&fs, class, color)?
+        };
+        let mesh = std::mem::take(&mut { cm.mesh.clone_shallow() });
+        char_model = Some(cm);
+        mesh
+    } else {
+        level::Level::load(&fs, &args.level)?.world_mesh()
+    };
     println!(
-        "world mesh: {} verts, {} tris, {} batches, {} textures, bounds {:?}..{:?}",
+        "mesh: {} verts, {} tris, {} batches, {} textures, bounds {:?}..{:?}",
         mesh.vertices.len(),
         mesh.indices.len() / 3,
         mesh.batches.len(),
@@ -93,6 +115,14 @@ fn snapshot(args: &Args) -> Result<()> {
     let gm = gpu.upload_mesh(&mesh)?;
     let mut inst = gpu.new_instance(&gm);
     inst.transform = mirror();
+    if let Some(cm) = &char_model {
+        let seq = cm.sequence(&args.seq).with_context(|| format!("no sequence {}", args.seq))?;
+        let mut an = character::Animator::new(seq);
+        an.frame = args.frame;
+        inst.parts = cm.part_transforms(&an.poses(&cm.skeleton));
+        let names: Vec<_> = cm.skeleton.sequences.iter().map(|s| s.name.as_str()).collect();
+        log::info!("sequences: {}", names.join(" "));
+    }
 
     let center = (mesh.bounds_min + mesh.bounds_max) * 0.5;
     let extent = (mesh.bounds_max - mesh.bounds_min).length();

@@ -42,6 +42,7 @@ pub struct Gpu {
 }
 
 struct GpuBatch {
+    part: u16,
     start: u32,
     count: u32,
     material: usize,
@@ -63,6 +64,8 @@ pub struct GpuMesh {
 pub struct Instance {
     bufs: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     pub transform: Mat4,
+    /// Per-part transforms for rigid-part models (applied before `transform`).
+    pub parts: Vec<Mat4>,
     pub tint: Vec4,
     pub visible: bool,
 }
@@ -254,6 +257,7 @@ impl Gpu {
                 }
             };
             batches.push(GpuBatch {
+                part: b.part,
                 start: b.start,
                 count: b.count,
                 material,
@@ -326,6 +330,7 @@ impl Gpu {
         Instance {
             bufs,
             transform: Mat4::IDENTITY,
+            parts: Vec::new(),
             tint: Vec4::ONE,
             visible: true,
         }
@@ -364,7 +369,8 @@ impl Gpu {
         for (mesh, inst) in draws {
             for (b, (buf, _)) in mesh.batches.iter().zip(&inst.bufs) {
                 let u = ModelUniform {
-                    transform: inst.transform.to_cols_array_2d(),
+                    transform: (inst.transform * inst.parts.get(b.part as usize).copied().unwrap_or(Mat4::IDENTITY))
+                        .to_cols_array_2d(),
                     tint: inst.tint.to_array(),
                     params: b.params,
                 };

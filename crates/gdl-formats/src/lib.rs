@@ -3,6 +3,7 @@
 //! Format knowledge comes from the community tools (MosesofEgypt/gdl_tools,
 //! haekb/io_scene_gdl, MeltyTool) and was verified against the retail disc.
 
+pub mod anim;
 pub mod bin;
 pub mod mesh;
 pub mod objects;

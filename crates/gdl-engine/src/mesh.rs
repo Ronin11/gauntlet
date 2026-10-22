@@ -25,6 +25,8 @@ pub struct Batch {
     pub lightmap: Option<usize>,
     pub blend: bool,
     pub prelit: bool,
+    /// Rigid part this batch belongs to (index into an instance's part transforms).
+    pub part: u16,
 }
 
 #[derive(Default)]
@@ -44,7 +46,7 @@ pub struct MeshBuilder<'a> {
     /// bitmap index -> texture slot
     tex_slots: HashMap<u16, Option<usize>>,
     /// (texture, lightmap, blend, prelit) -> (vertices, indices) accumulated per batch
-    groups: Vec<((Option<usize>, Option<usize>, bool, bool), Vec<u32>)>,
+    groups: Vec<((Option<usize>, Option<usize>, bool, bool, u16), Vec<u32>)>,
     pub data: MeshData,
 }
 
@@ -93,6 +95,11 @@ impl<'a> MeshBuilder<'a> {
 
     /// Append an object, transformed by `xf`.
     pub fn add_object(&mut self, obj: &Object, xf: Mat4) {
+        self.add_part(obj, xf, 0);
+    }
+
+    /// Append an object as rigid part `part`, transformed by `xf`.
+    pub fn add_part(&mut self, obj: &Object, xf: Mat4, part: u16) {
         let has_lmap = obj.flags & object_flags::LMAP != 0;
         let prelit = obj.flags & 0x30000 == 0x10000 || obj.flags & object_flags::VCOLORS != 0;
         let obj_alpha = obj.flags & (object_flags::ALPHA | object_flags::SORT_A) != 0;
@@ -117,7 +124,7 @@ impl<'a> MeshBuilder<'a> {
             let blend = obj_alpha
                 && self.bitmap_has_alpha(sub.tex_index)
                 && obj.flags & object_flags::ALPHA != 0;
-            let key = (tex, lm, blend, prelit && lm.is_none());
+            let key = (tex, lm, blend, prelit && lm.is_none(), part);
             let base = self.data.vertices.len() as u32;
             for i in 0..mesh.positions.len() {
                 let p = xf.transform_point3(Vec3::from(mesh.positions[i]));
@@ -143,7 +150,7 @@ impl<'a> MeshBuilder<'a> {
     }
 
     pub fn finish(mut self) -> MeshData {
-        for ((texture, lightmap, blend, prelit), idx) in std::mem::take(&mut self.groups) {
+        for ((texture, lightmap, blend, prelit, part), idx) in std::mem::take(&mut self.groups) {
             let start = self.data.indices.len() as u32;
             self.data.indices.extend(idx);
             self.data.batches.push(Batch {
@@ -153,6 +160,7 @@ impl<'a> MeshBuilder<'a> {
                 lightmap,
                 blend,
                 prelit,
+                part,
             });
         }
         if self.data.vertices.is_empty() {
@@ -160,5 +168,19 @@ impl<'a> MeshBuilder<'a> {
             self.data.bounds_max = Vec3::ZERO;
         }
         self.data
+    }
+}
+
+impl MeshData {
+    /// Copy of the geometry and textures (used where the original stays owned elsewhere).
+    pub fn clone_shallow(&self) -> MeshData {
+        MeshData {
+            vertices: self.vertices.clone(),
+            indices: self.indices.clone(),
+            batches: self.batches.clone(),
+            textures: self.textures.clone(),
+            bounds_min: self.bounds_min,
+            bounds_max: self.bounds_max,
+        }
     }
 }
