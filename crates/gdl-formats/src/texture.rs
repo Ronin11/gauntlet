@@ -159,6 +159,8 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
         b.format,
         fmt::A_8_IDX_8 | fmt::I_8_IDX_8 | fmt::A_4_IDX_4 | fmt::I_4_IDX_4
     );
+    // The "A" monochrome formats are used for lightmaps on GameCube, so expose the
+    // value in both the colour and alpha channels.
     let alpha_mono = matches!(b.format, fmt::A_8_IDX_8 | fmt::A_4_IDX_4);
 
     let mut out = vec![0u8; (w * h * 4) as usize];
@@ -174,7 +176,7 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
                 if mono {
                     let v = v * 17;
                     if alpha_mono {
-                        [255, 255, 255, v]
+                        [v, v, v, v]
                     } else {
                         [v, v, v, 255]
                     }
@@ -186,7 +188,7 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
                 let v = pix[i as usize];
                 if mono {
                     if alpha_mono {
-                        [255, 255, 255, v]
+                        [v, v, v, v]
                     } else {
                         [v, v, v, 255]
                     }

@@ -57,7 +57,7 @@ fn shade(v: VsOut) -> vec4<f32> {
     if (m.params.x > 0.5) {
         // Lightmapped world geometry: the lightmap carries the baked lighting.
         let lm = textureSample(t_light, s_light, v.lm_uv).rgb;
-        rgb = rgb * lm * 2.0;
+        rgb = rgb * lm;
     } else if (m.params.y > 0.5) {
         rgb = rgb * v.color.rgb * 2.0;
     } else {

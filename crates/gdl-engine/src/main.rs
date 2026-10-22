@@ -89,7 +89,7 @@ fn snapshot(args: &Args) -> Result<()> {
     println!("adapter: {:?}", adapter.get_info().name);
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
-    let gpu = gpu::Gpu::new(device, queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let gpu = gpu::Gpu::new(device, queue, wgpu::TextureFormat::Rgba8Unorm);
     let gm = gpu.upload_mesh(&mesh)?;
     let mut inst = gpu.new_instance(&gm);
     inst.transform = mirror();
