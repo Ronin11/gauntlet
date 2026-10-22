@@ -34,6 +34,7 @@ pub mod screen;
 pub mod select;
 pub mod shop;
 pub mod stats;
+pub mod texanim;
 pub mod tower;
 pub mod triggers;
 pub mod ui;

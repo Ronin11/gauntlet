@@ -1,9 +1,11 @@
 //! wgpu renderer: one pipeline pair (opaque with alpha test, alpha blended) shared by
 //! world geometry and actors.
 
-use crate::mesh::{MeshData, Vertex};
+use crate::mesh::{MeshData, TexAnimKind, Vertex};
+use crate::texanim::{self, GlobalState};
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
+use gdl_formats::anim::TexMod;
 use gdl_formats::Image;
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
@@ -25,7 +27,13 @@ struct ModelUniform {
     transform: [[f32; 4]; 4],
     tint: [f32; 4],
     params: [f32; 4],
+    /// Texture coordinate transform: u * x + y, v * z + w (the texture's scroll
+    /// record: uScale, uAdd, vScale, vAdd).
+    uv: [f32; 4],
 }
+
+/// Identity texture coordinate transform.
+const UV_IDENTITY: [f32; 4] = [1.0, 0.0, 1.0, 0.0];
 
 pub struct Gpu {
     pub device: wgpu::Device,
@@ -50,6 +58,51 @@ struct GpuBatch {
     material: usize,
     blend: bool,
     params: [f32; 4],
+    uv: [f32; 4],
+    /// Flipbook animating this batch's texture: (index into `GpuMesh::anims`,
+    /// material of each frame).
+    flip: Option<(usize, Vec<usize>)>,
+    /// Scroll animations of this batch's texture (U, V), by index into `GpuMesh::anims`.
+    scroll: [Option<usize>; 2],
+    /// Sequence-texmod flipbooks of this batch's texture: (index into
+    /// `MeshData::seq_anims`, material of each frame).
+    seq_flips: Vec<(usize, Vec<usize>)>,
+}
+
+impl GpuBatch {
+    /// Material, texture transform and opacity of this batch under `fx`.
+    fn resolve(&self, fx: Option<&PartFx>) -> (usize, [f32; 4], f32) {
+        let Some(fx) = fx else {
+            return (self.material, self.uv, 1.0);
+        };
+        let material = fx
+            .alt
+            .and_then(|(anim, frame)| {
+                let (_, mats) = self.seq_flips.iter().find(|(a, _)| *a == anim)?;
+                mats.get(frame).or(mats.last()).copied()
+            })
+            .unwrap_or(self.material);
+        // setTexShift: the texture's own scroll record wins over the node's
+        // UV scale/add.
+        let uv = match (self.scroll, fx.uv) {
+            ([None, None], Some(uv)) => uv,
+            _ => self.uv,
+        };
+        (material, uv, fx.alpha.map_or(1.0, |a| a as f32 / 255.0))
+    }
+}
+
+/// Per-part effects of an instance's sequence texmods and texmod nodes
+/// (`DoTexModSeqSub` on the part's node).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PartFx {
+    /// `MBTreeSetAltTex`: show frame `.1` of sequence flipbook `.0` (an index
+    /// into `MeshData::seq_anims`) on batches using that flipbook's texture.
+    pub alt: Option<(usize, usize)>,
+    /// `MBTreeSetUVScaleAdd`: uScale, uAdd, vScale, vAdd.
+    pub uv: Option<[f32; 4]>,
+    /// `MBTreeSetAlpha`: opacity 0..=255.
+    pub alpha: Option<u8>,
 }
 
 /// A mesh uploaded to the GPU, with its textures.
@@ -58,8 +111,43 @@ pub struct GpuMesh {
     ibuf: wgpu::Buffer,
     batches: Vec<GpuBatch>,
     materials: Vec<wgpu::BindGroup>,
+    /// The mesh's global texmods (see [`GpuMesh::animate_textures`]).
+    anims: Vec<TexMod>,
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,
+}
+
+impl GpuMesh {
+    /// Show the mesh's animated textures as they are after `inf_frame` game
+    /// frames (`DoTexMods` runs once per frame): flipbook frames swap the
+    /// batch's texture, scrolls offset its UVs.
+    pub fn animate_textures(&mut self, inf_frame: u32) {
+        if self.anims.is_empty() {
+            return;
+        }
+        let states: Vec<GlobalState> = self
+            .anims
+            .iter()
+            .map(|t| texanim::global_state(t, inf_frame))
+            .collect();
+        for b in &mut self.batches {
+            if let Some((a, frames)) = &b.flip {
+                if let GlobalState::Frame(f) = states[*a] {
+                    if let Some(&m) = frames.get(f) {
+                        b.material = m;
+                    }
+                }
+            }
+            for (axis, a) in b.scroll.iter().enumerate() {
+                if let Some(a) = a {
+                    match states[*a] {
+                        GlobalState::ScrollU(o) | GlobalState::ScrollV(o) => b.uv[axis * 2 + 1] = o,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// One placement of a mesh in the world. Owns uniform buffers for its batches.
@@ -72,6 +160,8 @@ pub struct Instance {
     pub hidden: Vec<bool>,
     pub tint: Vec4,
     pub visible: bool,
+    /// Per-part texmod effects (empty: none).
+    pub part_fx: Vec<PartFx>,
 }
 
 impl Gpu {
@@ -239,9 +329,9 @@ impl Gpu {
         let mut materials = Vec::new();
         let mut batches = Vec::new();
         let mut keys: Vec<(Option<usize>, Option<usize>)> = Vec::new();
-        for b in &mesh.batches {
-            let key = (b.texture, b.lightmap);
-            let material = match keys.iter().position(|k| *k == key) {
+        let mut material_for = |texture: Option<usize>, lightmap: Option<usize>| {
+            let key = (texture, lightmap);
+            match keys.iter().position(|k| *k == key) {
                 Some(i) => i,
                 None => {
                     keys.push(key);
@@ -251,7 +341,7 @@ impl Gpu {
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: wgpu::BindingResource::TextureView(view(b.texture)),
+                                resource: wgpu::BindingResource::TextureView(view(texture)),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
@@ -259,7 +349,7 @@ impl Gpu {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: wgpu::BindingResource::TextureView(view(b.lightmap)),
+                                resource: wgpu::BindingResource::TextureView(view(lightmap)),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
@@ -269,7 +359,45 @@ impl Gpu {
                     }));
                     materials.len() - 1
                 }
-            };
+            }
+        };
+        for b in &mesh.batches {
+            let mut material = material_for(b.texture, b.lightmap);
+            // Flipbooks an instance's sequence texmods may show instead.
+            let mut seq_flips = Vec::new();
+            for (ai, a) in mesh.seq_anims.iter().enumerate() {
+                if let (TexAnimKind::Flip(frames), true) = (&a.kind, Some(a.slot) == b.texture) {
+                    let mats: Vec<usize> = frames
+                        .iter()
+                        .map(|f| material_for(f.or(b.texture), b.lightmap))
+                        .collect();
+                    // InitTexMod points every texmod's texture at its first frame.
+                    material = mats[0];
+                    seq_flips.push((ai, mats));
+                }
+            }
+            // Global texmods of this batch's texture; when several flip it, the
+            // last one run each frame wins.
+            let mut flip = None;
+            let mut scroll = [None; 2];
+            for (ai, a) in mesh.tex_anims.iter().enumerate() {
+                if Some(a.slot) != b.texture {
+                    continue;
+                }
+                match &a.kind {
+                    TexAnimKind::Flip(frames) => {
+                        let mats: Vec<usize> = frames
+                            .iter()
+                            .map(|f| material_for(f.or(b.texture), b.lightmap))
+                            .collect();
+                        // Before the first step InitTexMod shows frame 0.
+                        material = mats[0];
+                        flip = Some((ai, mats));
+                    }
+                    TexAnimKind::ScrollU => scroll[0] = Some(ai),
+                    TexAnimKind::ScrollV => scroll[1] = Some(ai),
+                }
+            }
             batches.push(GpuBatch {
                 additive: b.additive,
                 part: b.part,
@@ -283,6 +411,10 @@ impl Gpu {
                     0.0,
                     0.0,
                 ],
+                uv: UV_IDENTITY,
+                flip,
+                scroll,
+                seq_flips,
             });
         }
         // Opaque first, then blended, so transparent surfaces draw over the world.
@@ -315,6 +447,7 @@ impl Gpu {
                 }),
             batches,
             materials,
+            anims: mesh.tex_anims.iter().map(|a| a.texmod.clone()).collect(),
             bounds_min: mesh.bounds_min,
             bounds_max: mesh.bounds_max,
         })
@@ -349,6 +482,7 @@ impl Gpu {
             hidden: Vec::new(),
             tint: Vec4::ONE,
             visible: true,
+            part_fx: Vec::new(),
         }
     }
 
@@ -429,6 +563,9 @@ impl Gpu {
                 if inst.hidden.get(b.part as usize).copied().unwrap_or(false) {
                     continue;
                 }
+                let (_, uv, alpha) = b.resolve(inst.part_fx.get(b.part as usize));
+                let mut tint = inst.tint;
+                tint.w *= alpha;
                 let u = ModelUniform {
                     transform: (inst.transform
                         * inst
@@ -437,8 +574,9 @@ impl Gpu {
                             .copied()
                             .unwrap_or(Mat4::IDENTITY))
                     .to_cols_array_2d(),
-                    tint: inst.tint.to_array(),
+                    tint: tint.to_array(),
                     params: b.params,
+                    uv,
                 };
                 self.queue.write_buffer(buf, 0, bytemuck::bytes_of(&u));
             }
@@ -492,14 +630,20 @@ impl Gpu {
                     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
                     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     for (b, (_, bg)) in mesh.batches.iter().zip(&inst.bufs) {
-                        let kind = if b.additive { 2 } else { b.blend as u8 };
+                        let (material, _, alpha) = b.resolve(inst.part_fx.get(b.part as usize));
+                        // Parts faded by a texmod blend while they are see-through.
+                        let kind = if b.additive {
+                            2
+                        } else {
+                            (b.blend || alpha < 1.0) as u8
+                        };
                         if kind != pass_kind
                             || b.count == 0
                             || inst.hidden.get(b.part as usize).copied().unwrap_or(false)
                         {
                             continue;
                         }
-                        pass.set_bind_group(1, &mesh.materials[b.material], &[]);
+                        pass.set_bind_group(1, &mesh.materials[material], &[]);
                         pass.set_bind_group(2, bg, &[]);
                         pass.draw_indexed(b.start..b.start + b.count, 0, 0..1);
                     }

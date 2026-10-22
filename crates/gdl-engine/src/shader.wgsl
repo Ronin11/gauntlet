@@ -12,6 +12,8 @@ struct Model {
     tint: vec4<f32>,
     // x = 1 when the batch has a lightmap, y = 1 when vertex colours are pre-lit
     params: vec4<f32>,
+    // Texture scroll record: u * x + y, v * z + w (texmod UV scrolls).
+    uv_xf: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -45,7 +47,7 @@ fn vs_main(v: VsIn) -> VsOut {
     o.clip = g.view_proj * world;
     o.normal = normalize((m.transform * vec4<f32>(v.normal, 0.0)).xyz);
     o.color = v.color;
-    o.uv = v.uv;
+    o.uv = vec2<f32>(v.uv.x * m.uv_xf.x + m.uv_xf.y, v.uv.y * m.uv_xf.z + m.uv_xf.w);
     o.lm_uv = v.lm_uv;
     o.world = world.xyz;
     return o;

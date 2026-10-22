@@ -2513,7 +2513,7 @@ impl Game {
                     .filter(|a| a.atrees.iter().any(|t| t.name.eq_ignore_ascii_case(&name)))
                     .and_then(|a| Model::from_anim(objects, textures, a, Some(&name)).ok())
                     .filter(|m| !m.mesh.indices.is_empty())
-                    .or_else(|| Model::from_objects(objects, textures, &[&name]));
+                    .or_else(|| Model::from_objects_anim(objects, textures, anim, &[&name]));
                 let idx = m.map(|m| self.add_model_pub(m));
                 known.insert(name, idx);
                 idx

@@ -2,9 +2,11 @@
 //! object animations that swap whole meshes per frame (grunts, barrels, ...).
 
 use crate::fs::GameFs;
-use crate::mesh::{MeshBuilder, MeshData};
+use crate::gpu::PartFx;
+use crate::mesh::{MeshBuilder, MeshData, TexBank};
+use crate::texanim::{self, SeqState};
 use anyhow::{Context, Result};
-use gdl_formats::anim::{ATree, Anim, Pose, ANIM_OBJECT};
+use gdl_formats::anim::{ATree, Anim, Pose, TexMod, ANIM_OBJECT};
 use gdl_formats::Objects;
 use glam::{Mat4, Vec3};
 
@@ -62,6 +64,83 @@ pub struct Model {
     /// armour plate `<prefix>D<node>`): (part, node).
     alt_parts: Vec<(u16, usize)>,
     pub part_count: usize,
+    /// Sequence texmods and texmod nodes, linked to the mesh's flipbooks and
+    /// parts (None when the model has none).
+    texmods: Option<TexmodLinks>,
+}
+
+/// A texmod node: the parts of its subtree and its flipbook in `MeshData::seq_anims`.
+struct TexmodNode {
+    node: usize,
+    anim: Option<usize>,
+    parts: Vec<u16>,
+}
+
+struct TexmodLinks {
+    /// seq[s][i]: the flipbook of sequence `s`'s texmod `i`.
+    seq: Vec<Vec<Option<usize>>>,
+    nodes: Vec<TexmodNode>,
+    all_parts: Vec<u16>,
+}
+
+impl TexmodLinks {
+    fn new(m: &Model) -> Option<Self> {
+        let skel = &m.skeleton;
+        let has_seq = skel.sequences.iter().any(|s| !s.texmods.is_empty());
+        let has_nodes = skel.nodes.iter().any(|n| n.texmod.is_some());
+        if !has_seq && !has_nodes {
+            return None;
+        }
+        let anim_of = |tm: &TexMod| m.mesh.seq_anims.iter().position(|a| a.texmod == *tm);
+        // The node each part hangs off.
+        let mut part_node: Vec<Option<usize>> = vec![None; m.part_count];
+        let mut set = |p: u16, n: usize| {
+            if let Some(e) = part_node.get_mut(p as usize) {
+                *e = Some(n);
+            }
+        };
+        for (ni, p) in m.node_part.iter().enumerate() {
+            if let Some(p) = p {
+                set(*p, ni);
+            }
+        }
+        for &(p, n) in m.attachments.iter().chain(&m.alt_parts) {
+            set(p, n);
+        }
+        for r in m.runs.iter().flatten() {
+            for &p in &r.parts {
+                set(p, r.node);
+            }
+        }
+        let nodes = skel
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(ni, n)| {
+                let tm = n.texmod.as_ref()?;
+                let parts = part_node
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, pn)| pn.is_some_and(|pn| m.in_subtree(pn, ni)))
+                    .map(|(p, _)| p as u16)
+                    .collect();
+                Some(TexmodNode {
+                    node: ni,
+                    anim: anim_of(tm),
+                    parts,
+                })
+            })
+            .collect();
+        Some(TexmodLinks {
+            seq: skel
+                .sequences
+                .iter()
+                .map(|s| s.texmods.iter().map(anim_of).collect())
+                .collect(),
+            nodes,
+            all_parts: (0..m.part_count as u16).collect(),
+        })
+    }
 }
 
 /// Object names are limited to 15 characters, so compare against a truncated name.
@@ -112,6 +191,27 @@ impl Model {
             .into_iter()
             .next()
             .context("player anim has no atree")?;
+        // The model directory's own ANIM.PS2 carries its texmods (InitTexMods on
+        // the model buffer, player.c), e.g. the wizard's RED_HANDGLOW, whose
+        // frames come from WEAPONS.
+        let texmods = fs
+            .read(&format!("{dir}/ANIM.PS2"))
+            .ok()
+            .and_then(|d| Anim::parse(&d).ok())
+            .map(|a| a.texmods)
+            .unwrap_or_default();
+        let weapons = if texmods.iter().any(|t| t.source == TexMod::EXTERNAL) {
+            fs.read("WEAPONS/objects.ngc")
+                .and_then(|d| Objects::parse(&d))
+                .and_then(|o| Ok((o, fs.read("WEAPONS/textures.ngc")?)))
+                .ok()
+        } else {
+            None
+        };
+        let banks: Vec<TexBank> = weapons
+            .iter()
+            .map(|(objects, textures)| TexBank { objects, textures })
+            .collect();
         Ok(Self::build(
             &objects,
             &textures,
@@ -119,6 +219,7 @@ impl Model {
             &format!("{class}_{color}"),
             Some("WEAP_"),
             &[],
+            (&texmods, &banks),
         ))
     }
 
@@ -146,7 +247,15 @@ impl Model {
         .with_context(|| format!("animation tree {tree:?} not found"))?
         .clone();
         let prefix = skeleton.prefix.clone();
-        Ok(Self::build(objects, textures, skeleton, &prefix, None, &[]))
+        Ok(Self::build(
+            objects,
+            textures,
+            skeleton,
+            &prefix,
+            None,
+            &[],
+            (&anim.texmods, &[]),
+        ))
     }
 
     /// [`Model::from_anim`] plus replacement objects for some nodes, by name
@@ -176,10 +285,18 @@ impl Model {
             })
             .collect();
         Ok(Self::build(
-            objects, textures, skeleton, &prefix, None, &alts,
+            objects,
+            textures,
+            skeleton,
+            &prefix,
+            None,
+            &alts,
+            (&anim.texmods, &[]),
         ))
     }
 
+    /// `texmods`: the bank's texmod table and the other banks external
+    /// texmods may draw from (see [`MeshBuilder::with_texmods`]).
     fn build(
         objects: &Objects,
         textures: &[u8],
@@ -187,8 +304,9 @@ impl Model {
         prefix: &str,
         weapon: Option<&str>,
         alts: &[(usize, &str)],
+        texmods: (&[TexMod], &[TexBank]),
     ) -> Self {
-        let mut b = MeshBuilder::new(objects, textures);
+        let mut b = MeshBuilder::new(objects, textures).with_texmods(texmods.0, texmods.1);
         let mut next_part: u16 = 0;
         let mut node_part = vec![None; skeleton.nodes.len()];
         let defs = &objects.object_defs;
@@ -284,7 +402,7 @@ impl Model {
             }
         }
 
-        Model {
+        let mut model = Model {
             mesh: b.finish(),
             skeleton,
             node_part,
@@ -292,12 +410,73 @@ impl Model {
             runs,
             alt_parts,
             part_count: next_part as usize,
+            texmods: None,
+        };
+        model.texmods = TexmodLinks::new(&model);
+        model
+    }
+
+    /// Effects of the sequence texmods and texmod nodes on each part at frame
+    /// `frame` of sequence `seq` (the texmod half of `DoAnimateTree` /
+    /// `AnimateNode`); empty when the model has none.
+    pub fn texmod_fx(&self, seq: usize, frame: f32) -> Vec<PartFx> {
+        let (Some(links), Some(s)) = (&self.texmods, self.skeleton.sequences.get(seq)) else {
+            return Vec::new();
+        };
+        let mut fx = vec![PartFx::default(); self.part_count];
+        // (s32)(0.5 + frame), counted from the end for reversed sequences.
+        let mut f = (0.5 + frame as f64) as i32;
+        if s.flags & 1 != 0 {
+            f = s.frame_count as i32 - f - 1;
         }
+        let apply = |fx: &mut [PartFx], state: SeqState, anim: Option<usize>, parts: &[u16]| {
+            for &p in parts {
+                let Some(e) = fx.get_mut(p as usize) else {
+                    continue;
+                };
+                match state {
+                    SeqState::Frame(n) => e.alt = anim.map(|a| (a, n)),
+                    SeqState::Uv(uv) => e.uv = Some(uv),
+                    SeqState::Alpha(a) => e.alpha = Some(a),
+                    SeqState::None => {}
+                }
+            }
+        };
+        // DoSeqTexMods on the root: the whole tree.
+        let ids = links.seq.get(seq).map_or(&[][..], |v| v);
+        for (state, &anim) in texanim::seq_states(&s.texmods, s.repeat, f)
+            .into_iter()
+            .zip(ids)
+        {
+            apply(&mut fx, state, anim, &links.all_parts);
+        }
+        // AnimateNode: each texmod node on its own subtree.
+        for n in &links.nodes {
+            if let Some(tm) = &self.skeleton.nodes[n.node].texmod {
+                apply(&mut fx, texanim::seq_state(tm, f), n.anim, &n.parts);
+            }
+        }
+        if fx.iter().all(|e| *e == PartFx::default()) {
+            return Vec::new();
+        }
+        fx
     }
 
     /// A static (non-animated) model made of the named objects.
     pub fn from_objects(objects: &Objects, textures: &[u8], names: &[&str]) -> Option<Self> {
-        let mut b = MeshBuilder::new(objects, textures);
+        Self::from_objects_anim(objects, textures, None, names)
+    }
+
+    /// [`Model::from_objects`], with the bank's texture animations (the global
+    /// texmods of its ANIM.PS2) when given.
+    pub fn from_objects_anim(
+        objects: &Objects,
+        textures: &[u8],
+        anim: Option<&Anim>,
+        names: &[&str],
+    ) -> Option<Self> {
+        let texmods = anim.map_or(&[][..], |a| &a.texmods);
+        let mut b = MeshBuilder::new(objects, textures).with_texmods(texmods, &[]);
         let mut any = false;
         for n in names {
             if let Some(obj) = objects.object_by_name(n) {
@@ -320,6 +499,7 @@ impl Model {
             runs: Vec::new(),
             alt_parts: Vec::new(),
             part_count: 1,
+            texmods: None,
         })
     }
 
@@ -530,5 +710,56 @@ impl Animator {
             }
             self.finished = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::TexAnimKind;
+
+    fn bank(dir: &str) -> Option<(Objects, Vec<u8>, Anim)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        let fs = GameFs::open(&root).ok()?;
+        Some((
+            Objects::parse(&fs.read(&format!("{dir}/objects.ngc")).ok()?).ok()?,
+            fs.read(&format!("{dir}/textures.ngc")).ok()?,
+            Anim::parse(&fs.read(&format!("{dir}/ANIM.PS2")).ok()?).ok()?,
+        ))
+    }
+
+    #[test]
+    fn sequence_texmods_flip_the_coin() {
+        let Some((objects, textures, anim)) = bank("ITEMS/levelC5") else {
+            eprintln!("game data not found; skipping");
+            return;
+        };
+        let m = Model::from_anim(&objects, &textures, &anim, Some("COIN_GOLD")).unwrap();
+        // ACTIVE's texmod flips NEL_COIN through NEL_COIN00..28.
+        let id = m
+            .mesh
+            .seq_anims
+            .iter()
+            .position(|a| a.texmod.name == "NEL_COIN")
+            .expect("NEL_COIN flipbook");
+        let TexAnimKind::Flip(frames) = &m.mesh.seq_anims[id].kind else {
+            panic!()
+        };
+        assert_eq!(frames.len(), 29);
+        let seq = m.sequence("ACTIVE").unwrap();
+        // Frame 6.6 rounds to 7 ((s32)(0.5 + frame)); rate 1.
+        let fx = m.texmod_fx(seq, 6.6);
+        assert_eq!(fx.len(), m.part_count);
+        assert!(fx.iter().all(|e| e.alt == Some((id, 7))));
+        // A model without texmods costs nothing.
+        let Some((objects, textures, anim)) = bank("MONSTERS/GRU") else {
+            return;
+        };
+        let m = Model::from_anim(&objects, &textures, &anim, Some("GRU1")).unwrap();
+        assert!(m.texmod_fx(0, 3.0).is_empty());
+        // The grunt's thrown bomb flips BOMB00..04 with its flight sequence.
+        let m = Model::from_anim(&objects, &textures, &anim, Some("GRU_BOMB")).unwrap();
+        let fx = m.texmod_fx(0, 3.0);
+        assert!(!fx.is_empty() && fx.iter().all(|e| e.alt.map(|a| a.1) == Some(3)));
     }
 }
