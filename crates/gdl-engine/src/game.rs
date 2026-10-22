@@ -30,6 +30,8 @@ const ATTACK_ARC_COS: f32 = 0.25;
 const ENEMY_ACTIVATE_DIST: f32 = 60.0;
 const GENERATOR_ACTIVATE_DIST: f32 = 40.0;
 const MAX_ENEMIES: usize = 48;
+const PROJECTILE_SPEED: f32 = 42.0;
+const PROJECTILE_LIFE: f32 = 0.9;
 /// Players are kept within this distance of the group's centre (stay on screen).
 const PARTY_RADIUS: f32 = 13.0;
 
@@ -54,8 +56,14 @@ impl Rng {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PlayerState {
     Normal,
-    Attacking { seq: usize, hit_done: bool },
-    Dead { timer: f32 },
+    Attacking {
+        seq: usize,
+        hit_done: bool,
+        ranged: bool,
+    },
+    Dead {
+        timer: f32,
+    },
 }
 
 pub struct Player {
@@ -71,6 +79,8 @@ pub struct Player {
     pub potions: u32,
     pub score: u32,
     pub hurt_flash: f32,
+    /// Model thrown by this hero's ranged attack.
+    pub proj_model: Option<usize>,
     walk_phase: u8,
 }
 
@@ -82,6 +92,7 @@ pub struct PlayerSeqs {
     attack: Vec<usize>,
     falling: Option<usize>,
     death: Option<usize>,
+    throw: Option<usize>,
 }
 
 impl PlayerSeqs {
@@ -98,6 +109,7 @@ impl PlayerSeqs {
                 .collect(),
             falling: s("FALLING"),
             death: s("DEATH"),
+            throw: s("THROW1").or(s("SSHOT1")).or(s("MAGICS")),
         }
     }
 }
@@ -184,6 +196,12 @@ pub enum Kind {
     },
     Hazard {
         radius: f32,
+        damage: f32,
+    },
+    Projectile {
+        owner: usize,
+        vel: Vec3,
+        life: f32,
         damage: f32,
     },
     Prop,
@@ -407,8 +425,34 @@ impl Game {
                 potions: 0,
                 score: 0,
                 hurt_flash: 0.0,
+                proj_model: None,
                 walk_phase: 0,
             });
+        }
+        // Ranged-attack projectile: the class's throw model, else its weapon.
+        for (i, (class, color)) in classes.iter().enumerate() {
+            let dir = format!("PLAYERS/{class}/{color}");
+            let Some(asset) = load_asset(fs, &dir) else {
+                continue;
+            };
+            let throw = asset
+                .objects
+                .object_defs
+                .iter()
+                .find(|d| d.name.contains("_THROW0"))
+                .or_else(|| {
+                    asset
+                        .objects
+                        .object_defs
+                        .iter()
+                        .find(|d| d.name.starts_with("WEAP_"))
+                })
+                .map(|d| d.name.clone());
+            if let Some(name) = throw {
+                if let Some(m) = Model::from_objects(&asset.objects, &asset.textures, &[&name]) {
+                    game.players[i].proj_model = Some(game.add_model(m));
+                }
+            }
         }
         game.cam_focus = game.players.first().map(|p| p.pos).unwrap_or(Vec3::ZERO);
         game.populate(fs, classes.len());
@@ -873,6 +917,18 @@ impl Game {
     fn update_players(&mut self, dt: f32, inputs: &[PlayerInput]) {
         let (fwd, right) = self.camera_basis();
         let mut attacks: Vec<(usize, Vec3, f32, f32)> = Vec::new();
+        let mut throws: Vec<(usize, Vec3, f32)> = Vec::new();
+        // Things a melee swing could hit, to choose between melee and a throw.
+        let targets: Vec<Vec3> = self
+            .entities
+            .iter()
+            .filter(|e| match &e.kind {
+                Kind::Enemy { state, .. } => !matches!(state, EnemyState::Dying { .. }),
+                Kind::Generator { .. } | Kind::Container { .. } => true,
+                _ => false,
+            })
+            .map(|e| e.pos)
+            .collect();
         for (i, p) in self.players.iter_mut().enumerate() {
             let inp = inputs.get(i).copied().unwrap_or_default();
             let seqs = &self.player_seqs[p.model];
@@ -904,11 +960,20 @@ impl Game {
             }
 
             // Attacks interrupt movement until the swing finishes.
-            if let PlayerState::Attacking { seq, hit_done } = &mut p.state {
+            if let PlayerState::Attacking {
+                seq,
+                hit_done,
+                ranged,
+            } = &mut p.state
+            {
                 let frames = model.skeleton.sequences[*seq].frame_count.max(1) as f32;
                 if !*hit_done && p.animator.frame >= frames * 0.4 {
                     *hit_done = true;
-                    attacks.push((i, p.pos, p.yaw, 10.0));
+                    if *ranged {
+                        throws.push((i, p.pos, p.yaw));
+                    } else {
+                        attacks.push((i, p.pos, p.yaw, 10.0));
+                    }
                 }
                 if p.animator.finished {
                     p.state = PlayerState::Normal;
@@ -918,13 +983,31 @@ impl Game {
                 && p.state == PlayerState::Normal
                 && !seqs.attack.is_empty()
             {
-                let seq = seqs.attack[(self.time * 7.0) as usize % seqs.attack.len()];
+                // Aim with the stick if it's held, then melee anything in reach or throw.
+                let aim = fwd * inp.stick.y + right * inp.stick.x;
+                if aim.length() > 0.3 {
+                    p.yaw = aim.x.atan2(aim.y);
+                }
+                let facing = Vec2::new(p.yaw.sin(), p.yaw.cos());
+                let in_reach = targets.iter().any(|t| {
+                    let d = Vec2::new(t.x - p.pos.x, t.z - p.pos.z);
+                    let dist = d.length();
+                    dist < ATTACK_RANGE + 1.0
+                        && (t.y - p.pos.y).abs() < 5.0
+                        && (dist < 1.0 || d.normalize().dot(facing) > ATTACK_ARC_COS)
+                });
+                let ranged = !in_reach && p.proj_model.is_some();
+                let seq = match (ranged, seqs.throw) {
+                    (true, Some(t)) => t,
+                    _ => seqs.attack[(self.time * 7.0) as usize % seqs.attack.len()],
+                };
                 p.state = PlayerState::Attacking {
                     seq,
                     hit_done: false,
+                    ranged,
                 };
                 p.animator.restart(seq);
-                p.animator.speed = 1.6;
+                p.animator.speed = if ranged { 2.0 } else { 1.6 };
             }
 
             let wish = fwd * inp.stick.y + right * inp.stick.x;
@@ -1015,6 +1098,21 @@ impl Game {
         for (pi, pos, yaw, dmg) in attacks {
             self.player_attack(pi, pos, yaw, dmg);
         }
+        for (pi, pos, yaw) in throws {
+            let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+            let model = self.players[pi].proj_model;
+            self.spawn(
+                Kind::Projectile {
+                    owner: pi,
+                    vel: dir * PROJECTILE_SPEED,
+                    life: PROJECTILE_LIFE,
+                    damage: 10.0,
+                },
+                model,
+                pos + Vec3::Y * 2.5 + dir * 1.2,
+                yaw,
+            );
+        }
     }
 
     fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, dmg: f32) {
@@ -1036,42 +1134,58 @@ impl Game {
             if dist > 1.0 && d.normalize().dot(dir) < ATTACK_ARC_COS {
                 continue;
             }
-            match &mut e.kind {
-                Kind::Enemy { hp, state, .. } => {
-                    if matches!(state, EnemyState::Dying { .. }) {
-                        continue;
-                    }
-                    *hp -= dmg;
-                    if *hp <= 0.0 {
-                        *state = EnemyState::Dying { timer: 0.5 };
-                        score += 10;
-                    } else {
-                        *state = EnemyState::Hurt { timer: 0.3 };
-                    }
-                    // Knock back.
-                    let push = if dist > 0.01 { d / dist } else { dir };
-                    e.pos.x += push.x * 1.2;
-                    e.pos.z += push.y * 1.2;
-                }
-                Kind::Generator { hp, .. } => {
-                    *hp -= dmg;
-                    if *hp <= 0.0 {
-                        e.alive = false;
-                        score += 100;
-                    }
-                }
-                Kind::Container { hp, drop } => {
-                    *hp -= dmg;
-                    if *hp <= 0.0 {
-                        e.alive = false;
-                        score += 5;
-                        drops.push((e.pos, *drop));
-                    }
-                }
-                _ => {}
-            }
+            let push = if dist > 0.01 { d / dist } else { dir };
+            let (sc, drop) = Self::apply_hit(e, dmg, push);
+            score += sc;
+            drops.extend(drop);
         }
         self.players[pi].score += score;
+        self.spawn_drops(drops);
+    }
+
+    /// Damage one entity. Returns score earned and a container drop, if it broke.
+    fn apply_hit(e: &mut Entity, dmg: f32, push: Vec2) -> (u32, Option<(Vec3, Option<usize>)>) {
+        match &mut e.kind {
+            Kind::Enemy { hp, state, .. } => {
+                if matches!(state, EnemyState::Dying { .. }) {
+                    return (0, None);
+                }
+                *hp -= dmg;
+                let score = if *hp <= 0.0 {
+                    *state = EnemyState::Dying { timer: 0.5 };
+                    10
+                } else {
+                    *state = EnemyState::Hurt { timer: 0.3 };
+                    0
+                };
+                // Knock back.
+                e.pos.x += push.x * 1.2;
+                e.pos.z += push.y * 1.2;
+                (score, None)
+            }
+            Kind::Generator { hp, .. } => {
+                *hp -= dmg;
+                if *hp <= 0.0 {
+                    e.alive = false;
+                    (100, None)
+                } else {
+                    (0, None)
+                }
+            }
+            Kind::Container { hp, drop } => {
+                *hp -= dmg;
+                if *hp <= 0.0 {
+                    e.alive = false;
+                    (5, Some((e.pos, *drop)))
+                } else {
+                    (0, None)
+                }
+            }
+            _ => (0, None),
+        }
+    }
+
+    fn spawn_drops(&mut self, drops: Vec<(Vec3, Option<usize>)>) {
         for (pos, drop) in drops {
             // Containers drop their item, or some gold.
             let kind = match drop.and_then(|i| self.level.worlds.item_infos.get(i)) {
@@ -1119,6 +1233,7 @@ impl Game {
         let mut opened: Vec<(usize, usize)> = Vec::new();
         let mut key_used: Vec<usize> = Vec::new();
         let mut exit: Option<String> = None;
+        let mut proj_hits: Vec<(usize, usize, f32, Vec2)> = Vec::new();
 
         for ei in 0..self.entities.len() {
             if !self.entities[ei].alive {
@@ -1283,6 +1398,28 @@ impl Game {
                         exit = Some(next.clone());
                     }
                 }
+                Kind::Projectile {
+                    owner,
+                    vel,
+                    life,
+                    damage: dmg,
+                } => {
+                    *life -= dt;
+                    let from = e.pos;
+                    let to = from + *vel * dt;
+                    if *life <= 0.0 || self.collision.raycast(from, to).is_some() {
+                        e.alive = false;
+                    } else {
+                        e.pos = to;
+                        e.spin += dt * 20.0;
+                        proj_hits.push((
+                            ei,
+                            *owner,
+                            *dmg,
+                            Vec2::new(vel.x, vel.z).normalize_or_zero(),
+                        ));
+                    }
+                }
                 Kind::Hazard {
                     radius,
                     damage: dmg,
@@ -1304,6 +1441,33 @@ impl Game {
                 }
             }
         }
+
+        // Projectiles hit the first damageable thing they touch.
+        let mut drops = Vec::new();
+        for (pidx, owner, dmg, dir) in proj_hits {
+            let ppos = self.entities[pidx].pos;
+            let target = (0..self.entities.len()).find(|&t| {
+                let e = &self.entities[t];
+                let r = match &e.kind {
+                    Kind::Enemy { state, .. } if !matches!(state, EnemyState::Dying { .. }) => 1.4,
+                    Kind::Generator { .. } => 2.2,
+                    Kind::Container { .. } => 1.6,
+                    _ => return false,
+                };
+                e.alive
+                    && Vec2::new(e.pos.x - ppos.x, e.pos.z - ppos.z).length() < r
+                    && (e.pos.y + 2.0 - ppos.y).abs() < 3.5
+            });
+            if let Some(t) = target {
+                let (sc, drop) = Self::apply_hit(&mut self.entities[t], dmg, dir);
+                if let Some(p) = self.players.get_mut(owner) {
+                    p.score += sc;
+                }
+                drops.extend(drop);
+                self.entities[pidx].alive = false;
+            }
+        }
+        self.spawn_drops(drops);
 
         // Monsters can't walk through doors, barrels and generators either.
         let moved: Vec<(usize, Vec3)> = (0..self.entities.len())
@@ -1475,6 +1639,15 @@ impl Game {
         let d = Vec2::new(to.x, to.z);
         let fighting = !matches!(t.kind, Kind::Pickup { .. });
         let close = d.length() < if fighting { 3.5 } else { 0.5 };
+        if fighting && !close && d.length() < 22.0 && (self.time * 3.0).fract() < 0.5 {
+            // In throwing range: face the target and fire.
+            return PlayerInput {
+                stick: d.normalize_or_zero() * 0.35,
+                attack: true,
+                attack_pressed: true,
+                ..Default::default()
+            };
+        }
         PlayerInput {
             stick: if close && fighting {
                 d.normalize_or_zero() * 0.06
@@ -1505,5 +1678,99 @@ impl Game {
             .filter(|e| matches!(e.kind, Kind::Pickup { .. }))
             .count();
         format!("enemies {enemies} generators {gens} pickups {pick}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data() -> Option<GameFs> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        GameFs::open(&root).ok()
+    }
+
+    #[test]
+    fn thrown_weapon_kills_grunt() {
+        let Some(fs) = data() else {
+            eprintln!("game data not found; skipping");
+            return;
+        };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        assert!(
+            g.players[0].proj_model.is_some(),
+            "warrior has a throw model"
+        );
+        g.entities.clear();
+        // Let the player settle on the ground, facing +z.
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = g.players[0].pos;
+        let class = g
+            .classes
+            .iter()
+            .position(|c| c.name == "GRU")
+            .expect("grunts loaded");
+        let model = g.classes[class].model(1);
+        let id = g.spawn(
+            Kind::Enemy {
+                class,
+                strength: 1,
+                hp: 10.0,
+                state: EnemyState::Idle,
+                cooldown: 99.0,
+                speed: 0.0,
+            },
+            model,
+            p + Vec3::new(0.0, 0.0, 12.0),
+            0.0,
+        );
+        let fire = PlayerInput {
+            stick: Vec2::new(0.0, 0.4),
+            attack: true,
+            attack_pressed: true,
+            ..Default::default()
+        };
+        for _ in 0..120 {
+            g.update(1.0 / 60.0, &[fire]);
+            if !g.entities.iter().any(|e| e.id == id) {
+                break;
+            }
+        }
+        assert!(
+            !g.entities.iter().any(|e| e.id == id),
+            "grunt should be dead"
+        );
+        assert!(g.players[0].score >= 10);
+    }
+
+    #[test]
+    fn locked_gate_blocks_until_key() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.retain(|e| matches!(e.kind, Kind::Door { .. }));
+        let walk = PlayerInput {
+            stick: Vec2::new(0.0, 1.0),
+            ..Default::default()
+        };
+        for _ in 0..400 {
+            g.update(1.0 / 60.0, &[walk]);
+        }
+        assert!(
+            g.players[0].pos.z < 27.0,
+            "gate at z=27.9 should block, got {}",
+            g.players[0].pos.z
+        );
+        g.players[0].keys = 1;
+        for _ in 0..200 {
+            g.update(1.0 / 60.0, &[walk]);
+        }
+        assert!(
+            g.players[0].pos.z > 29.0,
+            "gate should open with a key, got {}",
+            g.players[0].pos.z
+        );
+        assert_eq!(g.players[0].keys, 0);
     }
 }

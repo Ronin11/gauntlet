@@ -188,17 +188,3 @@ impl<'a> MeshBuilder<'a> {
         self.data
     }
 }
-
-impl MeshData {
-    /// Copy of the geometry and textures (used where the original stays owned elsewhere).
-    pub fn clone_shallow(&self) -> MeshData {
-        MeshData {
-            vertices: self.vertices.clone(),
-            indices: self.indices.clone(),
-            batches: self.batches.clone(),
-            textures: self.textures.clone(),
-            bounds_min: self.bounds_min,
-            bounds_max: self.bounds_max,
-        }
-    }
-}

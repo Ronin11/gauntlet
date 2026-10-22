@@ -106,9 +106,14 @@ impl Select {
     }
 
     pub fn draw(&self, c: &mut Canvas, time: f32) {
-        let scale = (c.height() / 360.0).min(c.width() / 560.0).clamp(1.0, 4.0).floor();
+        let scale = (c.height() / 360.0)
+            .min(c.width() / 560.0)
+            .clamp(1.0, 4.0)
+            .floor();
         let title = "GAUNTLET  DARK LEGACY";
-        let s = (scale * 3.0).min((c.width() * 0.95 / (title.len() as f32 * 8.0)).floor()).max(1.0);
+        let s = (scale * 3.0)
+            .min((c.width() * 0.95 / (title.len() as f32 * 8.0)).floor())
+            .max(1.0);
         c.text_shadow(
             (c.width() - title.len() as f32 * 8.0 * s) * 0.5,
             c.height() * 0.1,
