@@ -160,7 +160,10 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
     let fs = open_fs(args)?;
     let (class, color) = spec.split_once('/').unwrap_or((spec, "RED"));
     let cm = if class.eq_ignore_ascii_case("monster") {
-        let (dir, tree) = color.split_once(':').map(|(d, t)| (d, Some(t))).unwrap_or((color, None));
+        let (dir, tree) = color
+            .split_once(':')
+            .map(|(d, t)| (d, Some(t)))
+            .unwrap_or((color, None));
         character::Model::load_monster(&fs, dir, tree)?
     } else {
         character::Model::load_player(&fs, class, color)?
@@ -222,7 +225,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
     }
     let gpu = headless_gpu()?;
     let mut sc = scene::Scene::new(&gpu, &g)?;
-    sc.sync(&g);
+    sc.sync(&gpu, &g);
     let (w, h) = args.size;
     let mut globals = sc.globals(&g, w as f32 / h as f32);
     if let (Some(eye), Some(at)) = (args.eye, args.at) {

@@ -171,7 +171,7 @@ impl ApplicationHandler for App {
                     r.acc -= TICK;
                 }
 
-                r.scene.sync(&r.game);
+                r.scene.sync(&r.gpu, &r.game);
                 let frame = match r.surface.get_current_texture() {
                     Ok(f) => f,
                     Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {

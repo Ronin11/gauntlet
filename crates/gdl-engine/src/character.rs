@@ -74,8 +74,18 @@ impl Model {
         let dir = format!("PLAYERS/{class}/{color}");
         let objects = Objects::parse(&fs.read(&format!("{dir}/objects.ngc"))?)?;
         let textures = fs.read(&format!("{dir}/textures.ngc"))?;
-        let skeleton = anim.atrees.into_iter().next().context("player anim has no atree")?;
-        Ok(Self::build(&objects, &textures, skeleton, &format!("{class}_{color}"), Some("WEAP_")))
+        let skeleton = anim
+            .atrees
+            .into_iter()
+            .next()
+            .context("player anim has no atree")?;
+        Ok(Self::build(
+            &objects,
+            &textures,
+            skeleton,
+            &format!("{class}_{color}"),
+            Some("WEAP_"),
+        ))
     }
 
     /// Load the main animation tree of a monster directory (`MONSTERS/GRU`), picking
@@ -85,21 +95,33 @@ impl Model {
         let anim = Anim::parse(&fs.read(&format!("{path}/ANIM.PS2"))?)?;
         let objects = Objects::parse(&fs.read(&format!("{path}/objects.ngc"))?)?;
         let textures = fs.read(&format!("{path}/textures.ngc"))?;
-        Self::from_anim(&objects, &textures, anim, tree)
+        Self::from_anim(&objects, &textures, &anim, tree)
     }
 
     /// Build a model from an already-parsed objects/anim pair.
-    pub fn from_anim(objects: &Objects, textures: &[u8], anim: Anim, tree: Option<&str>) -> Result<Self> {
+    pub fn from_anim(
+        objects: &Objects,
+        textures: &[u8],
+        anim: &Anim,
+        tree: Option<&str>,
+    ) -> Result<Self> {
         let skeleton = match tree {
-            Some(t) => anim.atrees.into_iter().find(|a| a.name.eq_ignore_ascii_case(t)),
-            None => anim.atrees.into_iter().max_by_key(|t| t.sequences.len()),
+            Some(t) => anim.atrees.iter().find(|a| a.name.eq_ignore_ascii_case(t)),
+            None => anim.atrees.iter().max_by_key(|t| t.sequences.len()),
         }
-        .context("animation tree not found")?;
+        .with_context(|| format!("animation tree {tree:?} not found"))?
+        .clone();
         let prefix = skeleton.prefix.clone();
         Ok(Self::build(objects, textures, skeleton, &prefix, None))
     }
 
-    fn build(objects: &Objects, textures: &[u8], skeleton: ATree, prefix: &str, weapon: Option<&str>) -> Self {
+    fn build(
+        objects: &Objects,
+        textures: &[u8],
+        skeleton: ATree,
+        prefix: &str,
+        weapon: Option<&str>,
+    ) -> Self {
         let mut b = MeshBuilder::new(objects, textures);
         let mut next_part: u16 = 0;
         let mut node_part = vec![None; skeleton.nodes.len()];
@@ -111,7 +133,11 @@ impl Model {
                 continue;
             }
             let full = format!("{prefix}{}", node.name);
-            if let Some((oi, _)) = defs.iter().enumerate().find(|(_, d)| name_matches(&d.name, &full)) {
+            if let Some((oi, _)) = defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| name_matches(&d.name, &full))
+            {
                 if let Some(obj) = objects.objects.get(defs[oi].obj_index.max(0) as usize) {
                     b.add_part(obj, Mat4::IDENTITY, next_part);
                     node_part[ni] = Some(next_part);
@@ -122,7 +148,10 @@ impl Model {
 
         // Weapon attached to the right wrist (first of the upgrade models).
         let mut attachments = Vec::new();
-        if let (Some(w), Some(wrist)) = (weapon, skeleton.nodes.iter().position(|n| n.name == "R_WRIST")) {
+        if let (Some(w), Some(wrist)) = (
+            weapon,
+            skeleton.nodes.iter().position(|n| n.name == "R_WRIST"),
+        ) {
             if let Some(d) = defs.iter().find(|d| d.name.starts_with(w)) {
                 if let Some(obj) = objects.objects.get(d.obj_index.max(0) as usize) {
                     b.add_part(obj, Mat4::IDENTITY, next_part);
@@ -136,9 +165,13 @@ impl Model {
         let mut runs = vec![Vec::new(); skeleton.sequences.len()];
         let mut by_prefix: std::collections::HashMap<String, Vec<u16>> = Default::default();
         for (ni, node) in skeleton.nodes.iter().enumerate() {
-            let Some(first) = node.obj_anim_first else { continue };
+            let Some(first) = node.obj_anim_first else {
+                continue;
+            };
             for (si, run) in runs.iter_mut().enumerate() {
-                let Some(oa) = skeleton.obj_anims.get(first + si) else { continue };
+                let Some(oa) = skeleton.obj_anims.get(first + si) else {
+                    continue;
+                };
                 let p = oa.prefix().to_string();
                 let parts = by_prefix
                     .entry(p.clone())
@@ -162,12 +195,50 @@ impl Model {
                     })
                     .clone();
                 if !parts.is_empty() {
-                    run.push(FrameRun { node: ni, frame_count: oa.frame_count.max(1) as usize, parts });
+                    run.push(FrameRun {
+                        node: ni,
+                        frame_count: oa.frame_count.max(1) as usize,
+                        parts,
+                    });
                 }
             }
         }
 
-        Model { mesh: b.finish(), skeleton, node_part, attachments, runs, part_count: next_part as usize }
+        Model {
+            mesh: b.finish(),
+            skeleton,
+            node_part,
+            attachments,
+            runs,
+            part_count: next_part as usize,
+        }
+    }
+
+    /// A static (non-animated) model made of the named objects.
+    pub fn from_objects(objects: &Objects, textures: &[u8], names: &[&str]) -> Option<Self> {
+        let mut b = MeshBuilder::new(objects, textures);
+        let mut any = false;
+        for n in names {
+            if let Some(obj) = objects.object_by_name(n) {
+                b.add_part(obj, Mat4::IDENTITY, 0);
+                any = true;
+            }
+        }
+        any.then(|| Model {
+            mesh: b.finish(),
+            skeleton: ATree {
+                name: names.first().map(|s| s.to_string()).unwrap_or_default(),
+                prefix: String::new(),
+                nodes: Vec::new(),
+                sequences: Vec::new(),
+                tracks: Vec::new(),
+                obj_anims: Vec::new(),
+            },
+            node_part: Vec::new(),
+            attachments: Vec::new(),
+            runs: Vec::new(),
+            part_count: 1,
+        })
     }
 
     pub fn sequence(&self, name: &str) -> Option<usize> {
@@ -213,10 +284,17 @@ impl Model {
         let mut world: Vec<Mat4> = Vec::with_capacity(nodes.len());
         for (i, n) in nodes.iter().enumerate() {
             let p = poses.get(i).copied().unwrap_or_default();
-            let rot = if p.pyr_order { pyr_matrix(p.pyr) } else { ryp_matrix(p.pyr) };
+            let rot = if p.pyr_order {
+                pyr_matrix(p.pyr)
+            } else {
+                ryp_matrix(p.pyr)
+            };
             let t = Vec3::from(n.init_pos) + Vec3::from(p.xyz);
             let local = Mat4::from_translation(t) * rot * Mat4::from_scale(Vec3::from(p.scale));
-            let parent = usize::try_from(n.parent).ok().filter(|&pi| pi < i).map(|pi| world[pi]);
+            let parent = usize::try_from(n.parent)
+                .ok()
+                .filter(|&pi| pi < i)
+                .map(|pi| world[pi]);
             world.push(parent.map_or(local, |pm| pm * local));
         }
         world
@@ -236,7 +314,13 @@ pub struct Animator {
 
 impl Animator {
     pub fn new(seq: usize) -> Self {
-        Animator { seq, frame: 0.0, speed: 1.0, finished: false, force_loop: false }
+        Animator {
+            seq,
+            frame: 0.0,
+            speed: 1.0,
+            finished: false,
+            force_loop: false,
+        }
     }
 
     pub fn play(&mut self, seq: usize) {
@@ -252,7 +336,9 @@ impl Animator {
     }
 
     pub fn update(&mut self, skel: &ATree, dt: f32) {
-        let Some(s) = skel.sequences.get(self.seq) else { return };
+        let Some(s) = skel.sequences.get(self.seq) else {
+            return;
+        };
         let frames = s.frame_count.max(1) as f32;
         if s.repeat || self.force_loop {
             // For looping sequences `finished` pulses for one update per loop.
