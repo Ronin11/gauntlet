@@ -790,7 +790,22 @@ pub enum Kind {
         id: u8,
     },
     Prop,
+    /// items.c obstacles 0x28/0x31/0x34/0x35: a rock that falls (or sinks)
+    /// once a hero comes within its radius (fn_8005D730), or once shot (0x34).
+    Faller {
+        sub: i32,
+        active: bool,
+        vel: Vec3,
+        /// Tumble rate (rad/s): lbl_8011C904[index & 7] x the subtype's rate.
+        tumble: f32,
+        radius: f32,
+        height: f32,
+        tris: Option<(usize, usize)>,
+    },
 }
+
+/// lbl_8011C904: the fallers' tumble multipliers.
+const FALLER_TUMBLE: [f32; 8] = [-4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0];
 
 /// Solid collision shape of an entity, from its item info.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2252,6 +2267,52 @@ impl Game {
                         yaw,
                     );
                 }
+                // SetItem case 10: params[0] overrides the subtype.
+                ItemType::Obstacle
+                    if matches!(
+                        if p16(0) > 0 {
+                            p16(0) as i32
+                        } else {
+                            info.subtype
+                        },
+                        0x28 | 0x31 | 0x34 | 0x35
+                    ) && info.name.is_empty() =>
+                {
+                    let sub = if p16(0) > 0 {
+                        p16(0) as i32
+                    } else {
+                        info.subtype
+                    };
+                    // The model is the level object the instance names.
+                    let model = Model::from_objects(
+                        &self.level.objects,
+                        &self.level.textures_file,
+                        &[&inst.name],
+                    )
+                    .map(|m| self.add_model(m));
+                    let rate = match sub {
+                        0x31 => 0.174_532_93,
+                        0x35 => 0.017_453_292,
+                        _ => 0.349_065_85,
+                    };
+                    let i = self.entities.len();
+                    let tris = (inst.coll_tri_count > 0 && inst.coll_tri_index >= 0)
+                        .then(|| (inst.coll_tri_index as usize, inst.coll_tri_count as usize));
+                    self.spawn(
+                        Kind::Faller {
+                            sub,
+                            active: false,
+                            vel: Vec3::ZERO,
+                            tumble: rate * FALLER_TUMBLE[i & 7],
+                            radius: info.radius,
+                            height: info.height,
+                            tris,
+                        },
+                        model,
+                        pos,
+                        0.0,
+                    );
+                }
                 ItemType::Container | ItemType::Obstacle => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     if model.is_none() {
@@ -2591,6 +2652,14 @@ impl Game {
         self.damage_from = (knock != 0).then_some(self.players[pi].pos - dv);
         self.damage_player(pi, dmg, knock);
         self.damage_from = None;
+        // AudioWorldHitPlyr (lbl_801240DC by realm).
+        if knock == DmgType::KNOCKDOWN {
+            match self.wave.map(|w| w >> 8) {
+                Some(9) => self.sfx.push("S_MINECARPHIT".into()),
+                Some(15) => self.sfx.push("S_GENKILLA".into()),
+                _ => {}
+            }
+        }
     }
 
     fn snap_to_ground(collision: &Collision, pos: &mut Vec3, vy: &mut f32, dt: f32) -> bool {
@@ -4353,6 +4422,8 @@ impl Game {
             .filter(|&pi| player_pos.get(pi).is_some_and(|p| p.1));
         let mut barrier_touches = Vec::new();
         let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32)> = Vec::new();
+        let mut fallers_started: Vec<(i32, Option<(usize, usize)>)> = Vec::new();
+        let mut fallers_moved: Vec<((usize, usize), Vec3)> = Vec::new();
         // Which damage tiles are on screen (off-screen ones pause their cycle).
         let hazard_vis: HashSet<u64> = self
             .entities
@@ -5005,6 +5076,44 @@ impl Game {
                         ));
                     }
                 }
+                Kind::Faller {
+                    sub,
+                    active,
+                    vel,
+                    tumble,
+                    radius,
+                    height,
+                    tris,
+                } => {
+                    // fn_8005D730 via fn_8005F0F4: a hero within its cylinder
+                    // sets it off (not the shot-down kind).
+                    if !*active
+                        && *sub != 0x34
+                        && player_pos.iter().any(|(pp, alive)| {
+                            *alive
+                                && Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length()
+                                    <= *radius + PLAYER_RADIUS
+                                && (pp.y - e.pos.y).abs() <= *height + PLAYER_HEIGHT
+                        })
+                    {
+                        *active = true;
+                        fallers_started.push((*sub, *tris));
+                    }
+                    if *active {
+                        // 1 (sinking) or 2 units/s off the fall a 30 Hz frame;
+                        // gone 200 below the level.
+                        let g = if *sub == 0x31 { 1.0 } else { 2.0 };
+                        vel.y -= g * dt * 30.0;
+                        e.pos += *vel * dt;
+                        e.spin += *tumble * dt;
+                        if let Some(t) = *tris {
+                            fallers_moved.push((t, *vel * dt));
+                        }
+                        if e.pos.y < self.level.worlds.min_bounds[1] - 200.0 {
+                            e.alive = false;
+                        }
+                    }
+                }
                 Kind::Effect { life } => {
                     *life -= dt;
                     if *life <= 0.0 {
@@ -5051,6 +5160,68 @@ impl Game {
         }
 
         self.barrier_touches = barrier_touches;
+        // fn_8005EE18 case 0x34: a hero's missile sets a shoot-fall rock off.
+        for &(pidx, ..) in &proj_hits {
+            let ppos = self.entities[pidx].pos;
+            for e in self.entities.iter_mut().filter(|e| e.alive) {
+                if let Kind::Faller {
+                    sub: 0x34,
+                    active,
+                    radius,
+                    height,
+                    tris,
+                    ..
+                } = &mut e.kind
+                {
+                    if !*active
+                        && Vec2::new(ppos.x - e.pos.x, ppos.z - e.pos.z).length() <= *radius
+                        && (ppos.y - e.pos.y).abs() <= *height
+                    {
+                        *active = true;
+                        fallers_started.push((0x34, *tris));
+                    }
+                }
+            }
+        }
+        // The rocks' collision goes with them (UpdateObjWorldMat).
+        for ((start, count), d) in fallers_moved {
+            for t in start..(start + count).min(self.collision.tris.len()) {
+                for v in &mut self.collision.tris[t].v {
+                    *v += d;
+                }
+            }
+        }
+        // fn_8009D8CC (sinking) / fn_8009D91C (falling): the realm's sound.
+        let realm = self.wave.map_or(-1, |w| (w >> 8) as i32);
+        for (sub, _) in fallers_started {
+            let name = if sub == 0x31 {
+                match realm {
+                    4 => Some("S_LEAFBREAK"),
+                    9 => Some("S_WOODBREAKI"),
+                    15 => Some("S_ROCKROTATE"),
+                    _ => None,
+                }
+            } else {
+                let lo = self.wave.map_or(-1, |w| (w & 0xFF) as i32);
+                match realm {
+                    6 if lo == 1 => Some("S_ROCKBREAKF2"),
+                    9 if lo == 4 => Some("S_ICEBREAKY"),
+                    1 => Some("S_FALLAWAY"),
+                    2 => Some("S_ROCKBREAK"),
+                    3 => Some("S_LIMBBREAKC"),
+                    4 => Some("S_LIMBBREAK"),
+                    5 => Some("S_ROCKBREAKE"),
+                    6 => Some("S_ROCKBREAKF"),
+                    7 => Some("S_ROCKBREAKG"),
+                    8 => Some("S_LIMBBREAKH"),
+                    9 => Some("S_ICEBREAK"),
+                    _ => None,
+                }
+            };
+            if let Some(n) = name {
+                self.sfx.push(n.into());
+            }
+        }
         // Each hero is hurt by a tile at most once per what is left of its
         // cycle (fxhittime); a knocking tile pushes back along its facing.
         for (pi, dmg, flags, from, activetime) in trap_hits {
@@ -5977,6 +6148,52 @@ mod tests {
             .collect();
         println!("{} ambient sounds, missing {missing:?}", names.len());
         assert!(missing.len() * 4 < names.len(), "{missing:?}");
+    }
+
+    #[test]
+    fn rocks_fall_when_a_hero_comes_near() {
+        let Some(fs) = data() else { return };
+        for (l, sub) in [("levelE2", 0x28), ("levelI5", 0x35)] {
+            let mut g = Game::new(&fs, l, &[("WAR", "RED")]).unwrap();
+            let rocks: Vec<(u64, Vec3, bool)> = g
+                .entities
+                .iter()
+                .filter_map(|e| match e.kind {
+                    Kind::Faller { sub: s, .. } if s == sub => {
+                        Some((e.id, e.pos, e.model.is_some()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !rocks.is_empty() && rocks.iter().all(|r| r.2),
+                "{l}: rocks with models"
+            );
+            g.pending_enemies.clear();
+            g.entities
+                .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
+            let (id, at, _) = rocks[0];
+            g.players[0].pos = at;
+            g.players[0].health = 10_000.0;
+            for _ in 0..30 {
+                g.players[0].pos.x = at.x;
+                g.players[0].pos.z = at.z;
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            }
+            let e = g.entities.iter().find(|e| e.id == id).unwrap();
+            assert!(
+                matches!(e.kind, Kind::Faller { active: true, .. }),
+                "{l}: set off"
+            );
+            assert!(e.pos.y < at.y, "{l}: falling");
+            // The others stay put.
+            let other = g
+                .entities
+                .iter()
+                .find(|e| e.id == rocks[rocks.len() - 1].0)
+                .unwrap();
+            assert!(rocks.len() == 1 || matches!(other.kind, Kind::Faller { active: false, .. }));
+        }
     }
 
     #[test]

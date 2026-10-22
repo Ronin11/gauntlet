@@ -272,14 +272,16 @@ fn main() -> Result<()> {
             }
             for (i, it) in w.item_infos.iter().enumerate() {
                 println!(
-                    "info {i:3} {:?}/{} {:16} rad {} h {} hp {} val {} rnd {:?}",
+                    "info {i:3} {:?}/{}({}) {:16} rad {} h {} hp {} val {} coll {} rnd {:?}",
                     it.item_type,
                     it.subtype_name(),
+                    it.subtype,
                     it.name,
                     it.radius,
                     it.height,
                     it.hit_points,
                     it.value,
+                    it.coll_type,
                     it.random_indices
                 );
             }
