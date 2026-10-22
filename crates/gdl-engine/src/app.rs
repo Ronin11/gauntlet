@@ -3,6 +3,7 @@
 use crate::fs::GameFs;
 use crate::game::Game;
 use crate::gpu::Gpu;
+use crate::hud::{self, Hud};
 use crate::input::{Input, Source};
 use crate::scene::{Scene, CLEAR};
 use anyhow::{Context, Result};
@@ -30,6 +31,7 @@ struct Running {
     depth: wgpu::TextureView,
     game: Game,
     scene: Scene,
+    hud: Hud,
     input: Input,
     sources: Vec<Source>,
     last: Instant,
@@ -84,6 +86,7 @@ impl App {
             .collect();
         let game = Game::new(&self.cfg.fs, &self.cfg.level, &classes)?;
         let scene = Scene::new(&gpu, &game)?;
+        let hud = Hud::new(&gpu.device, config.format);
         let input = Input::new();
         let mut sources: Vec<Source> = input.pads().into_iter().map(Source::Pad).collect();
         sources.truncate(game.players.len());
@@ -99,6 +102,7 @@ impl App {
             depth,
             game,
             scene,
+            hud,
             input,
             sources,
             last: Instant::now(),
@@ -189,7 +193,44 @@ impl ApplicationHandler for App {
                     .globals(&r.game, r.config.width as f32 / r.config.height as f32);
                 r.gpu
                     .render(&view, &r.depth, &g, CLEAR, &r.scene.draws(&r.game));
+                let mut canvas = hud::Canvas::new(r.config.width, r.config.height);
+                let classes: Vec<String> =
+                    self.cfg.players.iter().map(|(c, _)| c.clone()).collect();
+                hud::build(&mut canvas, &r.game, &classes);
+                r.hud.draw(&r.gpu.device, &r.gpu.queue, &view, &canvas);
                 frame.present();
+
+                // Reaching an exit loads the next level, keeping each player's progress.
+                if let Some(next) = r.game.exit_to.take() {
+                    let classes: Vec<(&str, &str)> = self
+                        .cfg
+                        .players
+                        .iter()
+                        .map(|(a, b)| (a.as_str(), b.as_str()))
+                        .collect();
+                    match Game::new(&self.cfg.fs, &next, &classes) {
+                        Ok(mut g) => {
+                            for (np, op) in g.players.iter_mut().zip(&r.game.players) {
+                                np.health = op.health.max(300.0);
+                                np.score = op.score;
+                                np.keys = op.keys;
+                                np.potions = op.potions;
+                            }
+                            match Scene::new(&r.gpu, &g) {
+                                Ok(sc) => {
+                                    log::info!("entering {next}");
+                                    r.game = g;
+                                    r.scene = sc;
+                                }
+                                Err(e) => log::error!("loading {next}: {e:#}"),
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("loading {next}: {e:#}");
+                            r.game.messages.push((format!("{next} not available"), 3.0));
+                        }
+                    }
+                }
             }
             _ => {}
         }

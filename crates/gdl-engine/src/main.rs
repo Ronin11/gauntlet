@@ -4,6 +4,7 @@ mod collision;
 mod fs;
 mod game;
 mod gpu;
+mod hud;
 mod input;
 mod level;
 mod mesh;
@@ -191,7 +192,7 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
     let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
     let proj = Mat4::perspective_rh(50f32.to_radians(), w as f32 / h as f32, 0.1, 500.0);
     let g = gpu::globals(proj * view, m.transform_point3(eye), [0.0; 3], 0.0);
-    let img = gpu.render_to_image(w, h, &g, scene::CLEAR, &[(&gm, &inst)])?;
+    let img = gpu.render_to_image(w, h, &g, scene::CLEAR, &[(&gm, &inst)], None)?;
     write_png(args.snapshot.as_ref().unwrap(), &img)
 }
 
@@ -234,7 +235,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
         let proj = Mat4::perspective_rh(50f32.to_radians(), w as f32 / h as f32, 0.5, 2000.0);
         globals = gpu::globals(proj * view, m.transform_point3(eye), [0.0; 3], 0.0);
     }
-    let img = gpu.render_to_image(w, h, &globals, scene::CLEAR, &sc.draws(&g))?;
+    let hud = hud::Hud::new(&gpu.device, gpu.color_format);
+    let classes: Vec<String> = args.players.iter().map(|(c, _)| c.clone()).collect();
+    let draw_hud = |view: &wgpu::TextureView| {
+        let mut canvas = hud::Canvas::new(w, h);
+        hud::build(&mut canvas, &g, &classes);
+        hud.draw(&gpu.device, &gpu.queue, view, &canvas);
+    };
+    let img = gpu.render_to_image(w, h, &globals, scene::CLEAR, &sc.draws(&g), Some(&draw_hud))?;
     write_png(args.snapshot.as_ref().unwrap(), &img)
 }
 

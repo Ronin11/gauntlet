@@ -457,6 +457,7 @@ impl Gpu {
         globals: &Globals,
         clear: [f64; 3],
         draws: &[(&GpuMesh, &Instance)],
+        overlay: Option<&dyn Fn(&wgpu::TextureView)>,
     ) -> Result<Image> {
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
@@ -475,6 +476,9 @@ impl Gpu {
         let view = tex.create_view(&Default::default());
         let depth = self.depth_view(width, height);
         self.render(&view, &depth, globals, clear, draws);
+        if let Some(f) = overlay {
+            f(&view);
+        }
 
         let row = (width * 4).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
