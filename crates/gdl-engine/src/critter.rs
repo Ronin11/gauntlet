@@ -2122,11 +2122,33 @@ impl Game {
             false
         } else {
             let mut np = pos + Vec3::new(delta.x, 0.0, delta.z);
-            np = self
-                .collision
-                .resolve_walls(np, t0.rad.min(3.0), t0.hht * 1.5, 1.2);
+            let (moved, wall) =
+                self.collision
+                    .resolve_walls_hit(np, t0.rad.min(3.0), t0.hht * 1.5, 1.2);
+            np = moved;
+            // CritterWorldDamage: hurting walls and floors, every frame.
+            let floor = self.collision.ground_hit(np, np.y + 2.0);
+            for (owner, at) in wall
+                .into_iter()
+                .chain(floor.map(|(y, o)| (o, Vec3::new(np.x, y, np.z))))
+            {
+                let Some(flags) = self.hurting_surface(owner) else {
+                    continue;
+                };
+                let (dmg, knock) = match (flags >> 16) & 0xF {
+                    1 => (5.0, 0),
+                    2 => (5.0, DMG_KNOCKBACK),
+                    3..=5 => (15.0, DMG_KNOCKDOWN),
+                    _ => (0.0, 0),
+                };
+                if dmg > 0.0 {
+                    let d = pos - at;
+                    let dir = Vec3::new(d.x, 0.0, d.z).normalize_or_zero();
+                    self.critter_damage(c, 0, dmg, None, knock, dir, None);
+                }
+            }
             // Floor follow, at most 16 units/s down.
-            if let Some(g) = self.collision.ground_height(np, np.y + 2.0) {
+            if let Some((g, _)) = floor {
                 np.y = if g < np.y {
                     (np.y - 16.0 * dt).max(g)
                 } else {

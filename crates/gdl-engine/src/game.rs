@@ -2657,27 +2657,32 @@ impl Game {
             })
     }
 
-    /// PlayerMotion_FloorFX: a world object flagged 0xF0000 (lava, fire, spikes)
-    /// hurts the hero standing on or touching it, at most once a second. Objects
-    /// flagged 0x2000000 only while they move; nothing in a reaction state.
-    fn floor_fx(&mut self, pi: usize, owner: i32, dv: Vec3) {
-        let Some(&flags) = usize::try_from(owner)
-            .ok()
-            .and_then(|o| self.obj_flags.get(o))
-        else {
-            return;
-        };
+    /// WorldObjGetAllFlags of a collision triangle's owner when it hurts: a
+    /// 0xF0000 material, and for 0x2000000 objects only while they move.
+    pub(crate) fn hurting_surface(&self, owner: i32) -> Option<u32> {
+        let o = usize::try_from(owner).ok()?;
+        let flags = *self.obj_flags.get(o)?;
         if flags & 0xF0000 == 0 {
-            return;
+            return None;
         }
         if flags & 0x2000000 != 0
             && !self
                 .movers
                 .iter()
-                .any(|m| m.moving && m.objects.contains(&(owner as usize)))
+                .any(|m| m.moving && m.objects.contains(&o))
         {
-            return;
+            return None;
         }
+        Some(flags)
+    }
+
+    /// PlayerMotion_FloorFX: a world object flagged 0xF0000 (lava, fire, spikes)
+    /// hurts the hero standing on or touching it, at most once a second. Objects
+    /// flagged 0x2000000 only while they move; nothing in a reaction state.
+    fn floor_fx(&mut self, pi: usize, owner: i32, dv: Vec3) {
+        let Some(flags) = self.hurting_surface(owner) else {
+            return;
+        };
         let p = &self.players[pi];
         if p.act.motion >= 31 || self.time < p.floor_fx_time {
             return;
