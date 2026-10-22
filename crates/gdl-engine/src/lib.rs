@@ -26,6 +26,7 @@ pub mod progress;
 pub mod scene;
 pub mod screen;
 pub mod select;
+pub mod shop;
 pub mod stats;
 pub mod triggers;
 pub mod ui;

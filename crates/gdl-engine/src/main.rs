@@ -1,6 +1,6 @@
 use gdl_engine::{
     app, audio, character, fs, game, gpu, hud, input, mapscreen, menu, options, scene, screen,
-    select, ui,
+    select, shop, ui,
 };
 
 use anyhow::{Context, Result};
@@ -55,7 +55,10 @@ Controls: left stick / WASD move, A / J attack, X / Shift turbo,
 Testing:
   --snapshot <png>      Render one frame headless and exit
   --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
-                        map:<level>[:ticks] (e.g. map:A6:300)
+                        map:<level>[:ticks] (e.g. map:A6:300),
+                        shop[:after|menu|inv|final[:ticks[:events]]] with a fake
+                        2-player party after A1; events are <tick><key>[<player>]
+                        joined by commas, keys a b x u d (e.g. shop:after:900:600a)
   --simulate <frames>   Simulate N 60 Hz frames before the snapshot
   --hold <x,y>          Stick input held during simulation
   --attack-at <frame>   Press attack on that frame
@@ -321,6 +324,92 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
         None => None,
     };
+    // --screen shop[:mode[:ticks[:events]]]: the shop after that many ticks.
+    let shop_screen = match args.screen.as_deref() {
+        Some(spec) if spec == "shop" || spec.starts_with("shop:") => {
+            let mut parts = spec.split(':').skip(1);
+            let mode_name = parts.next().unwrap_or("after");
+            let (mode, final_stats) = match mode_name {
+                "after" => (shop::ShopMode::AfterLevel, false),
+                "final" => (shop::ShopMode::AfterLevel, true),
+                "menu" => (shop::ShopMode::FromMenu, false),
+                "inv" => (shop::ShopMode::Inventory, false),
+                m => anyhow::bail!("--screen shop: unknown mode {m}"),
+            };
+            let ticks: u32 = match parts.next() {
+                Some(t) => t.parse().context("--screen shop:<mode>:<ticks>")?,
+                None => 600,
+            };
+            // <tick><key>[<player>]
+            let mut events: Vec<(u32, char, Option<usize>)> = Vec::new();
+            for e in parts
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter(|e| !e.is_empty())
+            {
+                let k = e
+                    .find(|c: char| c.is_ascii_alphabetic())
+                    .context("shop event key")?;
+                let t: u32 = e[..k].parse().context("shop event tick")?;
+                let key = e[k..].chars().next().unwrap();
+                let who = e[k + 1..].parse().ok();
+                events.push((t, key, who));
+            }
+            let level = g
+                .worlds
+                .wave_of_dir("A1")
+                .and_then(|w| g.worlds.level(w))
+                .cloned();
+            let party = shop::demo_party();
+            let mut s = shop::Shop::new(&fs, &gpu, &mut hud, party, level, mode, final_stats);
+            if let Some(c) = s.collections.first_mut() {
+                c.fangs = 3;
+                c.crystals = [15, 40, 0, 0, 0, 0, 0, 0];
+                c.legend[1] = true;
+                c.legend[9] = true;
+                c.runes[2] = true;
+            }
+            println!("shop {mode_name}, music {:?}", s.music());
+            for t in 1..=ticks {
+                let mut inputs = vec![input::PlayerInput::default(); 2];
+                for &(et, key, who) in &events {
+                    if et != t {
+                        continue;
+                    }
+                    for (p, i) in inputs.iter_mut().enumerate() {
+                        if who.is_some_and(|w| w != p) {
+                            continue;
+                        }
+                        match key {
+                            'a' => i.attack_pressed = true,
+                            'b' => i.b_pressed = true,
+                            'x' => i.magic_pressed = true,
+                            'u' => i.stick.y = 1.0,
+                            'd' => i.stick.y = -1.0,
+                            _ => {}
+                        }
+                    }
+                }
+                let done = s.update(&inputs);
+                for x in s.sfx.drain(..) {
+                    println!("tick {t}: sfx {x}");
+                }
+                if done {
+                    println!("tick {t}: finished");
+                    break;
+                }
+            }
+            for (i, c) in s.players().iter().enumerate() {
+                println!(
+                    "player {i}: gold {} keys {} potions {:?} health {} bonus {:?}",
+                    c.gold, c.keys, c.potions, c.health, c.bonus
+                );
+            }
+            Some((s, ticks))
+        }
+        _ => None,
+    };
     let panels: Vec<hud::PanelInfo> = players
         .iter()
         .enumerate()
@@ -389,6 +478,11 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     .unwrap_or(300);
                 gdl_engine::attract::Attract::credits_demo(&fs, scroll)
                     .draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100), None);
+            }
+            Some(name) if name == "shop" || name.starts_with("shop:") => {
+                if let Some((sh, ticks)) = &shop_screen {
+                    sh.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, *ticks));
+                }
             }
             Some(s) if s.starts_with("map:") => {
                 if let Some((m, ticks)) = &map_screen {
