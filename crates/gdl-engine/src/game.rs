@@ -780,6 +780,16 @@ pub enum Kind {
         /// Bombs burst over this radius.
         splash: f32,
         gravity: f32,
+        /// C_DMG flags handed to damage_player (critter shots).
+        flags: u32,
+        /// Effect model shown where it bursts.
+        hit_model: Option<usize>,
+    },
+    /// A critter: a boss, golem, general or gargoyle (critter.rs).
+    Critter(Box<crate::critter::Critter>),
+    /// A one-shot effect model, gone after `life` seconds or its animation.
+    Effect {
+        life: f32,
     },
     /// Lever or pressure pad driving `Game::movers[mover]`.
     Trigger {
@@ -840,7 +850,7 @@ pub struct MonsterClass {
 }
 
 impl MonsterClass {
-    fn model(&self, strength: usize) -> Option<usize> {
+    pub(crate) fn model(&self, strength: usize) -> Option<usize> {
         if (4..=6).contains(&strength) {
             if let Some(m) = self.models[strength] {
                 return Some(m);
@@ -903,8 +913,6 @@ pub struct Game {
     pub world_changed: bool,
     /// The party's boss shards (bit = world order 1..11, as Progress::runes).
     pub runes: u16,
-    /// Items of Legend picked up (bit = the realm whose Guardian each is for).
-    pub legend_items: u16,
     /// Players who died in this level (inactivate_player outside the tower).
     pub deaths: u32,
     /// The level's monster types (realm ENMY + LEVL enemytype).
@@ -943,10 +951,30 @@ pub struct Game {
     pub msgs: crate::messages::Messages,
     /// Sound effects requested this frame (names from AUDATPS2.ROM); drained by the app.
     pub sfx: Vec<String>,
+    /// The level's boss, when it has one (boss.rs).
+    pub boss: Option<crate::boss::Boss>,
+    /// Boss runes (shards in the game's words) won here: bit = position in
+    /// progress::CRYSTAL_ORDER. The app adds them to Progress.runes.
+    pub boss_runes: u16,
+    /// Legend weapons the party carries: bit = the item's value (the realm of
+    /// the boss it is for). One is used up when its boss fight uses it.
+    pub legend_held: u16,
+    /// Items flying out of a dying boss.
+    pub spews: Vec<crate::boss::Spew>,
+    /// Critter ground waves (stomps, eruptions).
+    pub crit_waves: Vec<crate::critter::Wave>,
+    /// player.fxhittime: a critter's melee and cones skip a player until then.
+    pub crit_hit_until: [f32; 4],
+    /// Parsed CRITTER WADs by file name.
+    pub critter_wads: HashMap<String, std::sync::Arc<gdl_formats::critter::CritterWad>>,
+    /// The good wizard's model (atree WIZARD in the level's item file).
+    pub wizard_model: Option<usize>,
+    /// Where the hit being dealt landed (projectiles), for critter colnodes.
+    pub(crate) hit_from: Option<Vec3>,
 }
 
 /// Parsed objects/textures/anim files shared by several models.
-struct AssetFile {
+pub(crate) struct AssetFile {
     objects: Objects,
     textures: Vec<u8>,
     anim: Option<Anim>,
@@ -1292,7 +1320,6 @@ impl Game {
             barrier_touches: Vec::new(),
             world_changed: false,
             runes: 0,
-            legend_items: 0,
             deaths: 0,
             roster: Default::default(),
             tuning: gdl_formats::wdata::EnemyTuning::default().normalized(1),
@@ -1312,6 +1339,15 @@ impl Game {
             level_end: None,
             msgs: Default::default(),
             sfx: vec!["S_ENTRANCE".into()],
+            boss: None,
+            boss_runes: 0,
+            legend_held: 0,
+            spews: Vec::new(),
+            crit_waves: Vec::new(),
+            crit_hit_until: [0.0; 4],
+            critter_wads: HashMap::new(),
+            wizard_model: None,
+            hit_from: None,
         };
         if let Ok(rom) = fs.read("TEXT/ENGLISH.ROM") {
             if let Ok(rom) = gdl_formats::text::TextRom::parse(&rom) {
@@ -1463,7 +1499,7 @@ impl Game {
 
     /// Load (once) the models of monster type `etype` from its MONSTERS
     /// directory: tier trees `<DESC>0..3`, the A/B/S variants and the generators.
-    fn monster_class(
+    pub(crate) fn monster_class(
         &mut self,
         fs: &GameFs,
         cache: &mut HashMap<String, Option<AssetFile>>,
@@ -1633,7 +1669,7 @@ impl Game {
     }
 
     /// A new monster of `class` at a tier, as init_enemy sets it up.
-    fn new_enemy(&self, class: usize, strength: usize, state: EnemyState) -> Kind {
+    pub(crate) fn new_enemy(&self, class: usize, strength: usize, state: EnemyState) -> Kind {
         let etype = self.classes[class].etype;
         let t = &crate::enemies::TYPES[etype.min(33)];
         Kind::Enemy {
@@ -1664,7 +1700,10 @@ impl Game {
             _ => 0,
         };
         let mut animator = Animator::new(seq);
-        animator.force_loop = !matches!(kind, Kind::Enemy { .. });
+        animator.force_loop = !matches!(
+            kind,
+            Kind::Enemy { .. } | Kind::Critter(_) | Kind::Effect { .. }
+        );
         self.entities.push(Entity {
             id,
             solid: None,
@@ -1840,6 +1879,31 @@ impl Game {
                     };
                     // IT only plays the tag game with company.
                     if ty == crate::enemies::IT && num_players < 2 {
+                        continue;
+                    }
+                    // fn_80060114: golems, gargoyles and generals are critters.
+                    if matches!(ty, 29 | 32 | 33) {
+                        let variant = self.enemy_variant(ty);
+                        let realm = self.wave.map_or(0, |w| w >> 8);
+                        let wad = match ty {
+                            29 if realm == 9 => "golemI.wad".to_string(),
+                            29 if realm == 6 => "golemF.wad".to_string(),
+                            29 => "GOLEM.WAD".to_string(),
+                            33 => "GENERAL.WAD".to_string(),
+                            _ => format!(
+                                "GAR_{}.WAD",
+                                variant
+                                    .clone()
+                                    .unwrap_or_else(|| "eagl".into())
+                                    .to_ascii_uppercase()
+                            ),
+                        };
+                        if ty == 32 {
+                            let kind = variant.clone().unwrap_or_else(|| "eagl".into());
+                            let name = format!("GARG{}", kind.to_ascii_uppercase());
+                            self.item_model(fs, &mut cache, &mut known, &dirs, &name);
+                        }
+                        self.spawn_critter(fs, &wad, variant.as_deref(), pos, yaw, num_players);
                         continue;
                     }
                     let ty = self.roster.resolve(ty, strength as i32);
@@ -2073,6 +2137,26 @@ impl Game {
                 _ => {}
             }
         }
+        // The boss, its coins and key, and the good wizard (boss levels).
+        self.merge_item_models(std::mem::take(&mut known));
+        self.spawn_boss(fs, num_players);
+        if self.boss.is_some() {
+            let dir = format!("ITEMS/{}", self.level.name);
+            if let Some(asset) = cache
+                .entry(dir.clone())
+                .or_insert_with(|| load_asset(fs, &dir))
+                .as_ref()
+            {
+                if let Some(anim) = &asset.anim {
+                    if let Ok(m) =
+                        Model::from_anim(&asset.objects, &asset.textures, anim, Some("WIZARD"))
+                    {
+                        self.wizard_model = Some(self.add_model(m));
+                    }
+                }
+            }
+        }
+        known = self.item_models.clone();
         // Load the models of chest and barrel contents too, for when they pop out.
         for inst in &instances {
             if let Some(c) = infos
@@ -2122,6 +2206,25 @@ impl Game {
             count(|k| matches!(k, Kind::Door { .. })),
             self.models.len()
         );
+    }
+
+    /// The ENMY variant string of the level's record for monster type `ty`
+    /// (gargoyle kind, golem model directory), if any.
+    fn enemy_variant(&self, ty: usize) -> Option<String> {
+        let wave = self.wave?;
+        let r = self.worlds.realm(wave >> 8)?;
+        let l = self.worlds.level(wave)?;
+        let pick = l
+            .enemy_types
+            .iter()
+            .filter(|&&i| i >= 0)
+            .map(|&i| i as usize)
+            .find(|&i| r.enemies.get(i).is_some_and(|e| e.0 == ty as i32))
+            .or_else(|| r.enemies.iter().position(|e| e.0 == ty as i32))?;
+        r.enemy_variants
+            .get(pick)
+            .filter(|v| !v.is_empty())
+            .cloned()
     }
 
     /// Camera-relative movement basis on the ground plane (forward, right), in game coordinates.
@@ -2246,11 +2349,25 @@ impl Game {
             }
             self.sumner = Some(s);
         }
-        self.update_players(dt, inputs);
+        let inputs = self.legend_freeze_inputs(inputs);
+        self.update_players(dt, &inputs);
+        self.legend_face_boss();
         self.update_rings(dt);
         self.update_entities(dt);
+        self.update_critters(dt);
+        self.update_waves(dt);
+        self.update_spews(dt);
+        self.update_boss(dt);
         self.heartbeat();
         self.check_level_end();
+        if self
+            .boss
+            .as_ref()
+            .and_then(|b| b.cam.as_ref())
+            .is_some_and(|c| c.started)
+        {
+            return;
+        }
 
         // Camera follows the centroid of living players.
         let alive: Vec<Vec3> = self
@@ -2292,14 +2409,33 @@ impl Game {
         let mut turbos: Vec<(usize, Vec3, f32, bool)> = Vec::new();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
         let in_tower = self.wave == Some(gdl_formats::wdata::TOWER_WAVE);
+        let pu_rate = if self.boss.as_ref().is_some_and(|b| b.active && !b.dead) {
+            3.0
+        } else {
+            1.0
+        };
         let mut it_cleared = false;
         // Things an attack can be aimed at, with their radius.
-        let targets: Vec<(Vec3, f32)> = self
+        let mut targets: Vec<(Vec3, f32)> = self
             .entities
             .iter()
-            .filter(|e| e.alive)
+            .filter(|e| e.alive && !matches!(e.kind, Kind::Critter(_)))
             .filter_map(|e| Some((e.pos, Self::target_radius(e)?)))
             .collect();
+        // Critters are aimed at by their colnodes (at the players' height).
+        for e in self.entities.iter().filter(|e| e.alive) {
+            if let Kind::Critter(c) = &e.kind {
+                if !c.hittable() {
+                    continue;
+                }
+                let feet = self.players.first().map_or(e.pos.y, |p| p.pos.y);
+                for (_, _, p, r) in c.colliders() {
+                    targets.push((Vec3::new(p.x, feet, p.z), r));
+                }
+                let cp = c.coll_pos(0, e.pos, e.yaw);
+                targets.push((Vec3::new(cp.x, feet, cp.z), c.wad.types[c.parts[0].ty].rad));
+            }
+        }
         for (i, p) in self.players.iter_mut().enumerate() {
             let mut inp = inputs.get(i).copied().unwrap_or_default();
             // The d-pad runs the mini-inventory; only the stick walks.
@@ -2322,9 +2458,10 @@ impl Game {
                     }
                 }
             }
-            // PlayerProcessPowerups: timed power-ups run down outside the tower.
+            // PlayerProcessPowerups: timed power-ups run down outside the tower,
+            // three times as fast during a boss fight.
             if !in_tower {
-                p.powerups.tick(dt);
+                p.powerups.tick(dt * pu_rate);
             }
             p.fx = p.powerups.effects();
             if !in_tower {
@@ -2837,8 +2974,32 @@ impl Game {
             Kind::Generator { .. } => Some(2.0),
             Kind::Container { chest: false, .. } => Some(1.0),
             Kind::Trigger { .. } => Some(0.5),
+            Kind::Critter(c) if c.hittable() => Some(c.wad.types[c.parts[0].ty].rad),
             _ => None,
         }
+    }
+
+    /// Where an attack from `from` aims at entity `e`: the point and its
+    /// radius (a critter's nearest colnode, else the entity itself).
+    fn aim_point(e: &Entity, from: Vec3) -> Option<(Vec3, f32)> {
+        let r = match &e.kind {
+            Kind::Critter(c) => c.wad.types[c.parts[0].ty].rad,
+            _ => Self::target_radius(e)?,
+        };
+        if let Kind::Critter(c) = &e.kind {
+            let (_, node) = c.surface(from, e.pos, e.yaw);
+            if let Some((pi, ci)) = node {
+                if let Some((_, _, p, r)) = c
+                    .colliders()
+                    .into_iter()
+                    .find(|(a, b, _, _)| *a == pi && *b == ci)
+                {
+                    return Some((Vec3::new(p.x, from.y, p.z), r));
+                }
+            }
+            return Some((c.coll_pos(0, e.pos, e.yaw), r));
+        }
+        Some((e.pos, r))
     }
 
     /// A melee swing (PlayerMotion_DamageTarget): one target, the nearest in the
@@ -2861,10 +3022,12 @@ impl Game {
             .entities
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.alive && (e.pos.y - pos.y).abs() < 5.0)
+            .filter(|(_, e)| {
+                e.alive && (matches!(e.kind, Kind::Critter(_)) || (e.pos.y - pos.y).abs() < 5.0)
+            })
             .filter_map(|(i, e)| {
-                let r = Self::target_radius(e)?;
-                let d = Vec2::new(e.pos.x - pos.x, e.pos.z - pos.z);
+                let (at, r) = Self::aim_point(e, pos + Vec3::Y * 2.5)?;
+                let d = Vec2::new(at.x - pos.x, at.z - pos.z);
                 let surf = d.length() - r;
                 (surf < MELEE_REACH && (d.length() < 0.5 || d.normalize().dot(dir) >= AIM_CONE))
                     .then_some((i, surf))
@@ -2901,11 +3064,16 @@ impl Game {
                         Kind::Enemy { .. }
                             | Kind::Generator { .. }
                             | Kind::Container { chest: false, .. }
+                            | Kind::Critter(_)
                     )
             })
             .filter_map(|(i, e)| {
-                let d = Vec2::new(e.pos.x - pos.x, e.pos.z - pos.z);
-                (d.length() < radius).then(|| (i, d.normalize_or_zero()))
+                let (at, r) = match &e.kind {
+                    Kind::Critter(_) => Self::aim_point(e, pos)?,
+                    _ => (e.pos, 0.0),
+                };
+                let d = Vec2::new(at.x - pos.x, at.z - pos.z);
+                (d.length() - r < radius).then(|| (i, d.normalize_or_zero()))
             })
             .collect();
         for (i, push) in hits {
@@ -2915,7 +3083,11 @@ impl Game {
 
     /// Damage entity `t` on player `pi`'s behalf: sounds, experience (more for
     /// melee, which also charges the turbo meter) and anything it drops.
-    fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
+    pub(crate) fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
+        if matches!(self.entities[t].kind, Kind::Critter(_)) {
+            self.hit_critter(pi, t, dmg, push, melee);
+            return;
+        }
         let shrunk = self
             .players
             .iter()
@@ -3034,6 +3206,55 @@ impl Game {
         }
     }
 
+    /// A player's hit on a critter (pmotion.c:3633 / sfx.c:3168 into
+    /// CritterDamage): the part and colnode nearest where it landed take it.
+    fn hit_critter(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
+        let from = self.hit_from.take().unwrap_or_else(|| {
+            self.players
+                .get(pi)
+                .map_or(Vec3::ZERO, |p| p.pos + Vec3::Y * 2.5)
+        });
+        let (pos, yaw) = (self.entities[t].pos, self.entities[t].yaw);
+        let Kind::Critter(mut c) = std::mem::replace(&mut self.entities[t].kind, Kind::Prop) else {
+            return;
+        };
+        // PlayerDamagedEnemy ignores the boss until it wakes.
+        if !c.hittable() || (c.is_boss() && !self.boss.as_ref().is_some_and(|b| b.active)) {
+            self.entities[t].kind = Kind::Critter(c);
+            return;
+        }
+        let (_, node) = c.surface(from, pos, yaw);
+        let (part, colnode) = node.unwrap_or((0, usize::MAX));
+        let magic = MAGIC_HIT.with(|m| m.get());
+        let mut flags = if magic { crate::critter::DMG_MAGIC } else { 0 };
+        let mut dmg = dmg;
+        let elem = self
+            .players
+            .get(pi)
+            .map_or(0, |p| p.fx.weapon & crate::powerups::W_ELEMENT);
+        if !magic && elem != 0 {
+            // The hit already carries the neutral-target element bonus; let
+            // ModifyDamage apply this critter's own affinity instead.
+            flags |= elem;
+            dmg /= ELEMENT_BONUS;
+        }
+        let dir = Vec3::new(push.x, 0.0, push.y);
+        let node = (colnode != usize::MAX).then_some(colnode);
+        let (done, killed) = self.critter_damage(&mut c, part, dmg, Some(pi), flags, dir, node);
+        self.entities[t].kind = Kind::Critter(c);
+        if done > 0.0 {
+            self.sfx.push("S_WEAPONHITMETA".into());
+            if melee {
+                // Melee charges the turbo meter as it does on monsters.
+                let p = &mut self.players[pi];
+                p.power = (p.power + 0.025 * done).min(100.0);
+            }
+        }
+        if killed {
+            self.players[pi].stats.enemies_killed += 1;
+        }
+    }
+
     /// AddExp: scaled by the level's xpmul (less for players above its plevel);
     /// melee exp also charges the turbo meter. Each level gained adds 100 health.
     fn add_exp(&mut self, pi: usize, amount: f32, melee: bool) {
@@ -3065,6 +3286,14 @@ impl Game {
         };
         if !p.state.active() || flags & DmgType::MAGIC != 0 {
             return;
+        }
+        // Nothing hurts before a boss wakes, or while the good wizard talks
+        // (except being thrown).
+        if let Some(b) = &self.boss {
+            if flags & 0x8000 == 0 && (!b.active || b.wizard.as_ref().is_some_and(|w| w.state >= 4))
+            {
+                return;
+            }
         }
         // PWRB / PWRC turbo moves can't be interrupted.
         if matches!(p.state, PlayerState::Turbo { .. }) {
@@ -3128,11 +3357,21 @@ impl Game {
                 if !e.alive || ring.hit.contains(&e.id) {
                     continue;
                 }
-                if !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }) {
+                if !matches!(
+                    e.kind,
+                    Kind::Enemy { .. } | Kind::Generator { .. } | Kind::Critter(_)
+                ) {
                     continue;
                 }
-                let d = Vec2::new(e.pos.x - ring.pos.x, e.pos.z - ring.pos.z);
-                if d.length() < radius {
+                let (at, r) = match &e.kind {
+                    Kind::Critter(_) => match Self::aim_point(e, ring.pos) {
+                        Some(a) => a,
+                        None => continue,
+                    },
+                    _ => (e.pos, 0.0),
+                };
+                let d = Vec2::new(at.x - ring.pos.x, at.z - ring.pos.z);
+                if d.length() - r < radius {
                     ring.hit.push(e.id);
                     hits.push((ring.owner, i, dmg, d.normalize_or_zero()));
                 }
@@ -3148,7 +3387,7 @@ impl Game {
         MAGIC_HIT.with(|m| m.set(false));
     }
 
-    fn world_letter(&self) -> char {
+    pub(crate) fn world_letter(&self) -> char {
         self.level
             .name
             .trim_start_matches("level")
@@ -3380,6 +3619,7 @@ impl Game {
             .map(|(i, c)| (c.etype, i))
             .collect();
         let sight = 30.0 * self.tuning.visrad;
+        let boss_dying = self.boss.as_ref().is_some_and(|b| b.dying);
         let mut spawns: Vec<Spawn> = Vec::new();
         let mut shots: Vec<Shot> = Vec::new();
         let mut blasts: Vec<(Vec3, f32)> = Vec::new();
@@ -3391,7 +3631,9 @@ impl Game {
             .iter()
             .map(|p| p.fx.armor & crate::powerups::A_ANTIDEATH != 0)
             .collect();
-        let mut damage: Vec<(usize, f32)> = Vec::new();
+        let mut damage: Vec<(usize, f32, u32)> = Vec::new();
+        let mut bursts: Vec<(usize, Vec3)> = Vec::new();
+        let mut adds: Vec<(Vec3, Vec3)> = Vec::new();
         // Monster melee hits: (monster, player, damage).
         let mut melee: Vec<(usize, usize, f32)> = Vec::new();
         let mut pickups: Vec<(usize, PickupKind)> = Vec::new();
@@ -3425,7 +3667,8 @@ impl Game {
                     ..
                 } => {
                     let on = visible[ei];
-                    if (*always || on) && spawned.len() < *max {
+                    // generate_enemy refuses everything once the boss is dying.
+                    if (*always || on) && spawned.len() < *max && !boss_dying {
                         if *timer > 0.0 {
                             *timer -= dt * 60.0;
                         } else {
@@ -3898,6 +4141,8 @@ impl Game {
                     life,
                     splash,
                     gravity,
+                    flags,
+                    hit_model,
                 } => {
                     *life -= dt;
                     vel.y -= *gravity * dt;
@@ -3917,14 +4162,20 @@ impl Game {
                     if hit.is_some() || wall || floor || *life <= 0.0 {
                         e.alive = false;
                         let k = if shrunk { 0.5 } else { 1.0 };
+                        if let Some(m) = hit_model {
+                            bursts.push((*m, to));
+                        }
+                        if *flags & crate::critter::SHOT_ADDS != 0 {
+                            adds.push((to, *vel));
+                        }
                         if *splash > 0.0 {
                             for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                                 if *alive && (*pp - to).length() < *splash + PLAYER_RADIUS {
-                                    damage.push((pi, *dmg * k));
+                                    damage.push((pi, *dmg * k, *flags));
                                 }
                             }
                         } else if let Some(pi) = hit {
-                            damage.push((pi, *dmg * k));
+                            damage.push((pi, *dmg * k, *flags));
                         }
                     } else {
                         e.pos = to;
@@ -3952,6 +4203,12 @@ impl Game {
                         ));
                     }
                 }
+                Kind::Effect { life } => {
+                    *life -= dt;
+                    if *life <= 0.0 {
+                        e.alive = false;
+                    }
+                }
                 Kind::Hazard {
                     radius,
                     damage: dmg,
@@ -3962,14 +4219,14 @@ impl Game {
                             && (self.time * 2.0).fract() < dt * 2.0
                         {
                             if !levitating[pi] {
-                                damage.push((pi, *dmg));
+                                damage.push((pi, *dmg, 0));
                             }
                         }
                     }
                 }
                 _ => {}
             }
-            if !matches!(e.kind, Kind::Enemy { .. }) {
+            if !matches!(e.kind, Kind::Enemy { .. } | Kind::Critter(_)) {
                 if let Some(m) = e.model {
                     e.animator.update(&self.models[m].skeleton, dt);
                 }
@@ -3983,6 +4240,15 @@ impl Game {
             let ppos = self.entities[pidx].pos;
             let target = (0..self.entities.len()).find(|&t| {
                 let e = &self.entities[t];
+                if let Kind::Critter(c) = &e.kind {
+                    if !e.alive || !c.hittable() {
+                        return false;
+                    }
+                    let (surf, node) = c.surface(ppos, e.pos, e.yaw);
+                    let t0 = &c.wad.types[c.parts[0].ty];
+                    let cp = c.coll_pos(0, e.pos, e.yaw);
+                    return surf < 0.4 && (node.is_some() || (ppos.y - cp.y).abs() < t0.hht + 2.0);
+                }
                 let r = match &e.kind {
                     Kind::Enemy { state, .. } if !matches!(state, EnemyState::Dying { .. }) => 1.4,
                     Kind::Generator { .. } => 2.2,
@@ -3995,7 +4261,9 @@ impl Game {
             });
             if let Some(t) = target {
                 if owner < self.players.len() {
+                    self.hit_from = Some(ppos);
                     self.hit_entity(owner, t, dmg, dir, false);
+                    self.hit_from = None;
                 }
                 self.entities[pidx].alive = false;
             }
@@ -4082,8 +4350,14 @@ impl Game {
                 self.collision.enabled[t] = false;
             }
         }
-        for (pi, dmg) in damage {
-            self.damage_player(pi, dmg, 0);
+        for (pi, dmg, flags) in damage {
+            self.damage_player(pi, dmg, flags & !(0x1000 | crate::critter::SHOT_ADDS));
+        }
+        for (m, pos) in bursts {
+            self.spawn_effect(m, pos, 0.0);
+        }
+        for (pos, vel) in adds {
+            self.boss_generate_enemy(pos, vel);
         }
         for (ei, pi, dmg) in melee {
             let dmg = if shrunk { dmg * 0.5 } else { dmg };
@@ -4177,8 +4451,9 @@ impl Game {
                     self.shards |= 1 << bit;
                     self.welcome = 300;
                 }
-                // The item's value is the realm whose Guardian it is for.
-                PickupKind::Legend(v) => self.legend_items |= 1 << v.min(15),
+                PickupKind::Legend(v) => {
+                    self.legend_held |= 1 << v.min(15);
+                }
                 // towerAdvanceLevelRecord.
                 PickupKind::Gargoyle(i) => {
                     if self.garg_items[i] >= 0 {
@@ -4222,6 +4497,8 @@ impl Game {
                     life: 4.0,
                     splash,
                     gravity,
+                    flags: 0,
+                    hit_model: None,
                 },
                 model,
                 from + dir * 3.0,
@@ -4287,6 +4564,14 @@ impl Game {
         if let Some(c) = self.sumner.as_ref().and_then(|s| s.cam) {
             return (c.eye, c.eye + c.dir * 30.0, 0.5);
         }
+        if let Some(v) = self.boss_camera_view() {
+            return v;
+        }
+        self.camera_view_normal()
+    }
+
+    /// The level camera (do_camera): behind the party's centre.
+    pub(crate) fn camera_view_normal(&self) -> (Vec3, Vec3, f32) {
         let spread = self
             .players
             .iter()
@@ -4304,6 +4589,102 @@ impl Game {
             );
         let near = (dist - CUTAWAY_DEPTH).max(1.0);
         (eye, at, near)
+    }
+}
+
+/// pickup_kind for an item with default instance parameters.
+pub(crate) fn pickup_kind_pub(info: &gdl_formats::worlds::ItemInfo) -> PickupKind {
+    pickup_kind(info, &[0u8; 16])
+}
+
+/// Helpers the critter and boss code use.
+impl Game {
+    pub(crate) fn add_exp_pub(&mut self, pi: usize, amount: f32) {
+        self.add_exp(pi, amount, false);
+    }
+
+    pub(crate) fn add_model_pub(&mut self, m: Model) -> usize {
+        self.add_model(m)
+    }
+
+    /// The id the next spawned entity gets.
+    pub(crate) fn peek_next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    pub(crate) fn item_model_pub(
+        &mut self,
+        fs: &GameFs,
+        cache: &mut HashMap<String, Option<AssetFile>>,
+        known: &mut HashMap<String, Option<usize>>,
+        dirs: &[String],
+        name: &str,
+    ) -> Option<usize> {
+        self.item_model(fs, cache, known, dirs, name)
+    }
+
+    pub(crate) fn merge_item_models(&mut self, known: HashMap<String, Option<usize>>) {
+        for (k, v) in known {
+            self.item_models.entry(k.to_ascii_uppercase()).or_insert(v);
+        }
+    }
+
+    pub(crate) fn item_model_named(&self, name: &str) -> Option<usize> {
+        self.item_models
+            .get(&name.to_ascii_uppercase())
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn camera_locator_pub(&self, p: Vec3) -> Option<(f32, f32)> {
+        self.camera_locator(p)
+    }
+
+    /// A one-shot effect model at `pos`.
+    pub(crate) fn spawn_effect(&mut self, model: usize, pos: Vec3, yaw: f32) {
+        let life = self.models[model]
+            .skeleton
+            .sequences
+            .first()
+            .map_or(1.0, |s| {
+                (s.frame_count.max(1) as f32 / s.frame_rate.max(1) as f32).clamp(0.2, 10.0)
+            });
+        if self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Effect { .. }))
+            .count()
+            < 48
+        {
+            self.spawn(Kind::Effect { life }, Some(model), pos, yaw);
+        }
+    }
+
+    /// CritterDropItem for gargoyles: the level's GARG<kind> item.
+    pub(crate) fn spawn_garg_item(&mut self, kind: &str, pos: Vec3) {
+        let name = format!("GARG{}", kind.to_ascii_uppercase());
+        let info = self
+            .level
+            .worlds
+            .item_infos
+            .iter()
+            .find(|i| i.name.eq_ignore_ascii_case(&name))
+            .cloned();
+        let kind = match &info {
+            Some(i) => pickup_kind(i, &[0u8; 16]),
+            None => PickupKind::Gargoyle(match kind {
+                "serp" => 0,
+                "eagl" => 1,
+                _ => 2,
+            }),
+        };
+        let model = self.item_model_named(&name);
+        self.spawn(
+            Kind::Pickup { kind, radius: 2.0 },
+            model,
+            pos + Vec3::Y * 0.5,
+            0.0,
+        );
     }
 }
 
@@ -4354,27 +4735,37 @@ impl Game {
         let Some(p) = self.players.get(pi) else {
             return PlayerInput::default();
         };
-        let target = self
-            .entities
-            .iter()
-            .filter(|e| match &e.kind {
-                Kind::Enemy { state, .. } => !matches!(state, EnemyState::Dying { .. }),
-                Kind::Generator { .. } | Kind::Pickup { .. } => true,
-                _ => false,
-            })
-            .filter(|e| (e.pos.y - p.pos.y).abs() < 4.0)
-            .min_by(|a, b| {
-                (a.pos - p.pos)
-                    .length()
-                    .total_cmp(&(b.pos - p.pos).length())
-            });
-        let Some(t) = target else {
+        let target =
+            self.entities
+                .iter()
+                .filter(|e| match &e.kind {
+                    Kind::Enemy { state, .. } => !matches!(state, EnemyState::Dying { .. }),
+                    // A sleeping boss is walked up to (and swung at, harmlessly).
+                    Kind::Critter(c) => c.hittable() || (c.is_boss() && !c.deleted),
+                    Kind::Generator { .. } | Kind::Pickup { .. } => true,
+                    _ => false,
+                })
+                .filter_map(|e| {
+                    let (at, r) = match &e.kind {
+                        Kind::Critter(_) => Self::aim_point(e, p.pos + Vec3::Y * 2.5)?,
+                        _ => (e.pos, 0.0),
+                    };
+                    ((at.y - p.pos.y).abs() < 4.0 || matches!(e.kind, Kind::Critter(_)))
+                        .then_some((e, Vec3::new(at.x, p.pos.y, at.z), r))
+                })
+                .min_by(|a, b| {
+                    ((a.1 - p.pos).length() - a.2).total_cmp(&((b.1 - p.pos).length() - b.2))
+                });
+        let Some((t, at, r)) = target else {
             return PlayerInput::default();
         };
-        let to = t.pos - p.pos;
-        let d = Vec2::new(to.x, to.z);
+        let to = at - p.pos;
+        let world = Vec2::new(to.x, to.z);
+        // The stick is camera-relative: turn the world direction into it.
+        let (cf, cr) = self.camera_basis();
+        let d = Vec2::new(world.dot(cr), world.dot(cf));
         let fighting = !matches!(t.kind, Kind::Pickup { .. });
-        let close = d.length() < if fighting { 3.5 } else { 0.5 };
+        let close = d.length() - r < if fighting { 3.5 } else { 0.5 };
         if fighting && !close && d.length() < 22.0 && (self.time * 3.0).fract() < 0.5 {
             // In throwing range: face the target and fire.
             return PlayerInput {
@@ -4413,7 +4804,12 @@ impl Game {
             .iter()
             .filter(|e| matches!(e.kind, Kind::Pickup { .. }))
             .count();
-        format!("enemies {enemies} generators {gens} pickups {pick}")
+        let critters = self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Critter(_)))
+            .count();
+        format!("enemies {enemies} generators {gens} pickups {pick} critters {critters}")
     }
 }
 

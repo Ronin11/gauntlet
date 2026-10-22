@@ -702,6 +702,121 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
     }
 }
 
+/// Decode only a boss's health-meter textures (`*METER_BG*`, `*METER_FG*`)
+/// from its model directory, for [`Hud::load_images`].
+pub fn boss_meter_images(fs: &GameFs, dir: &str) -> Vec<(String, Image)> {
+    let Ok(data) = fs.read(&format!("{dir}/objects.ngc")) else {
+        return Vec::new();
+    };
+    let Ok(objs) = gdl_formats::Objects::parse(&data) else {
+        return Vec::new();
+    };
+    let Ok(tex) = fs.read(&format!("{dir}/textures.ngc")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Image)> = Vec::new();
+    for d in &objs.bitmap_defs {
+        let name = d.name.to_ascii_uppercase();
+        if !name.contains("METER_") || out.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if let Some(b) = objs.bitmaps.get(d.tex_index as usize) {
+            if let Ok(img) = gdl_formats::texture::decode_ngc(b, &tex) {
+                out.push((name, img));
+            }
+        }
+    }
+    out
+}
+
+/// The boss level's overlay: the boss health meters (HealthMeterUpdate) and
+/// the good wizard's caption (CaptionText, top of the screen).
+pub fn build_boss(s: &mut Scr, game: &Game, bank: Option<&TexBank>) {
+    let Some(b) = game.boss.as_ref() else { return };
+    if !b.meters_hidden && b.active {
+        let frozen = game
+            .boss_critter()
+            .is_some_and(|(_, c)| c.parts[0].freeze > 0.0);
+        for m in &b.meters {
+            let get = |kind: &str, i: i16| {
+                let name = if m.name.is_empty() {
+                    format!("METER_{kind}{i}")
+                } else {
+                    format!("{}_METER_{kind}{i}", m.name)
+                };
+                bank.and_then(|bk| bk.get(&name))
+            };
+            // Alpha 112, the background red-tinted while the boss is frozen.
+            let a = crate::screen::fade_opacity(112);
+            let n = m.pieces.clamp(1, 2);
+            for i in 0..n {
+                if m.bg {
+                    if let Some(t) = get("BG", i + 1) {
+                        let c = if frozen {
+                            [1.0, 0.5, 0.5, a]
+                        } else {
+                            [1.0, 1.0, 1.0, a]
+                        };
+                        s.blit_tint(t, m.x + 256.0 * i as f32, 8.0, 256.0, t.h as f32, c);
+                    }
+                }
+            }
+            let f = if m.max > 0.0 { m.shown / m.max } else { 0.0 };
+            let (l, r) = (m.inset.0 as f32, m.inset.1 as f32);
+            let widths: Vec<f32> = if n == 2 {
+                let f2 = 2.0 * f;
+                let a1 = if f2 >= 1.0 {
+                    256.0
+                } else {
+                    f2 * (256.0 - l) + l
+                };
+                let a2 = if f2 - 1.0 <= 0.0 {
+                    0.0
+                } else {
+                    (f2 - 1.0) * (256.0 - r)
+                };
+                vec![a1, a2]
+            } else {
+                vec![f * (256.0 - (l + r))]
+            };
+            for (i, w) in widths.into_iter().enumerate() {
+                if w <= 0.0 {
+                    continue;
+                }
+                if let Some(t) = get("FG", i as i16 + 1) {
+                    s.blit_uv(
+                        t,
+                        m.x + 256.0 * i as f32,
+                        8.0,
+                        w,
+                        t.h as f32,
+                        [0.0, 0.0, w / 256.0, 1.0],
+                        112,
+                    );
+                }
+            }
+        }
+    }
+    if let Some(text) = game.wizard_caption() {
+        // font32 at 0.667, white with a black shadow, centred, from y = 16.
+        let scale = 0.667;
+        let lh = s.font_height(crate::ui::FONT_32, scale).max(1.0) + 2.0;
+        for (k, line) in text.split('\n').enumerate() {
+            let y = 16.0 + k as f32 * lh;
+            s.text(
+                scale,
+                -257.0,
+                y + 1.0,
+                crate::ui::FONT_32,
+                0x000000,
+                0,
+                line,
+            );
+            s.text(scale, -256.0, y, crate::ui::FONT_32, 0xFFFFFF, 0, line);
+        }
+    }
+}
+
 /// draw_power_meter at power level `level` (0..100), not flashing.
 fn power_meter(s: &mut Scr, x0: f32, level: f32) {
     let f = 0.01 * level;
@@ -899,6 +1014,21 @@ impl Hud {
             bank.textures.insert(name, t);
         }
         Ok(bank)
+    }
+
+    /// Upload already-decoded named pictures as a bank.
+    pub fn load_images(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        images: &[(String, Image)],
+    ) -> TexBank {
+        let mut bank = TexBank::default();
+        for (name, img) in images {
+            let t = self.add_texture(device, queue, img);
+            bank.textures.insert(name.clone(), t);
+        }
+        bank
     }
 
     /// Release every texture of a bank from [`Hud::load_bank`].

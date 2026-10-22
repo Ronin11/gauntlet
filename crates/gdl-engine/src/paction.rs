@@ -845,7 +845,6 @@ impl Action {
             })
         };
         let round = |f: f32| (0.5 + f) as i32;
-        let mut dance = false;
         match d {
             ACTION_INIT => mode = 2,
             READY => {
@@ -1088,7 +1087,7 @@ impl Action {
                 }
             }
             THROW | THROWQ | THROW2 | THROW2Q => {
-                dance = matches!(d, THROW2 | THROW2Q);
+                let dance = matches!(d, THROW2 | THROW2Q);
                 if (atk_next > 1 && atk_next != 9 && atk_next != 10) || atk_next == 7 {
                     mode = 2;
                     frame = round(anim_frame);

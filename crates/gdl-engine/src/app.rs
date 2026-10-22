@@ -43,6 +43,8 @@ struct Playing {
     panels: Vec<PanelInfo>,
     /// Seconds played, for fading out the loading art.
     intro: f32,
+    /// The boss's health-meter textures (boss levels).
+    boss_bank: Option<crate::hud::TexBank>,
 }
 
 /// Health, score, keys and potions carried from one level to the next.
@@ -84,11 +86,13 @@ enum Screen {
         panels: Vec<PanelInfo>,
         from_menu: bool,
     },
-    /// A level's intro movie (init_gamemovie), then the level.
+    /// A level's intro movie (init_gamemovie), then the level; or an ending
+    /// movie ("garm", "victory"), then `after` (the shop).
     Intro {
         movie: Box<crate::movie::Movie>,
         level: String,
         panels: Vec<PanelInfo>,
+        after: Option<Box<Screen>>,
     },
     Playing {
         play: Box<Playing>,
@@ -377,7 +381,12 @@ impl App {
                     p.game.garg_items = r.progress.garg_items;
                     p.game.shards = r.progress.shards;
                     p.game.runes = r.progress.runes;
-                    p.game.legend_items = r.progress.legend_items;
+                    // The party's legend weapons; a boss fight may use one.
+                    p.game.set_legend_held(r.progress.legend);
+                    if let Some(dir) = p.game.boss_model_dir() {
+                        let imgs = hud::boss_meter_images(fs, &dir);
+                        p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
+                    }
                     match p.game.wave {
                         Some(TOWER_WAVE) => {
                             let progress = r.progress.clone();
@@ -600,14 +609,25 @@ impl App {
                     movie,
                     level,
                     panels,
+                    after,
                 } => {
                     let inputs: Vec<PlayerInput> = all.iter().map(|(_, i)| *i).collect();
                     if escape || movie.update(TICK, &inputs) {
                         r.audio.stop();
-                        next = Some(Screen::Loading {
-                            level: level.clone(),
-                            panels: panels.clone(),
-                            shown: false,
+                        next = Some(match after.take() {
+                            Some(s) => {
+                                if let Screen::Shop { shop, .. } = &*s {
+                                    if let Some(m) = shop.music() {
+                                        r.audio.play_bank_music(fs, &m);
+                                    }
+                                }
+                                *s
+                            }
+                            None => Screen::Loading {
+                                level: level.clone(),
+                                panels: panels.clone(),
+                                shown: false,
+                            },
                         });
                     }
                 }
@@ -896,6 +916,11 @@ impl App {
                     &p.game,
                     &p.panels,
                 );
+                hud::build_boss(
+                    &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+                    &p.game,
+                    p.boss_bank.as_ref(),
+                );
                 let fade = menu::loading_fade(p.intro);
                 if fade < 255 {
                     menu::transition(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), fade);
@@ -967,6 +992,7 @@ impl App {
             r.progress.crystals = play.game.crystals;
             r.progress.garg_items = play.game.garg_items;
             r.progress.shards = play.game.shards;
+            r.progress.legend = play.game.legend_held;
             let mut carry: Carry = Default::default();
             for (p, info) in play.game.players.iter().zip(&play.panels) {
                 carry[info.slot % 4] = Some(p.carried());
@@ -1001,8 +1027,12 @@ impl App {
                 r.progress.crystals = play.game.crystals;
                 r.progress.garg_items = play.game.garg_items;
                 r.progress.shards = play.game.shards;
-                r.progress.runes |= play.game.runes;
-                r.progress.legend_items |= play.game.legend_items;
+                r.progress.legend = play.game.legend_held;
+                // BossDeath: PlayerGiveRune, the boss's shard (a "rune" in the code).
+                r.progress.runes |= play.game.boss_runes | play.game.runes;
+                if let Some(bank) = play.boss_bank.take() {
+                    r.hud.free_bank(bank);
+                }
                 // A death on a Guardian's level counts as an attempt at it (more
                 // of its hint unlocks).
                 if let Some(w) = play.game.wave.filter(|&w| w != TOWER_WAVE) {
@@ -1140,14 +1170,48 @@ impl App {
                                     crate::shop::ShopMode::AfterLevel,
                                     w == Some(0x803),
                                 );
-                                match shop.music() {
-                                    Some(m) => r.audio.play_bank_music(fs, &m),
-                                    None => r.audio.stop(),
-                                }
-                                Screen::Shop {
-                                    shop: Box::new(shop),
-                                    panels,
-                                    from_menu: false,
+                                let ending = match w {
+                                    Some(0x601) => "garm",
+                                    Some(0x803) => "victory",
+                                    _ => "",
+                                };
+                                let movie = (!ending.is_empty())
+                                    .then(|| crate::movie::Movie::open(fs, ending).ok())
+                                    .flatten();
+                                match movie {
+                                    // After Skorne in the Underworld, "garm"; after
+                                    // Garm, "victory"; then the shop (gamemain.c).
+                                    Some(mut m) => {
+                                        r.audio.stop();
+                                        if let Some(a) = m.audio.take() {
+                                            r.audio.play_once(
+                                                a.pcm,
+                                                a.channels as u16,
+                                                a.playback_rate,
+                                            );
+                                        }
+                                        Screen::Intro {
+                                            movie: Box::new(m),
+                                            level: String::new(),
+                                            panels: panels.clone(),
+                                            after: Some(Box::new(Screen::Shop {
+                                                shop: Box::new(shop),
+                                                panels,
+                                                from_menu: false,
+                                            })),
+                                        }
+                                    }
+                                    None => {
+                                        match shop.music() {
+                                            Some(m) => r.audio.play_bank_music(fs, &m),
+                                            None => r.audio.stop(),
+                                        }
+                                        Screen::Shop {
+                                            shop: Box::new(shop),
+                                            panels,
+                                            from_menu: false,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1201,6 +1265,7 @@ fn start_game(
         scene,
         panels,
         intro: 0.0,
+        boss_bank: None,
     })
 }
 
@@ -1272,6 +1337,7 @@ fn intro_or_level(
                 movie: Box::new(m),
                 level: level.to_string(),
                 panels: panels.to_vec(),
+                after: None,
             }
         }
         None => Screen::Loading {
@@ -1298,7 +1364,7 @@ fn hint_facts(
         shards: progress.shards | game.shards | banked.1,
         boss_attempts: progress.boss_attempts,
         level_masks: progress.level_masks,
-        legend_held: progress.legend_items | game.legend_items,
+        legend_held: progress.legend | game.legend_held,
         sections: std::array::from_fn(|j| {
             game.garg_items[j] < 0 || game.garg_items[j] >= crate::game::GARG_NEEDED[j]
         }),

@@ -35,10 +35,10 @@ pub struct Progress {
     /// level_masks: Runestone levels beaten once / twice (bit = rune - 1) and
     /// legend-item levels beaten once / twice (bit = the item's realm).
     pub level_masks: [u16; 4],
-    /// Items of Legend held (bit = realm).
-    pub legend_items: u16,
     /// Sumner's hint pickers.
     pub hints: crate::hints::HintState,
+    /// Legend weapons carried (rune_near): bit = the item's value.
+    pub legend: u16,
 }
 
 /// lbl_80124D4C: the crystal colour that opens each realm type (0 = none).

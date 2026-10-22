@@ -4,8 +4,10 @@
 pub mod app;
 pub mod attract;
 pub mod audio;
+pub mod boss;
 pub mod character;
 pub mod collision;
+pub mod critter;
 pub mod cursor;
 pub mod enemies;
 pub mod fs;

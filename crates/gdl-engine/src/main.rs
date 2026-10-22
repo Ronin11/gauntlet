@@ -24,6 +24,8 @@ struct Args {
     simulate: u32,
     hold: Vec2,
     attack_at: Option<u32>,
+    kill_boss_at: Option<u32>,
+    legend: bool,
     bot: bool,
     mute: bool,
 }
@@ -63,6 +65,9 @@ Testing:
   --hold <x,y>          Stick input held during simulation
   --attack-at <frame>   Press attack on that frame
   --bot                 Let a simple bot play every player during simulation
+  --kill-boss-at <f>    Boss levels: the boss dies on that frame (its death, the
+                        coins and the good wizard follow)
+  --legend              Boss levels: the party carries this boss's legend weapon
   --char CLASS/COLOR    Snapshot a single character (or monster/NAME)
   --seq NAME --frame F  Animation sequence and frame for --char
   --eye x,y,z --at x,y,z --size WxH   Snapshot camera";
@@ -84,6 +89,8 @@ fn parse_args() -> Result<Args> {
         simulate: 0,
         hold: Vec2::ZERO,
         attack_at: None,
+        kill_boss_at: None,
+        legend: false,
         bot: false,
         mute: std::env::var_os("GDL_MUTE").is_some(),
     };
@@ -109,6 +116,8 @@ fn parse_args() -> Result<Args> {
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
             "--attack-at" => a.attack_at = Some(val()?.parse()?),
+            "--kill-boss-at" => a.kill_boss_at = Some(val()?.parse()?),
+            "--legend" => a.legend = true,
             "--bot" => a.bot = true,
             "--mute" => a.mute = true,
             "--hold" => {
@@ -286,8 +295,15 @@ fn snapshot_game(args: &Args) -> Result<()> {
     let box_close: Option<u32> = std::env::var("GDL_BOX_CLOSE")
         .ok()
         .and_then(|v| v.parse().ok());
+    if args.legend {
+        let realm = g.wave.map_or(0, |w| w >> 8);
+        g.set_legend_held(1 << realm);
+    }
     let mut sfx_seen: Vec<String> = Vec::new();
     for f in 0..args.simulate {
+        if args.kill_boss_at == Some(f) {
+            g.kill_boss();
+        }
         if let Some(b) = &mut g.scroll_box {
             let press = box_close.is_some_and(|n| b.ticks + 1 >= n);
             let inp = input::PlayerInput {
@@ -485,12 +501,21 @@ fn snapshot_game(args: &Args) -> Result<()> {
             class: select::CLASSES.iter().position(|k| k == c).unwrap_or(0),
         })
         .collect();
+    let boss_bank = g.boss_model_dir().map(|d| {
+        let imgs = hud::boss_meter_images(&fs, &d);
+        hud.load_images(&gpu.device, &gpu.queue, &imgs)
+    });
     let draw_hud = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
         hud::build(
             &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
             &g,
             &panels,
+        );
+        hud::build_boss(
+            &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
+            &g,
+            boss_bank.as_ref(),
         );
         if let Some(b) = &g.scroll_box {
             menu::draw_scroll(
