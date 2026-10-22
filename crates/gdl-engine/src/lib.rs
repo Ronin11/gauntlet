@@ -24,6 +24,7 @@ pub mod options;
 pub mod optmenu;
 pub mod powerups;
 pub mod progress;
+pub mod save;
 pub mod scene;
 pub mod screen;
 pub mod select;
