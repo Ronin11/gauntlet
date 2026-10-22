@@ -186,6 +186,9 @@ pub struct AudioDef {
     /// hit or exploding wall (AudioExplodeWall, wall sound 5).
     pub entersnd: i16,
     pub hitsnd: i16,
+    /// The level's spoken name (a sound id), -1 none: -1 in every level, so
+    /// AudioEnterNextStage never speaks.
+    pub namesnd: i32,
     /// Sequential parts per area (`<name>_1`, `<name>_2`, ...).
     pub parts: [i16; 8],
 }
@@ -396,6 +399,7 @@ impl Realm {
                     channels: i16_at(o + 0x2A),
                     entersnd: i16_at(o + 0x10),
                     hitsnd: i16_at(o + 0x12),
+                    namesnd: i32_at(o + 0x14),
                     parts,
                 });
             }
