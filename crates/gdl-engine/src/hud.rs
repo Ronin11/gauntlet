@@ -100,7 +100,7 @@ const CLASS_NAMES: [(&str, &str); 4] = [
 
 /// Build the in-game HUD for the current game state.
 pub fn build(c: &mut Canvas, game: &Game, classes: &[String]) {
-    let scale = (c.height() / 360.0).clamp(1.0, 4.0).floor();
+    let scale = (c.height() / 360.0).min(c.width() / 560.0).clamp(1.0, 4.0).floor();
     let panel_w = 120.0 * scale;
     let panel_h = 34.0 * scale;
     let n = game.players.len();
