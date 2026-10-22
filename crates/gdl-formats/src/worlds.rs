@@ -148,6 +148,11 @@ pub struct ItemInfo {
     pub value: i16,
     pub armor: i16,
     pub hit_points: i16,
+    pub active_type: i16,
+    pub active_off: i16,
+    /// For power-ups, seconds they last (scaled by the class's powerup_time);
+    /// negative for ones counted in uses.
+    pub active_on: i16,
     /// For `Random` items: candidate item_info indices.
     pub random_indices: Vec<i16>,
 }
@@ -323,6 +328,9 @@ impl Worlds {
                     value: 0,
                     armor: 0,
                     hit_points: 0,
+                    active_type: 0,
+                    active_off: 0,
+                    active_on: 0,
                     random_indices,
                 });
                 continue;
@@ -342,6 +350,9 @@ impl Worlds {
                 value: r.i16(d + 60)?,
                 armor: r.i16(d + 62)?,
                 hit_points: r.i16(d + 64)?,
+                active_type: r.i16(d + 66)?,
+                active_off: r.i16(d + 68)?,
+                active_on: r.i16(d + 70)?,
                 random_indices: Vec::new(),
             });
         }

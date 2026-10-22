@@ -19,6 +19,7 @@ pub mod mesh;
 pub mod movie;
 pub mod options;
 pub mod optmenu;
+pub mod powerups;
 pub mod progress;
 pub mod scene;
 pub mod screen;

@@ -123,6 +123,7 @@ pub struct Carried {
     pub level: u32,
     pub exp: u32,
     pub bonus: crate::stats::Atts,
+    pub powerups: crate::powerups::Powerups,
 }
 
 impl Carried {
@@ -146,6 +147,7 @@ impl Player {
             level: self.level,
             exp: self.exp,
             bonus: self.bonus,
+            powerups: self.powerups.clone(),
         }
     }
 
@@ -158,6 +160,7 @@ impl Player {
         self.level = c.level.max(1);
         self.exp = c.exp;
         self.bonus = c.bonus;
+        self.powerups = c.powerups.clone();
         self.refresh_stats();
     }
 
@@ -267,6 +270,9 @@ pub struct Player {
     pub power: f32,
     /// Each carried potion's colour, used last in first out.
     pub potion_colours: Vec<u8>,
+    pub powerups: crate::powerups::Powerups,
+    /// What the active power-ups add up to this frame.
+    pub fx: crate::powerups::Effects,
     pub keys: u32,
     pub potions: u32,
     /// Gold (GDL has no score), at most 99999.
@@ -383,6 +389,14 @@ pub enum PickupKind {
     Crystal(usize),
     /// A scroll: the line of the level's SCROLLS message it shows.
     Scroll(usize),
+    /// A power-up: type, flags, amount (uses or bonus) and seconds (negative
+    /// when counted in uses) before the class's powerup_time.
+    Powerup {
+        kind: u8,
+        flags: u32,
+        amount: f32,
+        seconds: f32,
+    },
     Other(u32),
 }
 
@@ -408,6 +422,12 @@ fn pickup_kind(info: &gdl_formats::worlds::ItemInfo, params: &[u8]) -> PickupKin
             Some(c) => PickupKind::Crystal(c),
             None => PickupKind::Other(0),
         },
+        "weapon" | "armor" | "speed" | "magic" | "special" => PickupKind::Powerup {
+            kind: info.subtype as u8,
+            flags: info.properties,
+            amount: info.value as f32,
+            seconds: info.active_on as f32,
+        },
         _ => PickupKind::Other(0),
     }
 }
@@ -419,6 +439,12 @@ fn can_take(p: &Player, kind: &PickupKind) -> bool {
         PickupKind::Food(hp) => hp < 0.0 || p.health < max_health(p.level),
         PickupKind::Key(_) => p.keys < MAX_KEYS,
         PickupKind::Potion(_) => p.potions < MAX_POTIONS,
+        // Only one boss item (horns, mask, gauntlets) at a time.
+        PickupKind::Powerup {
+            kind: crate::powerups::SPECIAL,
+            flags,
+            ..
+        } if flags & 0xF000 != 0 => p.fx.special & 0xF000 == 0,
         _ => true,
     }
 }
@@ -590,6 +616,8 @@ pub struct Game {
     pub scroll_box: Option<ScrollBox>,
     /// Potion blasts spreading out.
     pub rings: Vec<Ring>,
+    /// Lightning-shield strikes waiting out their second, by (player, monster).
+    shield_cooldown: HashMap<(usize, u64), f32>,
     /// Item models loaded for the level, by item name.
     item_models: HashMap<String, Option<usize>>,
     /// Crystals found per colour; -1 once a colour has opened its barrier.
@@ -829,6 +857,7 @@ impl Game {
             scrolls: Vec::new(),
             scroll_box: None,
             rings: Vec::new(),
+            shield_cooldown: HashMap::new(),
             item_models: HashMap::new(),
             crystals: [0; 9],
             crystal_shown: None,
@@ -884,6 +913,8 @@ impl Game {
                 derived: Default::default(),
                 power: 0.0,
                 potion_colours: Vec::new(),
+                powerups: Default::default(),
+                fx: Default::default(),
                 keys: 0,
                 potions: 0,
                 gold: 0,
@@ -1541,6 +1572,7 @@ impl Game {
         let mut rings: Vec<(usize, Vec3, u8)> = Vec::new();
         let mut turbos: Vec<(usize, Vec3, f32, bool)> = Vec::new();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
+        let in_tower = self.wave == Some(gdl_formats::wdata::TOWER_WAVE);
         // Things an attack can be aimed at, with their radius.
         let targets: Vec<(Vec3, f32)> = self
             .entities
@@ -1553,6 +1585,14 @@ impl Game {
             let seqs = &self.player_seqs[p.model];
             let model = &self.models[p.model];
             p.hurt_flash = (p.hurt_flash - dt * 3.0).max(0.0);
+            // PlayerProcessPowerups: timed power-ups run down outside the tower.
+            if !in_tower {
+                p.powerups.tick(dt);
+            }
+            p.fx = p.powerups.effects();
+            p.refresh_stats();
+            p.derived.speed = (p.derived.speed + p.fx.speed).min(12.5);
+            p.derived.magic_power = (p.derived.magic_power + p.fx.magic).min(32.0);
 
             match &mut p.state {
                 PlayerState::Dead { timer } => {
@@ -1597,6 +1637,7 @@ impl Game {
                 // damage_player: dying empties the turbo meter; the keys drop.
                 p.health = 0.0;
                 p.power = 0.0;
+                p.powerups.clear();
                 p.state = PlayerState::Dead { timer: 4.0 };
                 self.sfx.push(format!("S_{}DIE1", p.class));
                 if let Some(d) = seqs.death {
@@ -1807,7 +1848,13 @@ impl Game {
                     queued: false,
                 };
                 p.animator.restart(seq);
-                p.animator.speed = 1.0;
+                // Rapid fire plays the throw at 1 / 0.75 speed.
+                p.animator.speed = if throw.is_some() && p.fx.weapon & crate::powerups::W_RAPID != 0
+                {
+                    1.0 / 0.75
+                } else {
+                    1.0
+                };
             }
 
             let wish = fwd * inp.stick.y + right * inp.stick.x;
@@ -1901,6 +1948,7 @@ impl Game {
         for (pi, pos, yaw) in attacks {
             self.player_attack(pi, pos, yaw);
         }
+        self.shield_contact(dt);
         // start_magic: the potion's ring spreads out from where it was used.
         for (pi, pos, colour) in rings {
             let power = self.players[pi].derived.magic_power;
@@ -1938,25 +1986,45 @@ impl Game {
             }
         }
         for (pi, pos, yaw) in throws {
+            use crate::powerups as pu;
             self.sfx.push(format!("S_{}THROW", self.players[pi].class));
-            let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
             let p = &self.players[pi];
-            let (speed, damage, model) = (
+            let (speed, mut damage, model, w) = (
                 p.derived.missile_speed,
                 p.derived.missile_damage,
                 p.proj_model,
+                p.fx.weapon,
             );
-            self.spawn(
-                Kind::Projectile {
-                    owner: pi,
-                    vel: dir * speed,
-                    life: PROJECTILE_LIFE,
-                    damage,
-                },
-                model,
-                pos + Vec3::Y * 2.5 + dir * 1.2,
-                yaw,
-            );
+            if w & pu::W_ELEMENT != 0 {
+                damage *= ELEMENT_BONUS;
+            }
+            // A super shot doubles the damage, one use a throw.
+            if self.players[pi].powerups.use_one(pu::WEAPON, pu::W_SUPER) {
+                damage *= 2.0;
+            }
+            // 3-way and 5-way shots fan out 15 degrees apart.
+            let spread: &[f32] = if w & pu::W_5WAY != 0 {
+                &[0.0, 15.0, -15.0, 30.0, -30.0]
+            } else if w & pu::W_3WAY != 0 {
+                &[0.0, 15.0, -15.0]
+            } else {
+                &[0.0]
+            };
+            for a in spread {
+                let y = yaw + a.to_radians();
+                let dir = Vec3::new(y.sin(), 0.0, y.cos());
+                self.spawn(
+                    Kind::Projectile {
+                        owner: pi,
+                        vel: dir * speed,
+                        life: PROJECTILE_LIFE,
+                        damage,
+                    },
+                    model,
+                    pos + Vec3::Y * 2.5 + dir * 1.2,
+                    y,
+                );
+            }
         }
         for (pos, n) in key_drops {
             let model = self.pickup_model(&PickupKind::Key(1));
@@ -1969,6 +2037,48 @@ impl Game {
                 pos + Vec3::Y * 0.5,
                 0.0,
             );
+        }
+    }
+
+    /// The fire shield burns any monster touching the player (3 fire damage a
+    /// game frame); the lightning shield strikes each for 20, once a second.
+    fn shield_contact(&mut self, dt: f32) {
+        use crate::powerups as pu;
+        self.shield_cooldown.retain(|_, t| {
+            *t -= dt;
+            *t > 0.0
+        });
+        let mut hits = Vec::new();
+        for (pi, p) in self.players.iter().enumerate() {
+            let armor = p.fx.armor;
+            if !p.state.active() || armor & (pu::A_FIRE | pu::A_LIGHTNING) == 0 {
+                continue;
+            }
+            for (i, e) in self.entities.iter().enumerate() {
+                if !e.alive || !matches!(e.kind, Kind::Enemy { .. }) {
+                    continue;
+                }
+                let d = Vec2::new(e.pos.x - p.pos.x, e.pos.z - p.pos.z);
+                if d.length() > PLAYER_RADIUS + 1.5 {
+                    continue;
+                }
+                if armor & pu::A_FIRE != 0 {
+                    // 3 a 30 Hz frame, in the fire element.
+                    hits.push((
+                        pi,
+                        i,
+                        3.0 * ELEMENT_BONUS * dt * 30.0,
+                        d.normalize_or_zero(),
+                    ));
+                }
+                if armor & pu::A_LIGHTNING != 0 && !self.shield_cooldown.contains_key(&(pi, e.id)) {
+                    hits.push((pi, i, 20.0 * ELEMENT_BONUS, d.normalize_or_zero()));
+                    self.shield_cooldown.insert((pi, e.id), 1.0);
+                }
+            }
+        }
+        for (pi, i, dmg, push) in hits {
+            self.hit_entity(pi, i, dmg, push, false);
         }
     }
 
@@ -1987,7 +2097,19 @@ impl Game {
     /// A melee swing (PlayerMotion_DamageTarget): one target, the nearest in the
     /// forward cone within reach of its surface, takes the player's damage.
     fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32) {
+        use crate::powerups as pu;
         let dir = Vec2::new(yaw.sin(), yaw.cos());
+        // The hammer and breath power-ups replace the swing while they have uses.
+        if self.players[pi].powerups.use_one(pu::WEAPON, pu::W_HAMMER) {
+            self.sfx.push("S_HAMMER|S_EXPLODE1".into());
+            self.area_hit(pi, pos, 35.0, 100.0);
+            return;
+        }
+        if self.players[pi].powerups.use_one(pu::SPECIAL, pu::S_BREATH) {
+            let front = pos + Vec3::new(dir.x, 0.0, dir.y) * 10.0;
+            self.area_hit(pi, front, 20.0, 40.0 * ELEMENT_BONUS);
+            return;
+        }
         let target = self
             .entities
             .iter()
@@ -2007,7 +2129,15 @@ impl Game {
             *hit = true;
             return;
         }
-        let dmg = self.players[pi].derived.damage;
+        let p = &self.players[pi];
+        let mut dmg = p.derived.damage;
+        // Growth doubles melee; an amulet gives every hit its element.
+        if p.fx.special & crate::powerups::S_GROWTH != 0 {
+            dmg *= 2.0;
+        }
+        if p.fx.weapon & crate::powerups::W_ELEMENT != 0 {
+            dmg *= ELEMENT_BONUS;
+        }
         self.hit_entity(pi, t, dmg, dir, true);
     }
 
@@ -2039,6 +2169,15 @@ impl Game {
     /// Damage entity `t` on player `pi`'s behalf: sounds, experience (more for
     /// melee, which also charges the turbo meter) and anything it drops.
     fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
+        let shrunk = self
+            .players
+            .iter()
+            .any(|p| p.fx.special & crate::powerups::S_SHRINK != 0);
+        let dmg = if shrunk && matches!(self.entities[t].kind, Kind::Enemy { .. }) {
+            dmg * 2.0
+        } else {
+            dmg
+        };
         let r = Self::apply_hit(&mut self.entities[t], dmg, push);
         let e = &self.entities[t];
         if let Some(snd) = self.hit_sound(e, Self::is_destroyed(e)) {
@@ -2099,6 +2238,19 @@ impl Game {
             return;
         }
         let mut dmg = dmg;
+        let armor = p.fx.armor;
+        use crate::powerups as pu;
+        // ModifyDamage: invulnerable takes nothing, gold invulnerability turns a
+        // hit into a 10% heal, a gas mask stops poison.
+        if armor & pu::A_INVULN != 0 {
+            if armor & pu::A_GOLD != 0 && dmg > 1.0 {
+                p.health = (p.health + 0.1 * dmg).min(max_health(p.level));
+            }
+            return;
+        }
+        if armor & pu::A_GAS != 0 && flags & DmgType::POISON_GAS != 0 {
+            return;
+        }
         if flags & DmgType::POISON_GAS == 0 {
             dmg = (dmg - p.derived.armor).max(0.0);
         }
@@ -2315,11 +2467,32 @@ impl Game {
             .iter()
             .map(|p| (p.pos, p.state.active()))
             .collect();
+        use crate::powerups as pu;
+        // Invisible players are never chased; stop time freezes every monster;
+        // shrink halves what monsters deal (and doubles what they take).
+        let hidden: Vec<bool> = self
+            .players
+            .iter()
+            .map(|p| p.fx.special & pu::S_INVISIBLE != 0)
+            .collect();
+        let frozen = self
+            .players
+            .iter()
+            .any(|p| p.fx.special & pu::S_STOPTIME != 0);
+        let shrunk = self
+            .players
+            .iter()
+            .any(|p| p.fx.special & pu::S_SHRINK != 0);
+        let levitating: Vec<bool> = self
+            .players
+            .iter()
+            .map(|p| p.fx.special & pu::S_LEVITATE != 0)
+            .collect();
         let nearest = |pos: Vec3| -> Option<(usize, f32)> {
             player_pos
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, alive))| *alive)
+                .filter(|(i, (_, alive))| *alive && !hidden[*i])
                 .map(|(i, (pp, _))| (i, (*pp - pos).length()))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         };
@@ -2330,6 +2503,8 @@ impl Game {
             .count();
         let mut spawns: Vec<(usize, usize, Vec3, u64)> = Vec::new();
         let mut damage: Vec<(usize, f32)> = Vec::new();
+        // Monster melee hits: (monster, player, damage).
+        let mut melee: Vec<(usize, usize, f32)> = Vec::new();
         let mut pickups: Vec<(usize, PickupKind)> = Vec::new();
         let mut opened: Vec<(usize, usize)> = Vec::new();
         let mut key_used: Vec<usize> = Vec::new();
@@ -2368,6 +2543,7 @@ impl Game {
                         }
                     }
                 }
+                Kind::Enemy { .. } if frozen => {}
                 Kind::Enemy {
                     strength,
                     state,
@@ -2448,7 +2624,8 @@ impl Game {
                                         // get_enemy_fight: 12 / 15 / 18 by the
                                         // monster's tier (x the level's enemy
                                         // damage, 1.0 here).
-                                        damage.push((
+                                        melee.push((
+                                            ei,
                                             pi,
                                             [12.0, 15.0, 18.0][(*strength).clamp(1, 3) - 1],
                                         ));
@@ -2611,7 +2788,9 @@ impl Game {
                             && (*pp - e.pos).length() < *radius
                             && (self.time * 2.0).fract() < dt * 2.0
                         {
-                            damage.push((pi, *dmg));
+                            if !levitating[pi] {
+                                damage.push((pi, *dmg));
+                            }
                         }
                     }
                 }
@@ -2731,6 +2910,23 @@ impl Game {
         for (pi, dmg) in damage {
             self.damage_player(pi, dmg, 0);
         }
+        for (ei, pi, dmg) in melee {
+            let dmg = if shrunk { dmg * 0.5 } else { dmg };
+            let special = self.players[pi].fx.special;
+            if special & (pu::S_HANDOFDEATH | pu::S_VAMPIRE) != 0 {
+                // Hand of Death turns the blow back on the monster; Health Vampire
+                // does that too and heals the player by it.
+                if let Some(e) = self.entities.get_mut(ei) {
+                    Self::apply_hit(e, dmg, Vec2::ZERO);
+                }
+                if special & pu::S_VAMPIRE != 0 {
+                    let p = &mut self.players[pi];
+                    p.health = (p.health + dmg).min(max_health(p.level));
+                }
+            } else {
+                self.damage_player(pi, dmg, 0);
+            }
+        }
         let mut poisoned: Vec<(usize, f32)> = Vec::new();
         for (pi, kind) in pickups {
             let p = &mut self.players[pi];
@@ -2740,7 +2936,7 @@ impl Game {
                 PickupKind::Gold(_) => "S_PICKUPCRYST".into(),
                 PickupKind::Potion(_) => "S_PICKUPMAGIC".into(),
                 PickupKind::Crystal(_) => "S_PICKUPCRYST".into(),
-                PickupKind::Scroll(_) => "S_PICKUPSPECIAL".into(),
+                PickupKind::Scroll(_) | PickupKind::Powerup { .. } => "S_PICKUPSPECIAL".into(),
                 PickupKind::Other(_) => "S_PICKUPSPECIAL".into(),
             });
             match kind {
@@ -2777,6 +2973,21 @@ impl Game {
                             text: text.clone(),
                             ticks: 0,
                         });
+                    }
+                }
+                // PlayerAddPowerup, for the class's powerup_time; the turbo
+                // pick-up fills the meter at once.
+                PickupKind::Powerup {
+                    kind,
+                    flags,
+                    amount,
+                    seconds,
+                } => {
+                    if kind == crate::powerups::SPECIAL && flags & crate::powerups::S_TURBO != 0 {
+                        p.power = 100.0;
+                    } else {
+                        let t = seconds * crate::stats::powerup_time(p.class_id);
+                        p.powerups.add(kind, flags, amount, t);
                     }
                 }
                 PickupKind::Other(_) => {}
@@ -3182,6 +3393,63 @@ mod tests {
             .filter(|e| matches!(e.kind, Kind::Trigger { gate: Some(_), .. }))
             .count();
         assert_eq!(barriers, 8, "one crystal barrier per crystal realm");
+    }
+
+    #[test]
+    fn powerup_items_match_the_spec() {
+        let Some(fs) = data() else { return };
+        // Find the power-up items across the levels and check their data.
+        let mut seen = std::collections::HashMap::new();
+        for dir in fs.list_dirs("LEVELS") {
+            let Ok(level) = crate::level::Level::load(&fs, &dir) else {
+                continue;
+            };
+            for info in &level.worlds.item_infos {
+                if let PickupKind::Powerup {
+                    kind,
+                    flags,
+                    amount,
+                    seconds,
+                } = pickup_kind(info, &[0; 16])
+                {
+                    seen.insert(
+                        info.name.to_ascii_uppercase(),
+                        (kind, flags, amount, seconds),
+                    );
+                }
+            }
+        }
+        assert_eq!(seen.get("XBOWICON"), Some(&(5, 0x100000, 5.0, -1.0)));
+        assert_eq!(seen.get("MULTIICON"), Some(&(5, 0x80000, 0.0, 45.0)));
+        assert_eq!(seen.get("INVULICON"), Some(&(6, 0x10000, 0.0, 30.0)));
+    }
+
+    #[test]
+    fn three_way_throws_three() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("ARC", "GRE")]).unwrap();
+        g.entities
+            .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
+        g.players[0]
+            .powerups
+            .add(crate::powerups::WEAPON, crate::powerups::W_3WAY, 0.0, 45.0);
+        let attack = PlayerInput {
+            attack_pressed: true,
+            attack: true,
+            ..Default::default()
+        };
+        let mut most = 0;
+        for _ in 0..40 {
+            g.update(1.0 / 60.0, &[attack]);
+            let n = g
+                .entities
+                .iter()
+                .filter(|e| matches!(e.kind, Kind::Projectile { .. }))
+                .count();
+            most = most.max(n);
+        }
+        assert_eq!(most % 3, 0);
+        assert!(most >= 3);
     }
 
     #[test]
