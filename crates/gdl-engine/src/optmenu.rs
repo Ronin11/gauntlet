@@ -113,6 +113,9 @@ pub struct OptMenu {
     pub time: u32,
     /// START counts as A (OPTMENU_TITLE).
     pub title: bool,
+    /// Extra space under every item (the menu entries' dy; 4 in the memory
+    /// card lists).
+    pub dy: f32,
     dirs: Dirs,
 }
 
@@ -129,13 +132,14 @@ impl OptMenu {
             sel: 0,
             time: 0,
             title: false,
+            dy: 0.0,
             dirs: Dirs::default(),
         }
     }
 
-    /// Line advance: FontHeight(6, scale) + the item's dy (always 0 here).
+    /// Line advance: FontHeight(6, scale) + the items' dy.
     pub fn line_height(&self) -> f32 {
-        (32.0 * self.scale).floor()
+        (32.0 * self.scale).floor() + self.dy
     }
 
     /// do_optmenu: advance the clock by `ticks` and handle one player's input.

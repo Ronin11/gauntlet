@@ -57,6 +57,7 @@ Controls: left stick / WASD move, A / J attack, X / Shift turbo,
 Testing:
   --snapshot <png>      Render one frame headless and exit
   --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
+                        select:load|save|result|char (memory card screens),
                         map:<level>[:ticks] (e.g. map:A6:300),
                         shop[:after|menu|inv|final[:ticks[:events]]] with a fake
                         2-player party after A1; events are <tick><key>[<player>]
@@ -549,6 +550,12 @@ fn snapshot_game(args: &Args) -> Result<()> {
             Some("select") => {
                 select::Select::demo().draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
             }
+            // select:load|save|result|char: the memory card screens.
+            Some(name) if name.starts_with("select:") => {
+                if let Some(sel) = select::Select::demo_card(&name[7..]) {
+                    sel.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
+                }
+            }
             Some("loading") => menu::draw_loading(&mut screen::Scr::new(&mut canvas, &hud.ui, 40)),
             Some(name) if name.starts_with("gamemenu") || name.starts_with("towermenu") => {
                 let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
@@ -662,5 +669,6 @@ fn main() -> Result<()> {
         level: args.level,
         players: args.players,
         mute: args.mute,
+        save_dir: gdl_engine::save::MemCard::default_dir(),
     })
 }
