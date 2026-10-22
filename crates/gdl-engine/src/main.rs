@@ -316,7 +316,9 @@ fn snapshot_game(args: &Args) -> Result<()> {
             Some("titlemenu") => {
                 menu::Title::demo(true).draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
             }
-            Some("select") => select::Select::demo().draw(&mut canvas, &style, t),
+            Some("select") => {
+                select::Select::demo().draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
+            }
             Some("loading") => menu::draw_loading(&mut screen::Scr::new(&mut canvas, &hud.ui, 40)),
             Some("pause") => {
                 hud::build(&mut canvas, &hud.ui, &g, &names);

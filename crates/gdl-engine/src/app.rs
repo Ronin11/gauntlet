@@ -362,9 +362,12 @@ impl App {
                     }
                 }
                 Screen::Select(sel) => {
-                    if escape {
+                    for snd in sel.sfx.drain(..) {
+                        r.audio.play(fs, &snd);
+                    }
+                    if escape || sel.leave {
                         next = Some(Screen::Title(Title::default()));
-                    } else if let Some(players) = sel.update(&r.input, TICK) {
+                    } else if let Some(players) = sel.update(&all) {
                         r.sources = sel.sources();
                         next = Some(Screen::Loading {
                             level: self.cfg.level.clone(),
@@ -385,7 +388,7 @@ impl App {
                         match action {
                             Some(PauseAction::Resume) => *pause = None,
                             Some(PauseAction::ChangeHeroes) => {
-                                next = Some(Screen::Select(Select::default()));
+                                next = Some(Screen::Select(Select::new(Default::default())));
                             }
                             Some(PauseAction::QuitToTitle) => {
                                 next = Some(Screen::Title(Title::default()));
@@ -423,7 +426,7 @@ impl App {
         let mut in_game = false;
         match &mut r.screen {
             Screen::Title(t) => t.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
-            Screen::Select(sel) => sel.draw(&mut canvas, &style, time),
+            Screen::Select(sel) => sel.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Loading { shown, .. } => {
                 menu::draw_loading(&mut Scr::new(&mut canvas, &r.hud.ui, ticks));
                 *shown = true;

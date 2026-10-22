@@ -74,31 +74,36 @@ impl Canvas {
         uv: [f32; 4],
         color: [f32; 4],
     ) {
+        self.quad_colors(tex, x, y, w, h, uv, [color; 4]);
+    }
+
+    /// As [`Canvas::quad`] with a colour per corner: top-left, top-right,
+    /// bottom-right, bottom-left. Colours above 1 brighten the texture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quad_colors(
+        &mut self,
+        tex: Tex,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uv: [f32; 4],
+        colors: [[f32; 4]; 4],
+    ) {
         if self.batches.last().map(|b| b.0) != Some(tex.id) {
             self.batches.push((tex.id, self.verts.len() as u32));
         }
         let to = |px: f32, py: f32| [px / self.w * 2.0 - 1.0, 1.0 - py / self.h * 2.0];
         let [u0, v0, u1, v1] = uv;
-        let a = V {
-            pos: to(x, y),
-            uv: [u0, v0],
+        let v = |px: f32, py: f32, u: f32, vv: f32, color: [f32; 4]| V {
+            pos: to(px, py),
+            uv: [u, vv],
             color,
         };
-        let b = V {
-            pos: to(x + w, y),
-            uv: [u1, v0],
-            color,
-        };
-        let c = V {
-            pos: to(x + w, y + h),
-            uv: [u1, v1],
-            color,
-        };
-        let d = V {
-            pos: to(x, y + h),
-            uv: [u0, v1],
-            color,
-        };
+        let a = v(x, y, u0, v0, colors[0]);
+        let b = v(x + w, y, u1, v0, colors[1]);
+        let c = v(x + w, y + h, u1, v1, colors[2]);
+        let d = v(x, y + h, u0, v1, colors[3]);
         self.verts.extend([a, b, c, a, c, d]);
     }
 

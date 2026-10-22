@@ -111,6 +111,35 @@ impl<'a> Scr<'a> {
         self.blit_tint(t, x, y, w, h, [1.0, 1.0, 1.0, fade_opacity(fade)]);
     }
 
+    /// A blit with flag 0x4000: a light sweeping diagonally across the screen every
+    /// 150 ticks brightens each corner (mbBlitCalcLight).
+    pub fn blit_shimmer(&mut self, t: Tex, x: f32, y: f32, w: f32, h: f32, fade: i32) {
+        let a = fade_opacity(fade);
+        let phase = 7.0 * ((self.ticks % 150) as f32 / 150.0);
+        let corner = |cx: f32, cy: f32| {
+            // Blit colours are 0x80 = 1.0; the light adds up to 127.
+            let l = 1.0 + calc_light(cx, 384.0 - cy, phase) as f32 / 128.0;
+            [l, l, l, a]
+        };
+        let colors = [
+            corner(x, y),
+            corner(x + w, y),
+            corner(x + w, y + h),
+            corner(x, y + h),
+        ];
+        let (hu, hv) = (0.5 / t.w as f32, 0.5 / t.h as f32);
+        let k = self.k;
+        self.c.quad_colors(
+            t,
+            self.x0 + x * k,
+            self.y0 + y * k,
+            w * k,
+            h * k,
+            [hu, hv, 1.0 - hu, 1.0 - hv],
+            colors,
+        );
+    }
+
     /// A named texture at (x, y) at its own size (MBNewBlit); false if missing.
     pub fn blit_named(&mut self, name: &str, x: f32, y: f32, fade: i32) -> bool {
         match self.ui.get(name) {
@@ -149,6 +178,7 @@ impl<'a> Scr<'a> {
 
     /// DrawTextKeepScale: `s` in font slot `font` with its top-left at (x, y), or
     /// centred on -x when x is negative. Returns the width.
+    #[allow(clippy::too_many_arguments)]
     pub fn text(
         &mut self,
         scale: f32,
@@ -279,6 +309,44 @@ impl<'a> Scr<'a> {
             y += lh;
         }
     }
+}
+
+/// mbBlitCalcLight: the light (0..127) at screen point (x, y), y measured from the
+/// bottom, for sweep phase 0..7.
+fn calc_light(x: f32, y: f32, phase: f32) -> i32 {
+    let mut v = (x + y) / (512.0 + 384.0);
+    let p = phase;
+    v = if v < 0.5 {
+        if p < 1.0 {
+            -(4.0 * v - p)
+        } else if p < 2.0 {
+            2.0 * (v * (p - 3.0)) + 1.0
+        } else if p < 3.0 {
+            2.0 * ((3.0 - p) * (0.5 - v)) + 2.0 * ((p - 2.0) * v)
+        } else if p < 4.0 {
+            2.0 * v + 2.0 * ((3.0 - p) * (0.5 - v))
+        } else if p < 5.0 {
+            2.0 * ((3.0 - p) * (0.5 - v)) + 2.0 * ((5.0 - p) * v)
+        } else {
+            0.0
+        }
+    } else {
+        let v = 1.0 - v;
+        if p < 2.0 {
+            0.0
+        } else if p < 3.0 {
+            2.0 * ((p - 4.0) * (0.5 - v)) + 2.0 * ((p - 2.0) * v)
+        } else if p < 4.0 {
+            2.0 * v + 2.0 * ((p - 4.0) * (0.5 - v))
+        } else if p < 5.0 {
+            2.0 * ((p - 4.0) * (0.5 - v)) + 2.0 * ((5.0 - p) * v)
+        } else if p < 6.0 {
+            2.0 * (v * (4.0 - p)) + 1.0
+        } else {
+            -(4.0 * v - (7.0 - p))
+        }
+    };
+    (v * 127.0).clamp(0.0, 127.0) as i32
 }
 
 /// The button icon drawn for `*<c>` in text (mb_font.c).

@@ -102,7 +102,7 @@ impl Title {
         let input = inputs
             .iter()
             .find(|(s, _)| *s == owner)
-            .map(|(_, i)| i.clone())
+            .map(|(_, i)| *i)
             .unwrap_or_default();
         match self.menu.update(&input, 1, true) {
             Event::Chose(11) => {
