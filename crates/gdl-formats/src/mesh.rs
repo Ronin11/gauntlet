@@ -112,23 +112,30 @@ impl Mesh {
             match (data_type, storage) {
                 (DATA_GEOM, ST_NULL | ST_STRIP_0_END | ST_STRIP_N_END) | (DATA_UV, ST_UNKNOWN) => {}
                 (DATA_GEOM, ST_FLOAT32) => {
-                    strips.push(Strip { face_dir: r.f32(base + 8)?, draw: Vec::new() });
+                    strips.push(Strip {
+                        face_dir: r.f32(base + 8)?,
+                        draw: Vec::new(),
+                    });
                 }
                 (DATA_POS, ST_FLOAT32) => {
                     // A single un-stripped triangle: 12 vec4s of position, normal, colour, uv.
-                    let Some(strip) = strips.last_mut() else { bail!("triangle before strip header") };
+                    let Some(strip) = strips.last_mut() else {
+                        bail!("triangle before strip header")
+                    };
                     strip.draw.push(true);
                     strip.face_dir = -1.0;
                     for j in 0..3 {
                         let o = base + j * 16;
                         let w = r.f32(o + 12)?;
                         let s = if w != 0.0 { 1.0 / w } else { 1.0 };
-                        m.positions.push([r.f32(o)? * s, r.f32(o + 4)? * s, r.f32(o + 8)? * s]);
+                        m.positions
+                            .push([r.f32(o)? * s, r.f32(o + 4)? * s, r.f32(o + 8)? * s]);
                     }
                     for j in 3..6 {
                         let o = base + j * 16;
                         let s = r.f32(o + 12)?;
-                        m.normals.push([r.f32(o)? * s, r.f32(o + 4)? * s, r.f32(o + 8)? * s]);
+                        m.normals
+                            .push([r.f32(o)? * s, r.f32(o + 4)? * s, r.f32(o + 8)? * s]);
                     }
                     for j in 6..9 {
                         let o = base + j * 16;
@@ -145,15 +152,21 @@ impl Mesh {
                     for i in 0..count.saturating_sub(1) {
                         let o = base + i * st;
                         let v = match storage {
-                            ST_SINT8_XYZ => [r.i8(o)? as f32, r.i8(o + 1)? as f32, r.i8(o + 2)? as f32],
-                            ST_SINT16_XYZ => [r.i16(o)? as f32, r.i16(o + 2)? as f32, r.i16(o + 4)? as f32],
+                            ST_SINT8_XYZ => {
+                                [r.i8(o)? as f32, r.i8(o + 1)? as f32, r.i8(o + 2)? as f32]
+                            }
+                            ST_SINT16_XYZ => {
+                                [r.i16(o)? as f32, r.i16(o + 2)? as f32, r.i16(o + 4)? as f32]
+                            }
                             _ => [r.i32(o)? as f32, r.i32(o + 4)? as f32, r.i32(o + 8)? as f32],
                         };
                         m.positions.push(v.map(|c| c * POS_SCALE));
                     }
                 }
                 (DATA_NORM, _) => {
-                    let Some(strip) = strips.last_mut() else { bail!("normals before strip header") };
+                    let Some(strip) = strips.last_mut() else {
+                        bail!("normals before strip header")
+                    };
                     for i in 0..count {
                         let n = r.u16(base + i * 2)?;
                         m.normals.push(unpack_norm(n));
@@ -172,7 +185,9 @@ impl Mesh {
                         let o = base + i * st;
                         let uv = match storage {
                             ST_UINT8_UV => [r.u8(o)? as f32, r.u8(o + 1)? as f32],
-                            ST_UINT16_UV | ST_UINT16_LMUV => [r.u16(o)? as f32, r.u16(o + 2)? as f32],
+                            ST_UINT16_UV | ST_UINT16_LMUV => {
+                                [r.u16(o)? as f32, r.u16(o + 2)? as f32]
+                            }
                             _ => [r.u32(o)? as f32, r.u32(o + 4)? as f32],
                         };
                         m.uvs.push(uv.map(|c| c * UV_SCALE));

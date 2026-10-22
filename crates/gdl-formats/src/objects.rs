@@ -117,7 +117,9 @@ impl Objects {
 
         let mut objects = Vec::with_capacity(objects_count);
         for i in 0..objects_count {
-            objects.push(parse_object(r, objects_ptr + i * 64).with_context(|| format!("object {i}"))?);
+            objects.push(
+                parse_object(r, objects_ptr + i * 64).with_context(|| format!("object {i}"))?,
+            );
         }
 
         let mut bitmaps = Vec::with_capacity(bitmaps_count);
@@ -174,7 +176,10 @@ impl Objects {
 
     /// Look up an object by its definition name (case-insensitive).
     pub fn object_by_name(&self, name: &str) -> Option<&Object> {
-        let def = self.object_defs.iter().find(|d| d.name.eq_ignore_ascii_case(name))?;
+        let def = self
+            .object_defs
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(name))?;
         self.objects.get(usize::try_from(def.obj_index).ok()?)
     }
 }

@@ -51,7 +51,10 @@ impl Disc {
         let mut hdr = vec![0u8; 0x440];
         file.read_exact(&mut hdr)?;
         if be32(&hdr, 0x1c) != 0xC233_9F3D {
-            bail!("{} is not a GameCube disc image (bad magic)", path.display());
+            bail!(
+                "{} is not a GameCube disc image (bad magic)",
+                path.display()
+            );
         }
         let header = Header {
             game_id: cstr(&hdr[0..6]),
@@ -60,7 +63,11 @@ impl Disc {
             fst_offset: be32(&hdr, 0x424) as u64,
             fst_size: be32(&hdr, 0x428) as u64,
         };
-        let mut disc = Disc { file, header, entries: Vec::new() };
+        let mut disc = Disc {
+            file,
+            header,
+            entries: Vec::new(),
+        };
         disc.entries = disc.read_fst()?;
         Ok(disc)
     }
@@ -81,13 +88,27 @@ impl Disc {
             let name_off = (be32(e, 0) & 0x00FF_FFFF) as usize;
             let name = cstr(&strings[name_off..]);
             let prefix = &dirs.last().unwrap().1;
-            let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
             if is_dir {
                 let end = be32(e, 8) as usize;
                 dirs.push((end, path.clone()));
-                out.push(Entry { path, is_dir, offset: 0, size: 0 });
+                out.push(Entry {
+                    path,
+                    is_dir,
+                    offset: 0,
+                    size: 0,
+                });
             } else {
-                out.push(Entry { path, is_dir, offset: be32(e, 4) as u64, size: be32(e, 8) as u64 });
+                out.push(Entry {
+                    path,
+                    is_dir,
+                    offset: be32(e, 4) as u64,
+                    size: be32(e, 8) as u64,
+                });
             }
         }
         Ok(out)
@@ -102,11 +123,16 @@ impl Disc {
 
     pub fn find(&self, path: &str) -> Option<&Entry> {
         let path = path.trim_start_matches('/');
-        self.entries.iter().find(|e| !e.is_dir && e.path.eq_ignore_ascii_case(path))
+        self.entries
+            .iter()
+            .find(|e| !e.is_dir && e.path.eq_ignore_ascii_case(path))
     }
 
     pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
-        let e = self.find(path).with_context(|| format!("no such file on disc: {path}"))?.clone();
+        let e = self
+            .find(path)
+            .with_context(|| format!("no such file on disc: {path}"))?
+            .clone();
         self.read_at(e.offset, e.size as usize)
     }
 

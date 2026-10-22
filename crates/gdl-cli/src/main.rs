@@ -25,6 +25,8 @@ enum Cmd {
     Textures { dir: PathBuf, out: PathBuf },
     /// Survey every objects.ngc under a directory: formats used, decode failures
     Survey { root: PathBuf },
+    /// Summarise a WORLDS.PS2 level file
+    World { path: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -32,7 +34,10 @@ fn main() -> Result<()> {
         Cmd::Ls { iso } => {
             let disc = Disc::open(&iso)?;
             let h = &disc.header;
-            println!("{} \"{}\" dol@{:#x} fst@{:#x}+{:#x}", h.game_id, h.title, h.dol_offset, h.fst_offset, h.fst_size);
+            println!(
+                "{} \"{}\" dol@{:#x} fst@{:#x}+{:#x}",
+                h.game_id, h.title, h.dol_offset, h.fst_offset, h.fst_size
+            );
             for e in &disc.entries {
                 if e.is_dir {
                     println!("{:>10}  {}/", "", e.path);
@@ -55,38 +60,71 @@ fn main() -> Result<()> {
         }
         Cmd::Objects { path } => {
             let objs = Objects::parse(&std::fs::read(&path)?)?;
-            println!("{:?} {:?} v{:#x}", objs.dir_name, objs.model_name, objs.version);
-            println!("{} objects, {} defs, {} bitmaps, {} bitmap defs",
-                objs.objects.len(), objs.object_defs.len(), objs.bitmaps.len(), objs.bitmap_defs.len());
+            println!(
+                "{:?} {:?} v{:#x}",
+                objs.dir_name, objs.model_name, objs.version
+            );
+            println!(
+                "{} objects, {} defs, {} bitmaps, {} bitmap defs",
+                objs.objects.len(),
+                objs.object_defs.len(),
+                objs.bitmaps.len(),
+                objs.bitmap_defs.len()
+            );
             for d in &objs.object_defs {
-                println!("def {:16} idx {:4} frames {:3} rad {:.2}", d.name, d.obj_index, d.frames, d.bnd_rad);
+                println!(
+                    "def {:16} idx {:4} frames {:3} rad {:.2}",
+                    d.name, d.obj_index, d.frames, d.bnd_rad
+                );
             }
             for (i, o) in objs.objects.iter().enumerate() {
                 let mut verts = 0;
                 let mut tris = 0;
                 for g in &o.geometry {
                     match Mesh::decode(g) {
-                        Ok(m) => { verts += m.positions.len(); tris += m.indices.len() / 3; }
+                        Ok(m) => {
+                            verts += m.positions.len();
+                            tris += m.indices.len() / 3;
+                        }
                         Err(e) => println!("  obj {i}: decode error: {e:#}"),
                     }
                 }
-                println!("obj {i:4} flags {:#07x} subs {:2} hdr v/t {}/{} decoded v/t {verts}/{tris}",
-                    o.flags, o.sub_objects.len(), o.vert_count, o.tri_count);
+                println!(
+                    "obj {i:4} flags {:#07x} subs {:2} hdr v/t {}/{} decoded v/t {verts}/{tris}",
+                    o.flags,
+                    o.sub_objects.len(),
+                    o.vert_count,
+                    o.tri_count
+                );
             }
             for (i, b) in objs.bitmaps.iter().enumerate() {
-                println!("bmp {i:4} fmt {:3} {}x{} mips {} flags {:#06x} ptr {:#x} frames {}",
-                    b.format, b.width, b.height, b.mipmap_count, b.flags, b.tex_pointer, b.frame_count);
+                println!(
+                    "bmp {i:4} fmt {:3} {}x{} mips {} flags {:#06x} ptr {:#x} frames {}",
+                    b.format,
+                    b.width,
+                    b.height,
+                    b.mipmap_count,
+                    b.flags,
+                    b.tex_pointer,
+                    b.frame_count
+                );
             }
             for d in &objs.bitmap_defs {
-                println!("bdef {:30} idx {} {}x{}", d.name, d.tex_index, d.width, d.height);
+                println!(
+                    "bdef {:30} idx {} {}x{}",
+                    d.name, d.tex_index, d.width, d.height
+                );
             }
         }
         Cmd::Textures { dir, out } => {
             let objs = Objects::parse(&std::fs::read(dir.join("objects.ngc"))?)?;
             let tex = std::fs::read(dir.join("textures.ngc"))?;
             std::fs::create_dir_all(&out)?;
-            let names: BTreeMap<u16, &str> =
-                objs.bitmap_defs.iter().map(|d| (d.tex_index, d.name.as_str())).collect();
+            let names: BTreeMap<u16, &str> = objs
+                .bitmap_defs
+                .iter()
+                .map(|d| (d.tex_index, d.name.as_str()))
+                .collect();
             for (i, b) in objs.bitmaps.iter().enumerate() {
                 match texture::decode_ngc(b, &tex) {
                     Ok(img) => {
@@ -98,6 +136,60 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Survey { root } => survey(&root)?,
+        Cmd::World { path } => {
+            let w = gdl_formats::Worlds::parse(&std::fs::read(&path)?)?;
+            println!(
+                "bounds {:?}..{:?} grid {} {}x{}",
+                w.min_bounds, w.max_bounds, w.grid_size, w.grid_number_x, w.grid_number_z
+            );
+            println!(
+                "{} world objects, {} coll tris, {} item infos, {} instances, {} locators",
+                w.world_objects.len(),
+                w.coll_tris.len(),
+                w.item_infos.len(),
+                w.item_instances.len(),
+                w.locators.len()
+            );
+            let pos = w.world_positions();
+            for (o, p) in w.world_objects.iter().zip(&pos).take(40) {
+                println!(
+                    "wo {:16} flags {:#010x} pos {:?} abs {:?} child {} next {} tris {}@{}",
+                    o.name,
+                    o.flags,
+                    o.pos,
+                    p,
+                    o.child_index,
+                    o.next_index,
+                    o.coll_tri_count,
+                    o.coll_tri_index
+                );
+            }
+            for t in w.coll_tris.iter().take(5) {
+                println!("tri {:?}", t);
+            }
+            for (i, it) in w.item_infos.iter().enumerate() {
+                println!(
+                    "info {i:3} {:?}/{} {:16} rad {} h {} hp {} val {} rnd {:?}",
+                    it.item_type,
+                    it.subtype_name(),
+                    it.name,
+                    it.radius,
+                    it.height,
+                    it.hit_points,
+                    it.value,
+                    it.random_indices
+                );
+            }
+            for it in w.item_instances.iter().take(40) {
+                println!(
+                    "inst {:3} {:16} pos {:?} rot {:?} minp {} flags {}",
+                    it.item_index, it.name, it.pos, it.rot, it.min_players, it.flags
+                );
+            }
+            for l in &w.locators {
+                println!("loc {:?} {:?} {:?} next {}", l.kind, l.pos, l.rot, l.next);
+            }
+        }
     }
     Ok(())
 }
@@ -132,7 +224,10 @@ fn survey(root: &Path) -> Result<()> {
     for f in &files {
         let objs = match Objects::parse(&std::fs::read(f)?) {
             Ok(o) => o,
-            Err(e) => { println!("PARSE FAIL {}: {e:#}", f.display()); continue; }
+            Err(e) => {
+                println!("PARSE FAIL {}: {e:#}", f.display());
+                continue;
+            }
         };
         let tex = std::fs::read(f.with_file_name("textures.ngc")).unwrap_or_default();
         for o in &objs.objects {
@@ -142,16 +237,28 @@ fn survey(root: &Path) -> Result<()> {
                 n_sub += 1;
                 match Mesh::decode(g) {
                     Ok(m) => v += m.positions.len(),
-                    Err(e) => { sub_err += 1; if sub_err < 10 { println!("mesh err {}: {e:#}", f.display()); } }
+                    Err(e) => {
+                        sub_err += 1;
+                        if sub_err < 10 {
+                            println!("mesh err {}: {e:#}", f.display());
+                        }
+                    }
                 }
             }
-            if o.vert_count > 0 && v as i32 != o.vert_count { mism += 1; }
+            if o.vert_count > 0 && v as i32 != o.vert_count {
+                mism += 1;
+            }
         }
         for b in &objs.bitmaps {
             *formats.entry(b.format).or_default() += 1;
             match texture::decode_ngc(b, &tex) {
                 Ok(_) => tex_ok += 1,
-                Err(e) => { tex_err += 1; if tex_err < 10 { println!("tex err {}: {e:#}", f.display()); } }
+                Err(e) => {
+                    tex_err += 1;
+                    if tex_err < 10 {
+                        println!("tex err {}: {e:#}", f.display());
+                    }
+                }
             }
         }
     }

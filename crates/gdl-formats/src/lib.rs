@@ -7,7 +7,9 @@ pub mod bin;
 pub mod mesh;
 pub mod objects;
 pub mod texture;
+pub mod worlds;
 
 pub use mesh::Mesh;
 pub use objects::Objects;
 pub use texture::Image;
+pub use worlds::Worlds;

@@ -40,7 +40,11 @@ pub struct Image {
 
 impl Image {
     pub fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Image {
-        Image { width, height, rgba: rgba.repeat((width * height) as usize) }
+        Image {
+            width,
+            height,
+            rgba: rgba.repeat((width * height) as usize),
+        }
     }
 }
 
@@ -50,7 +54,12 @@ pub fn rgb5a3(c: u16) -> [u8; 4] {
         let r = ((c >> 10) & 31) as u8;
         let g = ((c >> 5) & 31) as u8;
         let b = (c & 31) as u8;
-        [(r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2), 255]
+        [
+            (r << 3) | (r >> 2),
+            (g << 3) | (g >> 2),
+            (b << 3) | (b >> 2),
+            255,
+        ]
     } else {
         let a = ((c >> 12) & 7) as u8;
         let r = ((c >> 8) & 15) as u8;
@@ -80,7 +89,12 @@ fn layout(format: u8) -> Result<(u32, usize)> {
 /// Size in bytes of the palette + top mip for a bitmap.
 pub fn data_size(b: &Bitmap) -> Result<usize> {
     let (bpp, pal) = layout(b.format)?;
-    let pal_bytes = pal * if matches!(b.format, 34 | 35 | 66 | 67) { 4 } else { 2 };
+    let pal_bytes = pal
+        * if matches!(b.format, 34 | 35 | 66 | 67) {
+            4
+        } else {
+            2
+        };
     Ok(pal_bytes + (b.width as usize * b.height as usize * bpp as usize).div_ceil(8))
 }
 
@@ -121,7 +135,10 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
     let start = b.tex_pointer as usize;
     let need = data_size(b)?;
     let Some(data) = textures.get(start..start + need) else {
-        bail!("texture data {start:#x}+{need:#x} past end of file ({:#x})", textures.len());
+        bail!(
+            "texture data {start:#x}+{need:#x} past end of file ({:#x})",
+            textures.len()
+        );
     };
     let be16 = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
 
@@ -138,7 +155,10 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
         .collect();
     let pix = &data[pal_count * if wide_pal { 4 } else { 2 }..];
 
-    let mono = matches!(b.format, fmt::A_8_IDX_8 | fmt::I_8_IDX_8 | fmt::A_4_IDX_4 | fmt::I_4_IDX_4);
+    let mono = matches!(
+        b.format,
+        fmt::A_8_IDX_8 | fmt::I_8_IDX_8 | fmt::A_4_IDX_4 | fmt::I_4_IDX_4
+    );
     let alpha_mono = matches!(b.format, fmt::A_8_IDX_8 | fmt::A_4_IDX_4);
 
     let mut out = vec![0u8; (w * h * 4) as usize];
@@ -153,7 +173,11 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
                 let v = if i & 1 == 0 { byte >> 4 } else { byte & 15 };
                 if mono {
                     let v = v * 17;
-                    if alpha_mono { [255, 255, 255, v] } else { [v, v, v, 255] }
+                    if alpha_mono {
+                        [255, 255, 255, v]
+                    } else {
+                        [v, v, v, 255]
+                    }
                 } else {
                     palette[v as usize]
                 }
@@ -161,7 +185,11 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
             8 => {
                 let v = pix[i as usize];
                 if mono {
-                    if alpha_mono { [255, 255, 255, v] } else { [v, v, v, 255] }
+                    if alpha_mono {
+                        [255, 255, 255, v]
+                    } else {
+                        [v, v, v, 255]
+                    }
                 } else {
                     palette[v as usize]
                 }
@@ -183,5 +211,9 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
         let o = ((y * w + x) * 4) as usize;
         out[o..o + 4].copy_from_slice(&px);
     }
-    Ok(Image { width: w, height: h, rgba: out })
+    Ok(Image {
+        width: w,
+        height: h,
+        rgba: out,
+    })
 }

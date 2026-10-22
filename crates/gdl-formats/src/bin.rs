@@ -16,7 +16,10 @@ impl<'a> Le<'a> {
     fn get<const N: usize>(&self, at: usize) -> Result<[u8; N]> {
         match self.data.get(at..at + N) {
             Some(b) => Ok(b.try_into().unwrap()),
-            None => bail!("read of {N} bytes at {at:#x} past end ({:#x})", self.data.len()),
+            None => bail!(
+                "read of {N} bytes at {at:#x} past end ({:#x})",
+                self.data.len()
+            ),
         }
     }
 
@@ -55,7 +58,10 @@ impl<'a> Le<'a> {
     pub fn bytes(&self, at: usize, len: usize) -> Result<&'a [u8]> {
         match self.data.get(at..at + len) {
             Some(b) => Ok(b),
-            None => bail!("slice of {len} bytes at {at:#x} past end ({:#x})", self.data.len()),
+            None => bail!(
+                "slice of {len} bytes at {at:#x} past end ({:#x})",
+                self.data.len()
+            ),
         }
     }
 }
