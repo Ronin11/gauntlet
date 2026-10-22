@@ -2353,6 +2353,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skorne_throws_the_held_hero_back_onto_the_arena() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelF2", &[("WAR", "RED")]).unwrap();
+        let (mut held, mut thrown) = (false, false);
+        for _ in 0..900 {
+            let input = g.bot_input(0);
+            g.update(1.0 / 60.0, &[input]);
+            let now = g.entities.iter().any(
+                |e| matches!(&e.kind, Kind::Critter(c) if c.parts.iter().any(|q| q.grab == 0)),
+            );
+            if held {
+                // Held heroes don't build up a fall.
+                assert!(g.players[0].vy.abs() < 1e-3 || !now);
+            }
+            thrown |= held && !now;
+            held = now;
+        }
+        assert!(thrown, "never grabbed and released");
+        let p = &g.players[0];
+        assert!(p.on_ground && (p.pos.y + 10.0).abs() < 1.0, "{:?}", p.pos);
+    }
+
+    #[test]
+    fn heroes_below_the_world_come_back_beside_a_partner() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
+        for _ in 0..30 {
+            g.update(
+                1.0 / 60.0,
+                &[
+                    crate::input::PlayerInput::default(),
+                    crate::input::PlayerInput::default(),
+                ],
+            );
+        }
+        let partner = g.players[0].pos;
+        g.players[1].pos = Vec3::new(partner.x, g.level.worlds.min_bounds[1] - 1.0, partner.z);
+        g.update(
+            1.0 / 60.0,
+            &[
+                crate::input::PlayerInput::default(),
+                crate::input::PlayerInput::default(),
+            ],
+        );
+        let p = g.players[1].pos;
+        assert!(
+            p.distance(partner) < 6.0 && (p.y - partner.y).abs() <= 3.0,
+            "{p:?} vs {partner:?}"
+        );
+    }
+
     fn wake(g: &mut Game) {
         for _ in 0..1200 {
             if g.boss.as_ref().is_some_and(|b| b.active) {

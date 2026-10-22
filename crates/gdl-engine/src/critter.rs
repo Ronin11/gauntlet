@@ -2002,11 +2002,14 @@ impl Game {
         }
     }
 
-    /// CritterReleasePlayer: the held player is thrown for the damage.
-    fn critter_release(&mut self, c: &mut Critter, pi: usize, d: &Damage, amount: f32, _yaw: f32) {
+    /// CritterReleasePlayer: the held player is thrown along the critter's
+    /// facing for the damage.
+    fn critter_release(&mut self, c: &mut Critter, pi: usize, d: &Damage, amount: f32, yaw: f32) {
         let g = c.parts[pi].grab;
         c.parts[pi].grab = -1;
         if g >= 0 {
+            let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+            self.damage_from = self.players.get(g as usize).map(|p| p.pos - fwd);
             self.critter_hits_player(
                 c,
                 pi,
@@ -2014,6 +2017,7 @@ impl Game {
                 amount,
                 d.dmgtype | DMG_THROWN | DMG_BLOWNAWAY | DMG_KNOCKBACK,
             );
+            self.damage_from = None;
         }
     }
 
@@ -2026,6 +2030,8 @@ impl Game {
                 if pl.state.active() {
                     let at = p.node_pos;
                     pl.pos = Vec3::new(at.x, pl.pos.y.max(at.y - 4.0), at.z);
+                    // Held: no falling meanwhile.
+                    pl.vy = 0.0;
                 }
             }
         }

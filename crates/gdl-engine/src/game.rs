@@ -2689,6 +2689,75 @@ impl Game {
         }
     }
 
+    /// get_player_pos (in play): a spot on the floor around another hero in
+    /// play (0.5 + radius out, sixteen tries each, from a random one), else
+    /// around the start position.
+    fn get_player_pos(&mut self, pi: usize) {
+        // lbl_80120BF0 + 16: the tries' (x, z) directions.
+        const SPREAD: [(f32, f32); 16] = [
+            (-2.0, -2.0),
+            (-2.0, 0.0),
+            (-2.0, 2.0),
+            (0.0, -2.0),
+            (0.0, 2.0),
+            (2.0, -2.0),
+            (2.0, 0.0),
+            (2.0, 2.0),
+            (-2.0, -1.0),
+            (-2.0, 1.0),
+            (-1.0, -2.0),
+            (-1.0, 2.0),
+            (1.0, -2.0),
+            (1.0, 2.0),
+            (2.0, -1.0),
+            (2.0, 1.0),
+        ];
+        let r = 0.5 + PLAYER_RADIUS;
+        let n = self.players.len();
+        let first = self.rng.next_u32() as usize % 4;
+        let mut bases: Vec<Vec3> = (0..4)
+            .map(|j| (first + j) % 4)
+            .filter(|&i| i != pi && i < n)
+            .filter(|&i| self.players[i].state.active() && self.players[i].on_ground)
+            .map(|i| self.players[i].pos)
+            .collect();
+        let start = self
+            .level
+            .worlds
+            .locators
+            .iter()
+            .find(|l| {
+                l.kind == gdl_formats::worlds::LocatorType::Start && l.next == self.start_index
+            })
+            .map(|l| Vec3::from(l.pos));
+        bases.extend(start);
+        let free = |c: &Collision, at: Vec3| {
+            c.resolve_walls(at, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT)
+                .distance(at)
+                < 0.01
+        };
+        for base in bases {
+            for (dx, dz) in SPREAD {
+                let at = base + Vec3::new(dx * r, 0.0, dz * r);
+                if let Some(g) = self.collision.ground_height(at, base.y + 3.0) {
+                    let at = Vec3::new(at.x, g, at.z);
+                    if (g - base.y).abs() <= 3.0 && free(&self.collision, at) {
+                        let p = &mut self.players[pi];
+                        p.pos = at;
+                        p.vy = 0.0;
+                        p.knock_vel = Vec3::ZERO;
+                        return;
+                    }
+                }
+            }
+        }
+        // Nowhere free: the start itself.
+        if let Some(b) = start {
+            self.players[pi].pos = b;
+            self.players[pi].vy = 0.0;
+        }
+    }
+
     /// WorldObjGetAllFlags of a collision triangle's owner when it hurts: a
     /// 0xF0000 material, and for 0x2000000 objects only while they move.
     pub(crate) fn hurting_surface(&self, owner: i32) -> Option<u32> {
@@ -2863,6 +2932,7 @@ impl Game {
         let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
         let mut floor_fx: Vec<(usize, i32, Vec3)> = Vec::new();
+        let mut fallen: Vec<usize> = Vec::new();
         let in_tower = self.wave == Some(gdl_formats::wdata::TOWER_WAVE);
         let pu_rate = if self.boss.as_ref().is_some_and(|b| b.active && !b.dead) {
             3.0
@@ -3337,9 +3407,9 @@ impl Game {
                     }
                 }
             }
-            if p.pos.y < self.level.worlds.min_bounds[1] - 50.0 {
-                p.pos = self.cam_focus + Vec3::Y * 2.0;
-                p.vy = 0.0;
+            // Below the world: get_player_pos puts the hero back.
+            if p.pos.y <= self.level.worlds.min_bounds[1] {
+                fallen.push(i);
             }
             // The model shows the action's animation (falling while airborne).
             if !p.on_ground && p.vy < -15.0 && seqs.falling.is_some() {
@@ -3352,6 +3422,9 @@ impl Game {
         }
         for (pi, owner, dv) in floor_fx {
             self.floor_fx(pi, owner, dv);
+        }
+        for pi in fallen {
+            self.get_player_pos(pi);
         }
         self.update_combos();
         // Players don't overlap each other.
@@ -6771,7 +6844,7 @@ mod tests {
         for _ in 0..180 {
             g.update(1.0 / 60.0, &[PlayerInput::default()]);
             match missiles(&g).first() {
-                Some(&(pos, v, _)) => {
+                Some(&(pos, _v, _)) => {
                     top = top.max(pos.y);
                     last = pos;
                 }
