@@ -4495,9 +4495,9 @@ mod tests {
             g.update(1.0 / 60.0, &[hold]);
             throws += g.sfx.drain(..).filter(|s| s.ends_with("THROW")).count();
         }
-        // Wind-up + release at native speed is ~0.54 s: about 9 throws in 5 s
-        // (the old double-speed release-only loop threw ~80).
-        assert!((7..=11).contains(&throws), "{throws} throws in 5 s");
+        // THROW1S cut at frame 2, THROW1, THROW1R, all rate 24 (37.5 frames a
+        // second): ~0.37 s a throw, about 13-14 in 5 s.
+        assert!((12..=16).contains(&throws), "{throws} throws in 5 s");
     }
 
     #[test]

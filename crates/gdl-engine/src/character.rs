@@ -377,15 +377,20 @@ impl Animator {
             // For looping sequences `finished` pulses for one update per loop.
             self.finished = false;
         }
-        self.frame += dt * s.frame_rate.max(1) as f32 * self.speed;
-        if self.frame >= frames - 1.0 {
+        // InitAnim / CalcAnimInfo: a frame lasts rate/30 x animscale x 1/30 s, so
+        // `rate` is an inverse speed (30 plays 30 frames a second, 60 plays 15);
+        // `speed` is 1/animscale. A sequence is done half a frame past its last.
+        let rate = if s.frame_rate > 0 { s.frame_rate as f32 } else { 30.0 };
+        self.frame += dt * 900.0 / rate * self.speed;
+        let end = (frames - 0.5).max(0.5);
+        if self.frame >= end {
             if s.repeat || self.force_loop {
-                self.frame %= (frames - 1.0).max(1.0);
-                self.finished = true;
+                // A loop restarts from frame 0.
+                self.frame = 0.0;
             } else {
                 self.frame = (frames - 1.0).max(0.0);
-                self.finished = true;
             }
+            self.finished = true;
         }
     }
 }
