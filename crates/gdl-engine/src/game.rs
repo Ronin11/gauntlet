@@ -86,6 +86,9 @@ pub struct Player {
     pub proj_model: Option<usize>,
     /// Display name ("WARRIOR"), for announcer messages.
     pub name: String,
+    /// Class and colour codes ("WAR", "RED") for sounds.
+    pub class: String,
+    pub color: String,
     low_health_warned: bool,
     walk_phase: u8,
 }
@@ -278,6 +281,8 @@ pub struct Game {
     /// Set when a player reaches the exit.
     pub exit_to: Option<String>,
     pub messages: Vec<(String, f32)>,
+    /// Sound effects requested this frame (names from AUDATPS2.ROM); drained by the app.
+    pub sfx: Vec<String>,
 }
 
 /// Parsed objects/textures/anim files shared by several models.
@@ -407,6 +412,7 @@ impl Game {
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             exit_to: None,
             messages: Vec::new(),
+            sfx: vec!["S_ENTRANCE".into()],
         };
 
         for (class, color) in classes {
@@ -438,6 +444,8 @@ impl Game {
                     .map(|(_, n)| n.to_string())
                     .unwrap_or_else(|| classes[i].0.to_string()),
                 low_health_warned: false,
+                class: classes[i].0.to_string(),
+                color: classes[i].1.to_string(),
                 walk_phase: 0,
             });
         }
@@ -968,16 +976,22 @@ impl Game {
                 p.low_health_warned = true;
                 self.messages
                     .push((format!("{} NEEDS FOOD, BADLY!", p.name), 3.0));
+                self.sfx.push(format!(
+                    "VOICE:S_{}{}1+S_NEEDSFOOD+S_BADLY|VOICE:S_NEEDSFOOD+S_BADLY",
+                    p.color, p.class
+                ));
             } else if p.health > 300.0 {
                 p.low_health_warned = false;
             }
             if inp.magic_pressed && p.potions > 0 {
                 p.potions -= 1;
+                self.sfx.push("S_POTION1".into());
                 blasts.push((i, p.pos));
             }
             if p.health <= 0.0 {
                 p.health = 0.0;
                 p.state = PlayerState::Dead { timer: 4.0 };
+                self.sfx.push(format!("S_{}DIE1", p.class));
                 if let Some(d) = seqs.death {
                     p.animator.restart(d);
                 }
@@ -1143,6 +1157,7 @@ impl Game {
             self.spawn_drops(drops);
         }
         for (pi, pos, yaw) in throws {
+            self.sfx.push(format!("S_{}THROW", self.players[pi].class));
             let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
             let model = self.players[pi].proj_model;
             self.spawn(
@@ -1163,6 +1178,7 @@ impl Game {
         let dir = Vec2::new(yaw.sin(), yaw.cos());
         let mut drops = Vec::new();
         let mut score = 0;
+        let mut hits = Vec::new();
         for e in self.entities.iter_mut().filter(|e| e.alive) {
             let d = Vec2::new(e.pos.x - pos.x, e.pos.z - pos.z);
             let dist = d.length();
@@ -1182,9 +1198,74 @@ impl Game {
             let (sc, drop) = Self::apply_hit(e, dmg, push);
             score += sc;
             drops.extend(drop);
+            hits.push(e.id);
+        }
+        for id in hits {
+            if let Some(e) = self.entities.iter().find(|e| e.id == id) {
+                if let Some(snd) = self.hit_sound(e, Self::is_destroyed(e)) {
+                    self.sfx.push(snd);
+                }
+            }
         }
         self.players[pi].score += score;
         self.spawn_drops(drops);
+    }
+
+    fn world_letter(&self) -> char {
+        self.level
+            .name
+            .trim_start_matches("level")
+            .chars()
+            .next()
+            .unwrap_or('A')
+    }
+
+    /// Sound for hitting (or destroying) entity `e`.
+    fn hit_sound(&self, e: &Entity, destroyed: bool) -> Option<String> {
+        let w = self.world_letter();
+        Some(match &e.kind {
+            Kind::Enemy { class, .. } if destroyed => {
+                let n = self
+                    .classes
+                    .get(*class)
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("");
+                let p = match n {
+                    "GRU" => "GRUNT",
+                    "GHO" => "GHOST",
+                    "SKE" => "SKEL",
+                    "DEM" => "DEMON",
+                    "KNI" => "KNIGHT",
+                    "TRO" => "TROLL",
+                    "SCO" => "SCORP",
+                    "SNA" => "SNAK",
+                    "SOR" => "SORC",
+                    "MUM" => "MUMMY",
+                    "WOL" => "WOLF",
+                    "SPI" => "SPID",
+                    "GAR" => "GRG",
+                    other => other,
+                };
+                format!("S_{p}1DIECLOS|S_{p}DIECLOSE|S_{p}DIECLOS|S_{p}2DIECLOS|S_WEAPONHITMETA")
+            }
+            Kind::Enemy { .. } => "S_WEAPONHITMETA".into(),
+            Kind::Generator { .. } if destroyed => format!("S_GEN{w}CHIT1|S_WEAPONHITSTON"),
+            Kind::Generator { .. } => "S_WEAPONHITSTON".into(),
+            Kind::Container { .. } if destroyed => "S_CHEST".into(),
+            Kind::Container { .. } => "S_WEAPONHITWOOD".into(),
+            _ => return None,
+        })
+    }
+
+    fn is_destroyed(e: &Entity) -> bool {
+        !e.alive
+            || matches!(
+                e.kind,
+                Kind::Enemy {
+                    state: EnemyState::Dying { .. },
+                    ..
+                }
+            )
     }
 
     /// Damage one entity. Returns score earned and a container drop, if it broke.
@@ -1504,6 +1585,10 @@ impl Game {
             });
             if let Some(t) = target {
                 let (sc, drop) = Self::apply_hit(&mut self.entities[t], dmg, dir);
+                let e = &self.entities[t];
+                if let Some(snd) = self.hit_sound(e, Self::is_destroyed(e)) {
+                    self.sfx.push(snd);
+                }
                 if let Some(p) = self.players.get_mut(owner) {
                     p.score += sc;
                 }
@@ -1568,6 +1653,8 @@ impl Game {
         for pi in key_used {
             self.players[pi].keys -= 1;
             self.messages.push(("Door unlocked".into(), 2.0));
+            let w = self.world_letter();
+            self.sfx.push(format!("S_GATE{w}1|S_SECRETWALL"));
         }
         for (start, count) in opened {
             for t in start..(start + count).min(self.collision.enabled.len()) {
@@ -1580,10 +1667,21 @@ impl Game {
                 continue;
             }
             p.health -= dmg;
+            if p.hurt_flash < 0.3 {
+                let n = 1 + (self.time * 13.0) as u32 % 4;
+                self.sfx.push(format!("S_{}PAIN{n}|S_PLYRDMG", p.class));
+            }
             p.hurt_flash = 1.0;
         }
         for (pi, kind) in pickups {
             let p = &mut self.players[pi];
+            self.sfx.push(match kind {
+                PickupKind::Food(_) => format!("S_{}EAT|S_{}EATSFX", p.class, p.class),
+                PickupKind::Key => "S_PICKUPKEY".into(),
+                PickupKind::Gold(_) => "S_PICKUPCRYST".into(),
+                PickupKind::Potion => "S_PICKUPMAGIC".into(),
+                PickupKind::Other(_) => "S_PICKUPSPECIAL".into(),
+            });
             match kind {
                 PickupKind::Food(hp) => p.health = (p.health + hp).min(PLAYER_MAX_HEALTH),
                 PickupKind::Key => p.keys += 1,
@@ -1843,5 +1941,29 @@ mod tests {
             before == 0 || after < before,
             "before {before} after {after}"
         );
+    }
+
+    #[test]
+    fn event_sounds_resolve() {
+        let Some(fs) = data() else { return };
+        let reqs: Vec<String> = [
+            "VOICE:S_REDWAR1+S_NEEDSFOOD+S_BADLY",
+            "VOICE:S_BLUVAL1+S_NEEDSFOOD+S_BADLY",
+            "S_WARPAIN2|S_PLYRDMG",
+            "S_WAREAT|S_WAREATSFX",
+            "S_WARDIE1",
+            "S_POTION1",
+            "S_GATEA1|S_SECRETWALL",
+            "S_CHEST",
+            "S_PICKUPMAGIC",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for (req, found) in crate::audio::check_sounds(&fs, &reqs) {
+            let (alt, len) = found.unwrap_or_else(|| panic!("{req} did not resolve"));
+            assert!(len > 0.1, "{alt} is empty");
+            eprintln!("{req} -> {alt} {len:.2}s");
+        }
     }
 }

@@ -92,6 +92,7 @@ impl App {
 
         let hud = Hud::new(&gpu.device, config.format);
         let mut audio = Audio::new(self.cfg.mute);
+        audio.load_sounds(&self.cfg.fs);
         audio.play_level_music(&self.cfg.fs, &self.cfg.level);
         let input = Input::new();
         let (play, select, sources) = if self.cfg.players.is_empty() {
@@ -259,6 +260,9 @@ impl ApplicationHandler for App {
                     r.acc -= TICK;
                 }
 
+                for snd in p.game.sfx.drain(..) {
+                    r.audio.play(&self.cfg.fs, &snd);
+                }
                 p.scene.sync(&r.gpu, &p.game);
                 let g = p
                     .scene

@@ -1,4 +1,4 @@
-use gdl_engine::{app, character, fs, game, gpu, hud, input, scene};
+use gdl_engine::{app, audio, character, fs, game, gpu, hud, input, scene};
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec2, Vec3};
@@ -217,6 +217,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
         }
     }
+    let mut sfx_seen: Vec<String> = Vec::new();
     for f in 0..args.simulate {
         let inp = input::PlayerInput {
             stick: args.hold,
@@ -227,6 +228,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
             .map(|i| if args.bot { g.bot_input(i) } else { inp })
             .collect();
         g.update(1.0 / 60.0, &inputs);
+        sfx_seen.extend(g.sfx.drain(..));
         if f % 600 == 0 {
             let p = &g.players[0];
             println!(
@@ -248,6 +250,16 @@ fn snapshot_game(args: &Args) -> Result<()> {
             g.models[p.model].skeleton.sequences[p.animator.seq].name,
             p.animator.frame
         );
+    }
+    if std::env::var_os("GDL_CHECK_SFX").is_some() {
+        sfx_seen.sort();
+        sfx_seen.dedup();
+        for (req, found) in audio::check_sounds(&fs, &sfx_seen) {
+            match found {
+                Some((alt, len)) => println!("sfx {req:60} -> {alt} ({len:.2}s)"),
+                None => println!("sfx {req:60} -> MISSING"),
+            }
+        }
     }
     let gpu = headless_gpu()?;
     let mut sc = scene::Scene::new(&gpu, &g)?;
