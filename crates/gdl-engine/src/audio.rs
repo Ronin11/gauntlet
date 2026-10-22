@@ -132,8 +132,7 @@ pub struct Audio {
 
 impl Audio {
     pub fn new(muted: bool) -> Self {
-        // Android audio output isn't wired up yet.
-        if muted || cfg!(target_os = "android") {
+        if muted {
             return Audio {
                 sfx_vol: 1.0,
                 tx: None,
@@ -142,82 +141,67 @@ impl Audio {
             };
         }
         let (tx, rx) = mpsc::channel::<Cmd>();
-        #[cfg(target_os = "android")]
-        let spawned: std::io::Result<()> = {
-            drop(rx);
-            Ok(())
-        };
-        #[cfg(not(target_os = "android"))]
         let spawned = std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
                 use rodio::Source;
-                let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+                let Ok(mut stream) = rodio::OutputStreamBuilder::open_default_stream() else {
                     log::warn!("no audio output device");
                     return;
                 };
-                let clips = |c: Vec<(Pcm, u32)>| {
-                    c.into_iter()
-                        .map(|(pcm, rate)| rodio::buffer::SamplesBuffer::new(1, rate, pcm.to_vec()))
-                };
+                stream.log_on_drop(false);
+                let handle = stream.mixer().clone();
+                // rodio mixes f32 samples.
+                fn buf(ch: u16, rate: u32, pcm: &[i16]) -> rodio::buffer::SamplesBuffer {
+                    let f: Vec<f32> = pcm.iter().map(|&v| v as f32 / 32768.0).collect();
+                    rodio::buffer::SamplesBuffer::new(ch, rate, f)
+                }
+                let new_sink = || rodio::Sink::connect_new(&handle);
+                let clips =
+                    |c: Vec<(Pcm, u32)>| c.into_iter().map(|(pcm, rate)| buf(1, rate, &pcm));
                 // Keep the current music sink alive; replacing it stops the previous track.
                 let mut _music: Option<rodio::Sink> = None;
                 let mut music_vol = 1.0f32;
-                let voice = rodio::Sink::try_new(&handle).ok();
+                let voice = Some(new_sink());
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         Cmd::Music(pcm, ch, rate) => {
-                            if let Ok(s) = rodio::Sink::try_new(&handle) {
-                                s.set_volume(0.5 * music_vol);
-                                s.append(
-                                    rodio::buffer::SamplesBuffer::new(ch, rate, pcm)
-                                        .repeat_infinite(),
-                                );
-                                _music = Some(s);
-                            }
+                            let s = new_sink();
+                            s.set_volume(0.5 * music_vol);
+                            s.append(buf(ch, rate, &pcm).repeat_infinite());
+                            _music = Some(s);
                         }
                         Cmd::MusicOnce(pcm, ch, rate) => {
-                            if let Ok(s) = rodio::Sink::try_new(&handle) {
-                                s.append(rodio::buffer::SamplesBuffer::new(ch, rate, pcm));
-                                _music = Some(s);
-                            }
+                            let s = new_sink();
+                            s.append(buf(ch, rate, &pcm));
+                            _music = Some(s);
                         }
                         Cmd::MusicLoop(pcm, rate, loop_start) => {
-                            if let Ok(s) = rodio::Sink::try_new(&handle) {
-                                s.set_volume(0.5 * music_vol);
-                                let split =
-                                    loop_start.map_or(pcm.len(), |f| (2 * f).min(pcm.len()));
-                                let (intro, body) = pcm.split_at(split);
-                                if !intro.is_empty() {
-                                    s.append(rodio::buffer::SamplesBuffer::new(
-                                        2,
-                                        rate,
-                                        intro.to_vec(),
-                                    ));
-                                }
-                                if !body.is_empty() {
-                                    s.append(
-                                        rodio::buffer::SamplesBuffer::new(2, rate, body.to_vec())
-                                            .repeat_infinite(),
-                                    );
-                                }
-                                _music = Some(s);
+                            let s = new_sink();
+                            s.set_volume(0.5 * music_vol);
+                            let split = loop_start.map_or(pcm.len(), |f| (2 * f).min(pcm.len()));
+                            let (intro, body) = pcm.split_at(split);
+                            if !intro.is_empty() {
+                                s.append(buf(2, rate, intro));
                             }
+                            if !body.is_empty() {
+                                s.append(buf(2, rate, body).repeat_infinite());
+                            }
+                            _music = Some(s);
                         }
                         Cmd::MusicParts(parts) => {
-                            if let Ok(s) = rodio::Sink::try_new(&handle) {
-                                s.set_volume(0.5 * music_vol);
-                                let n = parts.len();
-                                for (i, (pcm, ch, rate)) in parts.into_iter().enumerate() {
-                                    let b = rodio::buffer::SamplesBuffer::new(ch, rate, pcm);
-                                    if i + 1 == n {
-                                        s.append(b.repeat_infinite());
-                                    } else {
-                                        s.append(b);
-                                    }
+                            let s = new_sink();
+                            s.set_volume(0.5 * music_vol);
+                            let n = parts.len();
+                            for (i, (pcm, ch, rate)) in parts.into_iter().enumerate() {
+                                let b = buf(ch, rate, &pcm);
+                                if i + 1 == n {
+                                    s.append(b.repeat_infinite());
+                                } else {
+                                    s.append(b);
                                 }
-                                _music = Some(s);
                             }
+                            _music = Some(s);
                         }
                         Cmd::MusicVolume(v) => {
                             music_vol = v;
@@ -227,13 +211,12 @@ impl Audio {
                         }
                         Cmd::StopMusic => _music = None,
                         Cmd::Sfx(c, vol) => {
-                            if let Ok(s) = rodio::Sink::try_new(&handle) {
-                                s.set_volume(vol);
-                                for b in clips(c) {
-                                    s.append(b);
-                                }
-                                s.detach();
+                            let s = new_sink();
+                            s.set_volume(vol);
+                            for b in clips(c) {
+                                s.append(b);
                             }
+                            s.detach();
                         }
                         Cmd::Voice(c, vol) => {
                             if let Some(v) = &voice {

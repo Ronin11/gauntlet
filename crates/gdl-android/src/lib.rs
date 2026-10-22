@@ -23,7 +23,7 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         fs,
         level: "levelA1".into(),
         players: Vec::new(),
-        mute: true,
+        mute: false,
     };
     if let Err(e) = app::run_android(cfg, app) {
         log::error!("fatal: {e:#}");
