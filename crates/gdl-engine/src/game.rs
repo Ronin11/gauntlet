@@ -213,6 +213,15 @@ impl DmgType {
     pub const POISON_GAS: u32 = 0x800;
     /// Death's drain: armour doesn't stop it.
     pub const NO_ARMOR: u32 = 0x1000;
+    pub const KNOCKBACK: u32 = 0x10;
+    pub const KNOCKDOWN: u32 = 0x20;
+    pub const BLOWNAWAY: u32 = 0x40;
+    pub const STUN: u32 = 0x80;
+    pub const KNOCKOVER: u32 = 0x100;
+    pub const SPIKE: u32 = 0x2000;
+    pub const WHIRLWIND: u32 = 0x10000;
+    /// A low blow (short monsters): levitation dodges it.
+    pub const LOW: u32 = 0x4000_0000;
 }
 
 /// ModifyDamage: an elemental hit on a target with no affinity does 1.5x. Every
@@ -357,6 +366,20 @@ pub struct Player {
     pub inv: crate::powerups::MiniInv,
     /// The action machine: what the hero is doing and animating.
     pub act: crate::paction::Action,
+    /// This frame's hits for PlayerKnockback: damage, flags and the push
+    /// direction; and the knock velocity they give.
+    hit_damage: f32,
+    hit_flags: u32,
+    hit_force: Vec3,
+    knock_vel: Vec3,
+    /// Two-player combos: the linked partner, the one about to be linked, the
+    /// combo timer (timer_1FA, ticks), the place before being picked up, and
+    /// whose DUMMY node this hero rides while grabbed (hud 0x20).
+    pub grab_partner: Option<usize>,
+    grab_pending: Option<usize>,
+    combo_timer: i32,
+    saved_pos: Vec3,
+    attached_to: Option<usize>,
 }
 
 /// Animation sequence indices for a player model.
@@ -661,6 +684,8 @@ pub enum Kind {
         reload: f32,
         /// Death: health drained so far; IT and the rest: unused.
         drained: f32,
+        /// The Warlock's blink: seconds left seen (> 0) or unseen (< 0).
+        blink: f32,
     },
     Generator {
         class: usize,
@@ -859,6 +884,17 @@ pub struct Game {
     pub world_changed: bool,
     /// A camera set from outside (the attract flyby): eye and look-at.
     pub fixed_camera: Option<(Vec3, Vec3)>,
+    /// Placed monsters not yet in view.
+    pending_enemies: Vec<PendingEnemy>,
+    /// Where the next damage_player hit comes from (for its push).
+    pub damage_from: Option<Vec3>,
+    /// The music area asked for (sMusicSubIndex) and how to change to it
+    /// (sMusicSubState: 1 fade out first, 2 at once); and the sound items
+    /// that select areas: (position, radius, area, fade).
+    pub music_area: (usize, i16),
+    music_items: Vec<(Vec3, f32, usize, i16)>,
+    /// Ambient sound items: (position, radius, sound name).
+    ambient_items: Vec<(Vec3, f32, String)>,
     /// The party's boss shards (bit = world order 1..11, as Progress::runes).
     pub runes: u16,
     /// Players who died in this level (inactivate_player outside the tower).
@@ -881,6 +917,9 @@ pub struct Game {
     damg_cooldown: HashMap<(usize, u64), f32>,
     /// 0 Easy, 1 Medium, 2 Hard.
     pub difficulty: usize,
+    /// The Multiplayer option: 0 Normal (shots pass heroes), 1 Shots Stun,
+    /// 2 Shots Hurt.
+    pub friendly_fire: usize,
     /// Each player model's action slots (InitActions) and class PDATA.
     action_seqs: Vec<crate::paction::ActionSeqs>,
     pdata: Vec<gdl_formats::pdata::PlayerData>,
@@ -926,6 +965,17 @@ pub struct Game {
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
     pub(crate) hit_from: Option<Vec3>,
+}
+
+/// A placed monster waiting to come into view (an ENE item before
+/// fn_80060114 turns it into an enemy).
+struct PendingEnemy {
+    kind: Kind,
+    model: Option<usize>,
+    pos: Vec3,
+    yaw: f32,
+    /// The item's visibility radius.
+    visrad: f32,
 }
 
 /// Parsed objects/textures/anim files shared by several models.
@@ -1275,6 +1325,11 @@ impl Game {
             barrier_touches: Vec::new(),
             world_changed: false,
             fixed_camera: None,
+            pending_enemies: Vec::new(),
+            damage_from: None,
+            music_area: (0, 0),
+            music_items: Vec::new(),
+            ambient_items: Vec::new(),
             runes: 0,
             deaths: 0,
             roster: Default::default(),
@@ -1286,6 +1341,7 @@ impl Game {
             shield_cooldown: HashMap::new(),
             damg_cooldown: HashMap::new(),
             difficulty,
+            friendly_fire: 0,
             action_seqs: Vec::new(),
             pdata: Vec::new(),
             item_models: HashMap::new(),
@@ -1421,6 +1477,15 @@ impl Game {
                 sumner_exp: 0,
                 inv: Default::default(),
                 act: crate::paction::Action::new(),
+                hit_damage: 0.0,
+                hit_flags: 0,
+                hit_force: Vec3::ZERO,
+                knock_vel: Vec3::ZERO,
+                grab_partner: None,
+                grab_pending: None,
+                combo_timer: 0,
+                saved_pos: Vec3::ZERO,
+                attached_to: None,
             });
         }
         // Ranged-attack projectile: the class's throw model, else its weapon.
@@ -1567,6 +1632,81 @@ impl Game {
         }
     }
 
+    /// items.c case 0xD / AudioSecretProc: each ambient sound's volume (0..1),
+    /// full within its radius and fading out by 1.5x the radius from the
+    /// nearest hero; quiet (16/127) during Sumner's speeches and trigger cameras.
+    pub fn ambient_levels(&self) -> Vec<(u64, &str, f32)> {
+        let hushed = self
+            .sumner
+            .as_ref()
+            .is_some_and(|s| s.cam.is_some() || s.controls_locked());
+        self.ambient_items
+            .iter()
+            .enumerate()
+            .map(|(i, (pos, range, name))| {
+                let d = self
+                    .players
+                    .iter()
+                    .filter(|p| p.state.active())
+                    .map(|p| (p.pos - *pos).length())
+                    .fold(f32::MAX, f32::min);
+                let mut vol = if d == f32::MAX {
+                    0.0
+                } else if d < *range || *range <= 2.0 {
+                    1.0
+                } else {
+                    (2.0 * (1.5 * range - d) / range).clamp(0.0, 1.0)
+                };
+                if hushed && vol > 0.0 {
+                    vol = 16.0 / 127.0;
+                }
+                (i as u64, name.as_str(), vol)
+            })
+            .collect()
+    }
+
+    /// items.c case 0xD: the highest music area whose sound item has a hero
+    /// within its radius is asked for.
+    fn update_music_area(&mut self) {
+        let mut best: Option<(usize, i16)> = None;
+        for &(pos, radius, area, fade) in &self.music_items {
+            let near = self
+                .players
+                .iter()
+                .filter(|p| p.state.active())
+                .map(|p| (p.pos - pos).length())
+                .fold(f32::MAX, f32::min);
+            if near < radius && best.is_none_or(|b| area > b.0) {
+                best = Some((area, fade));
+            }
+        }
+        if let Some((area, fade)) = best {
+            if area != self.music_area.0 {
+                self.music_area = (area, fade);
+            }
+        }
+    }
+
+    /// fn_80060114: a placed monster appears when a sphere four times its
+    /// visibility radius is on screen and it is within 50 of the camera's
+    /// look-at point (never in the attract flyby).
+    fn spawn_placed_enemies(&mut self) {
+        if self.fixed_camera.is_some() || self.pending_enemies.is_empty() {
+            return;
+        }
+        let (_, at, _) = self.camera_view();
+        let ready: Vec<usize> = (0..self.pending_enemies.len())
+            .filter(|&i| {
+                let p = &self.pending_enemies[i];
+                (p.pos - at).length() <= 50.0 && self.on_screen(p.pos, 4.0 * p.visrad)
+            })
+            .collect();
+        for i in ready.into_iter().rev() {
+            let p = self.pending_enemies.remove(i);
+            self.spawn(p.kind, p.model, p.pos, p.yaw);
+        }
+    }
+
     /// generate_enemy: place a generator's monster in front of it (or around it,
     /// for small monsters) where there's floor and no wall in the way.
     fn spawn_from_generator(&mut self, sp: Spawn) {
@@ -1661,6 +1801,7 @@ impl Game {
             target: None,
             reload: 0.0,
             drained: 0.0,
+            blink: 0.0,
         }
     }
 
@@ -1900,7 +2041,14 @@ impl Game {
                             // A half-second freeze as it appears.
                             *cooldown = if strength < 4 { 0.5 } else { 0.0 };
                         }
-                        self.spawn(kind, model, pos, yaw);
+                        // fn_80060114: it appears once it comes into view.
+                        self.pending_enemies.push(PendingEnemy {
+                            kind,
+                            model,
+                            pos,
+                            yaw,
+                            visrad: info.radius.max(1.0),
+                        });
                     }
                 }
                 // SetItem case 3: tier, max alive and interval (with the level's
@@ -2108,6 +2256,21 @@ impl Game {
                         pos,
                         yaw,
                     );
+                }
+                // SetItem case 13: a sound item with a music area selects it
+                // while a hero is within its radius.
+                ItemType::Sound => {
+                    let radius = f32::from_le_bytes(inst.params[0..4].try_into().unwrap());
+                    let area = i32::from_le_bytes(inst.params[4..8].try_into().unwrap());
+                    let fade = i16::from_le_bytes(inst.params[8..10].try_into().unwrap());
+                    if area > 0 {
+                        self.music_items
+                            .push((pos, radius, area as usize - 1, fade));
+                    } else if !inst.name.is_empty() {
+                        // Otherwise it loops its sound (named by the instance).
+                        self.ambient_items
+                            .push((pos, radius, inst.name.to_ascii_uppercase()));
+                    }
                 }
                 ItemType::Transporter | ItemType::Rotator => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
@@ -2332,8 +2495,10 @@ impl Game {
         }
         let inputs = self.legend_freeze_inputs(inputs);
         self.update_players(dt, &inputs);
+        self.update_music_area();
         self.legend_face_boss();
         self.update_rings(dt);
+        self.spawn_placed_enemies();
         self.update_entities(dt);
         self.update_critters(dt);
         self.update_waves(dt);
@@ -2436,6 +2601,18 @@ impl Game {
                 ));
             }
         }
+        // fn_80088EF4's candidates: who could be grabbed for a combo.
+        let combo_info: Vec<(Vec3, bool, u8)> = self
+            .players
+            .iter()
+            .map(|p| {
+                let free = p.state.active()
+                    && p.grab_partner.is_none()
+                    && p.grab_pending.is_none()
+                    && p.fx.special & 0x400 == 0;
+                (p.pos, free, (p.class_id % 8) as u8)
+            })
+            .collect();
         for (i, p) in self.players.iter_mut().enumerate() {
             let mut inp = inputs.get(i).copied().unwrap_or_default();
             // The d-pad runs the mini-inventory; only the stick walks.
@@ -2569,12 +2746,77 @@ impl Game {
                 shield: p.fx.armor,
                 stat_armor: p.derived.armor,
                 char_type: ct,
-                // (Two-player combos need the partner's side; not yet.)
-                partner: false,
+                partner_ct: p.grab_partner.and_then(|g| combo_info.get(g)).map(|c| c.2),
                 ..Default::default()
             };
+            // A combo partner: the nearest free hero within 5 in a 45 degree
+            // cone ahead, at about the same height.
+            let facing = Vec2::new(p.yaw.sin(), p.yaw.cos());
+            let candidate = if p.grab_partner.is_none()
+                && p.grab_pending.is_none()
+                && p.fx.special & 0x400 == 0
+            {
+                combo_info
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, (pos, free, _))| {
+                        let d = Vec2::new(pos.x - p.pos.x, pos.z - p.pos.z);
+                        j != i
+                            && *free
+                            && d.length() <= 5.0
+                            && (pos.y - p.pos.y).abs() <= 3.0
+                            && d.normalize_or_zero().dot(facing) >= 0.707
+                    })
+                    .min_by(|a, b| {
+                        let da = (a.1 .0 - p.pos).length();
+                        let db = (b.1 .0 - p.pos).length();
+                        da.total_cmp(&db)
+                    })
+                    .map(|(j, _)| j)
+            } else {
+                None
+            };
+            ctx.partner = candidate.is_some();
             let ms = p.act.motion_state(levels, edges, &ctx);
             p.act.tick_idle(1);
+            if ms == 0x16 {
+                p.grab_pending = candidate;
+            }
+            // PlayerKnockback: this frame's hits push and pick a reaction, unless
+            // the hero is in an untouchable move.
+            let mut reaction = 0u8;
+            if p.hit_damage > 1.0 && p.act.action < 11 {
+                let f = p.hit_flags;
+                let pojo = p.fx.special & 0x400 != 0;
+                let (k, r) = if f & DmgType::WHIRLWIND != 0 {
+                    (100.0, 30)
+                } else if f & DmgType::BLOWNAWAY != 0 {
+                    (100.0, 20)
+                } else if f & (DmgType::KNOCKDOWN | DmgType::KNOCKOVER) != 0 {
+                    (if pojo { 80.0 } else { 32.0 }, 20)
+                } else if f & DmgType::KNOCKBACK != 0 {
+                    (16.0, 10)
+                } else if f & DmgType::SPIKE != 0 {
+                    (0.0, 3)
+                } else if f & DmgType::STUN != 0 {
+                    (0.0, 2)
+                } else {
+                    (0.0, 1)
+                };
+                p.knock_vel += p.hit_force * k;
+                reaction = r;
+                // Hit from behind: the forward fall.
+                if r >= 10 && p.hit_force.length() > 0.0 {
+                    let from = (-p.hit_force.x).atan2(-p.hit_force.z);
+                    if wrap_angle(from - p.yaw).abs() > std::f32::consts::FRAC_PI_2 {
+                        reaction += 1;
+                    }
+                }
+            }
+            p.hit_damage = 0.0;
+            p.hit_flags = 0;
+            p.hit_force = Vec3::ZERO;
+            ctx.reaction = reaction;
 
             // PlayerGetTarget: the nearest thing in the cone around the heading
             // (the stick, else the facing), measured to its surface.
@@ -2672,6 +2914,8 @@ impl Game {
                 pa::PWRA_THROW => vec![rows.turbo_a_throw],
                 pa::PWRB => vec![rows.turbo_b],
                 pa::PWRC => vec![rows.turbo_c1, rows.turbo_c2],
+                pa::COMBO_ACTIVE1 if p.grab_partner.is_some() => vec![rows.combo1],
+                pa::COMBO_ACTIVE3 if p.grab_partner.is_some() => vec![rows.combo2],
                 _ => vec![],
             };
             let (t0, t1) = (p.act.prev_frame, frame);
@@ -2705,6 +2949,17 @@ impl Game {
             let a = &p.act;
             let mut movement = joymag * a.stick_scale;
             let mut mdir = joyang;
+            // The hero carrying the Dwarf runs where the Dwarf steers.
+            if a.cur == pa::COMBO_DWF2 {
+                if let Some(g) = p.grab_partner {
+                    let gi = inputs.get(g).copied().unwrap_or_default();
+                    let gw = fwd * gi.stick.y + right * gi.stick.x;
+                    if gw.length() > 0.0 {
+                        movement = gw.length().min(1.0);
+                        mdir = gw.x.atan2(gw.y);
+                    }
+                }
+            }
             if a.cur == pa::SHOVE {
                 movement = 1.0;
                 if joymag < 0.25 {
@@ -2729,7 +2984,8 @@ impl Game {
             let turn = 15.707_963 * dt * a.turn_scale;
             p.yaw += wrap_angle(head - p.yaw).clamp(-turn, turn);
             let speed = a.move_scale * p.derived.speed * movement;
-            let moving = speed > 0.0;
+            let grabbed = a.hud & 0x20 != 0;
+            let moving = speed > 0.0 && !grabbed;
             if moving {
                 let dir = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
                 let target = p.pos + dir * speed * dt;
@@ -2739,11 +2995,20 @@ impl Game {
                     p.pos = target;
                 }
             }
-            p.pos = self
-                .collision
-                .resolve_walls(p.pos, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT);
-            p.pos = Self::resolve_solids(&self.entities, p.pos, PLAYER_RADIUS, 0);
-            p.on_ground = Self::snap_to_ground(&self.collision, &mut p.pos, &mut p.vy, dt);
+            // The knock velocity carries the hero (none in untouchable moves),
+            // decaying x0.667 a 30 Hz frame.
+            if p.act.action >= 11 {
+                p.knock_vel = Vec3::ZERO;
+            }
+            if !grabbed {
+                p.pos += p.knock_vel * dt;
+                p.knock_vel *= 0.667f32.powf(dt * 30.0);
+                p.pos =
+                    self.collision
+                        .resolve_walls(p.pos, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT);
+                p.pos = Self::resolve_solids(&self.entities, p.pos, PLAYER_RADIUS, 0);
+                p.on_ground = Self::snap_to_ground(&self.collision, &mut p.pos, &mut p.vy, dt);
+            }
             if p.pos.y < self.level.worlds.min_bounds[1] - 50.0 {
                 p.pos = self.cam_focus + Vec3::Y * 2.0;
                 p.vy = 0.0;
@@ -2757,6 +3022,7 @@ impl Game {
                 p.animator.frame = p.act.anim.frame;
             }
         }
+        self.update_combos();
         // Players don't overlap each other.
         for a in 0..self.players.len() {
             for b in (a + 1)..self.players.len() {
@@ -2982,6 +3248,201 @@ impl Game {
 
     /// A melee swing (PlayerMotion_DamageTarget): one target, the nearest in the
     /// forward cone within reach of its surface, takes the player's damage.
+    /// PlayerMotion's combo block (pmotion.c:2938-3120): link the partner as
+    /// COMBOACT1 starts (paying the turbo), hold or ride them by class, the
+    /// Warrior's throw and the Dwarf's ride, then let go; heroes held follow
+    /// the other's DUMMY node.
+    fn update_combos(&mut self) {
+        use crate::paction::p as pa;
+        let n = self.players.len();
+        let grab = |g: &mut Game, x: usize, onto: usize| {
+            let p = &mut g.players[x];
+            p.saved_pos = p.pos;
+            p.act.hud |= 0x20;
+            p.attached_to = Some(onto);
+        };
+        let release = |g: &mut Game, x: usize, restore: bool| {
+            let p = &mut g.players[x];
+            if restore {
+                p.pos = p.saved_pos;
+            }
+            p.act.hud &= !0x20;
+            p.attached_to = None;
+        };
+        let unlink = |g: &mut Game, i: usize, partner: usize| {
+            g.players[partner].grab_partner = None;
+            g.players[i].grab_partner = None;
+        };
+        for i in 0..n {
+            let cur = self.players[i].act.cur;
+            let combo_anim = matches!(cur, pa::COMBO_ACTIVE1 | pa::COMBO_ACTIVE2);
+            self.players[i].combo_timer -= 1;
+            if combo_anim {
+                if let Some(t) = self.players[i].grab_pending.take() {
+                    if t < n {
+                        let p = &mut self.players[i];
+                        p.grab_partner = Some(t);
+                        p.power = (p.power - p.act.coll_score).max(0.0);
+                        p.act.coll_score = 0.0;
+                        self.players[t].act.hud |= 0x10;
+                        self.players[t].grab_partner = Some(i);
+                    }
+                }
+            } else {
+                self.players[i].grab_pending = None;
+            }
+            let pojo = self.players[i].fx.special & 0x400 != 0;
+            let Some(partner) = self.players[i].grab_partner else {
+                continue;
+            };
+            // Only the hero who started the combo runs it.
+            if self.players[partner].act.hud & 0x50 == 0 && self.players[i].act.hud & 0x50 != 0 {
+                continue;
+            }
+            let kind = if pojo {
+                99
+            } else {
+                (self.players[i].class_id % 8) as u8
+            };
+            let ph = self.players[partner].act.hud;
+            match kind {
+                // Wizard, Knight, Sorceress, Jester: hold the partner on the
+                // DUMMY node (the Jester lets go again at once).
+                2 | 5 | 6 | 7 => {
+                    if combo_anim {
+                        if ph & 0x20 == 0 {
+                            grab(self, partner, i);
+                            continue;
+                        }
+                        if kind != 7 {
+                            continue;
+                        }
+                    }
+                    if ph & 0x10 != 0 {
+                        if ph & 0x20 != 0 {
+                            release(self, partner, true);
+                        }
+                        self.players[partner].act.hud &= !0x10;
+                        unlink(self, i, partner);
+                    }
+                }
+                // Valkyrie, Archer: ride the partner, who turns to face them.
+                1 | 3 => {
+                    if combo_anim {
+                        if self.players[i].act.hud & 0x20 == 0 {
+                            let d = self.players[i].pos - self.players[partner].pos;
+                            self.players[partner].yaw = d.x.atan2(d.z);
+                            grab(self, i, partner);
+                        }
+                    } else if ph & 0x10 != 0 {
+                        if self.players[i].act.hud & 0x20 != 0 {
+                            release(self, i, true);
+                        }
+                        self.players[partner].act.hud &= !0x10;
+                        unlink(self, i, partner);
+                    }
+                }
+                // Warrior: lift the partner for 30 frames, then throw them; they
+                // fly as COMBOWAR2 for 240 ticks.
+                0 => {
+                    let lifting = cur == pa::COMBO_ACTIVE1 && self.players[i].act.anim.frame < 30.0;
+                    if lifting {
+                        if ph & 0x20 == 0 {
+                            grab(self, partner, i);
+                        }
+                    } else {
+                        if ph & 0x10 != 0 {
+                            if ph & 0x20 != 0 {
+                                release(self, partner, false);
+                            }
+                            let h = &mut self.players[partner].act.hud;
+                            *h = (*h & !0x10) | 0x40;
+                            self.players[i].combo_timer = 240;
+                        }
+                        if self.players[partner].act.hud & 0x40 != 0
+                            && self.players[i].combo_timer <= 0
+                        {
+                            self.players[partner].act.hud &= !0x40;
+                            self.players[i].act.hud &= !0x80;
+                            unlink(self, i, partner);
+                        }
+                    }
+                }
+                // Dwarf: climb on the partner, who then runs with him (steered
+                // by the Dwarf) for 240 ticks.
+                4 => {
+                    if cur == pa::COMBO_ACTIVE1 {
+                        if self.players[i].act.hud & 0x20 == 0 {
+                            let d = self.players[i].pos - self.players[partner].pos;
+                            self.players[partner].yaw = d.x.atan2(d.z);
+                            grab(self, i, partner);
+                            self.players[i].act.hud |= 0x80;
+                        }
+                        self.players[i].combo_timer = 240;
+                    } else if ph & 0x10 != 0 {
+                        let h = &mut self.players[partner].act.hud;
+                        *h = (*h & !0x10) | 0x40;
+                    } else if ph & 0x40 != 0 && self.players[i].combo_timer <= 0 {
+                        if self.players[i].act.hud & 0x20 != 0 {
+                            release(self, i, false);
+                        }
+                        self.players[partner].act.hud &= !0x40;
+                        self.players[i].act.hud &= !0x80;
+                        unlink(self, i, partner);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Held heroes ride the other's DUMMY node.
+        for x in 0..n {
+            let Some(y) = self.players[x].attached_to else {
+                continue;
+            };
+            let (pos, yaw, model, seq, frame) = {
+                let h = &self.players[y];
+                (h.pos, h.yaw, h.model, h.animator.seq, h.animator.frame)
+            };
+            let node = self.models[model]
+                .node_matrix(seq, frame, "DUMMY")
+                .map_or(Vec3::Y * 3.0, |m| m.w_axis.truncate());
+            let p = &mut self.players[x];
+            p.pos = pos + glam::Quat::from_rotation_y(yaw) * node;
+            p.yaw = yaw;
+        }
+        // The thrown Warrior's partner and the Dwarf's carrier knock down what
+        // they run into (50 and 10).
+        for pi in 0..n {
+            let cur = self.players[pi].act.cur;
+            let dmg = match cur {
+                pa::COMBO_WAR2 => 50.0,
+                pa::COMBO_DWF2 => 10.0,
+                _ => continue,
+            };
+            let pos = self.players[pi].pos;
+            let hits: Vec<(usize, Vec2)> = self
+                .entities
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    e.alive
+                        && matches!(e.kind, Kind::Enemy { .. } | Kind::Critter(_))
+                        && !self.damg_cooldown.contains_key(&(pi, e.id))
+                })
+                .filter_map(|(i, e)| {
+                    let d = Vec2::new(e.pos.x - pos.x, e.pos.z - pos.z);
+                    (d.length() < PLAYER_RADIUS + 2.0 && (e.pos.y - pos.y).abs() < 4.0)
+                        .then_some((i, d.normalize_or_zero()))
+                })
+                .collect();
+            for (i, push) in hits {
+                let id = self.entities[i].id;
+                self.damg_cooldown.insert((pi, id), 0.5);
+                self.hit_entity(pi, i, dmg, push, true);
+            }
+        }
+    }
+
     /// A swing lands (pmotion.c:2621): the one target in the facing cone within
     /// 3.5, for the melee damage times `mult` (x2 slow / step, x3 power).
     fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, _knock: bool) {
@@ -3351,8 +3812,9 @@ impl Game {
                 return;
             }
         }
-        // Turbo moves, combos and the like (action >= 11) can't be hurt.
-        if p.act.action >= 11 {
+        // Turbo moves, combos and the like (action >= 11), and both heroes of a
+        // two-player combo, can't be hurt.
+        if p.act.action >= 11 || p.act.hud & 0x10 != 0 || p.grab_partner.is_some() {
             return;
         }
         let mut dmg = dmg;
@@ -3372,11 +3834,31 @@ impl Game {
         if flags & (DmgType::POISON_GAS | DmgType::NO_ARMOR) == 0 {
             dmg = (dmg - p.derived.armor).max(0.0);
         }
-        // damage_player: a block (DEFEND2) stops the hit; a charge halves it.
-        if p.act.hud & crate::paction::hud::BLOCK != 0 {
+        // Levitation lifts the hero over low blows.
+        let mut flags = flags;
+        if flags & DmgType::LOW != 0 && p.fx.special & crate::powerups::S_LEVITATE != 0 {
             dmg = 0.0;
-        } else if p.act.hud & crate::paction::hud::CHARGE != 0 {
-            dmg *= 0.5;
+        }
+        // damage_player: a block (DEFEND2) stops the hit; a charge halves it;
+        // either way a heavy knock becomes a plain knockback.
+        if dmg > 1.0 && p.act.hud & (crate::paction::hud::BLOCK | crate::paction::hud::CHARGE) != 0
+        {
+            if p.act.hud & crate::paction::hud::BLOCK != 0 {
+                dmg = 0.0;
+            } else {
+                dmg *= 0.5;
+            }
+            if flags & 0x10160 != 0 {
+                flags = (flags & !0x10160) | DmgType::KNOCKBACK;
+            }
+        }
+        // For PlayerKnockback: the damage, its flags and the push away from
+        // where it came from.
+        p.hit_damage += dmg;
+        p.hit_flags |= flags;
+        if let Some(src) = self.damage_from.take() {
+            let d = p.pos - src;
+            p.hit_force += Vec3::new(d.x, 0.0, d.z).normalize_or_zero();
         }
         let old = (p.health + 0.5) as i32;
         p.health -= dmg;
@@ -3617,6 +4099,14 @@ impl Game {
     }
 
     fn update_entities(&mut self, dt: f32) {
+        // Where each monster stood before this frame's move (do_enemy_move
+        // reverts a move that runs into another monster or a hero).
+        let before: HashMap<u64, Vec3> = self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Enemy { .. }))
+            .map(|e| (e.id, e.pos))
+            .collect();
         let player_pos: Vec<(Vec3, bool)> = self
             .players
             .iter()
@@ -3778,6 +4268,7 @@ impl Game {
                     target,
                     reload,
                     drained,
+                    blink,
                     ..
                 } => {
                     let Some(model) = e.model else { continue };
@@ -3786,6 +4277,35 @@ impl Game {
                     };
                     let skel = &self.models[model].skeleton;
                     let ty = &crate::enemies::TYPES[(*etype).min(33)];
+                    // fn_8004D958: the Warlock blinks while standing or walking,
+                    // 1-2 s seen then 1-2 s unseen, fading 16/255 a tick; any
+                    // other action fades it back in.
+                    if *etype == 24 {
+                        let calm = matches!(state, EnemyState::Idle | EnemyState::Chase);
+                        let mut hide = false;
+                        if calm {
+                            if *blink == 0.0 {
+                                *blink = self.rng.range(1.0, 2.0);
+                            } else if *blink > 0.0 {
+                                *blink -= dt;
+                                if *blink <= 0.0 {
+                                    *blink = -self.rng.range(1.0, 2.0);
+                                }
+                            } else {
+                                *blink += dt;
+                                if *blink >= 0.0 {
+                                    *blink = self.rng.range(1.0, 2.0);
+                                }
+                            }
+                            hide = *blink < 0.0;
+                        }
+                        let step = 16.0 / 255.0 * dt * 60.0;
+                        e.fade = if hide {
+                            (e.fade - step).max(0.0)
+                        } else {
+                            (e.fade + step).min(1.0)
+                        };
+                    }
                     // Recognize a player within sight; chase from then on.
                     if !*recognized && near.is_some_and(|(_, d)| d <= sight) {
                         *recognized = true;
@@ -4325,6 +4845,28 @@ impl Game {
                     self.hit_from = None;
                 }
                 self.entities[pidx].alive = false;
+            } else if self.friendly_fire > 0 {
+                // The Multiplayer option: a hero's shot stuns (1) or hurts (2)
+                // another hero it hits (combat.c:1129).
+                let hit = (0..self.players.len()).find(|&pi| {
+                    let p = &self.players[pi];
+                    pi != owner
+                        && p.state.active()
+                        && Vec2::new(p.pos.x - ppos.x, p.pos.z - ppos.z).length() < PLAYER_RADIUS
+                        && (p.pos.y + 2.5 - ppos.y).abs() < 3.0
+                });
+                if let Some(pi) = hit {
+                    self.entities[pidx].alive = false;
+                    if self.friendly_fire == 1 {
+                        let p = &mut self.players[pi];
+                        p.hit_damage = p.hit_damage.max(2.0);
+                        p.hit_flags |= DmgType::STUN;
+                    } else {
+                        self.damage_from = Some(ppos);
+                        self.damage_player(pi, dmg, 0);
+                        self.damage_from = None;
+                    }
+                }
             }
         }
 
@@ -4349,34 +4891,48 @@ impl Game {
             self.entities[i].pos = p;
         }
 
-        // Keep monsters from stacking on top of each other (and on players).
+        // do_enemy_move: a monster's move is undone if it brings it into
+        // another monster (their radii touching) or into a hero (radius + 0.5 +
+        // the hero's 1.5); moving apart is always allowed.
         let enemy_idx: Vec<usize> = (0..self.entities.len())
             .filter(|&i| {
                 self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. })
             })
             .collect();
-        for a in 0..enemy_idx.len() {
-            for b in (a + 1)..enemy_idx.len() {
-                let (ia, ib) = (enemy_idx[a], enemy_idx[b]);
-                let d = Vec2::new(
-                    self.entities[ib].pos.x - self.entities[ia].pos.x,
-                    self.entities[ib].pos.z - self.entities[ia].pos.z,
-                );
-                let len = d.length();
-                if len < 1.6 && len > 1e-4 {
-                    let push = d / len * (1.6 - len) * 0.5;
-                    self.entities[ia].pos -= Vec3::new(push.x, 0.0, push.y);
-                    self.entities[ib].pos += Vec3::new(push.x, 0.0, push.y);
-                }
+        let size = |e: &Entity| match &e.kind {
+            Kind::Enemy { etype, .. } => {
+                let t = &crate::enemies::TYPES[(*etype).min(33)];
+                (t.radius, t.height * 0.5)
             }
-            for (pp, alive) in &player_pos {
-                let e = &mut self.entities[enemy_idx[a]];
-                let d = Vec2::new(e.pos.x - pp.x, e.pos.z - pp.z);
-                let len = d.length();
-                if *alive && len < 1.8 && len > 1e-4 {
-                    let push = d / len * (1.8 - len);
-                    e.pos += Vec3::new(push.x, 0.0, push.y);
+            _ => (1.5, 3.0),
+        };
+        for &i in &enemy_idx {
+            let Some(&old) = before.get(&self.entities[i].id) else {
+                continue;
+            };
+            let new = self.entities[i].pos;
+            if new == old {
+                continue;
+            }
+            let (ri, hi) = size(&self.entities[i]);
+            let flat = |a: Vec3, b: Vec3| Vec2::new(a.x - b.x, a.z - b.z).length();
+            let into = |other: Vec3, reach: f32, height: f32| {
+                (new.y - other.y).abs() < height
+                    && flat(new, other) < reach
+                    && flat(new, other) < flat(old, other) - 1e-4
+            };
+            let mut blocked = enemy_idx.iter().any(|&j| {
+                if j == i {
+                    return false;
                 }
+                let (rj, hj) = size(&self.entities[j]);
+                into(self.entities[j].pos, ri + rj, hi + hj)
+            });
+            blocked |= player_pos
+                .iter()
+                .any(|(pp, alive)| *alive && into(*pp, ri + 0.5 + PLAYER_RADIUS, hi + 2.5));
+            if blocked {
+                self.entities[i].pos = old;
             }
         }
 
@@ -4432,7 +4988,15 @@ impl Game {
                     p.health = (p.health + dmg).min(max_health(p.level));
                 }
             } else {
-                self.damage_player(pi, dmg, 0);
+                // Short monsters' blows are low.
+                let (from, low) = self.entities.get(ei).map_or((None, false), |e| {
+                    let low = matches!(e.kind, Kind::Enemy { etype, .. }
+                        if crate::enemies::TYPES[etype.min(33)].height * 0.5 <= 2.0);
+                    (Some(e.pos), low)
+                });
+                self.damage_from = from;
+                self.damage_player(pi, dmg, if low { DmgType::LOW } else { 0 });
+                self.damage_from = None;
             }
         }
         let mut poisoned: Vec<(usize, f32)> = Vec::new();
@@ -4569,7 +5133,9 @@ impl Game {
             self.sfx.push("S_EXPLODE1|S_SUICIDEEXP".into());
             for pi in 0..self.players.len() {
                 if (self.players[pi].pos - pos).length() < 8.0 {
+                    self.damage_from = Some(pos);
                     self.damage_player(pi, dmg, 0);
+                    self.damage_from = None;
                 }
             }
         }
@@ -4988,6 +5554,182 @@ mod tests {
     }
 
     #[test]
+    fn hits_stagger_and_knock_down() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        g.pending_enemies.clear();
+        let idle = [PlayerInput::default()];
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &idle);
+        }
+        use crate::paction::p as pa;
+        let p0 = g.players[0].pos;
+        g.damage_player(0, 10.0, 0);
+        g.update(1.0 / 60.0, &idle);
+        assert_eq!(g.players[0].act.cur, pa::HIT_REACT);
+        for _ in 0..60 {
+            g.update(1.0 / 60.0, &idle);
+        }
+        // Knocked down from behind (the hero faces +z): the forward fall, a push
+        // forward, then up again.
+        g.damage_from = Some(p0 - Vec3::Z * 3.0);
+        g.damage_player(0, 10.0, DmgType::KNOCKDOWN);
+        let mut seen = vec![];
+        for _ in 0..180 {
+            g.update(1.0 / 60.0, &idle);
+            let c = g.players[0].act.cur;
+            if seen.last() != Some(&c) {
+                seen.push(c);
+            }
+        }
+        assert!(
+            seen.starts_with(&[pa::FALL_DOWN_FWD, pa::GET_UP_FWD]),
+            "{seen:?}"
+        );
+        assert!(g.players[0].pos.z > p0.z + 0.5, "pushed forward");
+    }
+
+    #[test]
+    fn wizard_combo_holds_the_partner() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WIZ", "BLU"), ("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        g.pending_enemies.clear();
+        let idle = [PlayerInput::default(), PlayerInput::default()];
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &idle);
+        }
+        // The Wizard faces +z with the Warrior 3 ahead.
+        let base = g.players[0].pos;
+        g.players[0].yaw = 0.0;
+        g.players[1].pos = base + Vec3::Z * 3.0;
+        g.players[0].power = 60.0;
+        let z = [
+            PlayerInput {
+                combo: true,
+                ..Default::default()
+            },
+            PlayerInput::default(),
+        ];
+        use crate::paction::p as pa;
+        let mut partner_anims = vec![];
+        let mut linked = false;
+        for _ in 0..240 {
+            g.update(1.0 / 60.0, &z);
+            linked |= g.players[1].grab_partner == Some(0);
+            let c = g.players[1].act.cur;
+            if partner_anims.last() != Some(&c) {
+                partner_anims.push(c);
+            }
+        }
+        assert!(linked, "the combo linked");
+        assert!(partner_anims.contains(&pa::COMBO_WIZ), "{partner_anims:?}");
+        assert!(g.players[0].power < 20.0, "turbo paid");
+        assert!(
+            g.players[1].grab_partner.is_none() && g.players[1].act.hud & 0x30 == 0,
+            "let go"
+        );
+    }
+
+    #[test]
+    fn warrior_combo_throws_the_partner() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
+        g.entities.clear();
+        g.pending_enemies.clear();
+        let idle = [PlayerInput::default(), PlayerInput::default()];
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &idle);
+        }
+        let base = g.players[0].pos;
+        g.players[0].yaw = 0.0;
+        g.players[1].pos = base + Vec3::Z * 3.0;
+        g.players[0].power = 60.0;
+        let z = [
+            PlayerInput {
+                combo: true,
+                ..Default::default()
+            },
+            PlayerInput::default(),
+        ];
+        use crate::paction::p as pa;
+        let mut seen = vec![];
+        for _ in 0..600 {
+            g.update(1.0 / 60.0, &z);
+            let c = g.players[1].act.cur;
+            if seen.last() != Some(&c) {
+                seen.push(c);
+            }
+        }
+        assert!(
+            seen.contains(&pa::COMBO_WAR1) && seen.contains(&pa::COMBO_WAR2),
+            "{seen:?}"
+        );
+        assert!(
+            g.players[1].grab_partner.is_none(),
+            "free again after the throw"
+        );
+    }
+
+    #[test]
+    fn music_areas_exist_and_have_streams() {
+        let Some(fs) = data() else { return };
+        let wd = gdl_formats::wdata::Worlds::load(|p| fs.read(p)).unwrap();
+        let mut with_items = 0;
+        for d in std::fs::read_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../game-data/files/Gauntlet/LEVELS"),
+        )
+        .unwrap()
+        {
+            let name = d.unwrap().file_name().into_string().unwrap();
+            // (The unused test levels name streams that aren't on the disc.)
+            if name.starts_with("levelT") {
+                continue;
+            }
+            let Some(w) = wd.wave_of_dir(&name) else {
+                continue;
+            };
+            let (_, n) = wd.music_area(w, 0);
+            for a in 0..n {
+                for s in wd.music_area(w, a).0 {
+                    assert!(
+                        fs.read(&format!("STREAMS/{s}.ads")).is_ok(),
+                        "{name} area {a}: {s}"
+                    );
+                }
+            }
+            let g = Game::new(&fs, &name, &[("WAR", "RED")]).unwrap();
+            if !g.music_items.is_empty() {
+                // (An area past the music's last is ignored, as in the game.)
+                with_items += 1;
+            }
+        }
+        assert!(with_items > 0, "some levels switch music by area");
+    }
+
+    #[test]
+    fn ambient_sounds_resolve() {
+        let Some(fs) = data() else { return };
+        let mut names = Vec::new();
+        for l in ["levelA1", "levelG1", "levelI1", "levelD1", "levelL1"] {
+            let g = Game::new(&fs, l, &[("WAR", "RED")]).unwrap();
+            names.extend(g.ambient_items.iter().map(|a| a.2.clone()));
+        }
+        names.sort();
+        names.dedup();
+        let found = crate::audio::check_sounds(&fs, &names);
+        let missing: Vec<_> = found
+            .iter()
+            .filter(|(_, f)| f.is_none())
+            .map(|(n, _)| n)
+            .collect();
+        println!("{} ambient sounds, missing {missing:?}", names.len());
+        assert!(missing.len() * 4 < names.len(), "{missing:?}");
+    }
+
+    #[test]
     fn holding_attack_throws_at_original_rate() {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
@@ -5285,8 +6027,9 @@ mod tests {
         let Some(fs) = data() else { return };
         for level in ["levelA3", "levelB4", "levelC4", "levelJ3"] {
             let mut g = Game::new(&fs, level, &[("WAR", "RED")]).unwrap();
+            // Placed monsters wait to come into view.
             let Some(archer) = g
-                .entities
+                .pending_enemies
                 .iter()
                 .find(|e| {
                     matches!(

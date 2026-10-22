@@ -50,6 +50,12 @@ enum Cmd {
     /// Played once on the music channel (a movie soundtrack).
     MusicOnce(Vec<i16>, u16, u32),
     StopMusic,
+    /// A looping ambient sound by id (a level's sound items), its volume, and
+    /// stopping it / all of them.
+    LoopStart(u64, Vec<(Pcm, u32)>, f32),
+    LoopVolume(u64, f32),
+    LoopStop(u64),
+    LoopStopAll,
     /// Clips played back to back, at a sample rate and volume.
     Sfx(Vec<(Pcm, u32)>, f32),
     /// Announcer: queued after any line already playing.
@@ -126,6 +132,11 @@ pub struct Audio {
     tx: Option<mpsc::Sender<Cmd>>,
     /// Sound-effect volume from the options (1.0 = the default 128).
     sfx_vol: f32,
+    /// Music volume from the options, and the fade applied on top of it.
+    music_vol: f32,
+    music_fade: f32,
+    /// Ambient loops playing, by id, at their last volume.
+    loops: std::collections::HashMap<u64, f32>,
     current: String,
     lib: Option<SoundLib>,
 }
@@ -135,6 +146,9 @@ impl Audio {
         if muted {
             return Audio {
                 sfx_vol: 1.0,
+                music_vol: 1.0,
+                music_fade: 1.0,
+                loops: Default::default(),
                 tx: None,
                 current: String::new(),
                 lib: None,
@@ -163,6 +177,7 @@ impl Audio {
                 let mut _music: Option<rodio::Sink> = None;
                 let mut music_vol = 1.0f32;
                 let voice = Some(new_sink());
+                let mut loops: std::collections::HashMap<u64, rodio::Sink> = Default::default();
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         Cmd::Music(pcm, ch, rate) => {
@@ -210,6 +225,32 @@ impl Audio {
                             }
                         }
                         Cmd::StopMusic => _music = None,
+                        Cmd::LoopStart(id, c, vol) => {
+                            let s = new_sink();
+                            s.set_volume(vol);
+                            // The clips back to back, looping.
+                            let pcm: Vec<f32> = c
+                                .iter()
+                                .flat_map(|(p, _)| p.iter().map(|&v| v as f32 / 32768.0))
+                                .collect();
+                            let rate = c.first().map_or(22050, |c| c.1);
+                            if !pcm.is_empty() {
+                                s.append(
+                                    rodio::buffer::SamplesBuffer::new(1, rate, pcm)
+                                        .repeat_infinite(),
+                                );
+                                loops.insert(id, s);
+                            }
+                        }
+                        Cmd::LoopVolume(id, vol) => {
+                            if let Some(s) = loops.get(&id) {
+                                s.set_volume(vol);
+                            }
+                        }
+                        Cmd::LoopStop(id) => {
+                            loops.remove(&id);
+                        }
+                        Cmd::LoopStopAll => loops.clear(),
                         Cmd::Sfx(c, vol) => {
                             let s = new_sink();
                             s.set_volume(vol);
@@ -234,6 +275,9 @@ impl Audio {
             });
         Audio {
             sfx_vol: 1.0,
+            music_vol: 1.0,
+            music_fade: 1.0,
+            loops: Default::default(),
             tx: spawned.ok().map(|_| tx),
             current: String::new(),
             lib: None,
@@ -244,6 +288,46 @@ impl Audio {
     pub fn load_sounds(&mut self, fs: &GameFs) {
         if self.tx.is_some() && self.lib.is_none() {
             self.lib = SoundLib::load(fs);
+        }
+    }
+
+    /// Keep ambient sound `id` (`name`) looping at `vol` (0..1 before the
+    /// effects volume); 0 stops it.
+    pub fn ambient(&mut self, fs: &GameFs, id: u64, name: &str, vol: f32) {
+        let (Some(tx), Some(lib)) = (&self.tx, &mut self.lib) else {
+            return;
+        };
+        let v = vol * 0.8 * self.sfx_vol;
+        match self.loops.get_mut(&id) {
+            Some(_) if vol <= 0.0 => {
+                self.loops.remove(&id);
+                let _ = tx.send(Cmd::LoopStop(id));
+            }
+            Some(cur) => {
+                if (*cur - v).abs() > 0.01 {
+                    *cur = v;
+                    let _ = tx.send(Cmd::LoopVolume(id, v));
+                }
+            }
+            None if vol > 0.0 => {
+                if let Some((clips, dv)) = lib.resolve(fs, name) {
+                    let v = v * dv.max(0.3);
+                    self.loops.insert(id, v);
+                    let _ = tx.send(Cmd::LoopStart(id, clips, v));
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Stop every ambient sound (leaving a level).
+    pub fn ambient_clear(&mut self) {
+        if self.loops.is_empty() {
+            return;
+        }
+        self.loops.clear();
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Cmd::LoopStopAll);
         }
     }
 
@@ -419,8 +503,21 @@ impl Audio {
     /// Apply the Audio options: music and sfx volumes (128 is the default).
     pub fn set_volumes(&mut self, prefs: &crate::options::Prefs) {
         self.sfx_vol = prefs.sfx_vol as f32 / 128.0;
+        self.music_vol = prefs.music_vol as f32 / 128.0;
+        self.send_music_volume();
+    }
+
+    /// AudioMusicVolUpdate's fade (1.0 = full), on top of the music volume.
+    pub fn set_music_fade(&mut self, f: f32) {
+        if (f - self.music_fade).abs() > 1e-4 {
+            self.music_fade = f;
+            self.send_music_volume();
+        }
+    }
+
+    fn send_music_volume(&self) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Cmd::MusicVolume(prefs.music_vol as f32 / 128.0));
+            let _ = tx.send(Cmd::MusicVolume(self.music_vol * self.music_fade));
         }
     }
 

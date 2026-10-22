@@ -1779,6 +1779,61 @@ fn footer(s: &mut Scr, x: f32, back: bool) {
 
 #[cfg(test)]
 mod tests {
+    /// Random presses on four pads for a long while: player select (with its
+    /// memory-card screens) must never panic.
+    #[test]
+    fn fuzzed_players_never_crash_select() {
+        for seed in 1..=6u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let srcs = [
+                Source::Keyboard,
+                Source::Device(1),
+                Source::Device(2),
+                Source::Device(3),
+            ];
+            let mut sel = Select::with_first(Source::Keyboard);
+            for _ in 0..20_000 {
+                let inputs: Vec<(Source, PlayerInput)> = srcs
+                    .iter()
+                    .map(|&src| {
+                        let r = next();
+                        let b = |k: u32| r >> k & 7 == 0;
+                        let dir = (r >> 40) % 5;
+                        let stick = match dir {
+                            1 => glam::Vec2::new(0.0, 1.0),
+                            2 => glam::Vec2::new(0.0, -1.0),
+                            3 => glam::Vec2::new(1.0, 0.0),
+                            4 => glam::Vec2::new(-1.0, 0.0),
+                            _ => glam::Vec2::ZERO,
+                        };
+                        (
+                            src,
+                            PlayerInput {
+                                stick,
+                                attack: b(0),
+                                attack_pressed: b(0),
+                                b_pressed: b(4),
+                                turbo: b(4),
+                                start_pressed: b(8) && b(12),
+                                magic_pressed: b(16),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect();
+                if sel.update(&inputs).is_some() || sel.leave {
+                    sel = Select::with_first(Source::Keyboard);
+                }
+            }
+        }
+    }
+
     use super::*;
     use glam::Vec2;
 

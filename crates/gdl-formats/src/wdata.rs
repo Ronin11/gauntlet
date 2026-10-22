@@ -486,6 +486,23 @@ impl Worlds {
             .unwrap_or_default()
     }
 
+    /// A wave's music for area `area` (sMusicSubIndex), and how many areas it has.
+    pub fn music_area(&self, wave: u32, area: usize) -> (Vec<String>, usize) {
+        let Some(realm) = self.realm(wave >> 8) else {
+            return (Vec::new(), 0);
+        };
+        let Some(level) = realm.levels.get((wave & 0xFF) as usize) else {
+            return (Vec::new(), 0);
+        };
+        realm
+            .audio
+            .get(level.audio_index.max(0) as usize)
+            .map_or((Vec::new(), 0), |a| {
+                let n = a.areas.max(1) as usize;
+                (a.streams(area.min(n - 1)), n)
+            })
+    }
+
     /// The map-screen record of a wave's level (level_data.mapdata), if it has one.
     pub fn map(&self, wave: u32) -> Option<&MapDef> {
         let realm = self.realm(wave >> 8)?;

@@ -166,6 +166,8 @@ impl Ads {
 pub struct SoundDef {
     pub samples: Vec<usize>,
     pub volume: u8,
+    /// A looping sound (ambience).
+    pub looped: bool,
 }
 
 /// A sound-effect bank (`AUDIO/*.VBK`, magic "KNBV"): sound table + DSP-ADPCM samples.
@@ -185,6 +187,7 @@ impl Vbk {
         let nsamples = be32(b, 0x10) as usize;
         // Sound table: 8-byte entries. Each holds sample references (bit 15 marks the
         // final one; earlier unflagged words are played before it) and a volume.
+        // Looping sounds (ambience) also set bits 13-14 on the sample word.
         let mut sounds = Vec::with_capacity(nsounds);
         for i in 0..nsounds {
             let o = 0x14 + i * 8;
@@ -194,22 +197,28 @@ impl Vbk {
             let w: Vec<u16> = (0..4).map(|k| be16(b, o + k * 2)).collect();
             let mut samples = Vec::new();
             let mut volume = 100;
+            let mut looped = false;
             for k in 0..3 {
-                let idx = (w[k] & 0x3FFF) as usize;
+                let idx = (w[k] & 0x1FFF) as usize;
                 if w[k] & 0x8000 != 0 && w[k + 1] <= 0x7F && idx < nsamples {
                     // Earlier unflagged words are clips played first ("Red" + "Warrior").
                     for &prev in &w[..k] {
-                        let p = (prev & 0x3FFF) as usize;
+                        let p = (prev & 0x1FFF) as usize;
                         if prev & 0x8000 == 0 && p < nsamples {
                             samples.push(p);
                         }
                     }
                     samples.push(idx);
                     volume = w[k + 1] as u8;
+                    looped = w[k] & 0x6000 != 0;
                     break;
                 }
             }
-            sounds.push(SoundDef { samples, volume });
+            sounds.push(SoundDef {
+                samples,
+                volume,
+                looped,
+            });
         }
         // Samples: standard 0x60-byte DSP headers followed by their data.
         let mut samples = Vec::with_capacity(nsamples);

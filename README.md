@@ -98,7 +98,6 @@ in `~/.android/gauntlet-rs.keystore`.
 
 ## Not done yet (roadmap)
 
-- Two-player combos (the partner's side), player knockback reactions
 - Bosses and their arenas (in progress), attract-mode level flybys
 - Texture animations (flowing water, flames), particle effects
 - Save games (load game)

@@ -596,6 +596,11 @@ pub struct Ctx {
     pub char_type: u8,
     /// A combo partner stands in reach (fn_80088EF4).
     pub partner: bool,
+    /// PlayerKnockback's reaction this frame: 1 hit, 2 stun, 3 spike, 10/11
+    /// knockback, 20/21 knocked down (from behind: forward), 30/31 whirlwind.
+    pub reaction: u8,
+    /// The linked combo partner's char_type, while linked.
+    pub partner_ct: Option<u8>,
 }
 
 /// One player's action state.
@@ -646,7 +651,14 @@ impl Action {
         if ctx.special & 0x400 != 0 && levels & bits::ATK_SLOW != 0 {
             levels = (levels & !bits::ATK_SLOW) | bits::ATK_QUICK;
         }
-        let ms = if levels & bits::MAGIC != 0 {
+        // Being a combo partner, or carrying one, comes first.
+        let ms = if self.hud & 0x40 != 0 {
+            0x27
+        } else if self.hud & 0x10 != 0 {
+            0x26
+        } else if self.hud & 0x80 != 0 {
+            0x17
+        } else if levels & bits::MAGIC != 0 {
             0x18
         } else if levels & bits::COMBO != 0 && ctx.power >= 50.0 && ctx.partner {
             0x16
@@ -778,6 +790,25 @@ impl Action {
                 self.coll_score = 50.0;
                 p::COMBO_ACTIVE1
             }
+            0x17 => p::COMBO_ACTIVE2,
+            // The partner plays the combo of the hero who started it.
+            0x26 => match ctx.partner_ct {
+                Some(0) => p::COMBO_WAR1,
+                Some(1) => p::COMBO_VAL,
+                Some(2) => p::COMBO_WIZ,
+                Some(3) => p::COMBO_ARC,
+                Some(4) => p::COMBO_DWF1,
+                Some(5) => p::COMBO_KNI,
+                Some(6) => p::COMBO_SOR,
+                Some(7) => p::COMBO_JES,
+                _ => p::READY,
+            },
+            // Thrown by the Warrior, or carrying the Dwarf.
+            0x27 => match ctx.partner_ct {
+                Some(0) => p::COMBO_WAR2,
+                Some(4) => p::COMBO_DWF2,
+                _ => p::READY,
+            },
             0x18 => {
                 if ctx.potions > 0 {
                     p::USE_MAGIC
@@ -794,6 +825,18 @@ impl Action {
                 }
             }
             _ => p::READY,
+        };
+        // A reaction takes over the motion (pmotion.c:1476-1563, 1838-2089); a
+        // plain hit only staggers a hero who is standing, walking or running.
+        self.next = match ctx.reaction {
+            1 if matches!(ms, 1 | 8 | 0x0D) => p::HIT_REACT,
+            2 => p::STUN_REACT,
+            3 => p::SPIKE_HIT,
+            10 | 11 => p::KNOCKBACK,
+            20 => p::FALL_DOWN,
+            21 => p::FALL_DOWN_FWD,
+            30 | 31 => p::WHIRLWIND,
+            _ => self.next,
         };
         msg
     }

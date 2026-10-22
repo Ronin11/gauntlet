@@ -161,6 +161,10 @@ struct Running {
     screen: Screen,
     /// The attract sequence, kept across visits to the title screen.
     attract: Attract,
+    /// The level music's area playing, the one being faded to, and the fade.
+    music_now: usize,
+    music_switch: Option<usize>,
+    music_fade: f32,
     /// The party's realm progress.
     progress: Progress,
     /// The level a secret icon was found in, kept while the secret level runs.
@@ -278,6 +282,9 @@ impl App {
             depth,
             screen,
             attract: Attract::new(),
+            music_now: 0,
+            music_switch: None,
+            music_fade: 1.0,
             progress: Progress::default(),
             prefs: Prefs::default(),
             suspended: None,
@@ -433,6 +440,7 @@ impl App {
                         }
                     }
                     r.checkpoint = r.carry.clone();
+                    p.game.friendly_fire = r.prefs.multiplayer;
                     p.game.crystals = r.progress.crystals;
                     p.game.garg_items = r.progress.garg_items;
                     p.game.shards = r.progress.shards;
@@ -474,6 +482,10 @@ impl App {
                         .wave
                         .map(|w| p.game.worlds.music(w))
                         .unwrap_or_default();
+                    r.music_now = 0;
+                    r.music_switch = None;
+                    r.music_fade = 1.0;
+                    r.audio.set_music_fade(1.0);
                     if !r.audio.play_streams(fs, &streams) {
                         r.audio.play_level_music(fs, &level);
                     }
@@ -869,6 +881,33 @@ impl App {
                     } else {
                         play.game.update(TICK, &inputs);
                         play.intro += TICK;
+                        // AudioMusicVolUpdate / AudioSetupLevelStreams: a new music
+                        // area fades the stream out (3/127 a tick; or switches at
+                        // once), plays the area's stream, and fades back in.
+                        let (want, how) = play.game.music_area;
+                        if want != r.music_now && r.music_switch != Some(want) {
+                            r.music_switch = Some(want);
+                        }
+                        if let Some(area) = r.music_switch {
+                            if how >= 2 || r.music_fade <= 3.0 / 127.0 {
+                                if let Some(w) = play.game.wave {
+                                    let (streams, n) = play.game.worlds.music_area(w, area);
+                                    if n > 1 {
+                                        r.audio.play_streams(fs, &streams);
+                                    }
+                                }
+                                r.music_now = area;
+                                r.music_switch = None;
+                            } else {
+                                r.music_fade = (r.music_fade - 3.0 / 127.0).max(0.0);
+                            }
+                        } else if r.music_fade < 1.0 {
+                            r.music_fade = (r.music_fade + 8.0 / 127.0).min(1.0);
+                        }
+                        r.audio.set_music_fade(r.music_fade);
+                        for (id, name, vol) in play.game.ambient_levels() {
+                            r.audio.ambient(fs, id, name, vol);
+                        }
                         // Sumner's lectern: HintMenu.
                         if let Some(pi) = play
                             .game
@@ -911,6 +950,13 @@ impl App {
             }
         }
         if let Some(s) = next {
+            // Out of a level, the music plays at full volume again.
+            if !matches!(s, Screen::Playing { .. }) {
+                r.music_fade = 1.0;
+                r.audio.set_music_fade(1.0);
+            }
+            // A new screen starts with no ambient sounds.
+            r.audio.ambient_clear();
             if matches!(s, Screen::Title(_) | Screen::Select(_)) {
                 r.audio.play_select_music(fs);
             }

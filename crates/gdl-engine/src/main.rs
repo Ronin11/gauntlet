@@ -354,8 +354,16 @@ fn snapshot_game(args: &Args) -> Result<()> {
             attack_pressed: args.attack_at == Some(f),
             ..Default::default()
         };
+        // GDL_FUZZ=seed: every hero mashes random buttons and sticks.
+        let fuzz = std::env::var("GDL_FUZZ")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
         let inputs: Vec<_> = (0..g.players.len())
-            .map(|i| if args.bot { g.bot_input(i) } else { inp })
+            .map(|i| match fuzz {
+                Some(seed) => fuzz_input(seed, f, i),
+                None if args.bot => g.bot_input(i),
+                None => inp,
+            })
             .collect();
         g.update(1.0 / 60.0, &inputs);
         sfx_seen.extend(g.sfx.drain(..));
@@ -496,8 +504,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 c.runes[2] = true;
             }
             println!("shop {mode_name}, music {:?}", s.music());
+            let fuzz = std::env::var("GDL_FUZZ")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
             for t in 1..=ticks {
                 let mut inputs = vec![input::PlayerInput::default(); 2];
+                if let Some(seed) = fuzz {
+                    inputs = (0..2).map(|p| fuzz_input(seed, t, p)).collect();
+                }
                 for &(et, key, who) in &events {
                     if et != t {
                         continue;
@@ -717,4 +731,44 @@ fn main() -> Result<()> {
         mute: args.mute,
         save_dir: gdl_engine::save::MemCard::default_dir(),
     })
+}
+
+/// A pseudo-random input for hero `i` on frame `f` (held for 8 frames).
+fn fuzz_input(seed: u64, f: u32, i: usize) -> input::PlayerInput {
+    let mut x = seed ^ ((f / 8) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i as u64) << 32;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let r = next();
+    let edge = f % 8 == 0;
+    let bit = |k: u32| r >> k & 1 == 1;
+    let stick = Vec2::new(
+        ((next() % 200) as f32 / 100.0) - 1.0,
+        ((next() % 200) as f32 / 100.0) - 1.0,
+    )
+    .clamp_length_max(1.0);
+    input::PlayerInput {
+        stick,
+        attack: bit(0),
+        attack_pressed: edge && bit(0),
+        slow: bit(1),
+        slow_pressed: edge && bit(1),
+        turbo: bit(2),
+        b_pressed: edge && bit(2),
+        magic: bit(3) && bit(9),
+        magic_pressed: edge && bit(3) && bit(9),
+        charge_pressed: edge && bit(4) && bit(10),
+        strafe: bit(5) && bit(11),
+        combo: bit(6),
+        inv: gdl_engine::powerups::DPad {
+            up: edge && bit(7) && bit(12),
+            down: edge && bit(8) && bit(13),
+            left: edge && bit(14) && bit(15),
+            right: edge && bit(16) && bit(17),
+        },
+        ..Default::default()
+    }
 }
