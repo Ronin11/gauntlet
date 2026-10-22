@@ -54,6 +54,11 @@ enum Screen {
     Legal(u32),
     /// The attract loop (movies, group shots); its state is `Running::attract`.
     Attract,
+    /// MG_OVER: "GAME OVER" typed out for 240 ticks, then the attract loop.
+    GameOver {
+        ticks: i32,
+        text: String,
+    },
     Title(Title),
     Select(Select),
     /// The loading art is shown for one frame, then the level loads.
@@ -399,6 +404,16 @@ impl App {
                         next = Some(Screen::Attract);
                     }
                 }
+                Screen::GameOver { ticks, .. } => {
+                    *ticks += 1;
+                    if *ticks == 60 {
+                        r.audio.play(fs, "S_GAMEOVERVOX");
+                    }
+                    if *ticks >= 240 {
+                        r.attract = std::mem::take(&mut r.attract).game_over();
+                        next = Some(Screen::Attract);
+                    }
+                }
                 Screen::Attract => {
                     let inputs: Vec<PlayerInput> = all.iter().map(|(_, i)| *i).collect();
                     let ev = if escape {
@@ -524,8 +539,7 @@ impl App {
                             OptionsAction::Shop | OptionsAction::Inventory => *pause = None,
                             OptionsAction::QuitGame => {
                                 r.audio.stop();
-                                r.attract = std::mem::take(&mut r.attract).game_over();
-                                next = Some(Screen::Attract);
+                                next = Some(game_over_screen(fs));
                             }
                             OptionsAction::None => {}
                         }
@@ -587,6 +601,18 @@ impl App {
         let ticks = (time * 60.0) as u32;
         let mut in_game = false;
         match &mut r.screen {
+            Screen::GameOver { ticks, text } => {
+                // DrawStringText centres the whole string, then it is cut to
+                // (t - 60) / 8 letters, so they appear in place one by one.
+                let mut s = Scr::new(&mut canvas, &r.hud.ui, *ticks as u32);
+                s.bars(1.0);
+                s.rect(0.0, 0.0, 512.0, 384.0, [0.0, 0.0, 0.0, 1.0]);
+                let n = ((*ticks - 60) >> 3).clamp(0, 9) as usize;
+                let w = s.text_width(crate::ui::FONT_32, 2.0, text);
+                let x = 256.0 - (w * 0.5).floor();
+                let shown: String = text.chars().take(n).collect();
+                s.text(2.0, x, 120.0, crate::ui::FONT_32, 0xFFFFFF, 0, &shown);
+            }
             Screen::Legal(_) => attract::draw_legal(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Attract => {
                 if let Some(attract::Show::Movie(m)) = &mut r.attract.show {
@@ -712,8 +738,7 @@ impl App {
                     // Nobody left playing: game over (MG_OVER), then the attract
                     // loop's fail movie.
                     r.audio.stop();
-                    r.attract = std::mem::take(&mut r.attract).game_over();
-                    r.screen = Screen::Attract;
+                    r.screen = game_over_screen(fs);
                     return Ok(());
                 }
                 let wave = play.game.wave;
@@ -853,4 +878,15 @@ fn menu_owner(menu: &Options) -> usize {
 /// Is a closed menu still finishing its fade?
 fn menu_drawing(menu: &Option<Options>) -> bool {
     menu.as_ref().is_some_and(|m| m.is_drawing())
+}
+
+/// MG_OVER with ENGLISH.ROM message 169 ("GAME OVER").
+fn game_over_screen(fs: &GameFs) -> Screen {
+    let text = fs
+        .read("TEXT/ENGLISH.ROM")
+        .ok()
+        .and_then(|d| gdl_formats::text::TextRom::parse(&d).ok())
+        .and_then(|r| r.messages.get(169).and_then(|m| m.lines.first().cloned()))
+        .unwrap_or_else(|| "GAME OVER".into());
+    Screen::GameOver { ticks: 0, text }
 }
