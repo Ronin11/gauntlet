@@ -52,6 +52,12 @@ pub enum Show {
         prefix: &'static str,
         ticks: i32,
     },
+    /// The credits roll over CRED_ALL: three blocks of lines from the DOL.
+    Credits {
+        blocks: [Vec<String>; 3],
+        scroll: i32,
+        ticks: i32,
+    },
 }
 
 pub enum Event {
@@ -62,6 +68,8 @@ pub enum Event {
     MovieStarted,
     /// A movie ended or was skipped: stop its soundtrack.
     MovieEnded,
+    /// The credits started: play castle2b.
+    Credits,
 }
 
 pub struct Attract {
@@ -88,6 +96,17 @@ impl Attract {
             game_over: false,
             show: None,
         }
+    }
+
+    /// The credits roll `scroll` pixels in, for snapshots.
+    pub fn credits_demo(fs: &GameFs, scroll: i32) -> Attract {
+        let mut a = Attract::new();
+        a.show = credit_lines(fs).map(|blocks| Show::Credits {
+            blocks,
+            scroll,
+            ticks: 0,
+        });
+        a
     }
 
     /// After "Quit Game" or a game over (MG_OVER): the "fail" movie plays next.
@@ -145,6 +164,18 @@ impl Attract {
                     return Event::None;
                 }
                 Entry::Title if self.loops == 0 => return Event::Title,
+                // The credits roll every 16th loop.
+                Entry::Credits if self.loops & 15 == 15 => match credit_lines(fs) {
+                    Some(blocks) => {
+                        self.show = Some(Show::Credits {
+                            blocks,
+                            scroll: 0,
+                            ticks: 0,
+                        });
+                        return Event::Credits;
+                    }
+                    None => continue,
+                },
                 Entry::Title | Entry::Flyby | Entry::Credits => continue,
             }
         }
@@ -155,6 +186,27 @@ impl Attract {
         let ended = match &mut self.show {
             None => true,
             Some(Show::Movie(m)) => m.update(1.0 / 60.0, inputs),
+            Some(Show::Credits {
+                blocks,
+                scroll,
+                ticks,
+            }) => {
+                if self.started
+                    && inputs
+                        .iter()
+                        .any(|i| i.start_pressed || i.attack_pressed || i.b_pressed)
+                {
+                    self.show = None;
+                    return Event::Title;
+                }
+                *ticks += 1;
+                // scroll_credits: 1 a frame, 2 once the first block has passed.
+                let (alive, past) = credits_state(blocks, *scroll);
+                if *ticks % 2 == 0 {
+                    *scroll += if past { 2 } else { 1 };
+                }
+                !alive || *ticks >= 5400
+            }
             Some(Show::Screen2D { ticks, .. }) => {
                 // attract_check_input: Start or a face button goes to the title.
                 if self.started
@@ -172,7 +224,7 @@ impl Attract {
         if !ended {
             return Event::None;
         }
-        let was_movie = matches!(self.show, Some(Show::Movie(_)));
+        let was_movie = matches!(self.show, Some(Show::Movie(_) | Show::Credits { .. }));
         self.show = None;
         match self.advance(fs) {
             Event::None if was_movie => Event::MovieEnded,
@@ -192,6 +244,21 @@ impl Attract {
                 s.quad_screen(prefix, 0);
                 s.glow_text_lines(1.0, -432.0, -320.0, "Press\nStart");
             }
+            Some(Show::Credits { blocks, scroll, .. }) => {
+                s.quad_screen("CRED_ALL", 0);
+                for (x, y, scale, line) in credit_layout(blocks, *scroll) {
+                    // 16-pixel fade bands at the top and bottom of the screen.
+                    let a = if 384.0 - y < 16.0 {
+                        255 - (384 - y as i32) * 16
+                    } else if y < 16.0 {
+                        (16 - y as i32) * 16
+                    } else {
+                        0
+                    };
+                    let font = crate::ui::FONT_CREDITS;
+                    s.text(scale, x, 383.0 - y, font, 0xFFFFFF, a.clamp(0, 255), line);
+                }
+            }
             None => s.rect(0.0, 0.0, 512.0, 384.0, [0.0, 0.0, 0.0, 1.0]),
         }
     }
@@ -207,4 +274,48 @@ impl Default for Attract {
 pub fn draw_legal(s: &mut Scr) {
     s.bars(1.0);
     s.quad_screen("SONY_SCREEN", 0);
+}
+
+/// The credits text: entries 337.., 429.. and 469.. of the string table at
+/// 0x80118188 in main.dol (92, 40 and 10 lines).
+fn credit_lines(fs: &GameFs) -> Option<[Vec<String>; 3]> {
+    let dol = gdl_formats::dol::Dol::new(fs.read_dol().ok()?);
+    let block = |first: u32, n: u32| -> Vec<String> {
+        (first..first + n)
+            .map(|i| dol.str_ptr(0x8011_8188, i).unwrap_or_default())
+            .collect()
+    };
+    Some([block(337, 92), block(429, 40), block(469, 10)])
+}
+
+/// Each visible credit line: x, its scroll height (0 at the bottom), scale and
+/// text. Block 1 lines are 21 apart at scale 1; the others 15 apart at 0.833.
+fn credit_layout(blocks: &[Vec<String>; 3], scroll: i32) -> Vec<(f32, f32, f32, &str)> {
+    let mut out = Vec::new();
+    let mut y = scroll;
+    for (b, lines) in blocks.iter().enumerate() {
+        let (step, scale) = if b == 0 { (21, 1.0) } else { (15, 0.833) };
+        for l in lines {
+            if y < 0 {
+                return out;
+            }
+            if y < 384 {
+                out.push((32.0, y as f32, scale, l.as_str()));
+            }
+            y -= step;
+        }
+    }
+    out
+}
+
+/// Whether the roll is still running (a line is on screen, or the first has
+/// yet to rise past the top), and whether the first block's last line is past
+/// the middle (the roll then doubles its speed).
+fn credits_state(blocks: &[Vec<String>; 3], scroll: i32) -> (bool, bool) {
+    let layout = credit_layout(blocks, scroll);
+    let last_first = scroll - 21 * (blocks[0].len() as i32 - 1);
+    (
+        !layout.is_empty() || scroll < 384,
+        last_first > 192 || layout.is_empty(),
+    )
 }

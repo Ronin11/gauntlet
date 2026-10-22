@@ -450,6 +450,9 @@ impl App {
                             }
                         }
                         attract::Event::MovieEnded => r.audio.stop(),
+                        attract::Event::Credits => {
+                            r.audio.play_streams(fs, &["castle2b".into()]);
+                        }
                         attract::Event::Title => {
                             r.audio.stop();
                             r.attract.show = None;

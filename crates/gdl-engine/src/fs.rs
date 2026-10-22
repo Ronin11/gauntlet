@@ -89,6 +89,23 @@ impl GameFs {
     }
 
     /// Read a file by path relative to the `Gauntlet/` folder, e.g. `LEVELS/levelA1/WORLDS.PS2`.
+    /// The game's executable: from the disc image, or a main.dol next to the
+    /// extracted files.
+    pub fn read_dol(&self) -> Result<Vec<u8>> {
+        match self {
+            GameFs::Dir(root) => {
+                for dir in root.ancestors().take(4) {
+                    let p = dir.join("main.dol");
+                    if p.is_file() {
+                        return Ok(std::fs::read(p)?);
+                    }
+                }
+                anyhow::bail!("no main.dol near {}", root.display())
+            }
+            GameFs::Disc(d) => d.borrow_mut().read_dol(),
+        }
+    }
+
     pub fn read(&self, rel: &str) -> Result<Vec<u8>> {
         match self {
             GameFs::Dir(root) => {

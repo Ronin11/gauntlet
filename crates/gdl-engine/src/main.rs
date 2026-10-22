@@ -382,6 +382,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     o.draw(&mut s);
                 }
             }
+            Some(name) if name.starts_with("credits") => {
+                let scroll = name
+                    .strip_prefix("credits:")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(300);
+                gdl_engine::attract::Attract::credits_demo(&fs, scroll)
+                    .draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100), None);
+            }
             Some(s) if s.starts_with("map:") => {
                 if let Some((m, ticks)) = &map_screen {
                     m.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, *ticks));

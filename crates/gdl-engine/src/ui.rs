@@ -96,6 +96,7 @@ pub const FONT_8X8: usize = 0;
 pub const FONT_8HI: usize = 1;
 pub const FONT_32: usize = 6;
 pub const FONT_INITIALS: usize = 7;
+pub const FONT_CREDITS: usize = 13;
 
 /// Decode a model directory's named textures (`<dir>/objects.ngc` + `textures.ngc`),
 /// for banks loaded on demand (the map screen's `MAPS/level<name>`). Names are
@@ -121,7 +122,9 @@ pub fn load_bank_images(fs: &GameFs, dir: &str) -> anyhow::Result<Vec<(String, I
 }
 
 /// Texture banks loaded for the front end, in lookup order.
-const BANKS: [&str; 6] = ["STATIC", "SELECT", "TITLE", "SONY", "GROUP1", "POWERUPS"];
+const BANKS: [&str; 7] = [
+    "STATIC", "SELECT", "TITLE", "SONY", "GROUP1", "POWERUPS", "CREDITS",
+];
 
 /// Every front-end texture by name plus the fonts, ready for upload.
 #[derive(Default)]
@@ -160,6 +163,9 @@ impl UiAssets {
             .iter()
             .map(|&(name, space)| font(&ui, name, name).map(|f| Font { space, ..f }))
             .collect();
+        // Slot 13: FontInitSpecial("credits", 8) for the credits roll.
+        ui.fonts.resize(FONT_CREDITS + 1, None);
+        ui.fonts[FONT_CREDITS] = font(&ui, "CREDITS", "CREDITS").map(|f| Font { space: 8.0, ..f });
         ui.font32_glow = ui.fonts[FONT_32].clone().and_then(|f| {
             Some(Font {
                 tex: ui.get("FONT32_GLOW")?,
