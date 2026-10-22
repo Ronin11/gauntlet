@@ -1,4 +1,4 @@
-use gdl_engine::{app, audio, character, fs, game, gpu, hud, input, scene};
+use gdl_engine::{app, audio, character, fs, game, gpu, hud, input, menu, scene, select, ui};
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec2, Vec3};
@@ -13,6 +13,7 @@ struct Args {
     eye: Option<Vec3>,
     at: Option<Vec3>,
     spawn: Option<Vec3>,
+    screen: Option<String>,
     size: (u32, u32),
     character: Option<String>,
     seq: String,
@@ -67,6 +68,7 @@ fn parse_args() -> Result<Args> {
         eye: None,
         at: None,
         spawn: None,
+        screen: None,
         size: (1280, 720),
         character: None,
         seq: "READY".into(),
@@ -109,6 +111,7 @@ fn parse_args() -> Result<Args> {
             "--eye" => a.eye = Some(parse_vec3(&val()?)?),
             "--at" => a.at = Some(parse_vec3(&val()?)?),
             "--spawn" => a.spawn = Some(parse_vec3(&val()?)?),
+            "--screen" => a.screen = Some(val()?),
             "--size" => {
                 let v = val()?;
                 let (w, h) = v.split_once('x').context("--size WxH")?;
@@ -279,14 +282,57 @@ fn snapshot_game(args: &Args) -> Result<()> {
         let proj = Mat4::perspective_rh(50f32.to_radians(), w as f32 / h as f32, 0.5, 2000.0);
         globals = gpu::globals(proj * view, m.transform_point3(eye), [0.0; 3], 0.0);
     }
-    let hud = hud::Hud::new(&gpu.device, gpu.color_format);
-    let classes: Vec<String> = players.iter().map(|(c, _)| c.clone()).collect();
+    let hud = hud::Hud::new(
+        &gpu.device,
+        &gpu.queue,
+        gpu.color_format,
+        ui::UiAssets::load(&fs),
+    );
+    let names: Vec<String> = players
+        .iter()
+        .map(|(c, _)| {
+            select::HEROES
+                .iter()
+                .find(|(k, _)| k == c)
+                .map_or(c.clone(), |(_, n)| n.to_string())
+        })
+        .collect();
     let draw_hud = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
-        hud::build(&mut canvas, &g, &classes);
+        hud::build(&mut canvas, &hud.ui, &g, &names);
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
     };
-    let img = gpu.render_to_image(w, h, &globals, scene::CLEAR, &sc.draws(&g), Some(&draw_hud))?;
+    // Menu screens for checking their layout headlessly.
+    let t = 1.0;
+    let style = hud::Style { ui: &hud.ui };
+    let draw_screen = |view: &wgpu::TextureView| {
+        let mut canvas = hud::Canvas::new(w, h);
+        match args.screen.as_deref() {
+            Some("title") => menu::Title::default().draw(&mut canvas, &style, t),
+            Some("select") => select::Select::demo().draw(&mut canvas, &style, t),
+            Some("loading") => menu::draw_loading(&mut canvas, &style, &args.level),
+            Some("pause") => {
+                hud::build(&mut canvas, &hud.ui, &g, &names);
+                menu::Pause::default().draw(&mut canvas, &style, t);
+            }
+            _ => {}
+        }
+        hud.draw(&gpu.device, &gpu.queue, view, &canvas);
+    };
+    let img = match args.screen.as_deref() {
+        Some("pause") => gpu.render_to_image(
+            w,
+            h,
+            &globals,
+            scene::CLEAR,
+            &sc.draws(&g),
+            Some(&draw_screen),
+        )?,
+        Some(_) => gpu.render_to_image(w, h, &globals, scene::CLEAR, &[], Some(&draw_screen))?,
+        None => {
+            gpu.render_to_image(w, h, &globals, scene::CLEAR, &sc.draws(&g), Some(&draw_hud))?
+        }
+    };
     write_png(args.snapshot.as_ref().unwrap(), &img)
 }
 

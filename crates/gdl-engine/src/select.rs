@@ -2,7 +2,7 @@
 //! hero and readies up.
 
 use crate::game::PLAYER_COLORS;
-use crate::hud::{Canvas, PLAYER_RGB};
+use crate::hud::{Canvas, Style, DIM, GOLD, PLAYER_RGB};
 use crate::input::{Input, Source};
 
 /// Selectable heroes: (directory, display name). The first four are the classic
@@ -16,7 +16,7 @@ pub const HEROES: &[(&str, &str)] = &[
     ("KNI", "KNIGHT"),
     ("SOR", "SORCERESS"),
     ("JES", "JESTER"),
-    ("FAL", "FALCONER"),
+    ("FAL", "FALCONESS"),
     ("JAC", "JACKAL"),
     ("TIG", "TIGRESS"),
     ("UNI", "UNICORN"),
@@ -40,6 +40,33 @@ pub struct Select {
 }
 
 impl Select {
+    /// A sample screen for layout checks: three players joined, one ready.
+    pub fn demo() -> Select {
+        let slot = |hero, ready| Slot {
+            source: Source::Keyboard,
+            hero,
+            ready,
+            last_x: 0.0,
+        };
+        Select {
+            slots: vec![slot(0, false), slot(5, true), slot(10, false)],
+            countdown: None,
+        }
+    }
+
+    /// A join screen with `first` already joined (the controller that left the title).
+    pub fn with_first(first: Source) -> Select {
+        Select {
+            slots: vec![Slot {
+                source: first,
+                hero: 0,
+                ready: false,
+                last_x: 0.0,
+            }],
+            countdown: None,
+        }
+    }
+
     /// Process input. Returns the chosen (class, colour) list once everyone is ready.
     pub fn update(&mut self, input: &Input, dt: f32) -> Option<Vec<(String, String)>> {
         let sources = input.sources();
@@ -104,99 +131,125 @@ impl Select {
         self.slots.iter().map(|s| s.source).collect()
     }
 
-    pub fn draw(&self, c: &mut Canvas, time: f32) {
-        let scale = (c.height() / 360.0)
-            .min(c.width() / 560.0)
-            .clamp(1.0, 4.0)
-            .floor();
-        let title = "GAUNTLET  DARK LEGACY";
-        let s = (scale * 3.0)
-            .min((c.width() * 0.95 / (title.len() as f32 * 8.0)).floor())
-            .max(1.0);
-        c.text_shadow(
-            (c.width() - title.len() as f32 * 8.0 * s) * 0.5,
-            c.height() * 0.1,
-            s,
-            [1.0, 0.8, 0.2, 1.0],
-            title,
-        );
-        let w = (c.width() - 10.0 * scale) / 4.0;
+    pub fn draw(&self, c: &mut Canvas, st: &Style, time: f32) {
+        let ui = st.ui;
+        let (w, h) = (c.width(), c.height());
+        let u = (h / 720.0).min(w / 1120.0);
+        c.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 1.0]);
+        st.backdrop(c, 0.82);
+        st.centered(c, w * 0.5, 22.0 * u, 50.0 * u, GOLD, "Choose Your Hero");
+
+        // Four tall frames (S1_BORDER over the S1_PLYRn nebula), 1:2 like the art.
+        let gap = 18.0 * u;
+        let fw = ((w - gap * 5.0) / 4.0).min((h - 190.0 * u) * 0.5);
+        let fh = fw * 2.0;
+        let x0 = (w - (fw * 4.0 + gap * 3.0)) * 0.5;
+        let y = 92.0 * u;
         for i in 0..4 {
-            let x = 5.0 * scale + i as f32 * w;
-            let y = c.height() * 0.35;
+            let x = x0 + i as f32 * (fw + gap);
             let rgb = PLAYER_RGB[i];
-            c.rect(
-                x + 4.0 * scale,
-                y,
-                w - 8.0 * scale,
-                c.height() * 0.4,
-                [rgb[0] * 0.2, rgb[1] * 0.2, rgb[2] * 0.2, 0.85],
-            );
-            c.rect(
-                x + 4.0 * scale,
-                y,
-                w - 8.0 * scale,
-                3.0 * scale,
-                [rgb[0], rgb[1], rgb[2], 1.0],
-            );
-            let cx = |len: usize, sc: f32| x + (w - len as f32 * 8.0 * sc) * 0.5;
-            match self.slots.get(i) {
+            let col = [rgb[0], rgb[1], rgb[2], 1.0];
+            let slot = self.slots.get(i);
+            let lit = if slot.is_some() { 1.0 } else { 0.45 };
+            match ui.get(&format!("S1_PLYR{}", i + 1)) {
+                Some(t) => c.sprite(t, x, y, fw, fh, [lit, lit, lit, 1.0]),
+                None => c.rect(
+                    x,
+                    y,
+                    fw,
+                    fh,
+                    [rgb[0] * 0.2, rgb[1] * 0.2, rgb[2] * 0.2, 1.0],
+                ),
+            }
+            match slot {
                 None => {
-                    if (time * 2.0).fract() < 0.6 {
-                        let t = "PRESS START";
-                        c.text_shadow(
-                            cx(t.len(), scale),
-                            y + 40.0 * scale,
-                            scale,
-                            [1.0, 1.0, 1.0, 1.0],
-                            t,
+                    if (time * 1.6).fract() < 0.7 {
+                        st.centered(c, x + fw * 0.5, y + fh * 0.4, 34.0 * u, col, "Press");
+                        st.centered(
+                            c,
+                            x + fw * 0.5,
+                            y + fh * 0.4 + 40.0 * u,
+                            34.0 * u,
+                            col,
+                            "Start",
                         );
                     }
                 }
                 Some(slot) => {
-                    let name = HEROES[slot.hero].1;
-                    let ns = scale * 2.0;
-                    let arrows = if slot.ready {
-                        name.to_string()
+                    let (code, name) = HEROES[slot.hero];
+                    let color = PLAYER_COLORS[i];
+                    let portrait = ui.find(&[
+                        &format!("S12_{code}_{color}"),
+                        &format!("S12_{code}_"),
+                        &format!("S12_{code}"),
+                    ]);
+                    if let Some(t) = portrait {
+                        c.sprite(t, x, y, fw, fh, [1.0; 4]);
+                    }
+                    // Name banner along the bottom of the frame.
+                    let by = y + fh - fh * 0.16;
+                    c.rect(x, by - 6.0 * u, fw, fh * 0.13, [0.0, 0.0, 0.0, 0.55]);
+                    match ui.get(&format!("{code}_NAME")) {
+                        Some(t) => {
+                            let bw = fw * 0.86;
+                            let bh = bw * t.h as f32 / t.w as f32;
+                            c.sprite(t, x + (fw - bw) * 0.5, by, bw, bh, GOLD);
+                        }
+                        None => st.centered(c, x + fw * 0.5, by, 30.0 * u, GOLD, name),
+                    }
+                    if slot.ready {
+                        st.centered(c, x + fw * 0.5, y + fh * 0.06, 40.0 * u, col, "Ready!");
                     } else {
-                        format!("< {name} >")
-                    };
-                    c.text_shadow(
-                        cx(arrows.len(), ns),
-                        y + 30.0 * scale,
-                        ns,
-                        [rgb[0], rgb[1], rgb[2], 1.0],
-                        &arrows,
-                    );
-                    let dev = match slot.source {
-                        Source::Keyboard => "KEYBOARD",
-                        Source::Pad(_) | Source::Device(_) => "CONTROLLER",
-                    };
-                    c.text_shadow(
-                        cx(dev.len(), scale),
-                        y + 60.0 * scale,
-                        scale,
-                        [0.7, 0.7, 0.7, 1.0],
-                        dev,
-                    );
-                    let st = if slot.ready { "READY!" } else { "A TO CONFIRM" };
-                    c.text_shadow(
-                        cx(st.len(), scale),
-                        y + 80.0 * scale,
-                        scale,
-                        [1.0, 1.0, 0.6, 1.0],
-                        st,
-                    );
+                        // Arrows either side while choosing.
+                        let a = 64.0 * u;
+                        let ay = y + fh * 0.45;
+                        let pulse = 0.7 + 0.3 * (time * 5.0).sin();
+                        if let Some(t) = ui.get("MARKER_LEFT") {
+                            let aw = a * 2.0;
+                            c.sprite(t, x - aw * 0.25, ay, aw, a, [pulse, pulse, pulse, 1.0]);
+                        }
+                        if let Some(t) = ui.get("MARKER_RIGHT") {
+                            let aw = a * 2.0;
+                            c.sprite(t, x + fw - aw * 0.75, ay, aw, a, [pulse, pulse, pulse, 1.0]);
+                        }
+                    }
                 }
             }
+            match ui.get("S1_BORDER") {
+                Some(t) => c.sprite(
+                    t,
+                    x,
+                    y,
+                    fw,
+                    fh,
+                    [
+                        0.85 + rgb[0] * 0.15,
+                        0.85 + rgb[1] * 0.15,
+                        0.85 + rgb[2] * 0.15,
+                        1.0,
+                    ],
+                ),
+                None => c.rect(x, y, fw, 3.0 * u, col),
+            }
+            // Which device the player is using, under the frame.
+            if let Some(slot) = slot {
+                let dev = match slot.source {
+                    Source::Keyboard => "KEYBOARD",
+                    Source::Pad(_) | Source::Device(_) => "CONTROLLER",
+                };
+                let dw = st.small_width(dev, 16.0 * u);
+                st.small(
+                    c,
+                    x + (fw - dw) * 0.5,
+                    y + fh + 10.0 * u,
+                    16.0 * u,
+                    DIM,
+                    dev,
+                );
+            }
         }
-        let help = "LEFT/RIGHT CHOOSE HERO   A / ENTER READY   B BACK";
-        c.text_shadow(
-            (c.width() - help.len() as f32 * 8.0 * scale) * 0.5,
-            c.height() * 0.85,
-            scale,
-            [0.8, 0.8, 0.8, 1.0],
-            help,
-        );
+        let help = "LEFT/RIGHT  CHOOSE      A  READY      B  BACK";
+        let hw = st.small_width(help, 18.0 * u);
+        st.small(c, (w - hw) * 0.5, h - 36.0 * u, 18.0 * u, DIM, help);
     }
 }

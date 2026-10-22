@@ -243,14 +243,22 @@ impl Audio {
 
     /// Start the music for `level` (no-op if it is already playing).
     pub fn play_level_music(&mut self, fs: &GameFs, level: &str) {
-        let Some(tx) = &self.tx else { return };
-        for name in music_candidates(level) {
+        if !self.play_music(fs, &music_candidates(level)) {
+            log::warn!("no music found for {level}");
+        }
+    }
+
+    /// Play the first of these `STREAMS/*.ads` tracks that exists (no-op if it is
+    /// already playing). Returns false if none exist.
+    pub fn play_music(&mut self, fs: &GameFs, names: &[String]) -> bool {
+        let Some(tx) = &self.tx else { return true };
+        for name in names.iter().cloned() {
             let path = format!("STREAMS/{name}.ads");
             if !fs.exists(&path) {
                 continue;
             }
             if self.current == name {
-                return;
+                return true;
             }
             let Ok(bytes) = fs.read(&path) else { continue };
             self.current = name.clone();
@@ -269,9 +277,9 @@ impl Audio {
                 }
                 Err(e) => log::warn!("music {name}: {e:#}"),
             });
-            return;
+            return true;
         }
-        log::warn!("no music found for {level}");
+        false
     }
 
     pub fn stop(&mut self) {

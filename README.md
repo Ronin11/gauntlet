@@ -18,17 +18,20 @@ cargo build --release
 extracted with `gdl extract`. If you omit it, the game looks for `$GDL_DATA`, a
 `game-data/` folder, or an `.iso` next to the executable. `./run.sh` does the same.
 
-On the join screen each controller presses **Start** (or **A**) to join, picks a hero with
-**left/right**, and presses **A** to ready up. The keyboard counts as a controller (Enter).
+Press **Start** on the title screen. On the hero select screen each controller presses
+**Start** (or **A**) to join, picks a hero with **left/right**, and presses **A** to ready
+up. The keyboard counts as a controller (Enter). **Start** (or Esc) pauses the game; the
+pause menu can change heroes, go back to the title, or quit. The title, hero select,
+loading screen, pause menu and HUD use the original game's art and fonts from the disc.
 
 | Action | Controller | Keyboard |
 |---|---|---|
 | Move | Left stick / D-pad | WASD / arrows |
 | Attack | A (South) | J / Space |
 | Turbo | X (West) / RT | L / Shift |
-| Back (join screen) | B | K |
+| Potion / back | B | K |
+| Pause | Start | Enter / Esc |
 | Fullscreen | | F11 |
-| Quit | | Esc |
 
 Other options: `--level levelB1` to start elsewhere, `--players WAR,VAL/BLU` to skip the
 join screen, `--mute`. See `gauntlet --help`.
@@ -61,10 +64,13 @@ in `~/.android/gauntlet-rs.keystore`.
   by generators that can be destroyed. They chase and attack players.
 - **Items**: food, keys, gold, gems, potions, barrels and chests (breakable), locked gates
   (open with a key), exit portals (load the next level), damage tiles.
+- **Levers and pressure pads**: walk into a lever or onto a pad to raise elevators, sink
+  spiked barricades and reveal bridges, with the original's latch/toggle/hold rules.
 - **Up to 4 players** on gamepads and keyboard, a Gauntlet-style HUD, health drain,
   kid-friendly respawning, a follow camera that keeps the party together.
-- **Combat**: melee when something is in reach, otherwise a thrown weapon; potions (B/K)
-  blast every monster nearby.
+- **Combat**: melee when something is in reach, otherwise a thrown weapon, at the original
+  animation speeds (wind-up, release, recovery; quick-attack combos); potions (B/K) blast
+  every monster nearby.
 - **Music**: each world's soundtrack, decoded from the disc's DSP-ADPCM streams.
 - **Sound effects and announcer**: weapon hits, monster deaths, pickups, gates, hero pain
   and death voices, and "Red Warrior needs food, badly!", decoded from the `.VBK` banks
@@ -78,7 +84,7 @@ in `~/.android/gauntlet-rs.keystore`.
 - Scripted cameras for boss arenas, and some dark arena/boss levels
 - Bosses, moving platforms and elevators, triggers, teleporters, secret areas
 - Texture animations (flowing water, flames), particle effects
-- Save games, menus, shops
+- Save games, the main menu (new/load game, options), shops
 - Android: analog sticks (D-pad and buttons work), audio, touch controls
 
 ## Layout
