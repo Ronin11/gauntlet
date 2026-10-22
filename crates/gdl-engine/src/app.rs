@@ -440,6 +440,7 @@ impl App {
                         }
                     }
                     r.checkpoint = r.carry.clone();
+                    p.game.friendly_fire = r.prefs.multiplayer;
                     p.game.crystals = r.progress.crystals;
                     p.game.garg_items = r.progress.garg_items;
                     p.game.shards = r.progress.shards;

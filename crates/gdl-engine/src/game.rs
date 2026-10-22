@@ -917,6 +917,9 @@ pub struct Game {
     damg_cooldown: HashMap<(usize, u64), f32>,
     /// 0 Easy, 1 Medium, 2 Hard.
     pub difficulty: usize,
+    /// The Multiplayer option: 0 Normal (shots pass heroes), 1 Shots Stun,
+    /// 2 Shots Hurt.
+    pub friendly_fire: usize,
     /// Each player model's action slots (InitActions) and class PDATA.
     action_seqs: Vec<crate::paction::ActionSeqs>,
     pdata: Vec<gdl_formats::pdata::PlayerData>,
@@ -1338,6 +1341,7 @@ impl Game {
             shield_cooldown: HashMap::new(),
             damg_cooldown: HashMap::new(),
             difficulty,
+            friendly_fire: 0,
             action_seqs: Vec::new(),
             pdata: Vec::new(),
             item_models: HashMap::new(),
@@ -4828,6 +4832,28 @@ impl Game {
                     self.hit_from = None;
                 }
                 self.entities[pidx].alive = false;
+            } else if self.friendly_fire > 0 {
+                // The Multiplayer option: a hero's shot stuns (1) or hurts (2)
+                // another hero it hits (combat.c:1129).
+                let hit = (0..self.players.len()).find(|&pi| {
+                    let p = &self.players[pi];
+                    pi != owner
+                        && p.state.active()
+                        && Vec2::new(p.pos.x - ppos.x, p.pos.z - ppos.z).length() < PLAYER_RADIUS
+                        && (p.pos.y + 2.5 - ppos.y).abs() < 3.0
+                });
+                if let Some(pi) = hit {
+                    self.entities[pidx].alive = false;
+                    if self.friendly_fire == 1 {
+                        let p = &mut self.players[pi];
+                        p.hit_damage = p.hit_damage.max(2.0);
+                        p.hit_flags |= DmgType::STUN;
+                    } else {
+                        self.damage_from = Some(ppos);
+                        self.damage_player(pi, dmg, 0);
+                        self.damage_from = None;
+                    }
+                }
             }
         }
 
