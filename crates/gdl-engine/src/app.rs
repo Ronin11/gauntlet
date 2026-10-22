@@ -77,6 +77,13 @@ enum Screen {
         /// Back from a secret level: resume the suspended level afterwards.
         resume: bool,
     },
+    /// The shop: after a level (then player select and the tower), or from
+    /// the Tower Menu (then back to the tower as it was).
+    Shop {
+        shop: Box<crate::shop::Shop>,
+        panels: Vec<PanelInfo>,
+        from_menu: bool,
+    },
     /// A level's intro movie (init_gamemovie), then the level.
     Intro {
         movie: Box<crate::movie::Movie>,
@@ -410,6 +417,7 @@ impl App {
         // Fixed-rate simulation and menu input.
         let mut escape = std::mem::take(&mut r.escape);
         let mut next: Option<Screen> = None;
+        let mut menu_shop: Option<(crate::shop::Shop, Vec<PanelInfo>)> = None;
         while r.acc >= TICK && next.is_none() {
             let all: Vec<(Source, PlayerInput)> = r
                 .input
@@ -569,6 +577,43 @@ impl App {
                         });
                     }
                 }
+                Screen::Shop {
+                    shop,
+                    panels,
+                    from_menu,
+                } => {
+                    let inputs: Vec<PlayerInput> =
+                        r.sources.iter().map(|s| r.input.read(*s)).collect();
+                    let done = shop.update(&inputs);
+                    for snd in shop.sfx.drain(..) {
+                        r.audio.play(fs, &snd);
+                    }
+                    if done {
+                        // What was bought goes with each player.
+                        let mut carry = r.carry.clone().unwrap_or_default();
+                        for (info, c) in panels.iter().zip(shop.players()) {
+                            carry[info.slot % 4] = Some(c);
+                        }
+                        r.carry = Some(carry);
+                        shop.release(&mut r.hud);
+                        r.audio.stop();
+                        next = Some(match r.suspended.take().filter(|_| *from_menu) {
+                            Some(mut play) => {
+                                if let Some(carry) = &r.carry {
+                                    for (p, info) in play.game.players.iter_mut().zip(&play.panels)
+                                    {
+                                        if let Some(c) = &carry[info.slot % 4] {
+                                            p.restore(c);
+                                        }
+                                    }
+                                }
+                                r.audio.play_streams(fs, &["tower".into()]);
+                                Screen::Playing { play, pause: None }
+                            }
+                            None => Screen::Select(Select::from_game(panels, &r.sources)),
+                        });
+                    }
+                }
                 Screen::Playing { play, pause } => {
                     let inputs: Vec<PlayerInput> =
                         r.sources.iter().map(|s| r.input.read(*s)).collect();
@@ -600,7 +645,28 @@ impl App {
                                 )));
                             }
                             // TODO: the shop and the inventory screen (shop.c).
-                            OptionsAction::Shop | OptionsAction::Inventory => *pause = None,
+                            OptionsAction::Shop | OptionsAction::Inventory => {
+                                // init_shop(1 / 2) from the tower: the tower waits.
+                                let mode = if action == OptionsAction::Shop {
+                                    crate::shop::ShopMode::FromMenu
+                                } else {
+                                    crate::shop::ShopMode::Inventory
+                                };
+                                let party: Vec<_> = play
+                                    .panels
+                                    .iter()
+                                    .zip(&play.game.players)
+                                    .map(|(info, p)| (info.clone(), p.carried(), p.carried()))
+                                    .collect();
+                                let shop = crate::shop::Shop::new(
+                                    fs, &r.gpu, &mut r.hud, party, None, mode, false,
+                                );
+                                if let Some(m) = shop.music() {
+                                    r.audio.play_bank_music(fs, &m);
+                                }
+                                *pause = None;
+                                menu_shop = Some((shop, play.panels.clone()));
+                            }
                             OptionsAction::QuitGame => {
                                 r.audio.stop();
                                 next = Some(game_over_screen(fs));
@@ -654,6 +720,19 @@ impl App {
             r.input.end_frame();
             r.acc -= TICK;
         }
+        if let Some((shop, panels)) = menu_shop.take() {
+            let old = std::mem::replace(
+                &mut r.screen,
+                Screen::Shop {
+                    shop: Box::new(shop),
+                    panels,
+                    from_menu: true,
+                },
+            );
+            if let Screen::Playing { play, .. } = old {
+                r.suspended = Some(play);
+            }
+        }
         if let Some(s) = next {
             if matches!(s, Screen::Title(_) | Screen::Select(_)) {
                 r.audio.play_select_music(fs);
@@ -692,6 +771,7 @@ impl App {
                     .draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), r.movie_tex);
             }
             Screen::Map { map, .. } => map.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
+            Screen::Shop { shop, .. } => shop.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Intro { movie, .. } => {
                 if movie.dirty {
                     movie.dirty = false;
@@ -935,10 +1015,40 @@ impl App {
                                     resume: false,
                                 }
                             }
-                            // TODO: the shop comes first (init_shop(0)).
+                            // init_shop(0): the tally and the shop, then player
+                            // select and the tower. After Garm, Final Stats.
                             None => {
-                                r.audio.play_select_music(fs);
-                                Screen::Select(Select::from_game(&panels, &r.sources))
+                                let carry = r.carry.clone().unwrap_or_default();
+                                let start = r.checkpoint.clone().unwrap_or_default();
+                                let party: Vec<_> = panels
+                                    .iter()
+                                    .map(|info| {
+                                        let now = carry[info.slot % 4]
+                                            .clone()
+                                            .unwrap_or_else(crate::game::Carried::new_character);
+                                        let was =
+                                            start[info.slot % 4].clone().unwrap_or(now.clone());
+                                        (info.clone(), now, was)
+                                    })
+                                    .collect();
+                                let shop = crate::shop::Shop::new(
+                                    fs,
+                                    &r.gpu,
+                                    &mut r.hud,
+                                    party,
+                                    w.and_then(|w| worlds.level(w)).cloned(),
+                                    crate::shop::ShopMode::AfterLevel,
+                                    w == Some(0x803),
+                                );
+                                match shop.music() {
+                                    Some(m) => r.audio.play_bank_music(fs, &m),
+                                    None => r.audio.stop(),
+                                }
+                                Screen::Shop {
+                                    shop: Box::new(shop),
+                                    panels,
+                                    from_menu: false,
+                                }
                             }
                         }
                     }
