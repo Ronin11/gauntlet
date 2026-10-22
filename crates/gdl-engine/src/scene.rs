@@ -91,10 +91,10 @@ impl Scene {
     }
 
     pub fn globals(&self, game: &Game, aspect: f32) -> gpu::Globals {
-        let (eye, at) = game.camera();
+        let (eye, at, near) = game.camera_view();
         let m = mirror();
         let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
-        let proj = Mat4::perspective_rh(45f32.to_radians(), aspect, 1.0, 1500.0);
+        let proj = Mat4::perspective_rh(45f32.to_radians(), aspect, near, 1500.0);
         gpu::globals(
             proj * view,
             m.transform_point3(eye),

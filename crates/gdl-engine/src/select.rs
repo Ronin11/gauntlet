@@ -42,8 +42,7 @@ pub struct Select {
 impl Select {
     /// Process input. Returns the chosen (class, colour) list once everyone is ready.
     pub fn update(&mut self, input: &Input, dt: f32) -> Option<Vec<(String, String)>> {
-        let mut sources = vec![Source::Keyboard];
-        sources.extend(input.pads().into_iter().map(Source::Pad));
+        let sources = input.sources();
         for src in sources {
             let inp = input.read(src);
             let slot = self.slots.iter().position(|s| s.source == src);
@@ -171,7 +170,7 @@ impl Select {
                     );
                     let dev = match slot.source {
                         Source::Keyboard => "KEYBOARD",
-                        Source::Pad(_) => "CONTROLLER",
+                        Source::Pad(_) | Source::Device(_) => "CONTROLLER",
                     };
                     c.text_shadow(
                         cx(dev.len(), scale),

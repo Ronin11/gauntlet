@@ -1,8 +1,10 @@
-//! Input: keyboard (one player) and up to four gamepads, mapped to per-player commands.
+//! Input: keyboard, gamepads (via gilrs on desktop), and key-event controllers
+//! (Bluetooth pads on Android report buttons as key events per input device).
 
+#[cfg(not(target_os = "android"))]
 use gilrs::{Axis, Button, Gilrs};
 use glam::Vec2;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use winit::keyboard::KeyCode;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -16,22 +18,56 @@ pub struct PlayerInput {
     pub start_pressed: bool,
 }
 
+#[cfg(not(target_os = "android"))]
+pub type PadId = gilrs::GamepadId;
+#[cfg(target_os = "android")]
+pub type PadId = usize;
+
 /// Where a player's input comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Keyboard,
-    Pad(gilrs::GamepadId),
+    Pad(PadId),
+    /// A controller that reports buttons as key events (Android), by device id.
+    Device(u64),
+}
+
+/// Android key codes for gamepad buttons (android.view.KeyEvent).
+pub mod android_keys {
+    pub const DPAD_UP: u32 = 19;
+    pub const DPAD_DOWN: u32 = 20;
+    pub const DPAD_LEFT: u32 = 21;
+    pub const DPAD_RIGHT: u32 = 22;
+    pub const DPAD_CENTER: u32 = 23;
+    pub const BUTTON_A: u32 = 96;
+    pub const BUTTON_B: u32 = 97;
+    pub const BUTTON_X: u32 = 99;
+    pub const BUTTON_Y: u32 = 100;
+    pub const BUTTON_R1: u32 = 103;
+    pub const BUTTON_R2: u32 = 105;
+    pub const BUTTON_START: u32 = 108;
 }
 
 pub struct Input {
+    #[cfg(not(target_os = "android"))]
     gilrs: Option<Gilrs>,
     keys: HashSet<KeyCode>,
     pressed: HashSet<KeyCode>,
-    pad_pressed: Vec<(gilrs::GamepadId, Button)>,
+    #[cfg(not(target_os = "android"))]
+    pad_pressed: Vec<(PadId, Button)>,
+    dev_held: HashMap<u64, HashSet<u32>>,
+    dev_pressed: Vec<(u64, u32)>,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Input {
     pub fn new() -> Self {
+        #[cfg(not(target_os = "android"))]
         let gilrs = match Gilrs::new() {
             Ok(g) => {
                 for (_, pad) in g.gamepads() {
@@ -45,10 +81,14 @@ impl Input {
             }
         };
         Input {
+            #[cfg(not(target_os = "android"))]
             gilrs,
             keys: HashSet::new(),
             pressed: HashSet::new(),
+            #[cfg(not(target_os = "android"))]
             pad_pressed: Vec::new(),
+            dev_held: HashMap::new(),
+            dev_pressed: Vec::new(),
         }
     }
 
@@ -62,6 +102,18 @@ impl Input {
         }
     }
 
+    /// A raw button event from a key-reporting controller.
+    pub fn device_key(&mut self, dev: u64, code: u32, down: bool) {
+        let held = self.dev_held.entry(dev).or_default();
+        if down {
+            if held.insert(code) {
+                self.dev_pressed.push((dev, code));
+            }
+        } else {
+            held.remove(&code);
+        }
+    }
+
     pub fn held(&self, code: KeyCode) -> bool {
         self.keys.contains(&code)
     }
@@ -71,8 +123,10 @@ impl Input {
     }
 
     /// Drain gamepad events. Call once per frame before reading.
-    pub fn poll(&mut self) -> Vec<gilrs::GamepadId> {
+    pub fn poll(&mut self) -> Vec<PadId> {
+        #[allow(unused_mut)]
         let mut connected = Vec::new();
+        #[cfg(not(target_os = "android"))]
         if let Some(g) = &mut self.gilrs {
             while let Some(ev) = g.next_event() {
                 match ev.event {
@@ -89,15 +143,31 @@ impl Input {
     }
 
     /// All gamepads currently connected.
-    pub fn pads(&self) -> Vec<gilrs::GamepadId> {
-        self.gilrs
-            .as_ref()
-            .map(|g| g.gamepads().map(|(id, _)| id).collect())
-            .unwrap_or_default()
+    pub fn pads(&self) -> Vec<PadId> {
+        #[cfg(not(target_os = "android"))]
+        {
+            self.gilrs
+                .as_ref()
+                .map(|g| g.gamepads().map(|(id, _)| id).collect())
+                .unwrap_or_default()
+        }
+        #[cfg(target_os = "android")]
+        Vec::new()
     }
 
-    pub fn pad_pressed_any(&self, id: gilrs::GamepadId, b: Button) -> bool {
-        self.pad_pressed.iter().any(|&(i, bb)| i == id && bb == b)
+    /// Key-reporting controllers that have sent any button.
+    pub fn devices(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.dev_held.keys().copied().collect();
+        v.sort();
+        v
+    }
+
+    /// Every input source that could join a game.
+    pub fn sources(&self) -> Vec<Source> {
+        let mut v = vec![Source::Keyboard];
+        v.extend(self.pads().into_iter().map(Source::Pad));
+        v.extend(self.devices().into_iter().map(Source::Device));
+        v
     }
 
     pub fn read(&self, src: Source) -> PlayerInput {
@@ -126,6 +196,35 @@ impl Input {
                     start_pressed: self.just_pressed(KeyCode::Enter),
                 }
             }
+            Source::Device(dev) => {
+                use android_keys::*;
+                let empty = HashSet::new();
+                let held = self.dev_held.get(&dev).unwrap_or(&empty);
+                let h = |c: u32| held.contains(&c);
+                let p = |c: u32| self.dev_pressed.contains(&(dev, c));
+                let mut v = Vec2::ZERO;
+                if h(DPAD_UP) {
+                    v.y += 1.0;
+                }
+                if h(DPAD_DOWN) {
+                    v.y -= 1.0;
+                }
+                if h(DPAD_RIGHT) {
+                    v.x += 1.0;
+                }
+                if h(DPAD_LEFT) {
+                    v.x -= 1.0;
+                }
+                PlayerInput {
+                    stick: v.normalize_or_zero(),
+                    attack: h(BUTTON_A) || h(DPAD_CENTER),
+                    attack_pressed: p(BUTTON_A) || p(DPAD_CENTER),
+                    magic_pressed: p(BUTTON_B) || p(BUTTON_Y),
+                    turbo: h(BUTTON_X) || h(BUTTON_R1) || h(BUTTON_R2),
+                    start_pressed: p(BUTTON_START),
+                }
+            }
+            #[cfg(not(target_os = "android"))]
             Source::Pad(id) => {
                 let Some(g) = &self.gilrs else {
                     return PlayerInput::default();
@@ -151,21 +250,27 @@ impl Input {
                 } else {
                     v / mag * ((mag - 0.2) / 0.8).min(1.0)
                 };
+                let pressed =
+                    |b: Button| self.pad_pressed.iter().any(|&(i, bb)| i == id && bb == b);
                 PlayerInput {
                     stick: v,
                     attack: pad.is_pressed(Button::South),
-                    attack_pressed: self.pad_pressed_any(id, Button::South),
-                    magic_pressed: self.pad_pressed_any(id, Button::East),
+                    attack_pressed: pressed(Button::South),
+                    magic_pressed: pressed(Button::East),
                     turbo: pad.is_pressed(Button::West) || pad.is_pressed(Button::RightTrigger2),
-                    start_pressed: self.pad_pressed_any(id, Button::Start),
+                    start_pressed: pressed(Button::Start),
                 }
             }
+            #[cfg(target_os = "android")]
+            Source::Pad(_) => PlayerInput::default(),
         }
     }
 
     /// Clear per-frame edge state.
     pub fn end_frame(&mut self) {
         self.pressed.clear();
+        #[cfg(not(target_os = "android"))]
         self.pad_pressed.clear();
+        self.dev_pressed.clear();
     }
 }

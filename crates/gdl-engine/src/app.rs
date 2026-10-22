@@ -152,24 +152,36 @@ impl ApplicationHandler for App {
                 r.surface.configure(&r.gpu.device, &r.config);
                 r.depth = r.gpu.depth_view(r.config.width, r.config.height);
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    let down = event.state == ElementState::Pressed;
-                    r.input.key(code, down);
-                    if down && !event.repeat {
-                        match code {
-                            KeyCode::Escape => el.exit(),
-                            KeyCode::F11 => {
-                                let fs = r
-                                    .window
-                                    .fullscreen()
-                                    .is_none()
-                                    .then_some(Fullscreen::Borderless(None));
-                                r.window.set_fullscreen(fs);
+            WindowEvent::KeyboardInput {
+                device_id, event, ..
+            } => {
+                let down = event.state == ElementState::Pressed;
+                match event.physical_key {
+                    PhysicalKey::Code(code) => {
+                        r.input.key(code, down);
+                        if down && !event.repeat {
+                            match code {
+                                KeyCode::Escape => el.exit(),
+                                KeyCode::F11 => {
+                                    let fs = r
+                                        .window
+                                        .fullscreen()
+                                        .is_none()
+                                        .then_some(Fullscreen::Borderless(None));
+                                    r.window.set_fullscreen(fs);
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
+                    // Gamepad buttons on Android arrive as unmapped key codes, per device.
+                    PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(code)) => {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        device_id.hash(&mut h);
+                        r.input.device_key(h.finish(), code, down);
+                    }
+                    _ => {}
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -310,7 +322,18 @@ fn start_game(
 }
 
 pub fn run(cfg: Config) -> Result<()> {
-    let el = EventLoop::new()?;
+    run_with(cfg, EventLoop::new()?)
+}
+
+/// Android entry: the event loop must be built around the activity.
+#[cfg(target_os = "android")]
+pub fn run_android(cfg: Config, app: winit::platform::android::activity::AndroidApp) -> Result<()> {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+    let el = EventLoop::builder().with_android_app(app).build()?;
+    run_with(cfg, el)
+}
+
+fn run_with(cfg: Config, el: EventLoop<()>) -> Result<()> {
     el.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         cfg,

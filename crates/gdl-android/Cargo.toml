@@ -1,0 +1,34 @@
+[package]
+name = "gdl-android"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Android app for gauntlet-rs"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+gdl-engine = { path = "../gdl-engine" }
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", features = ["android-native-activity"] }
+android_logger = "0.14"
+
+[package.metadata.android]
+package = "com.gauntletrs.game"
+apk_name = "gauntlet-rs"
+build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 28
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "Gauntlet DL (rs)"
+
+[package.metadata.android.application.activity]
+orientation = "landscape"
+config_changes = "orientation|keyboardHidden|keyboard|screenSize|uiMode|navigation"

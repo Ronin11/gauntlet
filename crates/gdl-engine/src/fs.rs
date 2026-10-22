@@ -32,6 +32,28 @@ impl GameFs {
         )
     }
 
+    /// Look for a disc image or extracted data inside `dir`.
+    pub fn find_in(dir: &Path) -> Option<Self> {
+        if let Ok(fs) = GameFs::open(&dir.join("game-data")) {
+            return Some(fs);
+        }
+        let rd = std::fs::read_dir(dir).ok()?;
+        for e in rd.flatten() {
+            let p = e.path();
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(ext.as_str(), "iso" | "gcm") {
+                if let Ok(fs) = GameFs::open(&p) {
+                    return Some(fs);
+                }
+            }
+        }
+        None
+    }
+
     /// Find game data next to the executable or in common places.
     pub fn discover() -> Result<Self> {
         let mut cands: Vec<PathBuf> = Vec::new();

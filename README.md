@@ -33,6 +33,22 @@ On the join screen each controller presses **Start** (or **A**) to join, picks a
 Other options: `--level levelB1` to start elsewhere, `--players WAR,VAL/BLU` to skip the
 join screen, `--mute`. See `gauntlet --help`.
 
+## Android / tablets
+
+```sh
+scripts/build-android.sh                       # aarch64 APK for real devices
+scripts/build-android.sh x86_64-linux-android  # for the emulator
+adb install -r target/release/apk/gauntlet-rs.apk
+adb shell mkdir -p /sdcard/Android/data/com.gauntletrs.game/files
+adb push game.iso /sdcard/Android/data/com.gauntletrs.game/files/game.iso
+```
+
+Tested in the Android 15 tablet emulator: the join screen, joining with a gamepad's A
+button, and gameplay all work. Bluetooth controllers report their D-pad and buttons as key
+events per device, so several controllers can play at once. Analog sticks, sound and touch
+controls are not hooked up on Android yet. The APK is signed with a personal key created
+in `~/.android/gauntlet-rs.keystore`.
+
 ## What works
 
 - **Disc access**: reads the GameCube file system directly from the ISO (`crates/gcdisc`).
@@ -57,7 +73,7 @@ join screen, `--mute`. See `gauntlet --help`.
 - Bosses, moving platforms and elevators, triggers, teleporters, secret areas
 - Texture animations (flowing water, flames), particle effects
 - Save games, menus, shops
-- Android/tablet build (wgpu, winit and gilrs all support Android; the NDK is installed)
+- Android: analog sticks (D-pad and buttons work), audio, touch controls
 
 ## Layout
 

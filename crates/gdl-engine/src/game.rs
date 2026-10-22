@@ -32,6 +32,8 @@ const GENERATOR_ACTIVATE_DIST: f32 = 40.0;
 const MAX_ENEMIES: usize = 48;
 const PROJECTILE_SPEED: f32 = 42.0;
 const POTION_RADIUS: f32 = 30.0;
+/// How far in front of the camera focus (towards the camera) geometry is kept.
+const CUTAWAY_DEPTH: f32 = 12.0;
 const PROJECTILE_LIFE: f32 = 0.9;
 /// Players are kept within this distance of the group's centre (stay on screen).
 const PARTY_RADIUS: f32 = 13.0;
@@ -1635,6 +1637,13 @@ impl Game {
 
     /// Camera eye and target in game coordinates.
     pub fn camera(&self) -> (Vec3, Vec3) {
+        let (eye, at, _) = self.camera_view();
+        (eye, at)
+    }
+
+    /// Camera eye, target and near-plane distance. The near plane is pushed out to just
+    /// in front of the players so roofs and walls between them and the camera are cut away.
+    pub fn camera_view(&self) -> (Vec3, Vec3, f32) {
         let spread = self
             .players
             .iter()
@@ -1643,13 +1652,9 @@ impl Game {
         let dist = 36.0 + spread * 0.8;
         let pitch = 60f32.to_radians();
         let at = self.cam_focus + Vec3::Y * 2.0;
-        let mut eye = at + Vec3::new(0.0, pitch.sin() * dist, -pitch.cos() * dist);
-        // Pull the camera in front of any wall that would hide the players.
-        if let Some(f) = self.collision.raycast(at + Vec3::Y * 1.5, eye) {
-            let f = (f - 0.04).max(0.25);
-            eye = at + (eye - at) * f;
-        }
-        (eye, at)
+        let eye = at + Vec3::new(0.0, pitch.sin() * dist, -pitch.cos() * dist);
+        let near = (dist - CUTAWAY_DEPTH).max(1.0);
+        (eye, at, near)
     }
 }
 

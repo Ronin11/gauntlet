@@ -1,16 +1,4 @@
-mod app;
-mod audio;
-mod character;
-mod collision;
-mod fs;
-mod game;
-mod gpu;
-mod hud;
-mod input;
-mod level;
-mod mesh;
-mod scene;
-mod select;
+use gdl_engine::{app, character, fs, game, gpu, hud, input, scene};
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec2, Vec3};

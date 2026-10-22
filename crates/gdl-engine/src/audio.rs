@@ -48,13 +48,20 @@ pub struct Audio {
 
 impl Audio {
     pub fn new(muted: bool) -> Self {
-        if muted {
+        // Android audio output isn't wired up yet.
+        if muted || cfg!(target_os = "android") {
             return Audio {
                 tx: None,
                 current: String::new(),
             };
         }
         let (tx, rx) = mpsc::channel::<Cmd>();
+        #[cfg(target_os = "android")]
+        let spawned: std::io::Result<()> = {
+            drop(rx);
+            Ok(())
+        };
+        #[cfg(not(target_os = "android"))]
         let spawned = std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
