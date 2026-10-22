@@ -199,6 +199,11 @@ pub struct Critter {
     pub dying_sent: bool,
     /// Its model (in Game::models).
     pub model: Option<usize>,
+    /// typeFlags 0x800: the in-world GMETER model and its RED_FILLE node.
+    pub gmeter: Option<(usize, usize)>,
+    /// A tint and scale set on it (the Bellows' green, 0.8 size).
+    pub tint: Option<[f32; 4]>,
+    pub scale: f32,
 }
 
 impl PartialEq for Critter {
@@ -553,6 +558,9 @@ impl Critter {
             deleted: false,
             dying_sent: false,
             model: None,
+            gmeter: None,
+            tint: None,
+            scale: 1.0,
             wad,
         }
     }
@@ -1283,6 +1291,9 @@ impl Game {
             self.get_targets(c, pi, players, pos, yaw);
             c.parts[pi].set_difficulty(&w, eh);
         }
+        // CritterProcessSafeRocks (SafeRockHide: the WAD has a SPOUT2).
+        let hide = w.damage.iter().any(|d| d.kind == 6);
+        self.process_safe_rocks(hide, dt);
         // Wake-up.
         if c.parts[0].state == 0 {
             let t0 = &w.types[c.parts[0].ty];
@@ -1677,6 +1688,10 @@ impl Game {
     /// Play SFXX `i` (its sound, and its effect model once) at `at`.
     fn critter_sfx(&mut self, c: &Critter, i: usize, at: Vec3) {
         let Some(s) = c.wad.sfx.get(i) else { return };
+        // CritterDoSfx: flag 0x20 runs SafeRockSetup.
+        if s.flags & 0x20 != 0 {
+            self.safe_rock_setup();
+        }
         if !s.snddesc.is_empty() {
             let letter = self.world_letter().to_string();
             let name = s.snddesc.replace("%c", &letter).replace("%s", &letter);
@@ -1719,7 +1734,8 @@ impl Game {
                     + Mat4::from_rotation_y(yaw).transform_vector3(Vec3::from(d.offset))
             }
         };
-        if active && d.fx >= 0 && d.kind != 1 {
+        // (SPOUT effects go to the safe rocks instead of the move node.)
+        if active && d.fx >= 0 && !matches!(d.kind, 1 | 5 | 6) {
             self.critter_sfx(c, d.fx as usize, at);
         }
         match d.kind {
@@ -1734,17 +1750,44 @@ impl Game {
                 let at = c.parts[pi].node_pos;
                 self.boss_spew_coins(at, v, spread);
             }
-            2 | 3 | 5 | 6 | 8 if active => {
-                // [CHOICE] SPOUT / SPOUT2 erupt at the safe rocks; we have none, so
-                // they erupt under the target like FOUNTAIN does.
-                let at = if matches!(d.kind, 5 | 6) {
-                    usize::try_from(c.parts[pi].tgt)
-                        .ok()
-                        .and_then(|t| self.players.get(t))
-                        .map_or(at, |p| p.pos)
-                } else {
-                    at
-                };
+            // SPOUT: an eruption at every safe rock. SPOUT2: at the hidden rock
+            // nearest the target, which rises when the eruption is over.
+            5 if active => {
+                for at in self.safe_rock_positions() {
+                    if d.fx >= 0 {
+                        self.critter_sfx(c, d.fx as usize, at);
+                    }
+                    self.crit_waves.push(Wave {
+                        pos: at,
+                        radius: 0.0,
+                        max_radius: d.radius.max(1.0),
+                        damage: amount,
+                        flags: d.dmgtype,
+                        hit: [false; 4],
+                    });
+                }
+            }
+            6 if active => {
+                let fx_secs = usize::try_from(d.fx)
+                    .ok()
+                    .and_then(|i| c.fx_models.get(i).copied().flatten())
+                    .and_then(|m| self.models[m].skeleton.sequences.first())
+                    .map_or(1.0, |s| (s.frame_count as f32 - 1.0).max(0.0) / 30.0);
+                if let Some(at) = self.safe_rock_spout2(c.parts[pi].tgt, fx_secs) {
+                    if d.fx >= 0 {
+                        self.critter_sfx(c, d.fx as usize, at);
+                    }
+                    self.crit_waves.push(Wave {
+                        pos: at,
+                        radius: 0.0,
+                        max_radius: d.radius.max(1.0),
+                        damage: amount,
+                        flags: d.dmgtype,
+                        hit: [false; 4],
+                    });
+                }
+            }
+            2 | 3 | 8 if active => {
                 self.crit_waves.push(Wave {
                     pos: at,
                     radius: 0.0,

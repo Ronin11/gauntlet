@@ -24,7 +24,12 @@ pub struct Scene {
     models: Vec<GpuMesh>,
     players: Vec<Instance>,
     entities: HashMap<u64, Instance>,
+    /// How many world objects were hidden when the world mesh was built.
+    hidden_count: usize,
 }
+
+/// Instance key bit for a critter's GMETER bar.
+const METER_KEY: u64 = 1 << 63;
 
 /// Where a world point lands on the game's 512x384 screen (the 3D view is 4:3),
 /// or None behind the camera.
@@ -80,10 +85,28 @@ impl Scene {
             models,
             players,
             entities: HashMap::new(),
+            hidden_count: game.hidden.len(),
         })
     }
 
     pub fn sync(&mut self, gpu: &Gpu, game: &Game) {
+        // World objects hidden during play (SafeRockSetup's dirt mound and
+        // glow): rebuild the world mesh without them.
+        if game.hidden.len() != self.hidden_count {
+            let skip: std::collections::HashSet<usize> = game
+                .movers
+                .iter()
+                .flat_map(|m| m.objects.iter().copied())
+                .chain(game.hidden.iter().copied())
+                .collect();
+            if let Ok(world) = gpu.upload_mesh(&game.level.world_mesh(&skip)) {
+                let mut inst = gpu.new_instance(&world);
+                inst.transform = mirror();
+                self.world = world;
+                self.world_inst = inst;
+            }
+            self.hidden_count = game.hidden.len();
+        }
         for (slot, m) in self.movers.iter_mut().zip(&game.movers) {
             if let Some((_, inst)) = slot {
                 inst.transform = mirror() * Mat4::from_translation(Vec3::Y * m.offset);
@@ -126,6 +149,30 @@ impl Scene {
             inst.transform = mirror() * Mat4::from_translation(e.pos) * Mat4::from_rotation_y(yaw);
             let model = &game.models[m];
             if let Kind::Critter(c) = &e.kind {
+                inst.transform = inst.transform * Mat4::from_scale(Vec3::splat(c.scale));
+                // The GMETER bar: at meterdelta over it, the red fill scaled to
+                // its health; gone when it dies. [CHOICE] It faces the camera.
+                if let Some((gm, node)) = c.gmeter.filter(|_| c.parts[0].health > 0.0) {
+                    let t = &c.wad.types[c.parts[0].ty];
+                    let f = (c.parts[0].health / c.parts[0].health0.max(1.0)).clamp(0.0, 1.0);
+                    let gmodel = &game.models[gm];
+                    let mut world = gmodel.pose_layers(&[(None, 0, 0.0)]);
+                    if let Some(w) = world.get_mut(node) {
+                        *w *= Mat4::from_scale(Vec3::new(f.max(0.001), 1.0, 1.0));
+                    }
+                    let at = e.pos
+                        + Mat4::from_rotation_y(e.yaw).transform_vector3(Vec3::from(t.meterdelta));
+                    let minst = self
+                        .entities
+                        .entry(e.id | METER_KEY)
+                        .or_insert_with(|| gpu.new_instance(&self.models[gm]));
+                    minst.transform =
+                        mirror() * Mat4::from_translation(at) * Mat4::from_rotation_y(game.cam_yaw);
+                    (minst.parts, minst.hidden) = gmodel.evaluate_nodes(0, 0.0, &world, &[], &[]);
+                    minst.tint = Vec4::ONE;
+                    live.insert(e.id | METER_KEY);
+                }
+                let inst = self.entities.get_mut(&e.id).unwrap();
                 // The root's sequence with each child's branch on top; broken
                 // plates swapped, dead heads hidden.
                 let world = model.pose_layers(&c.layers());
@@ -139,6 +186,8 @@ impl Scene {
                     Vec4::new(0.7, 0.8, 1.6, c.alpha)
                 } else if flash > 0.0 {
                     Vec4::new(2.0, 2.0, 2.0, c.alpha)
+                } else if let Some(t) = c.tint {
+                    Vec4::new(t[0], t[1], t[2], t[3] * c.alpha)
                 } else {
                     Vec4::new(1.0, 1.0, 1.0, c.alpha)
                 };
@@ -193,6 +242,13 @@ impl Scene {
         for e in &game.entities {
             if let (Some(m), Some(inst)) = (e.model, self.entities.get(&e.id)) {
                 d.push((&self.models[m], inst));
+            }
+            if let (Kind::Critter(c), Some(inst)) =
+                (&e.kind, self.entities.get(&(e.id | METER_KEY)))
+            {
+                if let Some((gm, _)) = c.gmeter {
+                    d.push((&self.models[gm], inst));
+                }
             }
         }
         d

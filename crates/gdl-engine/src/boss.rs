@@ -126,6 +126,51 @@ pub struct Boss {
     /// Coin models (bronze, silver, gold) and Skorne's boss power-ups.
     pub coin_models: [Option<usize>; 3],
     pub key_model: Option<usize>,
+    /// Safe rocks (CollectSafeRocks): None until collected on the first boss
+    /// frame; empty when the level has none.
+    pub safe_rocks: Option<Vec<SafeRock>>,
+    /// SafeRockIdx: the last rock chosen.
+    pub rock_idx: i32,
+    /// sSafeRockCount: Skorne's stages (falling floor pieces).
+    pub rock_stage: u32,
+    /// Floor pieces flying off (subtype 0x33 obstacles).
+    pub fallers: Vec<Faller>,
+    /// Players' positions after last frame's camera limit (CameraLimitPlayerDpos).
+    pub player_prev: Vec<Option<Vec3>>,
+    /// The legend weapon's held model (FX 92, LEGENDHLD) and projectile
+    /// (FX 93, LEGENDPRJ) from the level's item file, and their entities.
+    pub legend_models: (Option<usize>, Option<usize>),
+    pub legend_hold: Option<u64>,
+    pub legend_shot: Option<u64>,
+    /// The safe rock's model (SAFEROCK0 in the realm's item file).
+    pub safe_rock_model: Option<usize>,
+}
+
+/// A safe rock (obstacle subtype 0x29): an eruption spot, and cover once it
+/// has risen.
+#[derive(Clone, Debug)]
+pub struct SafeRock {
+    pub pos: Vec3,
+    pub yaw: f32,
+    pub model: Option<usize>,
+    pub solid: Option<crate::game::Shape>,
+    pub hit_points: f32,
+    pub armor: f32,
+    /// The entity while it is shown.
+    pub entity: Option<u64>,
+    /// data.obsticle.strength: -1 hidden, 0 risen; > 0 counts as active.
+    pub strength: i32,
+    /// SafeRockActiveCounter: seconds until it rises.
+    pub counter: f32,
+}
+
+/// A floor piece thrown up by Skorne's stages (items.c case 0x33).
+#[derive(Clone, Copy, Debug)]
+pub struct Faller {
+    pub id: u64,
+    pub vel: Vec3,
+    /// Tumble rates (rad a 30 Hz frame) from lbl_8011C904.
+    pub spin: (f32, f32),
 }
 
 /// An item flying out of the boss as it dies (gSpewItems).
@@ -401,6 +446,15 @@ impl Game {
         let coins = ["COIN_BRONZE", "COIN_SILVER", "COIN_GOLD"]
             .map(|n| self.item_model_pub(fs, &mut cache, &mut known, &dirs, n));
         let key = self.item_model_pub(fs, &mut cache, &mut known, &dirs, "BOSSKEY");
+        // [CHOICE] The SAFEROCK item has models SAFEROCK0..3 (by damage, we
+        // take it); the undamaged one is used.
+        let safe_rock_model = self
+            .item_model_pub(fs, &mut cache, &mut known, &dirs, "SAFEROCK0")
+            .or_else(|| self.item_model_pub(fs, &mut cache, &mut known, &dirs, "SAFEROCK"));
+        let legend_models = (
+            self.item_model_pub(fs, &mut cache, &mut known, &dirs, "LEGENDHLD"),
+            self.item_model_pub(fs, &mut cache, &mut known, &dirs, "LEGENDPRJ"),
+        );
         for n in ["BGNTR_IC", "BMASK_IC", "BHORN_IC", "BGNTL_IC"] {
             if level.boss == 42 {
                 self.item_model_pub(fs, &mut cache, &mut known, &dirs, n);
@@ -415,6 +469,13 @@ impl Game {
         if let Some(b) = self.boss.as_mut() {
             b.coin_models = coins;
             b.key_model = key;
+            b.legend_models = legend_models;
+            b.safe_rock_model = safe_rock_model;
+        }
+        // Skorne's altar: the floor pieces his stages throw up (obstacles of
+        // subtype 0x33 whose model is the level object named by the instance).
+        if level.boss == 42 {
+            self.place_altar_pieces();
         }
         // A boss level ends through the good wizard only.
         for e in &mut self.entities {
@@ -468,6 +529,12 @@ impl Game {
                     .unwrap_or_else(|| format!("level{letter}"));
                 format!("MONSTERS/{}/{sub}", desc.name.to_ascii_uppercase())
             }
+            // Gargoyles: monsters/<name>_<kind> (GAR_EAGL, GAR_LION, GAR_SERP).
+            7 => format!(
+                "MONSTERS/{}_{}",
+                desc.name.to_ascii_uppercase(),
+                variant.unwrap_or("eagl").to_ascii_uppercase()
+            ),
             _ => format!("MONSTERS/{}", desc.name.to_ascii_uppercase()),
         };
         let dirs = [
@@ -483,12 +550,15 @@ impl Game {
             Some((o, t, a))
         })?;
         let tree = format!("{}{}", desc.prefix, wad.types[root].suffix);
-        let alts: Vec<(String, String)> = wad
+        let mut alts: Vec<(String, String)> = wad
             .type_colnodes(root)
             .iter()
             .filter(|n| n.flags & 2 != 0)
             .map(|n| (n.node.clone(), format!("{}D{}", desc.prefix, n.node)))
             .collect();
+        if desc.etype == 4 && desc.prefix.eq_ignore_ascii_case("PBOSS") {
+            alts.push(("EYEBALL".into(), "PBOSSQEYEBALL".into()));
+        }
         let model = match Model::from_anim_alts(&objects, &textures, &anim, &tree, &alts) {
             Ok(m) => m,
             Err(e) => {
@@ -505,6 +575,14 @@ impl Game {
         c.visrad = 0.0;
         let midx = self.add_model_pub(model);
         c.model = Some(midx);
+        // typeFlags 0x800: the GMETER bar over its head (CritterAddHealthMeter).
+        if wad.types[root].flags & 0x800 != 0 {
+            if let Ok(m) = Model::from_anim(&objects, &textures, &anim, Some("GMETER")) {
+                if let Some(node) = m.node_index("RED_FILLE") {
+                    c.gmeter = Some((self.add_model_pub(m), node));
+                }
+            }
+        }
         // Placed on the floor (CritterInitGeo, the same probe as every frame).
         let mut p = pos;
         if let Some(g) = self.critter_floor(pos) {
@@ -601,6 +679,455 @@ impl Game {
                 *recognized = true;
             }
             self.spawn(kind, model, p, y);
+        }
+    }
+
+    /// CritterProcessSafeRocks: collect the rocks once (hiding them when the
+    /// boss has a SPOUT2), then count down the risen-rock timers.
+    pub(crate) fn process_safe_rocks(&mut self, hide: bool, dt: f32) {
+        if self.boss.as_ref().is_some_and(|b| b.safe_rocks.is_none()) {
+            let rocks = self.collect_safe_rocks(hide);
+            let n = rocks.len();
+            let pick = if n > 0 {
+                (self.rng.next_u32() as usize % n) as i32
+            } else {
+                -1
+            };
+            if let Some(b) = self.boss.as_mut() {
+                b.safe_rocks = Some(rocks);
+                b.rock_idx = pick;
+            }
+            return;
+        }
+        let mut rise = Vec::new();
+        if let Some(rocks) = self.boss.as_mut().and_then(|b| b.safe_rocks.as_mut()) {
+            for (i, r) in rocks.iter_mut().enumerate() {
+                if r.counter > 0.0 {
+                    r.counter -= dt;
+                    if r.counter <= 0.0 {
+                        rise.push(i);
+                    }
+                }
+            }
+        }
+        for i in rise {
+            self.safe_rock_activate(i);
+        }
+    }
+
+    /// CollectSafeRocks: the level's obstacle items of subtype 0x29 (at most
+    /// 16), hidden (strength -1) when `hide`.
+    fn collect_safe_rocks(&mut self, hide: bool) -> Vec<SafeRock> {
+        use gdl_formats::worlds::ItemType;
+        let np = self.players.len().max(1);
+        let mut out = Vec::new();
+        let insts = self.level.worlds.item_instances.clone();
+        for inst in &insts {
+            let Some(info) = self.level.worlds.item_infos.get(inst.item_index as usize) else {
+                continue;
+            };
+            if info.item_type != ItemType::Obstacle || info.subtype != 0x29 {
+                continue;
+            }
+            if inst.min_players as usize > np {
+                continue;
+            }
+            let pos = Vec3::from(inst.pos);
+            let fwd = crate::character::ryp_matrix(inst.rot).transform_vector3(Vec3::Z);
+            let yaw = fwd.x.atan2(fwd.z);
+            let found = self
+                .entities
+                .iter_mut()
+                .find(|e| {
+                    e.alive
+                        && matches!(e.kind, Kind::Container { chest: false, .. })
+                        && (e.pos - pos).length() < 0.05
+                })
+                .map(|e| {
+                    if hide {
+                        e.alive = false;
+                    }
+                    (e.id, e.model, e.solid)
+                });
+            let model = found
+                .and_then(|f| f.1)
+                .or(self.boss.as_ref().and_then(|b| b.safe_rock_model));
+            let solid = found
+                .and_then(|f| f.2)
+                .or(Some(crate::game::Shape::Cylinder {
+                    radius: info.radius.clamp(0.4, 6.0),
+                }));
+            let mut r = SafeRock {
+                pos,
+                yaw,
+                model,
+                solid,
+                hit_points: info.hit_points.max(1) as f32,
+                armor: info.armor.max(0) as f32,
+                entity: found.map(|f| f.0),
+                strength: 1,
+                counter: 0.0,
+            };
+            if hide {
+                r.entity = None;
+                r.strength = -1;
+            } else if r.entity.is_none() {
+                // Shown from the start (no SPOUT2): place it.
+                let id = self.spawn(
+                    Kind::Container {
+                        hp: r.hit_points,
+                        drop: None,
+                        chest: false,
+                        armor: r.armor,
+                    },
+                    model,
+                    pos,
+                    yaw,
+                );
+                if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+                    e.solid = solid;
+                }
+                r.entity = Some(id);
+            }
+            out.push(r);
+            if out.len() >= 16 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Skorne's floor pieces as props, from the level's own objects.
+    fn place_altar_pieces(&mut self) {
+        use gdl_formats::worlds::ItemType;
+        let insts = self.level.worlds.item_instances.clone();
+        let mut made: std::collections::HashMap<String, Option<usize>> = Default::default();
+        for inst in &insts {
+            let Some(info) = self.level.worlds.item_infos.get(inst.item_index as usize) else {
+                continue;
+            };
+            if info.item_type != ItemType::Obstacle || info.subtype != 0x33 || inst.name.is_empty()
+            {
+                continue;
+            }
+            let model = match made.get(&inst.name) {
+                Some(m) => *m,
+                None => {
+                    let m = Model::from_objects(
+                        &self.level.objects,
+                        &self.level.textures_file,
+                        &[&inst.name],
+                    )
+                    .map(|m| self.add_model_pub(m));
+                    made.insert(inst.name.clone(), m);
+                    m
+                }
+            };
+            if model.is_some() {
+                self.spawn(Kind::Prop, model, Vec3::from(inst.pos), 0.0);
+            }
+        }
+    }
+
+    /// SafeRockActive: shown, unbroken and armed.
+    fn safe_rock_active(&self, i: usize) -> bool {
+        let Some(r) = self
+            .boss
+            .as_ref()
+            .and_then(|b| b.safe_rocks.as_ref())
+            .and_then(|v| v.get(i))
+        else {
+            return false;
+        };
+        let hp = r.entity.and_then(|id| {
+            self.entities
+                .iter()
+                .find(|e| e.id == id && e.alive)
+                .and_then(|e| match e.kind {
+                    Kind::Container { hp, .. } => Some(hp),
+                    _ => None,
+                })
+        });
+        hp.is_some_and(|h| h > 0.0) && r.strength > 0
+    }
+
+    /// SafeRockActivate: the rock is back, with 3x its hit points.
+    fn safe_rock_activate(&mut self, i: usize) {
+        let Some(r) = self
+            .boss
+            .as_ref()
+            .and_then(|b| b.safe_rocks.as_ref())
+            .and_then(|v| v.get(i))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(id) = r.entity {
+            if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+                e.alive = false;
+            }
+        }
+        let id = self.spawn(
+            Kind::Container {
+                hp: r.hit_points * 3.0,
+                drop: None,
+                chest: false,
+                armor: r.armor,
+            },
+            r.model,
+            r.pos,
+            r.yaw,
+        );
+        if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+            e.solid = r.solid;
+        }
+        if let Some(rr) = self
+            .boss
+            .as_mut()
+            .and_then(|b| b.safe_rocks.as_mut())
+            .and_then(|v| v.get_mut(i))
+        {
+            rr.entity = Some(id);
+            rr.strength = 0;
+        }
+    }
+
+    /// Where every collected safe rock is (SPOUT).
+    pub(crate) fn safe_rock_positions(&self) -> Vec<Vec3> {
+        self.boss
+            .as_ref()
+            .and_then(|b| b.safe_rocks.as_ref())
+            .map(|v| v.iter().map(|r| r.pos).collect())
+            .unwrap_or_default()
+    }
+
+    /// SPOUT2: SafeRockNearestTarget picks an inactive rock (nearest the
+    /// target player, or the next one round from SafeRockIdx without one);
+    /// it is busy for the effect's length, then rises. Its position, if any.
+    pub(crate) fn safe_rock_spout2(&mut self, target: i32, fx_secs: f32) -> Option<Vec3> {
+        let n = self.boss.as_ref()?.safe_rocks.as_ref()?.len();
+        if n == 0 {
+            return None;
+        }
+        let idx = self.boss.as_ref()?.rock_idx;
+        let mut pick = -1i32;
+        if target < 0 {
+            for i in 0..n {
+                let k = ((idx + i as i32 + 1).rem_euclid(n as i32)) as usize;
+                // As shipped: the test is on rock i, the answer rock k.
+                if !self.safe_rock_active(i) {
+                    pick = k as i32;
+                    break;
+                }
+            }
+        } else {
+            let p = self.players.get(target as usize)?.pos;
+            let mut best = 1e21f32;
+            let rocks = self.boss.as_ref()?.safe_rocks.clone()?;
+            for (i, r) in rocks.iter().enumerate() {
+                if self.safe_rock_active(i) {
+                    continue;
+                }
+                let d = Vec2::new(r.pos.x - p.x, r.pos.z - p.z).length();
+                if d < best {
+                    best = d;
+                    pick = i as i32;
+                }
+            }
+        }
+        let b = self.boss.as_mut()?;
+        b.rock_idx = pick;
+        let r = b
+            .safe_rocks
+            .as_mut()?
+            .get_mut(usize::try_from(pick).ok()?)?;
+        r.counter = fx_secs;
+        Some(r.pos)
+    }
+
+    /// SafeRockSetup (an SFXX with flag 0x20): the Lich's dirt mound and
+    /// Garm's purple glow go; Skorne's stage advances, throwing up the next
+    /// floor pieces.
+    pub(crate) fn safe_rock_setup(&mut self) {
+        let Some(t) = self.boss.as_ref().map(|b| b.boss_type) else {
+            return;
+        };
+        match t {
+            41 => {
+                self.hide_object("G5BIGDIRT");
+            }
+            44 => {
+                self.hide_object("H4NSFFXL_PURPLE");
+            }
+            42 => {
+                let stage = {
+                    let b = self.boss.as_mut().unwrap();
+                    b.rock_stage += 1;
+                    b.rock_stage
+                };
+                self.launch_fallers(stage);
+            }
+            _ => {}
+        }
+    }
+
+    /// items.c case 0x33: on each stage the floor pieces get their launch.
+    fn launch_fallers(&mut self, stage: u32) {
+        use gdl_formats::worlds::ItemType;
+        let centre = self.boss.as_ref().map_or(Vec3::ZERO, |b| b.pos);
+        let insts = self.level.worlds.item_instances.clone();
+        for (k, inst) in insts.iter().enumerate() {
+            let Some(info) = self.level.worlds.item_infos.get(inst.item_index as usize) else {
+                continue;
+            };
+            if info.item_type != ItemType::Obstacle || info.subtype != 0x33 {
+                continue;
+            }
+            let pos = Vec3::from(inst.pos);
+            let Some(e) = self
+                .entities
+                .iter()
+                .find(|e| e.alive && (e.pos - pos).length() < 0.05)
+            else {
+                continue;
+            };
+            let id = e.id;
+            let mut r = |lo: f32, span: f32| lo + self.rng.f32() * span;
+            let vel = match stage {
+                1 => Vec3::new(0.0, r(20.0, 10.0), 0.0),
+                2 => Vec3::new(0.0, r(30.0, 15.0), 0.0),
+                // [CHOICE] Stage 3 throws them outward from a point the code
+                // reads from a table we haven't identified; the boss's place.
+                _ => {
+                    let d =
+                        Vec2::new(pos.x - centre.x, pos.z - centre.z).normalize_or_zero() * 10.0;
+                    Vec3::new(d.x, r(50.0, 100.0), d.y)
+                }
+            };
+            const SPIN: [f32; 8] = [-4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0];
+            let spin = (SPIN[k & 7] * 0.349_065_85, SPIN[!k & 7] * 0.349_065_85);
+            // The piece's collision goes with it.
+            let owner = 100_000 + k as i32;
+            for (t, en) in self
+                .collision
+                .tris
+                .iter()
+                .zip(self.collision.enabled.iter_mut())
+            {
+                if t.owner == owner {
+                    *en = false;
+                }
+            }
+            if let Some(b) = self.boss.as_mut() {
+                b.fallers.retain(|f| f.id != id);
+                b.fallers.push(Faller { id, vel, spin });
+            }
+        }
+    }
+
+    /// The thrown floor pieces fly and tumble; 2 units/s of speed come off a
+    /// (30 Hz) frame, and they go 200 below the level.
+    fn update_fallers(&mut self, dt: f32) {
+        let Some(b) = self.boss.as_mut() else { return };
+        if b.fallers.is_empty() {
+            return;
+        }
+        let floor = self.level.worlds.min_bounds[1] - 200.0;
+        let frames = dt * 30.0;
+        let mut keep = Vec::new();
+        for mut f in std::mem::take(&mut b.fallers) {
+            let Some(e) = self.entities.iter_mut().find(|e| e.id == f.id && e.alive) else {
+                continue;
+            };
+            f.vel.y -= 2.0 * frames;
+            e.pos += f.vel * dt;
+            e.spin += f.spin.0 * frames;
+            e.solid = None;
+            if e.pos.y < floor {
+                e.alive = false;
+                continue;
+            }
+            keep.push(f);
+        }
+        if let Some(b) = self.boss.as_mut() {
+            b.fallers = keep;
+        }
+    }
+
+    /// CameraLimitPlayerDpos / CamLimitPlayerDpos: while the boss camera
+    /// runs, a player's move that would take them (a 1.9375 x col_height
+    /// sphere) further out of the frame is clipped in view space: across a
+    /// side plane the sideways part goes, across top or bottom the vertical
+    /// part, and toward or away from the camera as the code's plane masks
+    /// say; a corner or the near plane stops the move. The move is the
+    /// change since last frame (players move before the boss is updated).
+    fn limit_players_to_camera(&mut self) {
+        let Some(b) = self.boss.as_ref() else { return };
+        let Some(cam) = b.cam.filter(|c| c.started) else {
+            return;
+        };
+        // After the Lich, Spider Queen or Genie die, players may roam for the
+        // gold (fn_800629B0: gold left in the level).
+        let gold_left = || {
+            self.entities.iter().any(|e| {
+                e.alive
+                    && matches!(
+                        e.kind,
+                        Kind::Pickup {
+                            kind: PickupKind::Gold(_),
+                            ..
+                        }
+                    )
+            })
+        };
+        let free = (b.dead || b.dying) && matches!(b.boss_type, 36 | 37 | 41) && gold_left();
+        let slide = cam.dist <= cam.def.maxdist;
+        let fwd = cam_forward(cam.yaw, cam.pitch);
+        let eye = cam.attn - fwd * cam.dist;
+        let (right, up) = view_basis(fwd);
+        let prev = b.player_prev.clone();
+        let mut now = Vec::new();
+        for (i, p) in self.players.iter_mut().enumerate() {
+            let cur = p.pos;
+            let old = prev.get(i).copied().flatten();
+            if let (Some(old), true, false) = (old, p.state.active(), free) {
+                let dpos = cur - old;
+                let moved = Vec2::new(dpos.x, dpos.z).length();
+                if moved > 1e-4 && moved < 5.0 {
+                    let col = |at: Vec3| at + Vec3::Y * 2.5;
+                    let r = 1.9375 * 2.5;
+                    let (d0, _) = point_view_clip(eye, fwd, col(old), r);
+                    let (d1, flags) = point_view_clip(eye, fwd, col(cur), r);
+                    if d1 < 0.0 && d1 < d0 {
+                        let lr = flags & 0x30;
+                        let tb = flags & 0x300;
+                        let new = if !slide || (lr != 0 && tb != 0) || flags & 1 != 0 {
+                            old
+                        } else {
+                            let v = dpos;
+                            let (mut dx, mut dy, mut dz) = (v.dot(right), v.dot(up), v.dot(fwd));
+                            if lr != 0 {
+                                dx = 0.0;
+                            } else if tb != 0 {
+                                dy = 0.0;
+                            }
+                            if dz < 0.0 && flags & 0x230 != 0 {
+                                dz = 0.0;
+                            } else if dz > 0.0 && flags & 0x130 != 0 {
+                                dz = 0.0;
+                            }
+                            let w = right * dx + up * dy + fwd * dz;
+                            // dpos.y is kept as the player's own.
+                            Vec3::new(old.x + w.x, cur.y, old.z + w.z)
+                        };
+                        p.pos = Vec3::new(new.x, cur.y, new.z);
+                    }
+                }
+            }
+            now.push(Some(p.pos));
+        }
+        if let Some(b) = self.boss.as_mut() {
+            b.player_prev = now;
         }
     }
 
@@ -798,6 +1325,8 @@ impl Game {
             return;
         }
         self.update_meters(dt);
+        self.update_fallers(dt);
+        self.limit_players_to_camera();
         self.update_legend(dt);
         self.update_wizard(dt);
         self.update_boss_cam(dt);
@@ -832,6 +1361,7 @@ impl Game {
         }
         let t = b.boss_type;
         let letter = boss_letter(t);
+        let mut spawn_hold = None;
         match b.legend_state {
             2 => {
                 // The cutscene: everyone faces the boss and waits.
@@ -841,6 +1371,8 @@ impl Game {
                     // player.c:2508: the weapon is used up.
                     let realm = self.wave.map_or(0, |w| w >> 8);
                     self.legend_held &= !(1 << realm);
+                    // FX 92: the weapon appears in the holder's hand.
+                    spawn_hold = b.legend_models.0.filter(|_| b.legend_hold.is_none());
                 }
                 if now - b.legend_timer >= wait {
                     b.legend_state = 3;
@@ -850,8 +1382,9 @@ impl Game {
                     self.sfx.push("S_PICKUPMAGIC".into());
                 }
             }
-            3 => {
-                // The holder throws after its 60-tick wind-up; the hit ends it.
+            // The holder throws after its 60-tick wind-up (the throw runs on
+            // its own clock, quest_state, even if the ROAR ends first).
+            3..=5 if (2..=3).contains(&b.holder_step) => {
                 if b.holder_step == 2 && now >= b.holder_timer {
                     b.holder_step = 3;
                     b.holder_timer = now + 0.5;
@@ -859,7 +1392,7 @@ impl Game {
                 } else if b.holder_step == 3 && now >= b.holder_timer {
                     b.holder_step = 4;
                     self.sfx.push(format!("S_{letter}LEGWFLY"));
-                    self.legend_hit();
+                    self.legend_throw();
                 }
             }
             4 => {
@@ -872,6 +1405,12 @@ impl Game {
                     b.legend_state = 6;
                     self.sfx.push(format!("S_{letter}LEGWPDN"));
                     if let Some((_, c)) = self.boss_critter_mut() {
+                        // PBOSSEYEBALL comes back.
+                        for s in c.swapped.iter_mut() {
+                            if t == 38 {
+                                *s = false;
+                            }
+                        }
                         for p in &mut c.parts {
                             if t != 36 {
                                 p.fball_cap = 0.0;
@@ -885,7 +1424,143 @@ impl Game {
             }
             _ => {}
         }
-        let _ = dt;
+        if let Some(m) = spawn_hold {
+            let at = self.legend_hand();
+            let id = self.spawn(Kind::Effect { life: 1e9 }, Some(m), at, 0.0);
+            if let Some(b) = self.boss.as_mut() {
+                b.legend_hold = Some(id);
+            }
+        }
+        self.update_legend_fx(dt);
+    }
+
+    /// Where the legend weapon is held: the right hand for bosses 34-39,
+    /// (0, 8, 0) over the holder for the rest.
+    fn legend_hand(&self) -> Vec3 {
+        let Some(b) = self.boss.as_ref() else {
+            return Vec3::ZERO;
+        };
+        let Some(p) = b.legend_holder.and_then(|i| self.players.get(i)) else {
+            return Vec3::ZERO;
+        };
+        if (34..=39).contains(&b.boss_type) {
+            let m = &self.models[p.model];
+            if let Some(n) = m.node_index("R_WRIST") {
+                let w = m.pose_layers(&[(None, p.animator.seq, p.animator.frame)]);
+                let body = glam::Mat4::from_translation(p.pos) * glam::Mat4::from_rotation_y(p.yaw);
+                return body.transform_point3(w[n].w_axis.truncate());
+            }
+        }
+        p.pos + Vec3::new(0.0, 8.0, 0.0)
+    }
+
+    /// Where the legend projectile goes: the Chimera's second head, else
+    /// the boss's body centre.
+    fn legend_target(&self) -> Option<Vec3> {
+        let (e, c) = self.boss_critter()?;
+        let t = self.boss.as_ref()?.boss_type;
+        if t == 35 && c.parts.len() > 2 {
+            if let Some(p) = c.colliders().into_iter().find(|x| x.0 == 2) {
+                return Some(p.2);
+            }
+        }
+        Some(c.coll_pos(0, e.pos, e.yaw))
+    }
+
+    /// The throw (pmotion.c:2203-2390): the held weapon goes; the Dragon,
+    /// Chimera, Genie and Plague Fiend get a projectile (FX 93) flying at
+    /// 20 units/s that hits on arrival; the rest take the hit at once, with
+    /// FX 93 shown at the boss.
+    fn legend_throw(&mut self) {
+        let Some(b) = self.boss.as_ref() else { return };
+        let t = b.boss_type;
+        let (hold, prj) = (b.legend_hold, b.legend_models.1);
+        let from = self.legend_hand();
+        if (34..=39).contains(&t) || t == 41 {
+            if let Some(id) = hold {
+                if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+                    e.alive = false;
+                }
+            }
+            if let Some(b) = self.boss.as_mut() {
+                b.legend_hold = None;
+            }
+        }
+        if matches!(t, 34 | 35 | 36 | 38) {
+            if let Some(m) = prj {
+                let id = self.spawn(Kind::Effect { life: 10.0 }, Some(m), from, 0.0);
+                if let Some(b) = self.boss.as_mut() {
+                    b.legend_shot = Some(id);
+                }
+                return;
+            }
+            self.legend_hit();
+            return;
+        }
+        // FX 93 at the boss (offsets from the holder sequence), then the hit.
+        if let (Some(m), Some((e, _))) = (prj, self.boss_critter()) {
+            let off = match t {
+                37 => Vec3::new(0.0, 0.0, 5.0),
+                39 => Vec3::new(0.0, 10.0, 0.0),
+                40 => Vec3::new(0.0, -5.0, 10.0),
+                42 => Vec3::new(0.0, 17.0, 3.0),
+                _ => Vec3::ZERO,
+            };
+            let at = if t == 37 {
+                from + off
+            } else {
+                e.pos + glam::Mat4::from_rotation_y(e.yaw).transform_vector3(off)
+            };
+            self.spawn(Kind::Effect { life: 3.0 }, Some(m), at, 0.0);
+        }
+        self.legend_hit();
+    }
+
+    /// The held weapon follows the hand; the projectile homes on its target.
+    fn update_legend_fx(&mut self, dt: f32) {
+        let Some(b) = self.boss.as_ref() else { return };
+        let (hold, shot) = (b.legend_hold, b.legend_shot);
+        if let Some(id) = hold {
+            let at = self.legend_hand();
+            match self.entities.iter_mut().find(|e| e.id == id) {
+                Some(e) => {
+                    e.pos = at;
+                    e.spin += dt * 3.0;
+                }
+                None => {
+                    if let Some(b) = self.boss.as_mut() {
+                        b.legend_hold = None;
+                    }
+                }
+            }
+        }
+        if let Some(id) = shot {
+            let target = self.legend_target();
+            let arrived = match (
+                self.entities.iter_mut().find(|e| e.id == id && e.alive),
+                target,
+            ) {
+                (Some(e), Some(t)) => {
+                    let d = t - e.pos;
+                    let step = 20.0 * dt;
+                    e.yaw = d.x.atan2(d.z);
+                    if d.length() <= step.max(2.0) {
+                        e.alive = false;
+                        true
+                    } else {
+                        e.pos += d.normalize() * step;
+                        false
+                    }
+                }
+                _ => true,
+            };
+            if arrived {
+                if let Some(b) = self.boss.as_mut() {
+                    b.legend_shot = None;
+                }
+                self.legend_hit();
+            }
+        }
     }
 
     /// The legend projectile hits the boss: its damage and weakening (spec
@@ -918,8 +1593,22 @@ impl Game {
         match t {
             34 => c.parts[0].freeze = 1200.0,
             36 => c.parts[0].blind = 1800.0,
-            38 => c.parts[0].blind = 18000.0,
-            37 | 39 => c.parts[0].fball_cap = 0.5,
+            38 => {
+                c.parts[0].blind = 18000.0;
+                // The eye becomes PBOSSQEYEBALL until the weakness ends.
+                if let Some(n) = c.model.and_then(|m| self.models[m].node_index("EYEBALL")) {
+                    if let Some(s) = c.swapped.get_mut(n) {
+                        *s = true;
+                    }
+                }
+            }
+            37 => {
+                c.parts[0].fball_cap = 0.5;
+                // Tinted 0xFF40FF40 and shrunk to 0.8, for good.
+                c.tint = Some([0.25, 1.0, 0.25, 1.0]);
+                c.scale = 0.8;
+            }
+            39 => c.parts[0].fball_cap = 0.5,
             40 => c.parts[0].fball_cap = 0.25,
             42 => c.parts[0].fball_cap = 0.1,
             _ => {}
@@ -1430,20 +2119,46 @@ impl Game {
 /// PointViewDist: how far a sphere is inside the view frustum (negative when
 /// it pokes out), for the game's 45-degree 4:3 view.
 fn point_view_dist(eye: Vec3, fwd: Vec3, p: Vec3, r: f32) -> f32 {
+    point_view_clip(eye, fwd, p, r).0
+}
+
+/// The camera's view basis (right, up) for a forward direction.
+fn view_basis(fwd: Vec3) -> (Vec3, Vec3) {
     let right = fwd.cross(Vec3::Y).normalize_or_zero();
     let up = right.cross(fwd).normalize_or_zero();
+    (right, up)
+}
+
+/// PointViewDist with gPointViewClipFlags: 1 near, 0x10 / 0x20 the left /
+/// right planes, 0x200 / 0x100 the bottom / top planes (bit set when the
+/// sphere pokes out through it).
+fn point_view_clip(eye: Vec3, fwd: Vec3, p: Vec3, r: f32) -> (f32, u32) {
+    let (right, up) = view_basis(fwd);
     let d = p - eye;
     let (x, y, z) = (d.dot(right), d.dot(up), d.dot(fwd));
     let hv = 22.5f32.to_radians();
     let hh = (hv.tan() * 4.0 / 3.0).atan();
     // [CHOICE] The status panels cover the bottom 80 of the 384 lines, so the
-    // frame's bottom edge is taken at line 304 (our view is 45 degrees; the
-    // game's own frustum is not known).
+    // frame's bottom edge is taken at line 304. (The game's window is 60
+    // degrees wide (newcam zoom 1.0472), ours 45 degrees high at 4:3.)
     let hb = (hv.tan() * (2.0f32 * 304.0 / 384.0 - 1.0)).atan();
-    let side = |a: f32, h: f32| z * h.sin() - a.abs() * h.cos();
-    let near = z - 1.0;
-    let vert = if y >= 0.0 { side(y, hv) } else { side(y, hb) };
-    near.min(side(x, hh)).min(vert) - r
+    let side = |a: f32, h: f32| z * h.sin() - a * h.cos();
+    let planes = [
+        (z - 1.0 - r, 1u32),
+        (side(-x, hh) - r, 0x10),
+        (side(x, hh) - r, 0x20),
+        (side(-y, hb) - r, 0x200),
+        (side(y, hv) - r, 0x100),
+    ];
+    let mut best = 1e20f32;
+    let mut flags = 0;
+    for (d, bit) in planes {
+        best = best.min(d);
+        if d < 0.0 {
+            flags |= bit;
+        }
+    }
+    (best, flags)
 }
 
 /// CaptionTextSub's typewriter: the text revealed after `budget` (ticks / 2).
@@ -1762,6 +2477,162 @@ mod tests {
             c.parts[2].health
         );
         assert_eq!(g.legend_held & 2, 0, "the scimitar is used up");
+    }
+
+    fn rocks(g: &Game) -> Vec<SafeRock> {
+        g.boss
+            .as_ref()
+            .and_then(|b| b.safe_rocks.clone())
+            .unwrap_or_default()
+    }
+
+    /// The Yeti has a SPOUT2 (POUND), so I5's safe rocks are collected hidden;
+    /// a POUND erupts at the hidden rock nearest its target, which rises with
+    /// 3x its hit points once the eruption is over.
+    #[test]
+    fn yeti_pound_raises_the_safe_rock_nearest_the_target() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelI5", &[("WAR", "RED")]).unwrap();
+        g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        let r = rocks(&g);
+        assert!(r.len() >= 5, "{} rocks", r.len());
+        assert!(r.iter().all(|r| r.strength == -1 && r.entity.is_none()));
+        // A POUND aimed at the hero standing by rock 3.
+        g.players[0].pos = r[3].pos + Vec3::new(2.0, 0.0, 0.0);
+        let at = g.safe_rock_spout2(0, 0.5).expect("a rock erupts");
+        assert!((at - r[3].pos).length() < 1e-3);
+        for _ in 0..60 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        }
+        let r = rocks(&g);
+        let id = r[3].entity.expect("the rock rose");
+        assert_eq!(r[3].strength, 0);
+        let e = g.entities.iter().find(|e| e.id == id).unwrap();
+        assert!(
+            matches!(e.kind, Kind::Container { hp, .. } if (hp - 3.0 * r[3].hit_points).abs() < 1e-3)
+        );
+        // In the fight the Yeti pounds on its own.
+        let mut g = Game::new(&fs, "levelI5", &[("WAR", "RED")]).unwrap();
+        face_boss(&mut g, 45.0);
+        let mut risen = 0;
+        for _ in 0..3600 {
+            g.players[0].health = 500.0;
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            risen = risen.max(rocks(&g).iter().filter(|r| r.entity.is_some()).count());
+        }
+        assert!(risen >= 1, "no rock rose in a minute of fighting");
+    }
+
+    /// The Plague Fiend's SPOUT erupts at every safe rock; with no SPOUT2 its
+    /// rocks stay where they are.
+    #[test]
+    fn plague_fiend_spouts_at_every_safe_rock() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelK5", &[("WAR", "RED")]).unwrap();
+        g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        let r = rocks(&g);
+        assert!(!r.is_empty());
+        assert!(r.iter().all(|r| r.strength == 1 && r.entity.is_some()));
+        assert_eq!(g.safe_rock_positions().len(), r.len());
+    }
+
+    /// SafeRockSetup: the Lich's dirt mound is hidden; Skorne's stages throw
+    /// up the floor pieces (subtype 0x33).
+    #[test]
+    fn safe_rock_setup_per_boss() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelG5", &[("WAR", "RED")]).unwrap();
+        let n = g.hidden.len();
+        g.safe_rock_setup();
+        assert!(g.hidden.len() > n, "G5BIGDIRT hidden");
+        let mut g = Game::new(&fs, "levelE2", &[("WAR", "RED")]).unwrap();
+        g.safe_rock_setup();
+        let flying = g.boss.as_ref().unwrap().fallers.len();
+        eprintln!("E2 stage 1: {flying} pieces");
+        assert_eq!(g.boss.as_ref().unwrap().rock_stage, 1);
+    }
+
+    /// The Bellows tint the Spider Queen green and shrink her; the Javelin
+    /// swaps the Plague Fiend's eye; the weapon is held, then thrown.
+    #[test]
+    fn legend_weapon_visuals() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelD5", &[("WAR", "RED")]).unwrap();
+        g.set_legend_held(1 << 4);
+        face_boss(&mut g, 25.0);
+        let mut held = false;
+        for _ in 0..1800 {
+            g.players[0].health = 500.0;
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            held |= g.boss.as_ref().unwrap().legend_hold.is_some();
+        }
+        assert!(held, "the bellows were held");
+        let (_, c) = g.boss_critter().unwrap();
+        assert_eq!(c.scale, 0.8);
+        assert!(c.tint.is_some());
+        let mut g = Game::new(&fs, "levelK5", &[("WAR", "RED")]).unwrap();
+        g.set_legend_held(1 << 11);
+        face_boss(&mut g, 25.0);
+        let mut swapped = false;
+        let mut shot = false;
+        for _ in 0..1800 {
+            g.players[0].health = 500.0;
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            shot |= g.boss.as_ref().unwrap().legend_shot.is_some();
+            swapped |= g
+                .boss_critter()
+                .is_some_and(|(_, c)| c.swapped.iter().any(|&s| s));
+        }
+        assert!(shot, "the javelin flew");
+        assert!(swapped, "PBOSSQEYEBALL");
+    }
+
+    /// CameraLimitPlayerDpos: a step out of the boss camera's frame is
+    /// clipped; a step back in is not.
+    #[test]
+    fn players_stay_in_the_boss_cameras_frame() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelB6", &[("WAR", "RED")]).unwrap();
+        for _ in 0..600 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        }
+        let c = g.boss.as_ref().unwrap().cam.unwrap();
+        let fwd = cam_forward(c.yaw, c.pitch);
+        let eye = c.attn - fwd * c.dist;
+        let (right, _) = view_basis(fwd);
+        // Walk the hero to the edge of the frame, sideways, a unit at a time.
+        let start = g.players[0].pos;
+        let mut p = start;
+        for _ in 0..200 {
+            g.boss.as_mut().unwrap().player_prev = vec![Some(p)];
+            g.players[0].pos = p + right * 1.0;
+            g.limit_players_to_camera();
+            p = g.players[0].pos;
+        }
+        let vd = point_view_dist(eye, fwd, p + Vec3::Y * 2.5, 1.9375 * 2.5);
+        assert!(vd > -1.5, "walked off screen: {vd}");
+        assert!((p - start).length() > 2.0, "never moved");
+        // Back toward the middle is free.
+        g.boss.as_mut().unwrap().player_prev = vec![Some(p)];
+        g.players[0].pos = p - right;
+        g.limit_players_to_camera();
+        assert!((g.players[0].pos - (p - right)).length() < 1e-4);
+    }
+
+    /// Golems and gargoyles carry the GMETER bar; generals don't.
+    #[test]
+    fn gmeter_on_golems_and_gargoyles() {
+        let Some(fs) = data() else { return };
+        let g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let mut seen = std::collections::BTreeMap::new();
+        for e in &g.entities {
+            if let Kind::Critter(c) = &e.kind {
+                seen.insert(c.etype, c.gmeter.is_some());
+            }
+        }
+        assert_eq!(seen.get(&crate::critter::ET_GOLEM), Some(&true));
+        assert_eq!(seen.get(&crate::critter::ET_GARGOYLE), Some(&true));
+        assert_eq!(seen.get(&crate::critter::ET_GENERAL), Some(&false));
     }
 
     /// The Dragon's floor probe (a radius-5 sphere) finds the lip of the
