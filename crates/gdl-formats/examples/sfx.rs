@@ -12,6 +12,8 @@ fn main() {
         "S_GRUNT1DIECLOS",
         "S_WARPAIN1",
         "S_CHEST",
+        "S_SELECTMUS",
+        "S_WELCOME",
     ] {
         let Some(&(bank, idx, dur)) = names.get(n) else {
             println!("{n}: missing");

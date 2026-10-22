@@ -1,4 +1,6 @@
-use gdl_engine::{app, audio, character, fs, game, gpu, hud, input, menu, scene, select, ui};
+use gdl_engine::{
+    app, audio, character, fs, game, gpu, hud, input, menu, scene, screen, select, ui,
+};
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec2, Vec3};
@@ -308,9 +310,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
     let draw_screen = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
         match args.screen.as_deref() {
-            Some("title") => menu::Title::default().draw(&mut canvas, &style, t),
+            Some("title") => {
+                menu::Title::demo(false).draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
+            }
+            Some("titlemenu") => {
+                menu::Title::demo(true).draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
+            }
             Some("select") => select::Select::demo().draw(&mut canvas, &style, t),
-            Some("loading") => menu::draw_loading(&mut canvas, &style, t),
+            Some("loading") => menu::draw_loading(&mut screen::Scr::new(&mut canvas, &hud.ui, 40)),
             Some("pause") => {
                 hud::build(&mut canvas, &hud.ui, &g, &names);
                 menu::Pause::default().draw(&mut canvas, &style, t);

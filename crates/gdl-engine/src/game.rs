@@ -2283,6 +2283,10 @@ mod tests {
             "S_GATEA1|S_SECRETWALL",
             "S_CHEST",
             "S_PICKUPMAGIC",
+            "S_OPTMENUSEL",
+            "S_OPTMENUMOVVRT",
+            "S_CHOOSESELSFX",
+            "S_NO",
         ]
         .iter()
         .map(|s| s.to_string())

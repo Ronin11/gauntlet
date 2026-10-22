@@ -282,6 +282,13 @@ impl Audio {
         false
     }
 
+    /// The title / select music. The original plays S_SELECTMUS, a sequenced
+    /// track in SELECT.VBK that needs the game's sequencer (not yet decoded), so
+    /// the tower stream stands in for it.
+    pub fn play_select_music(&mut self, fs: &GameFs) {
+        self.play_music(fs, &["tower".into()]);
+    }
+
     pub fn stop(&mut self) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Cmd::StopMusic);

@@ -3,6 +3,8 @@
 
 use crate::hud::{Canvas, Style, DIM, GOLD};
 use crate::input::{PlayerInput, Source};
+use crate::optmenu::{Event, Item, OptMenu};
+use crate::screen::Scr;
 
 /// Up/down navigation shared by the menus: one step per stick push.
 #[derive(Default)]
@@ -30,65 +32,141 @@ impl Nav {
     }
 }
 
-/// "Press Start" title screen. Returns the source that pressed start.
-#[derive(Default)]
+/// The title screen (attract.c do_titlescreen): TITLE00-03 with the animated
+/// GLOWCROP glow, "Press Start", then the Start / Options title menu for the pad
+/// that pressed it.
 pub struct Title {
-    time: f32,
+    /// Ticks since the screen opened (lbl_80344270).
+    ticks: u32,
+    /// The pad that pressed Start and owns the menu.
+    owner: Option<Source>,
+    menu: OptMenu,
+    open: bool,
+    /// Ticks left of the glow's fade after choosing Start (lbl_80344274).
+    starting: Option<i32>,
+    /// Sounds to play, drained by the caller.
+    pub sfx: Vec<&'static str>,
+}
+
+impl Default for Title {
+    fn default() -> Self {
+        let mut menu = OptMenu::new(
+            vec![Item::new("Start", 11), Item::new("Options", 12)],
+            -256.0,
+            304.0,
+            1.0,
+        );
+        menu.title = true;
+        Title {
+            ticks: 0,
+            owner: None,
+            menu,
+            open: false,
+            starting: None,
+            sfx: Vec::new(),
+        }
+    }
 }
 
 impl Title {
-    pub fn update(&mut self, inputs: &[(Source, PlayerInput)], dt: f32) -> Option<Source> {
-        self.time += dt;
-        // Ignore presses carried over from the previous screen.
-        if self.time < 0.4 {
-            return None;
+    /// The screen after its fade-in, for snapshots; `menu` opens the title menu.
+    pub fn demo(menu: bool) -> Title {
+        Title {
+            ticks: 100,
+            owner: menu.then_some(Source::Keyboard),
+            open: menu,
+            ..Title::default()
         }
-        inputs
-            .iter()
-            .find(|(_, i)| i.start_pressed || i.attack_pressed)
-            .map(|(s, _)| *s)
     }
 
-    pub fn draw(&self, c: &mut Canvas, st: &Style, time: f32) {
-        let (w, h) = (c.width(), c.height());
-        st.backdrop(c, 0.6);
-        let u = (h / 720.0).min(w / 1120.0);
-        let lw = (w * 0.62).min(h * 1.3);
-        let lh = st.logo(c, w * 0.5, h * 0.12, lw, time);
-        if (time * 1.6).fract() < 0.7 {
-            st.centered(
-                c,
-                w * 0.5,
-                h * 0.12 + lh + 70.0 * u,
-                54.0 * u,
-                GOLD,
-                "Press Start",
-            );
+    /// One 60 Hz tick. Returns the pad that chose Start once the glow has faded.
+    pub fn update(&mut self, inputs: &[(Source, PlayerInput)]) -> Option<Source> {
+        self.ticks += 1;
+        if let Some(t) = &mut self.starting {
+            *t -= 1;
+            return (*t <= 0).then_some(self.owner).flatten();
         }
-        let hint = "A / ENTER";
-        let hw = st.small_width(hint, 18.0 * u);
-        st.small(
-            c,
-            (w - hw) * 0.5,
-            h * 0.12 + lh + 140.0 * u,
-            18.0 * u,
-            DIM,
-            hint,
-        );
+        let Some(owner) = self.owner else {
+            // new_start: a Start press assigns that pad, and the menu opens.
+            if self.ticks > 1 {
+                if let Some((src, _)) = inputs.iter().find(|(_, i)| i.start_pressed) {
+                    self.owner = Some(*src);
+                    self.open = true;
+                    self.sfx.push("S_OPTMENUSEL");
+                    // The press that opened the menu doesn't also choose.
+                    let _ = self.menu.update(&PlayerInput::default(), 0, true);
+                }
+            }
+            return None;
+        };
+        let input = inputs
+            .iter()
+            .find(|(s, _)| *s == owner)
+            .map(|(_, i)| i.clone())
+            .unwrap_or_default();
+        match self.menu.update(&input, 1, true) {
+            Event::Chose(11) => {
+                self.open = false;
+                self.starting = Some(30);
+                self.sfx.push("S_CHOOSESELSFX");
+            }
+            // TODO: the Options screens (options.c).
+            Event::Chose(_) | Event::Refused => self.sfx.push("S_NO"),
+            Event::Moved => self.sfx.push("S_OPTMENUMOVVRT"),
+            Event::Back => {
+                // B closes the menu and gives up the pad.
+                self.open = false;
+                self.owner = None;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub fn draw(&self, s: &mut Scr) {
+        s.bars(1.0);
+        s.quad_screen("TITLE", 0);
+        let mut fade = if self.ticks < 60 {
+            255 - (self.ticks as i32 * 255) / 60
+        } else {
+            0
+        };
+        if let Some(t) = self.starting {
+            fade = 255 - (t * 60) / 30;
+        }
+        if let Some(t) = s.ui.frame("GLOWCROP_00", (self.ticks as usize >> 2) % 10) {
+            s.blit(t, 192.0, 0.0, 128.0, 128.0, fade);
+        }
+        if self.starting.is_some() {
+            s.glow_text(1.0, -256.0, 320.0, "Loading...");
+        } else if self.open {
+            self.menu.draw(s, 0);
+        } else {
+            s.glow_text(1.0, -256.0, 320.0, "Press Start");
+        }
     }
 }
 
 /// The loading screen, as shop.c draws it while the next level loads:
 /// TransitionBlitShow(0) then DrawGlowText(1.0, 340, 260, "Loading...").
-pub fn draw_loading(c: &mut Canvas, st: &Style, time: f32) {
-    st.transition(c, 1.0);
-    st.glow_text(c, 340.0, 260.0, "Loading...", time);
+pub fn draw_loading(s: &mut Scr) {
+    transition(s, 0);
+    s.glow_text(1.0, 340.0, 260.0, "Loading...");
 }
 
-/// How opaque the loading art still is `t` seconds into a level: gauntworld.c
+/// TransitionBlitShow: TRANSITION_SCREEN stretched over the 512x384 screen, at
+/// MBBlitSetAlpha `fade`.
+pub fn transition(s: &mut Scr, fade: i32) {
+    s.bars(crate::screen::fade_opacity(fade));
+    if let Some(t) = s.ui.get("TRANSITION_SCREEN") {
+        s.blit(t, 0.0, 0.0, 512.0, 384.0, fade);
+    }
+}
+
+/// The loading art's MBBlitSetAlpha fade `t` seconds into a level: gauntworld.c
 /// fades it out as 255 * (1 - t / 2) over the first two seconds.
-pub fn loading_fade(t: f32) -> f32 {
-    (1.0 - 0.5 * t).clamp(0.0, 1.0)
+pub fn loading_fade(t: f32) -> i32 {
+    255 - (255.0 * (1.0 - 0.5 * t)).clamp(0.0, 255.0) as i32
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

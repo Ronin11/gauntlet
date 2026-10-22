@@ -1,5 +1,5 @@
-//! Front-end art from the disc: the menu/HUD textures in `STATIC` and `SELECT`, and the
-//! bitmap fonts described by `FONTS/*.FNT`.
+//! Front-end art from the disc: the menu/HUD texture banks (`STATIC`, `SELECT`,
+//! `TITLE`, ...) and the bitmap fonts described by `FONTS/*.FNT`.
 
 use crate::fs::GameFs;
 use gdl_formats::texture::{self, Image};
@@ -78,16 +78,43 @@ impl Font {
     }
 }
 
+/// The game's font slots (gFontDefs8x8 / gFontDefs in btext.c): FNT and texture
+/// name, and the advance of a space.
+pub const FONT_DEFS: [(&str, f32); 10] = [
+    ("FONT8X8", 8.0),
+    ("8HIFONTS", 8.0),
+    ("BARS", 4.0),
+    ("ARROWS", 8.0),
+    ("SCORE", 9.0),
+    ("SCORATT", 12.0),
+    ("FONT32", 16.0),
+    ("INITIALS", 12.0),
+    ("SCORATT8", 8.0),
+    ("NAMEFONT", 8.0),
+];
+pub const FONT_8X8: usize = 0;
+pub const FONT_8HI: usize = 1;
+pub const FONT_32: usize = 6;
+pub const FONT_INITIALS: usize = 7;
+
+/// Texture banks loaded for the front end, in lookup order.
+const BANKS: [&str; 5] = ["STATIC", "SELECT", "TITLE", "SONY", "GROUP1"];
+
 /// Every front-end texture by name plus the fonts, ready for upload.
 #[derive(Default)]
 pub struct UiAssets {
     /// Decoded images; index i + 1 is texture id i + 1 (id 0 is white).
     pub images: Vec<Image>,
-    names: HashMap<String, Tex>,
-    /// The big menu font, and its blurred "glow" twin used as an outline.
-    pub font32: Option<Font>,
+    /// Upper-cased bitmap-def name -> (bank, bitmap index).
+    names: HashMap<String, (usize, usize)>,
+    /// (bank, bitmap index) -> texture, for animation frames that follow a named one.
+    bitmaps: HashMap<(usize, usize), Tex>,
+    /// Font slots as the game numbers them (see [`FONT_DEFS`]).
+    pub fonts: Vec<Option<Font>>,
+    /// FONT32 laid out with the glow texture, for DrawGlowText's glow pass.
     pub font32_glow: Option<Font>,
-    /// Small fonts for the HUD.
+    /// HUD fonts, tightened to their ink (the HUD is not yet laid out as the game does).
+    pub font32: Option<Font>,
     pub font8: Option<Font>,
     pub name_font: Option<Font>,
 }
@@ -95,57 +122,44 @@ pub struct UiAssets {
 impl UiAssets {
     pub fn load(fs: &GameFs) -> UiAssets {
         let mut ui = UiAssets::default();
-        for dir in ["STATIC", "SELECT"] {
-            if let Err(e) = ui.load_dir(fs, dir) {
+        for (bank, dir) in BANKS.iter().enumerate() {
+            if let Err(e) = ui.load_dir(fs, bank, dir) {
                 log::warn!("front-end textures in {dir}: {e:#}");
             }
         }
         let font = |ui: &UiAssets, file: &str, tex: &str| {
-            let data = fs.read(&format!("FONTS/{file}")).ok()?;
+            let data = fs.read(&format!("FONTS/{file}.FNT")).ok()?;
             Font::parse(&data, ui.get(tex)?)
         };
-        // FONT32 is laid out as the game does (MBDrawText): each glyph advances by
-        // its FNT width, and a space by 16 (gFontDefs in btext.c).
-        ui.font32 = font(&ui, "FONT32.FNT", "FONT32").map(|f| Font { space: 16.0, ..f });
-        ui.font32_glow = font(&ui, "FONT32.FNT", "FONT32_GLOW");
-        ui.font8 = font(&ui, "8Hifonts.fnt", "8HIFONTS").map(|f| ui.tighten(f));
-        ui.name_font = font(&ui, "NAMEFONT.FNT", "NAMEFONT").map(|f| ui.tighten(f));
-        // The glow layer must line up with the lettering it outlines.
-        if let (Some(f), Some(g)) = (&ui.font32, &mut ui.font32_glow) {
-            g.glyphs = f.glyphs.clone();
-            g.space = f.space;
-        }
-        log::info!(
-            "front end: {} textures, fonts {}",
-            ui.images.len(),
-            [
-                ui.font32.is_some(),
-                ui.font8.is_some(),
-                ui.name_font.is_some()
-            ]
+        // Laid out as MBDrawText does: each glyph advances by its FNT width and a
+        // space by the slot's space width.
+        ui.fonts = FONT_DEFS
             .iter()
-            .filter(|b| **b)
-            .count()
+            .map(|&(name, space)| font(&ui, name, name).map(|f| Font { space, ..f }))
+            .collect();
+        ui.font32_glow = ui.fonts[FONT_32].clone().and_then(|f| {
+            Some(Font {
+                tex: ui.get("FONT32_GLOW")?,
+                ..f
+            })
+        });
+        ui.font32 = font(&ui, "FONT32", "FONT32").map(|f| ui.tighten(f));
+        ui.font8 = font(&ui, "8HIFONTS", "8HIFONTS").map(|f| ui.tighten(f));
+        ui.name_font = font(&ui, "NAMEFONT", "NAMEFONT").map(|f| ui.tighten(f));
+        log::info!(
+            "front end: {} textures, {} fonts",
+            ui.images.len(),
+            ui.fonts.iter().flatten().count()
         );
         ui
     }
 
-    fn load_dir(&mut self, fs: &GameFs, dir: &str) -> anyhow::Result<()> {
+    fn load_dir(&mut self, fs: &GameFs, bank: usize, dir: &str) -> anyhow::Result<()> {
         let objs = Objects::parse(&fs.read(&format!("{dir}/objects.ngc"))?)?;
         let tex = fs.read(&format!("{dir}/textures.ngc"))?;
-        let mut names: HashMap<u16, &str> = HashMap::new();
-        for d in &objs.bitmap_defs {
-            names.entry(d.tex_index).or_insert(d.name.as_str());
-        }
         for (i, b) in objs.bitmaps.iter().enumerate() {
             let Ok(img) = texture::decode_ngc(b, &tex) else {
                 continue;
-            };
-            // The Archer's name banner is the one unnamed banner-sized texture.
-            let name = match names.get(&(i as u16)) {
-                Some(n) if !n.is_empty() => n.to_string(),
-                _ if dir == "SELECT" && i == 0 => "ARC_NAME".to_string(),
-                _ => continue,
             };
             let t = Tex {
                 id: self.images.len() as u32 + 1,
@@ -153,7 +167,18 @@ impl UiAssets {
                 h: img.height,
             };
             self.images.push(img);
-            self.names.entry(name).or_insert(t);
+            self.bitmaps.insert((bank, i), t);
+        }
+        for d in &objs.bitmap_defs {
+            if !d.name.is_empty() {
+                self.names
+                    .entry(d.name.to_ascii_uppercase())
+                    .or_insert((bank, d.tex_index as usize));
+            }
+        }
+        // The Archer's name banner is the one unnamed banner-sized texture.
+        if dir == "SELECT" {
+            self.names.entry("ARC_NAME".into()).or_insert((bank, 0));
         }
         Ok(())
     }
@@ -185,21 +210,30 @@ impl UiAssets {
         f
     }
 
+    /// Texture by bitmap-def name (case-insensitive, as MBOX_FindTexture).
     pub fn get(&self, name: &str) -> Option<Tex> {
-        self.names.get(name).copied()
+        self.frame(name, 0)
+    }
+
+    /// Frame `n` of an animated texture: the n-th bitmap after the named one.
+    pub fn frame(&self, name: &str, n: usize) -> Option<Tex> {
+        let &(bank, i) = self.names.get(&name.to_ascii_uppercase())?;
+        self.bitmaps.get(&(bank, i + n)).copied()
+    }
+
+    /// Font slot `i` (see [`FONT_DEFS`]).
+    pub fn font(&self, i: usize) -> Option<&Font> {
+        self.fonts.get(i)?.as_ref()
     }
 
     /// First texture whose name starts with each prefix in turn.
     pub fn find(&self, prefixes: &[&str]) -> Option<Tex> {
         prefixes.iter().find_map(|p| {
             self.get(p).or_else(|| {
-                let mut v: Vec<(&String, &Tex)> = self
-                    .names
-                    .iter()
-                    .filter(|(n, _)| n.starts_with(p))
-                    .collect();
-                v.sort_by_key(|(n, _)| *n);
-                v.first().map(|(_, t)| **t)
+                let p = p.to_ascii_uppercase();
+                let mut v: Vec<&String> = self.names.keys().filter(|n| n.starts_with(&p)).collect();
+                v.sort();
+                self.get(v.first()?)
             })
         })
     }

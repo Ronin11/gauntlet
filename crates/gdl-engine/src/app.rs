@@ -9,6 +9,7 @@ use crate::hud::{self, Hud, Style};
 use crate::input::{Input, PlayerInput, Source};
 use crate::menu::{self, Pause, PauseAction, Title};
 use crate::scene::{Scene, CLEAR};
+use crate::screen::Scr;
 use crate::select::{Select, HEROES};
 use crate::ui::UiAssets;
 use anyhow::{Context, Result};
@@ -136,7 +137,7 @@ impl App {
         audio.load_sounds(&self.cfg.fs);
         let input = Input::new();
         let (screen, sources) = if self.cfg.players.is_empty() {
-            audio.play_music(&self.cfg.fs, &["tower".into()]);
+            audio.play_select_music(&self.cfg.fs);
             (Screen::Title(Title::default()), Vec::new())
         } else {
             let n = self.cfg.players.len();
@@ -316,7 +317,7 @@ impl App {
                 Err(e) => {
                     log::error!("loading {level}: {e:#}");
                     r.screen = Screen::Title(Title::default());
-                    r.audio.play_music(fs, &["tower".into()]);
+                    r.audio.play_select_music(fs);
                 }
             }
             // Don't fast-forward the game through the time spent loading.
@@ -353,8 +354,11 @@ impl App {
                     if escape {
                         el.exit();
                     }
-                    if let Some(src) = t.update(&all, TICK) {
+                    if let Some(src) = t.update(&all) {
                         next = Some(Screen::Select(Select::with_first(src)));
+                    }
+                    for snd in t.sfx.drain(..) {
+                        r.audio.play(fs, snd);
                     }
                 }
                 Screen::Select(sel) => {
@@ -408,19 +412,20 @@ impl App {
         }
         if let Some(s) = next {
             if matches!(s, Screen::Title(_) | Screen::Select(_)) {
-                r.audio.play_music(fs, &["tower".into()]);
+                r.audio.play_select_music(fs);
             }
             r.screen = s;
         }
 
         // Draw.
         let style = Style { ui: &r.hud.ui };
+        let ticks = (time * 60.0) as u32;
         let mut in_game = false;
         match &mut r.screen {
-            Screen::Title(t) => t.draw(&mut canvas, &style, time),
+            Screen::Title(t) => t.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Select(sel) => sel.draw(&mut canvas, &style, time),
             Screen::Loading { shown, .. } => {
-                menu::draw_loading(&mut canvas, &style, time);
+                menu::draw_loading(&mut Scr::new(&mut canvas, &r.hud.ui, ticks));
                 *shown = true;
             }
             Screen::Playing { play, pause } => {
@@ -437,8 +442,8 @@ impl App {
                     .render(&view, &r.depth, &g, CLEAR, &p.scene.draws(&p.game));
                 hud::build(&mut canvas, &r.hud.ui, &p.game, &hero_names(&p.players));
                 let fade = menu::loading_fade(p.intro);
-                if fade > 0.0 {
-                    style.transition(&mut canvas, fade);
+                if fade < 255 {
+                    menu::transition(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), fade);
                 }
                 if let Some(menu) = pause {
                     menu.draw(&mut canvas, &style, time);
