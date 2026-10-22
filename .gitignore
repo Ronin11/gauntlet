@@ -5,3 +5,4 @@
 *.rvz
 *.gcm
 /dist
+.claude/
