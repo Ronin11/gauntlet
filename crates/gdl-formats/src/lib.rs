@@ -11,6 +11,7 @@ pub mod movie;
 pub mod objects;
 pub mod sequence;
 pub mod texture;
+pub mod wdata;
 pub mod worlds;
 
 pub use mesh::Mesh;

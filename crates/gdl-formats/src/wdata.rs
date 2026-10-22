@@ -1,0 +1,186 @@
+//! Realm data: `WDATA/<realm>.WAD`, the per-realm level tables (gauntworld.c
+//! LoadWorldData / ResolveWorldData), and the realm list `sWorldDataTypes`.
+//!
+//! A level is addressed by a *wave*, `(realm type << 8) | index`, where the index
+//! is the position in the realm's LEVL table (play order). Its directory comes
+//! from the level's 2-character name: wave 0x101 is castle index 1, "A6".
+
+use anyhow::{bail, Context, Result};
+
+/// sWorldDataTypes (0x8011C4A8): (type, WAD name, letter), in table order.
+pub const REALMS: [(u32, &str, char); 14] = [
+    (1, "CASTLE", 'A'),
+    (2, "MOUNT", 'B'),
+    (3, "DESERT", 'C'),
+    (4, "FOREST", 'D'),
+    (5, "TEMPLE", 'E'),
+    (6, "HELL", 'F'),
+    (7, "TOWN", 'G'),
+    (8, "BATTLE", 'H'),
+    (9, "ICE", 'I'),
+    (10, "DREAM", 'J'),
+    (11, "SKY", 'K'),
+    (13, "TOWER", 'L'),
+    (12, "SECRET", 'S'),
+    (0, "TEST", 'T'),
+];
+
+/// The tower: realm 13, index 0 (sWorldDataConst).
+pub const TOWER_WAVE: u32 = 0xD00;
+
+/// One LEVL record (0x10C bytes).
+#[derive(Clone, Debug, Default)]
+pub struct LevelDef {
+    /// Directory code ("A6" -> LEVELS/levelA6).
+    pub name: String,
+    pub flags: i32,
+    pub enabled: i16,
+    /// Seconds a secret level lasts.
+    pub wavetime: i16,
+    /// "IN", "ON" or "AT", for the map screen's "<prep> <title>".
+    pub prep: String,
+    pub title: String,
+    pub audio: String,
+    /// Intro movie played before the level (VQMOVIES), if any.
+    pub movie: String,
+    /// Boss type for the realm's last level, else 0.
+    pub boss: i32,
+    pub map_index: i16,
+    pub max_enemies: i16,
+    pub rune: i16,
+    pub legend: i16,
+    pub player_level: f32,
+    pub xp_mul: f32,
+    pub damage: f32,
+    pub difficulty: f32,
+    /// The tally's pile scales: max gold, kills and experience.
+    pub shop_max: [i32; 3],
+}
+
+#[derive(Clone, Debug)]
+pub struct Realm {
+    pub realm_type: u32,
+    pub letter: char,
+    pub levels: Vec<LevelDef>,
+}
+
+fn cstr(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end]).into_owned()
+}
+
+impl Realm {
+    /// Parse a realm WAD. The directory is a run of 16-byte entries at the end of
+    /// the file, each a reversed 4-character tag, an offset and a count.
+    pub fn parse(d: &[u8], realm_type: u32, letter: char) -> Result<Realm> {
+        let u32_at = |o: usize| -> Result<u32> {
+            Ok(u32::from_le_bytes(
+                d.get(o..o + 4).context("WAD truncated")?.try_into()?,
+            ))
+        };
+        let mut dir = Vec::new();
+        let mut i = d.len().checked_sub(16).context("WAD too short")?;
+        loop {
+            let tag: String = d[i..i + 4].iter().rev().map(|&c| c as char).collect();
+            if !tag.chars().all(|c| c.is_ascii_alphanumeric()) {
+                break;
+            }
+            dir.push((tag, u32_at(i + 4)? as usize));
+            if i < 16 {
+                break;
+            }
+            i -= 16;
+        }
+        let find = |t: &str| dir.iter().find(|(n, _)| n == t).map(|(_, o)| *o);
+        let (Some(w), Some(lo)) = (find("WRLD"), find("LEVL")) else {
+            bail!("WAD has no WRLD/LEVL chunks");
+        };
+        let i16_at = |o: usize| i16::from_le_bytes([d[o], d[o + 1]]);
+        let f32_at = |o: usize| f32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let i32_at = |o: usize| i32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let count = i16_at(w + 0x18).max(0) as usize;
+        let mut levels = Vec::with_capacity(count);
+        for k in 0..count {
+            let o = lo + k * 0x10C;
+            if o + 0x10C > d.len() {
+                bail!("LEVL record {k} past end of WAD");
+            }
+            levels.push(LevelDef {
+                flags: i32_at(o),
+                enabled: i16_at(o + 4),
+                name: cstr(&d[o + 8..o + 12]),
+                wavetime: i16_at(o + 12),
+                prep: cstr(&d[o + 0x10..o + 0x14]),
+                title: cstr(&d[o + 0x14..o + 0x24]),
+                audio: cstr(&d[o + 0x24..o + 0x34]),
+                movie: cstr(&d[o + 0x34..o + 0x44]),
+                boss: i32_at(o + 0x44),
+                map_index: i16_at(o + 0x5C),
+                max_enemies: i16_at(o + 0x8E),
+                rune: i16_at(o + 0x90),
+                legend: i16_at(o + 0x92),
+                player_level: f32_at(o + 0x9C),
+                xp_mul: f32_at(o + 0xA0),
+                damage: f32_at(o + 0xA4),
+                difficulty: f32_at(o + 0xA8),
+                shop_max: [i32_at(o + 0xE0), i32_at(o + 0xE4), i32_at(o + 0xE8)],
+            });
+        }
+        Ok(Realm {
+            realm_type,
+            letter,
+            levels,
+        })
+    }
+}
+
+/// Every realm's level table, for resolving waves.
+#[derive(Clone, Debug, Default)]
+pub struct Worlds {
+    pub realms: Vec<Realm>,
+}
+
+impl Worlds {
+    /// Load `WDATA/<name>.WAD` for every realm via `read`.
+    pub fn load(mut read: impl FnMut(&str) -> Result<Vec<u8>>) -> Result<Worlds> {
+        let mut realms = Vec::new();
+        for (t, name, letter) in REALMS {
+            let d = read(&format!("WDATA/{name}.WAD"))?;
+            realms.push(Realm::parse(&d, t, letter).with_context(|| format!("{name}.WAD"))?);
+        }
+        Ok(Worlds { realms })
+    }
+
+    pub fn realm(&self, realm_type: u32) -> Option<&Realm> {
+        self.realms.iter().find(|r| r.realm_type == realm_type)
+    }
+
+    /// The level a wave names.
+    pub fn level(&self, wave: u32) -> Option<&LevelDef> {
+        self.realm(wave >> 8)?.levels.get((wave & 0xFF) as usize)
+    }
+
+    /// FindWave: a level-data code ("a2" = the realm's second level in play order).
+    pub fn find_wave(&self, code: &str) -> Option<u32> {
+        let mut c = code.chars();
+        let letter = c.next()?.to_ascii_uppercase();
+        let n = c.next()?.to_digit(10)? as u32;
+        let realm = self.realms.iter().find(|r| r.letter == letter)?;
+        let idx = n.checked_sub(1)?;
+        ((idx as usize) < realm.levels.len()).then_some((realm.realm_type << 8) | idx)
+    }
+
+    /// The wave whose directory is `levelXN`, if any realm lists it.
+    pub fn wave_of_dir(&self, dir: &str) -> Option<u32> {
+        let code = dir.trim_start_matches("level");
+        self.realms.iter().find_map(|r| {
+            let i = r.levels.iter().position(|l| l.name.eq_ignore_ascii_case(code))?;
+            Some((r.realm_type << 8) | i as u32)
+        })
+    }
+
+    /// The level directory for a wave ("levelA6").
+    pub fn dir(&self, wave: u32) -> Option<String> {
+        Some(format!("level{}", self.level(wave)?.name))
+    }
+}
