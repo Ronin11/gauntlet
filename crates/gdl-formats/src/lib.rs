@@ -7,6 +7,7 @@ pub mod anim;
 pub mod audio;
 pub mod bin;
 pub mod mesh;
+pub mod movie;
 pub mod objects;
 pub mod texture;
 pub mod worlds;
