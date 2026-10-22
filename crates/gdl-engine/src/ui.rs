@@ -143,11 +143,28 @@ pub struct UiAssets {
     pub font32: Option<Font>,
     pub font8: Option<Font>,
     pub name_font: Option<Font>,
+    /// The Control Style diagram's 16 labels per style (ENGLISH.ROM string
+    /// list 3) and their message scale.
+    pub control_labels: Vec<(Vec<String>, f32)>,
 }
 
 impl UiAssets {
     pub fn load(fs: &GameFs) -> UiAssets {
         let mut ui = UiAssets::default();
+        if let Some(rom) = fs
+            .read("TEXT/ENGLISH.ROM")
+            .ok()
+            .and_then(|d| gdl_formats::text::TextRom::parse(&d).ok())
+        {
+            ui.control_labels = rom
+                .lists
+                .get(3)
+                .into_iter()
+                .flatten()
+                .filter_map(|&m| rom.messages.get(m as usize))
+                .map(|m| (m.lines.clone(), m.scale))
+                .collect();
+        }
         for (bank, dir) in BANKS.iter().enumerate() {
             if let Err(e) = ui.load_dir(fs, bank, dir) {
                 log::warn!("front-end textures in {dir}: {e:#}");

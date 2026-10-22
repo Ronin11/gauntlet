@@ -8,7 +8,7 @@
 use crate::input::PlayerInput;
 use crate::optmenu::Repeat;
 use crate::screen::{glow_alpha, Scr};
-use crate::ui::{Tex, FONT_32};
+use crate::ui::{Tex, FONT_32, FONT_INITIALS};
 
 /// OPTMENU_FINISH_FRAMES: the fade-in and the fade-out on close, in ticks.
 const FINISH_FRAMES: i32 = 30;
@@ -32,6 +32,26 @@ const BURN_RECT: (f32, f32, f32, f32) = (290.0, 142.0, 224.0, 172.0);
 /// Control-style names at 0x8011F048. `% 3` in DoOptions keeps "One Handed" out of reach.
 pub const CONTROL_STYLES: [&str; 4] = ["Default", "Arcade", "Robotron", "One Handed"];
 /// ctl_blits at 0x8011FAF8: the controller diagram, each at its natural size.
+/// ctl_label_pos (0x8011FA38): {mode, dx, dy} per label.
+const CTL_LABELS: [(i32, f32, f32); 16] = [
+    (2, -125.0, 108.0),
+    (2, -142.0, 128.0),
+    (2, -155.0, 145.0),
+    (2, -155.0, 174.0),
+    (2, -152.0, 200.0),
+    (2, -136.0, 223.0),
+    (1, -26.0, 256.0),
+    (1, 30.0, 256.0),
+    (2, -72.0, 245.0),
+    (0, 72.0, 245.0),
+    (0, 127.0, 110.0),
+    (0, 140.0, 128.0),
+    (0, 136.0, 148.0),
+    (0, 156.0, 168.0),
+    (0, 136.0, 191.0),
+    (0, 160.0, 222.0),
+];
+
 const CTL_BLITS: [(&str, f32, f32); 3] = [
     ("CONTROLER_1", 96.0, 104.0),
     ("CONTROLER_2", 352.0, 104.0),
@@ -1589,8 +1609,32 @@ impl Options {
                 for (name, x, y) in CTL_BLITS {
                     s.blit_named(name, x, y, 0);
                 }
-                // TODO: the 16 per-style labels (string list 3 of ENGLISH.ROM,
-                // black, at ctl_label_pos 0x8011FA38) are not decoded yet.
+                // The style's 16 labels, black, in the message's own font
+                // (initials) and scale, lines 2 px apart.
+                let Some((labels, scale)) = s.ui.control_labels.get(self.control_style).cloned()
+                else {
+                    return;
+                };
+                let lh = s.font_height(FONT_INITIALS, scale) + 2.0;
+                for (text, &(mode, dx, dy)) in labels.iter().zip(&CTL_LABELS) {
+                    let lines: Vec<&str> = text.split('\n').collect();
+                    let w = lines
+                        .iter()
+                        .map(|l| s.text_width(FONT_INITIALS, scale, l))
+                        .fold(0.0, f32::max);
+                    let h = lines.len() as f32 * lh;
+                    // 1 centred on 256 + dx, 2 right-aligned there, else left-aligned.
+                    let cx = match mode {
+                        1 => 256.0 + dx,
+                        2 => 256.0 + dx - w / 2.0,
+                        _ => 256.0 + dx + w / 2.0,
+                    };
+                    let mut y = dy - h / 2.0;
+                    for l in lines {
+                        s.text(scale, -cx, y, FONT_INITIALS, 0x000000, 0, l);
+                        y += lh;
+                    }
+                }
             }
             _ => {}
         }
