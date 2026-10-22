@@ -15,10 +15,22 @@ pub fn ryp_matrix(a: [f32; 3]) -> Mat4 {
     let aa = -c2 * s1;
     let b = -s2 * s1;
     Mat4::from_cols_array(&[
-        c2 * c1, s2 * c1, s1, 0.0,
-        -s2 * c0 + aa * s0, c2 * c0 + b * s0, c1 * s0, 0.0,
-        s2 * s0 + aa * c0, -c2 * s0 + b * c0, c1 * c0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
+        c2 * c1,
+        s2 * c1,
+        s1,
+        0.0,
+        -s2 * c0 + aa * s0,
+        c2 * c0 + b * s0,
+        c1 * s0,
+        0.0,
+        s2 * s0 + aa * c0,
+        -c2 * s0 + b * c0,
+        c1 * c0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
     ])
 }
 
@@ -30,10 +42,22 @@ pub fn pyr_matrix(a: [f32; 3]) -> Mat4 {
     let aa = s0 * s1;
     let b = c0 * s1;
     Mat4::from_cols_array(&[
-        c1 * c2, -aa * c2 + c0 * s2, b * c2 + s0 * s2, 0.0,
-        -c1 * s2, aa * s2 + c0 * c2, b * -s2 + s0 * c2, 0.0,
-        -s1, -s0 * c1, c0 * c1, 0.0,
-        0.0, 0.0, 0.0, 1.0,
+        c1 * c2,
+        -aa * c2 + c0 * s2,
+        b * c2 + s0 * s2,
+        0.0,
+        -c1 * s2,
+        aa * s2 + c0 * c2,
+        b * -s2 + s0 * c2,
+        0.0,
+        -s1,
+        -s0 * c1,
+        c0 * c1,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
     ])
 }
 
@@ -52,8 +76,18 @@ impl CharacterModel {
         let dir = format!("PLAYERS/{class}/{color}");
         let objects = Objects::parse(&fs.read(&format!("{dir}/objects.ngc"))?)?;
         let textures = fs.read(&format!("{dir}/textures.ngc"))?;
-        let skeleton = anim.atrees.into_iter().next().context("player anim has no atree")?;
-        Ok(Self::build(&objects, &textures, skeleton, &format!("{class}_{color}"), Some("WEAP_")))
+        let skeleton = anim
+            .atrees
+            .into_iter()
+            .next()
+            .context("player anim has no atree")?;
+        Ok(Self::build(
+            &objects,
+            &textures,
+            skeleton,
+            &format!("{class}_{color}"),
+            Some("WEAP_"),
+        ))
     }
 
     /// Load a monster from `MONSTERS/<name>`.
@@ -71,14 +105,24 @@ impl CharacterModel {
         Ok(Self::build(&objects, &textures, skeleton, &prefix, None))
     }
 
-    fn build(objects: &Objects, textures: &[u8], skeleton: ATree, prefix: &str, weapon: Option<&str>) -> Self {
+    fn build(
+        objects: &Objects,
+        textures: &[u8],
+        skeleton: ATree,
+        prefix: &str,
+        weapon: Option<&str>,
+    ) -> Self {
         let mut b = MeshBuilder::new(objects, textures);
         let weapon_node = skeleton.nodes.iter().position(|n| n.name == "R_WRIST");
         let weapon_part = skeleton.nodes.len() as u16;
         let mut weapon_added = false;
         for (def, obj) in objects.object_defs.iter().zip(&objects.objects) {
             let rest = def.name.strip_prefix(prefix).unwrap_or(&def.name);
-            if let Some(ni) = skeleton.nodes.iter().position(|n| n.name.eq_ignore_ascii_case(rest)) {
+            if let Some(ni) = skeleton
+                .nodes
+                .iter()
+                .position(|n| n.name.eq_ignore_ascii_case(rest))
+            {
                 b.add_part(obj, Mat4::IDENTITY, ni as u16);
             } else if let Some(w) = weapon {
                 // First weapon model (upgrades swap to HD2/HD3 later).
@@ -89,7 +133,12 @@ impl CharacterModel {
             }
         }
         let part_count = skeleton.nodes.len() + 1;
-        CharacterModel { mesh: b.finish(), skeleton, part_count, weapon_node }
+        CharacterModel {
+            mesh: b.finish(),
+            skeleton,
+            part_count,
+            weapon_node,
+        }
     }
 
     /// Model-space transform of every part for the given node poses.
@@ -98,10 +147,17 @@ impl CharacterModel {
         let mut world: Vec<Mat4> = Vec::with_capacity(nodes.len() + 1);
         for (i, n) in nodes.iter().enumerate() {
             let p = poses.get(i).copied().unwrap_or_default();
-            let rot = if p.pyr_order { pyr_matrix(p.pyr) } else { ryp_matrix(p.pyr) };
+            let rot = if p.pyr_order {
+                pyr_matrix(p.pyr)
+            } else {
+                ryp_matrix(p.pyr)
+            };
             let t = Vec3::from(n.init_pos) + Vec3::from(p.xyz);
             let local = Mat4::from_translation(t) * rot * Mat4::from_scale(Vec3::from(p.scale));
-            let parent = usize::try_from(n.parent).ok().filter(|&pi| pi < i).map(|pi| world[pi]);
+            let parent = usize::try_from(n.parent)
+                .ok()
+                .filter(|&pi| pi < i)
+                .map(|pi| world[pi]);
             world.push(parent.map_or(local, |pm| pm * local));
         }
         world.push(self.weapon_node.map_or(Mat4::IDENTITY, |w| world[w]));
@@ -124,7 +180,12 @@ pub struct Animator {
 
 impl Animator {
     pub fn new(seq: usize) -> Self {
-        Animator { seq, frame: 0.0, speed: 1.0, finished: false }
+        Animator {
+            seq,
+            frame: 0.0,
+            speed: 1.0,
+            finished: false,
+        }
     }
 
     pub fn play(&mut self, seq: usize) {
@@ -136,7 +197,9 @@ impl Animator {
     }
 
     pub fn update(&mut self, skel: &ATree, dt: f32) {
-        let Some(s) = skel.sequences.get(self.seq) else { return };
+        let Some(s) = skel.sequences.get(self.seq) else {
+            return;
+        };
         let frames = s.frame_count.max(1) as f32;
         self.frame += dt * s.frame_rate.max(1) as f32 * self.speed;
         if self.frame >= frames - 1.0 {

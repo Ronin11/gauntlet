@@ -29,6 +29,8 @@ enum Cmd {
     World { path: PathBuf },
     /// Summarise an ANIM.PS2 file
     Anim { path: PathBuf },
+    /// Read values from main.dol at virtual addresses (e.g. 0x80347B08:f32 0x80118100:u32x9)
+    Dol { dol: PathBuf, addrs: Vec<String> },
 }
 
 fn main() -> Result<()> {
@@ -138,22 +140,79 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Survey { root } => survey(&root)?,
+        Cmd::Dol { dol, addrs } => {
+            let d = std::fs::read(&dol)?;
+            let be = |o: usize| u32::from_be_bytes(d[o..o + 4].try_into().unwrap());
+            let to_off = |addr: u32| -> Option<usize> {
+                (0..18).find_map(|i| {
+                    let (off, a, sz) = (be(i * 4), be(0x48 + i * 4), be(0x90 + i * 4));
+                    (addr >= a && addr < a + sz).then(|| (off + addr - a) as usize)
+                })
+            };
+            for spec in addrs {
+                let (a, ty) = spec.split_once(':').unwrap_or((spec.as_str(), "f32"));
+                let (ty, n) = ty
+                    .split_once('x')
+                    .map(|(t, n)| (t, n.parse().unwrap_or(1)))
+                    .unwrap_or((ty, 1usize));
+                let addr =
+                    u32::from_str_radix(a.trim_start_matches("0x").trim_start_matches("lbl_"), 16)?;
+                let Some(off) = to_off(addr) else {
+                    println!("{a}: not in any DOL section (bss?)");
+                    continue;
+                };
+                let vals: Vec<String> = (0..n)
+                    .map(|k| match ty {
+                        "f64" => format!(
+                            "{}",
+                            f64::from_be_bytes(d[off + k * 8..off + k * 8 + 8].try_into().unwrap())
+                        ),
+                        "u32" => format!("{:#x}", be(off + k * 4)),
+                        "i32" => format!("{}", be(off + k * 4) as i32),
+                        "str" => {
+                            let e = d[off..].iter().position(|&c| c == 0).unwrap_or(64);
+                            String::from_utf8_lossy(&d[off..off + e]).into_owned()
+                        }
+                        _ => format!("{}", f32::from_bits(be(off + k * 4))),
+                    })
+                    .collect();
+                println!("{a} {ty}: {}", vals.join(", "));
+            }
+        }
         Cmd::Anim { path } => {
             let a = gdl_formats::anim::Anim::parse(&std::fs::read(&path)?)?;
             println!("version {} atrees {}", a.version, a.atrees.len());
             for t in &a.atrees {
-                println!("atree {} prefix {:?}: {} nodes, {} seqs", t.name, t.prefix, t.nodes.len(), t.sequences.len());
+                println!(
+                    "atree {} prefix {:?}: {} nodes, {} seqs",
+                    t.name,
+                    t.prefix,
+                    t.nodes.len(),
+                    t.sequences.len()
+                );
                 for (i, n) in t.nodes.iter().enumerate() {
                     let ntracks = t.tracks[i].iter().filter(|x| x.is_some()).count();
-                    println!("  node {i:2} {:20} type {} parent {:3} pos {:?} mb {:#x} tracks {ntracks}", n.name, n.anim_type, n.parent, n.init_pos, n.mb_flags);
+                    println!(
+                        "  node {i:2} {:20} type {} parent {:3} pos {:?} mb {:#x} tracks {ntracks}",
+                        n.name, n.anim_type, n.parent, n.init_pos, n.mb_flags
+                    );
                 }
                 for s in &t.sequences {
-                    println!("  seq {:20} frames {:4} rate {:3} repeat {} flags {:#x}", s.name, s.frame_count, s.frame_rate, s.repeat, s.flags);
+                    println!(
+                        "  seq {:20} frames {:4} rate {:3} repeat {} flags {:#x}",
+                        s.name, s.frame_count, s.frame_rate, s.repeat, s.flags
+                    );
                 }
                 if let Some(si) = t.sequence_index("WALK1").or(Some(0)) {
                     for (i, tr) in t.tracks.iter().enumerate().take(6) {
                         if let Some(Some(tr)) = tr.get(si) {
-                            println!("  seq{si} node{i} flags {:#x} keys {} first {:?} last {:?}", tr.flags, tr.keys.len(), tr.keys.first(), tr.keys.last());
+                            println!(
+                                "  seq{si} node{i} flags {:#x} keys {} first {:?} last {:?}",
+                                tr.flags,
+                                tr.keys.len(),
+                                tr.keys.first(),
+                                tr.keys.last()
+                            );
                         }
                     }
                 }

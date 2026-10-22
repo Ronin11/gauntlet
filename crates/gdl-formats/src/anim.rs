@@ -49,7 +49,12 @@ pub struct Pose {
 
 impl Default for Pose {
     fn default() -> Self {
-        Pose { pyr: [0.0; 3], xyz: [0.0; 3], scale: [1.0; 3], pyr_order: false }
+        Pose {
+            pyr: [0.0; 3],
+            xyz: [0.0; 3],
+            scale: [1.0; 3],
+            pyr_order: false,
+        }
     }
 }
 
@@ -98,7 +103,8 @@ impl Anim {
             let o = infos + i * 36;
             let name = r.str(o, 32)?;
             let off = r.i32(o + 32)? as usize;
-            atrees.push(parse_atree(r, name.clone(), off).with_context(|| format!("atree {name}"))?);
+            atrees
+                .push(parse_atree(r, name.clone(), off).with_context(|| format!("atree {name}"))?);
         }
         Ok(Anim { version, atrees })
     }
@@ -147,13 +153,20 @@ fn parse_atree(r: Le, name: String, h: usize) -> Result<ATree> {
             if p == 0 {
                 return Ok(None);
             }
-            (0..256).map(|i| r.f32(ah + p as usize + i * 4)).collect::<Result<Vec<_>>>().map(Some)
+            (0..256)
+                .map(|i| r.f32(ah + p as usize + i * 4))
+                .collect::<Result<Vec<_>>>()
+                .map(Some)
         };
         let comp_ang = table(r.u32(ah)?)?;
         let comp_pos = table(r.u32(ah + 4)?)?;
         let comp_scale = table(r.u32(ah + 8)?)?;
         let blocks = ah + r.u32(ah + 12)? as usize;
-        let tables = [comp_ang.as_deref(), comp_pos.as_deref(), comp_scale.as_deref()];
+        let tables = [
+            comp_ang.as_deref(),
+            comp_pos.as_deref(),
+            comp_scale.as_deref(),
+        ];
 
         for (ni, node) in nodes.iter().enumerate() {
             if node.anim_type != ANIM_SKELETAL {
@@ -168,14 +181,27 @@ fn parse_atree(r: Le, name: String, h: usize) -> Result<ATree> {
                 if flags & 0xFFF == 0 {
                     continue;
                 }
-                let t = decode_track(r, blocks + data_off, flags, size, seq.frame_count.max(1) as usize, tables)
-                    .with_context(|| format!("node {} seq {}", node.name, seq.name))?;
+                let t = decode_track(
+                    r,
+                    blocks + data_off,
+                    flags,
+                    size,
+                    seq.frame_count.max(1) as usize,
+                    tables,
+                )
+                .with_context(|| format!("node {} seq {}", node.name, seq.name))?;
                 tracks[ni][si] = Some(t);
             }
         }
     }
 
-    Ok(ATree { name, prefix, nodes, sequences, tracks })
+    Ok(ATree {
+        name,
+        prefix,
+        nodes,
+        sequences,
+        tracks,
+    })
 }
 
 fn decode_track(
@@ -201,11 +227,16 @@ fn decode_track(
     };
 
     if flags & FLAG_INITIAL_ONLY != 0 {
-        return Ok(Track { flags, keys: vec![(0, read_abs(at, true)?)] });
+        return Ok(Track {
+            flags,
+            keys: vec![(0, read_abs(at, true)?)],
+        });
     }
 
     let bit_words = numframes.div_ceil(32);
-    let bits: Vec<u32> = (0..bit_words).map(|i| r.u32(at + i * 4)).collect::<Result<_>>()?;
+    let bits: Vec<u32> = (0..bit_words)
+        .map(|i| r.u32(at + i * 4))
+        .collect::<Result<_>>()?;
     let has_key = |f: usize| bits.get(f / 32).is_some_and(|w| w & (1 << (f % 32)) != 0);
     let data = at + bit_words * 4;
 
@@ -261,7 +292,11 @@ impl Track {
         let mut v = [0.0f32; 9];
         for c in 0..9 {
             let d = b[c] - a[c];
-            v[c] = if c < 3 && d.abs() >= std::f32::consts::FRAC_PI_2 { a[c] } else { a[c] + d * t };
+            v[c] = if c < 3 && d.abs() >= std::f32::consts::FRAC_PI_2 {
+                a[c]
+            } else {
+                a[c] + d * t
+            };
         }
         mk(&v)
     }
@@ -269,14 +304,21 @@ impl Track {
 
 impl ATree {
     pub fn sequence_index(&self, name: &str) -> Option<usize> {
-        self.sequences.iter().position(|s| s.name.eq_ignore_ascii_case(name))
+        self.sequences
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(name))
     }
 
     /// Pose of every node at `frame` of sequence `seq` (identity for nodes without data).
     pub fn sample(&self, seq: usize, frame: f32) -> Vec<Pose> {
         self.tracks
             .iter()
-            .map(|t| t.get(seq).and_then(|t| t.as_ref()).map(|t| t.sample(frame)).unwrap_or_default())
+            .map(|t| {
+                t.get(seq)
+                    .and_then(|t| t.as_ref())
+                    .map(|t| t.sample(frame))
+                    .unwrap_or_default()
+            })
             .collect()
     }
 }

@@ -369,8 +369,13 @@ impl Gpu {
         for (mesh, inst) in draws {
             for (b, (buf, _)) in mesh.batches.iter().zip(&inst.bufs) {
                 let u = ModelUniform {
-                    transform: (inst.transform * inst.parts.get(b.part as usize).copied().unwrap_or(Mat4::IDENTITY))
-                        .to_cols_array_2d(),
+                    transform: (inst.transform
+                        * inst
+                            .parts
+                            .get(b.part as usize)
+                            .copied()
+                            .unwrap_or(Mat4::IDENTITY))
+                    .to_cols_array_2d(),
                     tint: inst.tint.to_array(),
                     params: b.params,
                 };

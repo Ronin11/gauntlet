@@ -9,7 +9,11 @@ fn main() {
             let m = Mesh::decode(g).unwrap();
             if obj.flags & 0x20 != 0 {
                 *hist.entry((s.lm_index, s.tex_index > 0)).or_insert(0) += 1;
-                if m.lm_uvs.is_empty() { without += 1 } else { with_lm += 1 }
+                if m.lm_uvs.is_empty() {
+                    without += 1
+                } else {
+                    with_lm += 1
+                }
             }
         }
     }
@@ -18,7 +22,11 @@ fn main() {
     // sample lm uvs of first lmap object
     for obj in o.objects.iter().filter(|o| o.flags & 0x20 != 0).take(2) {
         let m = Mesh::decode(&obj.geometry[0]).unwrap();
-        println!("uvs {:?}\nlm {:?}", &m.uvs[..m.uvs.len().min(4)], &m.lm_uvs[..m.lm_uvs.len().min(4)]);
+        println!(
+            "uvs {:?}\nlm {:?}",
+            &m.uvs[..m.uvs.len().min(4)],
+            &m.lm_uvs[..m.lm_uvs.len().min(4)]
+        );
         let g = &obj.geometry[0];
         println!("{:02x?}", &g[..g.len().min(96)]);
     }
