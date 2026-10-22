@@ -9,7 +9,10 @@ use anyhow::{Context, Result};
 pub struct Message {
     /// The message's name, when DEFS names it ("SCROLLSA1").
     pub name: String,
+    /// The lines with "\r\n" read as a line break.
     pub lines: Vec<String>,
+    /// The lines as stored: in captions "\r" is a timed page break.
+    pub raw: Vec<String>,
     /// Font name from the FONT chunk ("font32"), if any.
     pub font: Option<String>,
     pub scale: f32,
@@ -68,14 +71,15 @@ impl TextRom {
             let first = u32_at(o + 4)? as i32;
             let font = u32_at(o + 8)? as i32;
             let scale = f32::from_bits(u32_at(o + 12)?);
-            let mut lines = Vec::new();
+            let mut raw = Vec::new();
             for j in 0..lines_n.max(0) {
                 let off = u32_at(toff + (first + j) as usize * 4)? as usize;
-                lines.push(cstr(text + off).replace("\r\n", "\n"));
+                raw.push(cstr(text + off));
             }
             messages.push(Message {
                 name,
-                lines,
+                lines: raw.iter().map(|l| l.replace("\r\n", "\n")).collect(),
+                raw,
                 font: (font >= 0)
                     .then(|| fonts.get(font as usize).cloned())
                     .flatten(),

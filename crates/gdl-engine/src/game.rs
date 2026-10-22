@@ -132,6 +132,8 @@ pub struct Carried {
     pub bonus: crate::stats::Atts,
     pub powerups: crate::powerups::Powerups,
     pub stats: PlayStats,
+    /// The experience at Sumner's last level-up check.
+    pub sumner_exp: u32,
 }
 
 impl Carried {
@@ -157,6 +159,7 @@ impl Player {
             bonus: self.bonus,
             powerups: self.powerups.clone(),
             stats: self.stats,
+            sumner_exp: self.sumner_exp,
         }
     }
 
@@ -171,6 +174,7 @@ impl Player {
         self.bonus = c.bonus;
         self.powerups = c.powerups.clone();
         self.stats = c.stats;
+        self.sumner_exp = c.sumner_exp;
         self.refresh_stats();
     }
 
@@ -195,21 +199,48 @@ impl PlayerState {
     }
 }
 
-/// A scroll's text on screen (ControllerMessageBox).
+/// A scroll's or a tower story message's text on screen (ControllerMessageBox):
+/// one page per line, each closed with B.
 #[derive(Clone, Debug)]
 pub struct ScrollBox {
-    /// The player who picked it up; only their B closes it.
-    pub player: usize,
-    pub text: String,
-    /// Ticks shown; input is ignored for the first 15.
+    /// The player who picked it up; None lets any player close it.
+    pub player: Option<usize>,
+    pub pages: Vec<String>,
+    pub page: usize,
+    /// The message's text scale (0.5 for scrolls, 0.6 for the story).
+    pub scale: f32,
+    /// Ticks the page has shown; input is ignored for the first 15.
     pub ticks: u32,
 }
 
 impl ScrollBox {
-    /// One tick; true when the player closes it with B.
-    pub fn update(&mut self, input: &PlayerInput) -> bool {
+    pub fn new(player: Option<usize>, pages: Vec<String>, scale: f32) -> ScrollBox {
+        ScrollBox {
+            player,
+            // The box draws "\r" page breaks as nothing.
+            pages: pages.into_iter().map(|p| p.replace('\r', "")).collect(),
+            page: 0,
+            scale,
+            ticks: 0,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        self.pages.get(self.page).map_or("", |s| s.as_str())
+    }
+
+    /// One tick; true once the last page is closed with B.
+    pub fn update(&mut self, inputs: &[PlayerInput]) -> bool {
         self.ticks += 1;
-        self.ticks > 15 && input.b_pressed
+        let pressed = match self.player {
+            Some(p) => inputs.get(p).is_some_and(|i| i.b_pressed),
+            None => inputs.iter().any(|i| i.b_pressed),
+        };
+        if self.ticks > 15 && pressed {
+            self.page += 1;
+            self.ticks = 0;
+        }
+        self.page >= self.pages.len()
     }
 }
 
@@ -358,6 +389,8 @@ pub struct Player {
     /// Class and colour codes ("WAR", "RED") for sounds.
     pub class: String,
     pub color: String,
+    /// The experience at Sumner's last level-up check (Player+0x1EDC).
+    pub sumner_exp: u32,
     walk_phase: u8,
 }
 
@@ -789,6 +822,8 @@ pub struct Entity {
     pub animator: Animator,
     pub spin: f32,
     pub alive: bool,
+    /// 1 = fully shown, 0 = invisible (the tower's fade-ins).
+    pub fade: f32,
 }
 
 /// A monster type (`GRU`, `RAT`, ...) with a model per strength level.
@@ -853,8 +888,19 @@ pub struct Game {
     pub worlds: gdl_formats::wdata::Worlds,
     /// This level's scroll texts (SCROLL_E.ROM "SCROLLS<level>"), by line.
     pub scrolls: Vec<String>,
+    pub scroll_scale: f32,
+    /// SCROLL_E.ROM, for the tower's story messages and Sumner's speeches.
+    pub scroll_rom: Option<gdl_formats::text::TextRom>,
     /// A scroll being read: the game is paused until its player presses B.
     pub scroll_box: Option<ScrollBox>,
+    /// The tower's wizard: speeches, story messages and trigger cameras.
+    pub sumner: Option<Box<crate::tower::Sumner>>,
+    /// Locked tower barriers touched this frame (crystal colour or 101-103).
+    pub barrier_touches: Vec<usize>,
+    /// World objects were hidden or shown: the scene's world mesh must be rebuilt.
+    pub world_changed: bool,
+    /// The party's boss shards (bit = world order 1..11, as Progress::runes).
+    pub runes: u16,
     /// The level's monster types (realm ENMY + LEVL enemytype).
     pub roster: crate::enemies::Roster,
     /// The level's monster and generator tuning, normalized for the difficulty.
@@ -1062,6 +1108,10 @@ impl Game {
 
     /// msgPost about `player` (or the party).
     pub fn post(&mut self, index: usize, player: Option<usize>, args: &[String]) -> bool {
+        // msgPost is refused while a trigger camera runs.
+        if self.sumner.as_ref().is_some_and(|s| s.cam.is_some()) {
+            return false;
+        }
         let active: Vec<usize> = (0..self.players.len().min(4))
             .filter(|&i| self.players[i].state.active())
             .collect();
@@ -1083,6 +1133,61 @@ impl Game {
             args
         };
         self.msgs.post(index, player, &active, args)
+    }
+
+    /// An item or effect model loaded for the level, by name.
+    pub fn model_named(&self, name: &str) -> Option<usize> {
+        self.item_models
+            .get(&name.to_ascii_uppercase())
+            .copied()
+            .flatten()
+    }
+
+    pub fn entity_mut(&mut self, id: u64) -> Option<&mut Entity> {
+        self.entities.iter_mut().find(|e| e.id == id)
+    }
+
+    /// A world object's position, by name.
+    pub fn object_pos(&self, name: &str) -> Option<Vec3> {
+        let objs = &self.level.worlds.world_objects;
+        let i = objs
+            .iter()
+            .position(|o| o.name.eq_ignore_ascii_case(name))?;
+        self.level.world_pos.get(i).map(|p| Vec3::from(*p))
+    }
+
+    /// Show a hidden world object again; false if it wasn't hidden.
+    pub fn show_object(&mut self, name: &str) -> bool {
+        let objs = &self.level.worlds.world_objects;
+        let Some(i) = objs.iter().position(|o| o.name.eq_ignore_ascii_case(name)) else {
+            return false;
+        };
+        let mut shown = false;
+        for j in self.level.subtree(i) {
+            shown |= self.hidden.remove(&j);
+        }
+        shown
+    }
+
+    /// ActivateSpecialTrigger(id, 0): set off the mover of trigger `id`.
+    pub fn activate_trigger(&mut self, id: u8) {
+        let movers: Vec<usize> = self
+            .entities
+            .iter()
+            .filter_map(|e| match e.kind {
+                Kind::Trigger {
+                    id: i,
+                    mover: Some(m),
+                    ..
+                } if i == id => Some(m),
+                _ => None,
+            })
+            .collect();
+        for m in movers {
+            if let Some(m) = self.movers.get_mut(m) {
+                m.active = true;
+            }
+        }
     }
 
     /// Hide a world object (and its children) by name; false if there is none.
@@ -1174,7 +1279,13 @@ impl Game {
             wave: None,
             worlds: Default::default(),
             scrolls: Vec::new(),
+            scroll_scale: 0.5,
+            scroll_rom: None,
             scroll_box: None,
+            sumner: None,
+            barrier_touches: Vec::new(),
+            world_changed: false,
+            runes: 0,
             roster: Default::default(),
             tuning: gdl_formats::wdata::EnemyTuning::default().normalized(1),
             max_enemies: 25,
@@ -1207,7 +1318,9 @@ impl Game {
                 let code = level_name.trim_start_matches("level");
                 if let Some(m) = rom.named(&format!("SCROLLS{code}")) {
                     game.scrolls = m.lines.clone();
+                    game.scroll_scale = m.scale;
                 }
+                game.scroll_rom = Some(rom);
             }
         }
         match gdl_formats::wdata::Worlds::load(|p| fs.read(p)) {
@@ -1293,6 +1406,7 @@ impl Game {
                     .unwrap_or_else(|| classes[i].0.to_string()),
                 class: classes[i].0.to_string(),
                 color: classes[i].1.to_string(),
+                sumner_exp: 0,
                 walk_phase: 0,
             });
         }
@@ -1529,7 +1643,7 @@ impl Game {
         }
     }
 
-    fn spawn(&mut self, kind: Kind, model: Option<usize>, pos: Vec3, yaw: f32) -> u64 {
+    pub(crate) fn spawn(&mut self, kind: Kind, model: Option<usize>, pos: Vec3, yaw: f32) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let seq = match (&kind, model) {
@@ -1552,6 +1666,7 @@ impl Game {
             animator,
             spin: 0.0,
             alive: true,
+            fade: 1.0,
         });
         id
     }
@@ -1974,6 +2089,15 @@ impl Game {
         {
             self.monster_class(fs, &mut cache, crate::enemies::DEATH);
         }
+        // The tower's Sumners and the shard and runestone effects.
+        if self.wave == Some(gdl_formats::wdata::TOWER_WAVE) {
+            let mut names: Vec<String> = vec!["GWIZ".into(), "WIZARD".into()];
+            names.extend((1..=8).map(|n| format!("SHARD{n}")));
+            names.extend((1..=13).map(|n| format!("RUNE{n}")));
+            for n in names {
+                self.item_model(fs, &mut cache, &mut known, &dirs, &n);
+            }
+        }
         self.item_models = known
             .iter()
             .map(|(k, v)| (k.to_ascii_uppercase(), *v))
@@ -2102,6 +2226,17 @@ impl Game {
         let voices: Vec<String> = self.msgs.voice.drain(..).collect();
         self.sfx.extend(voices);
         self.frame += 1;
+        // Sumner's speeches and trigger cameras take the controls away.
+        let blank;
+        let mut inputs = inputs;
+        if let Some(mut s) = self.sumner.take() {
+            s.update(self);
+            if s.controls_locked() {
+                blank = vec![PlayerInput::default(); inputs.len()];
+                inputs = &blank;
+            }
+            self.sumner = Some(s);
+        }
         self.update_players(dt, inputs);
         self.update_rings(dt);
         self.update_entities(dt);
@@ -3186,6 +3321,7 @@ impl Game {
         let it = self
             .it_holder
             .filter(|&pi| player_pos.get(pi).is_some_and(|p| p.1));
+        let mut barrier_touches = Vec::new();
         let nearest = |pos: Vec3| -> Option<(usize, f32)> {
             // Every monster goes after the player who is IT, at any range.
             if let Some(pi) = it {
@@ -3673,15 +3809,19 @@ impl Game {
                     });
                     // Walking into a lever or onto a pad sets it off; wall levers sit in
                     // the wall, so allow for the player's own radius.
-                    let touched = !locked
-                        && (*hit
-                            || (!*shoot
-                                && player_pos.iter().any(|(pp, alive)| {
-                                    *alive
-                                        && Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
-                                            < *radius + PLAYER_RADIUS + 0.6
-                                        && (pp.y - pos.y).abs() < 4.0
-                                })));
+                    let contact = *hit
+                        || (!*shoot
+                            && player_pos.iter().any(|(pp, alive)| {
+                                *alive
+                                    && Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
+                                        < *radius + PLAYER_RADIUS + 0.6
+                                    && (pp.y - pos.y).abs() < 4.0
+                            }));
+                    // A locked barrier says what it needs (TowerNeedCrystalsMsg).
+                    if locked && contact {
+                        barrier_touches.extend(*gate);
+                    }
+                    let touched = !locked && contact;
                     *hit = false;
                     let mut on = touched;
                     if let Some(m) = mover.and_then(|m| self.movers.get_mut(m)) {
@@ -3808,6 +3948,8 @@ impl Game {
                 }
             }
         }
+
+        self.barrier_touches = barrier_touches;
 
         // Projectiles hit the first damageable thing they touch.
         for (pidx, owner, dmg, dir) in proj_hits {
@@ -3976,21 +4118,20 @@ impl Game {
                 PickupKind::Crystal(c) => {
                     let n = &mut self.crystals[c];
                     if *n >= 0 {
+                        // TowerCheckMessages turns a met count into -1 with
+                        // its "UnlockLevel" message.
                         *n = (*n + 1).min(CRYSTALS_NEEDED[c]);
                         self.crystal_shown = Some((c, 3.0));
-                        if *n == CRYSTALS_NEEDED[c] {
-                            *n = -1;
-                        }
                     }
                 }
                 // ControllerMessageBox: the game stops until the box is closed.
                 PickupKind::Scroll(line) => {
                     if let Some(text) = self.scrolls.get(line) {
-                        self.scroll_box = Some(ScrollBox {
-                            player: pi,
-                            text: text.clone(),
-                            ticks: 0,
-                        });
+                        self.scroll_box = Some(ScrollBox::new(
+                            Some(pi),
+                            vec![text.clone()],
+                            self.scroll_scale,
+                        ));
                     }
                 }
                 // PlayerAddPowerup, for the class's powerup_time; the turbo
@@ -4017,10 +4158,8 @@ impl Game {
                 // towerAdvanceLevelRecord.
                 PickupKind::Gargoyle(i) => {
                     if self.garg_items[i] >= 0 {
+                        // -1 (gate open) comes with the tower's "UnlockSection".
                         self.garg_items[i] = (self.garg_items[i] + 1).min(GARG_NEEDED[i]);
-                        if self.garg_items[i] == GARG_NEEDED[i] {
-                            self.garg_items[i] = -1;
-                        }
                     }
                 }
                 PickupKind::Other(_) => {}
@@ -4121,6 +4260,9 @@ impl Game {
     /// Camera eye, target and near-plane distance. The near plane is pushed out to just
     /// in front of the players so roofs and walls between them and the camera are cut away.
     pub fn camera_view(&self) -> (Vec3, Vec3, f32) {
+        if let Some(c) = self.sumner.as_ref().and_then(|s| s.cam) {
+            return (c.eye, c.eye + c.dir * 30.0, 0.5);
+        }
         let spread = self
             .players
             .iter()

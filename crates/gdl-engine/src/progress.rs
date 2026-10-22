@@ -20,6 +20,15 @@ pub struct Progress {
     pub garg_items: [i32; 3],
     /// The last realm other than the tower that was played (lbl_803448C8).
     pub last_realm: Option<u32>,
+    /// The last level beaten (lbl_803448A8/AC); Sumner clears it once he has
+    /// spoken about the 13th runestone.
+    pub last_beaten: Option<u32>,
+    /// What Sumner has banked (save.rune_stones2 / rune_stones): new bits in
+    /// `runes` / `shards` start his speeches.
+    pub banked_runes: u16,
+    pub banked_shards: u16,
+    /// EnterTower has run this session (lbl_80344C4C).
+    pub entered_tower: bool,
 }
 
 impl Progress {
@@ -50,6 +59,7 @@ impl Progress {
     pub fn record_beaten(&mut self, wave: u32) {
         if wave != TOWER_WAVE {
             self.beaten[(wave >> 8) as usize & 15] |= 1 << (wave & 0xFF);
+            self.last_beaten = Some(wave);
         }
     }
 

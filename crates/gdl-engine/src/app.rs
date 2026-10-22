@@ -363,12 +363,26 @@ impl App {
                     p.game.crystals = r.progress.crystals;
                     p.game.garg_items = r.progress.garg_items;
                     p.game.shards = r.progress.shards;
+                    p.game.runes = r.progress.runes;
                     match p.game.wave {
                         Some(TOWER_WAVE) => {
                             let progress = r.progress.clone();
                             p.game.close_portals(|w| progress.portal_open(w));
                             p.game.enter_tower();
                             p.game.set_start(progress.tower_start());
+                            // sumnerUpdatePresence: the welcome is for a new party's
+                            // first visit.
+                            let welcome = !progress.entered_tower
+                                && p.game.players.iter().all(|pl| pl.exp == 0);
+                            r.progress.entered_tower = true;
+                            let entry = crate::tower::Entry {
+                                welcome,
+                                banked_runes: progress.banked_runes,
+                                banked_shards: progress.banked_shards,
+                                last_beaten: progress.last_beaten,
+                            };
+                            let sumner = crate::tower::Sumner::new(fs, &mut p.game, entry);
+                            p.game.sumner = Some(Box::new(sumner));
                             // Closed portals' glows are hidden from the world mesh.
                             p.scene = Scene::new(&r.gpu, &p.game).unwrap_or(p.scene);
                         }
@@ -617,6 +631,11 @@ impl App {
                 Screen::Playing { play, pause } => {
                     let inputs: Vec<PlayerInput> =
                         r.sources.iter().map(|s| r.input.read(*s)).collect();
+                    let sumner_busy = play
+                        .game
+                        .sumner
+                        .as_ref()
+                        .is_some_and(|s| s.controls_locked());
                     if let Some(menu) = pause {
                         // The menu's owner drives it; Esc acts as their Start.
                         let owner = menu_owner(menu);
@@ -678,11 +697,11 @@ impl App {
                         }
                     } else if let Some(b) = &mut play.game.scroll_box {
                         // A scroll being read stops the game until its reader presses B.
-                        let inp = inputs.get(b.player).copied().unwrap_or_default();
-                        if b.update(&inp) {
+                        if b.update(&inputs) {
                             play.game.scroll_box = None;
                         }
                     } else if let Some(src) = (play.game.wave == Some(TOWER_WAVE)
+                        && !sumner_busy
                         && r.sources.len() < 4)
                         .then(|| {
                             all.iter()
@@ -699,7 +718,11 @@ impl App {
                         sel.join(src);
                         next = Some(Screen::Select(sel));
                     } else if let Some(owner) = (0..inputs.len())
-                        .find(|&i| inputs[i].start_pressed && play.game.players[i].state.active())
+                        .find(|&i| {
+                            inputs[i].start_pressed
+                                && !sumner_busy
+                                && play.game.players[i].state.active()
+                        })
                         .or(escape.then_some(0))
                     {
                         // OptionsStart: a playing player's Start opens the Game
@@ -713,6 +736,11 @@ impl App {
                     } else {
                         play.game.update(TICK, &inputs);
                         play.intro += TICK;
+                        if std::mem::take(&mut play.game.world_changed) {
+                            if let Ok(sc) = Scene::new(&r.gpu, &play.game) {
+                                play.scene = sc;
+                            }
+                        }
                     }
                 }
             }
@@ -827,7 +855,11 @@ impl App {
                     menu::transition(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), fade);
                 }
                 if let Some(b) = &p.game.scroll_box {
-                    menu::draw_scroll(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), &b.text);
+                    menu::draw_scroll(
+                        &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+                        b.text(),
+                        b.scale,
+                    );
                 }
                 if let Some(menu) = pause {
                     menu.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks));
@@ -923,6 +955,11 @@ impl App {
                 r.progress.crystals = play.game.crystals;
                 r.progress.garg_items = play.game.garg_items;
                 r.progress.shards = play.game.shards;
+                r.progress.runes |= play.game.runes;
+                if let Some(sm) = &play.game.sumner {
+                    (r.progress.banked_runes, r.progress.banked_shards) = sm.banked();
+                    r.progress.last_beaten = sm.last_beaten();
+                }
                 let checkpoint = r.checkpoint.clone().unwrap_or_default();
                 // Players who died in the level get back what they had at its start.
                 let mut carry: Carry = Default::default();

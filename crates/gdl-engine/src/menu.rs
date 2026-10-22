@@ -207,17 +207,16 @@ pub fn loading_fade(t: f32) -> i32 {
 
 /// ControllerMessageBox: a scroll's text on parchment, centred on (256, 160),
 /// with "Press [B] Button when done." under it.
-pub fn draw_scroll(s: &mut Scr, text: &str) {
+pub fn draw_scroll(s: &mut Scr, text: &str, scale: f32) {
     use crate::ui::FONT_32;
     const PROMPT: &str = "Press     Button when done.";
-    let scale = 0.5;
     let lines: Vec<&str> = text.split('\n').collect();
     let lh = s.font_height(FONT_32, scale) + 4.0;
     let tw = lines
         .iter()
         .map(|l| s.text_width(FONT_32, scale, l))
         .fold(0.0, f32::max);
-    let min_w = s.text_width(FONT_32, scale, PROMPT) + 32.0;
+    let min_w = s.text_width(FONT_32, 0.5, PROMPT) + 32.0;
     let w = (tw + 96.0).clamp(min_w, 512.0);
     let h = lines.len() as f32 * lh + 96.0;
     let (left, top) = (256.0 - w / 2.0, 160.0 - h / 2.0);
@@ -230,8 +229,21 @@ pub fn draw_scroll(s: &mut Scr, text: &str) {
         y += lh;
     }
     let py = y + 8.0;
-    s.glow_text(scale, -256.0, py, PROMPT);
+    s.glow_text(0.5, -256.0, py, PROMPT);
     if let Some(t) = s.ui.get("BUTTON_TRI") {
         s.blit(t, 190.0, py - 2.0, 20.0, 20.0, 0);
+    }
+}
+
+/// CaptionText: Sumner's words centred on x 256 at `y`, font32 at 0.667, white
+/// with a black shadow; each line 32 x scale below the last.
+pub fn draw_caption(s: &mut Scr, text: &str, y: f32) {
+    use crate::ui::FONT_32;
+    let scale = 0.667;
+    let mut y = y;
+    for l in text.trim_start_matches('\n').split('\n') {
+        s.text(scale, -257.5, y + 1.5, FONT_32, 0x000000, 0, l);
+        s.text(scale, -256.0, y, FONT_32, 0xFFFFFF, 0, l);
+        y += 32.0 * scale;
     }
 }

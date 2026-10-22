@@ -131,6 +131,8 @@ impl Scene {
                 } => Vec4::new(1.0, 0.3, 0.3, (timer * 2.0).min(1.0)),
                 _ => Vec4::ONE,
             };
+            inst.tint.w *= e.fade;
+            inst.visible = e.fade > 0.0;
         }
         self.entities.retain(|id, _| live.contains(id));
     }

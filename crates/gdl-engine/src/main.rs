@@ -1,6 +1,6 @@
 use gdl_engine::{
-    app, audio, character, fs, game, gpu, hud, input, mapscreen, menu, options, scene, screen,
-    select, shop, ui,
+    app, audio, character, fs, game, gpu, hud, input, mapscreen, menu, options, progress, scene,
+    screen, select, shop, stats, ui,
 };
 
 use anyhow::{Context, Result};
@@ -235,8 +235,56 @@ fn snapshot_game(args: &Args) -> Result<()> {
         g.players[0].pos = p;
         g.cam_focus = p;
     }
+    // GDL_SUMNER=welcome | runes=..,shards=..,banked_runes=..,banked_shards=..,
+    // beaten=..,exp=..: the tower with Sumner, as the app would enter it (masks
+    // in hex, exp in decimal).
+    // GDL_BOX_CLOSE=n presses B n ticks into each message box page.
+    if let Ok(spec) = std::env::var("GDL_SUMNER") {
+        let mut entry = gdl_engine::tower::Entry::default();
+        for kv in spec.split(',') {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, "1"));
+            let n = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap_or(0);
+            match k {
+                "welcome" => entry.welcome = true,
+                "runes" => g.runes = n as u16,
+                "shards" => g.shards = n as u16,
+                "banked_runes" => entry.banked_runes = n as u16,
+                "banked_shards" => entry.banked_shards = n as u16,
+                "beaten" => entry.last_beaten = Some(n),
+                "exp" => {
+                    let n: u32 = v.parse()?;
+                    g.players.iter_mut().for_each(|p| {
+                        p.exp = n;
+                        p.level = stats::exp_to_level(n);
+                    })
+                }
+                "crystals" => g.crystals[1] = n as i32,
+                _ => anyhow::bail!("GDL_SUMNER: unknown key {k}"),
+            }
+        }
+        let progress = progress::Progress::default();
+        g.close_portals(|w| progress.portal_open(w));
+        g.enter_tower();
+        g.set_start(progress.tower_start());
+        let s = gdl_engine::tower::Sumner::new(&fs, &mut g, entry);
+        g.sumner = Some(Box::new(s));
+    }
+    let box_close: Option<u32> = std::env::var("GDL_BOX_CLOSE")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let mut sfx_seen: Vec<String> = Vec::new();
     for f in 0..args.simulate {
+        if let Some(b) = &mut g.scroll_box {
+            let press = box_close.is_some_and(|n| b.ticks + 1 >= n);
+            let inp = input::PlayerInput {
+                b_pressed: press,
+                ..Default::default()
+            };
+            if b.update(&vec![inp; g.players.len()]) {
+                g.scroll_box = None;
+            }
+            continue;
+        }
         let inp = input::PlayerInput {
             stick: args.hold,
             attack_pressed: args.attack_at == Some(f),
@@ -430,6 +478,13 @@ fn snapshot_game(args: &Args) -> Result<()> {
             &g,
             &panels,
         );
+        if let Some(b) = &g.scroll_box {
+            menu::draw_scroll(
+                &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
+                b.text(),
+                b.scale,
+            );
+        }
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
     };
     // Menu screens for checking their layout headlessly.

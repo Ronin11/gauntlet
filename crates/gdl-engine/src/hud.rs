@@ -677,6 +677,17 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
         };
         message_box(s, cx, cy, &lines, rgb);
     }
+    // A trigger camera letterboxes the view (bosscam.c), and Sumner's words
+    // are written over the lower bar.
+    if let Some(sm) = &game.sumner {
+        if sm.cam.is_some() {
+            s.rect(0.0, 0.0, 512.0, 48.0, [0.0, 0.0, 0.0, 1.0]);
+            s.rect(0.0, 304.0, 512.0, 80.0, [0.0, 0.0, 0.0, 1.0]);
+        }
+        if let Some(t) = &sm.text {
+            crate::menu::draw_caption(s, t, 312.0);
+        }
+    }
 }
 
 /// draw_power_meter at power level `level` (0..100), not flashing.
