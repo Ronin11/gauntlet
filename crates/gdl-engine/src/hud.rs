@@ -450,7 +450,22 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
                     s.blit_tint(t, x0, y, 128.0, h, color);
                 }
             }
-            s.text(1.2, -xc, 340.0, FONT_8HI, pal, 0, "IN TOWER");
+            let others = game.players.iter().any(|q| q.state.active());
+            if p.tower_choice && others {
+                for (icon, label, y) in [
+                    ("BUTTON_X", "Wait In Tower", 332.0),
+                    ("BUTTON_TRI", "Quit Game", 352.0),
+                ] {
+                    if let Some(t) = s.ui.get(icon) {
+                        s.blit(t, x0 + 6.0, y, 14.0, 14.0, 0);
+                    }
+                    s.text(1.2, x0 + 20.0, y + 4.0, FONT_8HI, 0xFFFFFF, 0, label);
+                }
+                continue;
+            }
+            if !p.quit {
+                s.text(1.2, -xc, 340.0, FONT_8HI, pal, 0, "IN TOWER");
+            }
             continue;
         }
         // Display mode 1: the rune-stone strip and the class portrait.

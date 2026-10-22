@@ -267,7 +267,7 @@ impl Select {
     }
 
     /// assign_controller + new_player: the first free column.
-    fn join(&mut self, src: Source) -> Option<usize> {
+    pub fn join(&mut self, src: Source) -> Option<usize> {
         let col = self.players.iter().position(|p| p.is_none())?;
         let mut menu = OptMenu::new(
             vec![Item::new("New", NEW), Item::new("Load", LOAD)],

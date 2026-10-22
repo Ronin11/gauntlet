@@ -144,6 +144,10 @@ pub struct Player {
     pub hurt_flash: f32,
     /// Where this player's exit leads (None = the tower).
     pub exit_dest: Option<u32>,
+    /// Dead while others play on: "Wait In Tower" (A) / "Quit Game" (B) is up.
+    pub tower_choice: bool,
+    /// Chose "Quit Game": leaves the party when the level ends.
+    pub quit: bool,
     /// Model thrown by this hero's ranged attack.
     pub proj_model: Option<usize>,
     /// Display name ("WARRIOR"), for announcer messages.
@@ -685,6 +689,8 @@ impl Game {
                 score: 0,
                 hurt_flash: 0.0,
                 exit_dest: None,
+                tower_choice: false,
+                quit: false,
                 proj_model: None,
                 name: crate::select::HEROES
                     .iter()
@@ -1353,6 +1359,7 @@ impl Game {
                     *timer -= dt;
                     if *timer <= 0.0 {
                         p.state = PlayerState::InTower;
+                        p.tower_choice = true;
                     }
                     p.animator.update(&model.skeleton, dt);
                     continue;
@@ -1368,7 +1375,19 @@ impl Game {
                     p.animator.update(&model.skeleton, dt);
                     continue;
                 }
-                PlayerState::Exited | PlayerState::InTower => continue,
+                PlayerState::InTower => {
+                    // A waits in the tower; B quits the game (abort_player).
+                    if p.tower_choice {
+                        if inp.attack_pressed {
+                            p.tower_choice = false;
+                        } else if inp.magic_pressed {
+                            p.tower_choice = false;
+                            p.quit = true;
+                        }
+                    }
+                    continue;
+                }
+                PlayerState::Exited => continue,
                 _ => {}
             }
 

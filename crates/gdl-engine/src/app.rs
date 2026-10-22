@@ -46,7 +46,8 @@ struct Playing {
 }
 
 /// Health, score, keys and potions carried from one level to the next.
-type Carry = Vec<(f32, u32, u32, u32)>;
+/// Indexed by slot (column), so players keep their stats whoever joins.
+type Carry = [Option<(f32, u32, u32, u32)>; 4];
 
 enum Screen {
     /// The licence screen shown at power-on, for this many more ticks.
@@ -321,9 +322,11 @@ impl App {
             match start_game(fs, &r.gpu, &level, panels) {
                 Ok(mut p) => {
                     if let Some(carry) = &r.carry {
-                        for (a, b) in p.game.players.iter_mut().zip(carry) {
-                            a.health = b.0;
-                            (a.score, a.keys, a.potions) = (b.1, b.2, b.3);
+                        for (a, info) in p.game.players.iter_mut().zip(&p.panels) {
+                            if let Some(b) = carry[info.slot % 4] {
+                                a.health = b.0;
+                                (a.score, a.keys, a.potions) = (b.1, b.2, b.3);
+                            }
                         }
                     }
                     r.checkpoint = r.carry.clone();
@@ -453,20 +456,16 @@ impl App {
                         let panels = sel.panels();
                         // New players start fresh; returning ones keep their stats.
                         let old = r.carry.take().unwrap_or_default();
-                        r.carry = Some(
-                            panels
-                                .iter()
-                                .enumerate()
-                                .map(|(i, _)| {
-                                    old.get(i).copied().unwrap_or((
-                                        crate::game::max_health(1),
-                                        0,
-                                        0,
-                                        0,
-                                    ))
-                                })
-                                .collect(),
-                        );
+                        let mut carry: Carry = Default::default();
+                        for info in &panels {
+                            carry[info.slot % 4] = Some(old[info.slot % 4].unwrap_or((
+                                crate::game::max_health(1),
+                                0,
+                                0,
+                                0,
+                            )));
+                        }
+                        r.carry = Some(carry);
                         // Player select always leads into the tower.
                         next = Some(Screen::Loading {
                             level: "levelL1".into(),
@@ -539,6 +538,22 @@ impl App {
                         if b.update(&inp) {
                             play.game.scroll_box = None;
                         }
+                    } else if let Some(src) = (play.game.wave == Some(TOWER_WAVE)
+                        && r.sources.len() < 4)
+                        .then(|| {
+                            all.iter()
+                                .find(|(s, i)| {
+                                    !r.sources.contains(s) && (i.start_pressed || i.attack_pressed)
+                                })
+                                .map(|(s, _)| *s)
+                        })
+                        .flatten()
+                    {
+                        // check_active_players: a new pad joins in the tower, which
+                        // opens player select for it (init_player_select(1)).
+                        let mut sel = Select::from_game(&play.panels, &r.sources);
+                        sel.join(src);
+                        next = Some(Screen::Select(sel));
                     } else if let Some(owner) = (0..inputs.len())
                         .find(|&i| inputs[i].start_pressed && play.game.players[i].state.active())
                         .or(escape.then_some(0))
@@ -668,18 +683,39 @@ impl App {
                 r.progress.crystals = play.game.crystals;
                 let checkpoint = r.checkpoint.clone().unwrap_or_default();
                 // Players who died in the level get back what they had at its start.
-                let carry: Carry = play
-                    .game
-                    .players
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| match (p.state, checkpoint.get(i)) {
-                        (PlayerState::InTower, Some(c)) => *c,
-                        _ => (p.health.max(1.0), p.score, p.keys, p.potions),
-                    })
-                    .collect();
+                let mut carry: Carry = Default::default();
+                for (p, info) in play.game.players.iter().zip(&play.panels) {
+                    let slot = info.slot % 4;
+                    carry[slot] = match (p.state, checkpoint[slot]) {
+                        (PlayerState::InTower, Some(c)) => Some(c),
+                        _ => Some((p.health.max(1.0), p.score, p.keys, p.potions)),
+                    };
+                }
                 r.carry = Some(carry);
-                let panels = play.panels.clone();
+                // Players who chose "Quit Game" while dead leave the party.
+                let mut panels = Vec::new();
+                let mut sources = Vec::new();
+                for (i, info) in play.panels.iter().enumerate() {
+                    if play.game.players.get(i).is_some_and(|p| p.quit) {
+                        if let Some(c) = r.carry.as_mut() {
+                            c[info.slot % 4] = None;
+                        }
+                        continue;
+                    }
+                    panels.push(info.clone());
+                    if let Some(s) = r.sources.get(i) {
+                        sources.push(*s);
+                    }
+                }
+                r.sources = sources;
+                if panels.is_empty() {
+                    // Nobody left playing: game over (MG_OVER), then the attract
+                    // loop's fail movie.
+                    r.audio.stop();
+                    r.attract = std::mem::take(&mut r.attract).game_over();
+                    r.screen = Screen::Attract;
+                    return Ok(());
+                }
                 let wave = play.game.wave;
                 let worlds = std::mem::take(&mut play.game.worlds);
                 let tower = "levelL1".to_string();
