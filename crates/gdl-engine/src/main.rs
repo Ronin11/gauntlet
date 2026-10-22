@@ -492,8 +492,12 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 c.runes[2] = true;
             }
             println!("shop {mode_name}, music {:?}", s.music());
+            let fuzz = std::env::var("GDL_FUZZ").ok().and_then(|v| v.parse::<u64>().ok());
             for t in 1..=ticks {
                 let mut inputs = vec![input::PlayerInput::default(); 2];
+                if let Some(seed) = fuzz {
+                    inputs = (0..2).map(|p| fuzz_input(seed, t, p)).collect();
+                }
                 for &(et, key, who) in &events {
                     if et != t {
                         continue;
