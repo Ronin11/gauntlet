@@ -2,11 +2,15 @@
 //! columns, one per player, each with its own New / name entry / class-and-colour
 //! pick / character menu flow.
 //!
-//! There is no memory card, so (as the original does with no card inserted) Load
-//! and Save are disabled.
+//! Heroes are saved to and loaded from a virtual memory card in Slot A
+//! (`crate::save::MemCard`): always present and formatted, so the select
+//! screen's format and no-card branches (motions 6 and 11) never come up, but
+//! the first save offers to create the Gauntlet save file (motion 12).
 
+use crate::game::Carried;
 use crate::input::{PlayerInput, Source};
 use crate::optmenu::{Event, Item, OptMenu, Repeat};
+use crate::save::{HeroSave, MemCard};
 use crate::screen::Scr;
 use crate::ui::{FONT_32, FONT_8X8, FONT_INITIALS};
 
@@ -133,12 +137,40 @@ struct Slot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Motion {
+    /// 0: New / Load.
     Top,
+    /// 1: Save / Change / Load / Quit / Done.
     Character,
+    /// 2: "Character Not Saved. Quit Anyway?"
     QuitConfirm,
+    /// 3: name entry.
     Name,
+    /// 4: class and colour pick.
     Class,
+    /// 5: step 0 "Current Character Not Saved. Load new Character Anyway?",
+    /// then the card list.
+    CardLoad,
+    /// 7: "No Gauntlet save data on Memory Card."
+    NoData,
+    /// 8: "Choose a File to Load".
+    PickLoad,
+    /// 9: loading, then "Load Complete" / "Load Failed!".
+    Loading,
+    /// 10: the card list for saving.
+    CardSave,
+    /// 12: "No Gauntlet save data on Memory Card. Create %d Blocks Save
+    /// File?", then creating it.
+    Create,
+    /// 13: "Choose a Location to Write to".
+    PickSave,
+    /// 14: "Overwrite Existing File?", then writing.
+    Writing,
 }
+
+/// Item codes of the card list and file lists (1000 + index).
+const ENTRY: i32 = 1000;
+/// The memory card list's one entry (setup_vmu_entries, no multitap).
+const CARD_SLOT: &str = " SLOT  1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -147,6 +179,8 @@ enum State {
 }
 
 struct Player {
+    /// The column (player index).
+    col: usize,
     source: Source,
     state: State,
     motion_save: Motion,
@@ -166,6 +200,31 @@ struct Player {
     slots: [Slot; 11],
     /// Previous frame's state, to notice entering the class pick.
     entered_class: bool,
+    /// The save image (Player.save) and the current class's live state
+    /// (None: a new character).
+    hero: HeroSave,
+    carried: Option<Carried>,
+    /// save.saved: -1 for a new hero (nothing to lose), 0 when changed since
+    /// the last save or load, 1 when saved or loaded.
+    saved: i8,
+    /// sel_step: a memory card sub-state's step and tick count.
+    step: i32,
+    /// sel_file_cursor: the file this player last loaded or picked to save to
+    /// (-1 none); other players can't use it.
+    file_cursor: i32,
+    /// sel_save_file.
+    save_file: usize,
+}
+
+/// What the party brings to player select: the memory card, each column's
+/// state carried from the last level and save image, and the party's
+/// progress (copied into saves).
+#[derive(Clone, Default)]
+pub struct Party {
+    pub card: MemCard,
+    pub carry: [Option<Carried>; 4],
+    pub heroes: [Option<HeroSave>; 4],
+    pub progress: crate::progress::Progress,
 }
 
 /// Out-of-game player data the select screen reads (the save file).
@@ -178,6 +237,11 @@ pub struct Progress {
 pub struct Select {
     players: [Option<Player>; 4],
     progress: Progress,
+    card: MemCard,
+    /// The party's realm progress, for saves.
+    party: crate::progress::Progress,
+    /// lbl_80344BB4: ticks before another save may start.
+    debounce: i32,
     /// Consecutive frames with every joined player ready and idle.
     idle_frames: u32,
     ticks: u32,
@@ -192,6 +256,9 @@ impl Select {
         Select {
             players: Default::default(),
             progress,
+            card: MemCard::in_memory(),
+            party: Default::default(),
+            debounce: 0,
             idle_frames: 0,
             ticks: 0,
             sfx: Vec::new(),
@@ -229,10 +296,59 @@ impl Select {
             p.character = info.class;
             p.class = info.class;
             p.in_tower = true;
+            // PlayerSaveState cleared save.saved during play.
+            p.saved = 0;
+            p.hero = HeroSave::new(&p.name, p.character, p.colour);
             p.open_character_menu(DONE);
         }
         // Players joining here pass through the class pick as usual.
         s
+    }
+
+    /// The memory card, and each column's carried state, save image and the
+    /// party's progress.
+    pub fn with_party(mut self, party: Party) -> Select {
+        self.card = party.card;
+        self.party = party.progress;
+        for (col, p) in self.players.iter_mut().enumerate() {
+            let Some(p) = p else {
+                continue;
+            };
+            p.carried = party.carry[col].clone();
+            if let Some(h) = &party.heroes[col] {
+                p.hero = h.clone();
+                p.hero.name = p.name.clone();
+            }
+        }
+        self
+    }
+
+    /// The state each column's player takes into the game (their class's
+    /// slot of their save, or what they carried in); None for a new
+    /// character.
+    pub fn carried(&self, col: usize) -> Option<Carried> {
+        self.players.get(col)?.as_ref()?.carried.clone()
+    }
+
+    /// Each column's save image, kept for the next visit.
+    pub fn heroes(&self) -> [Option<HeroSave>; 4] {
+        std::array::from_fn(|c| self.players[c].as_ref().map(|p| p.hero.clone()))
+    }
+
+    /// Every player's save accumulates the party's achievements, so the
+    /// party gets the union of what each player's class record holds (a
+    /// loaded hero brings its own).
+    pub fn merge_progress(&self, party: &mut crate::progress::Progress) {
+        for p in self.players.iter().flatten() {
+            if let Some(cs) = p.hero.classes.get(p.character) {
+                cs.progress.merge_into(party);
+            }
+        }
+    }
+
+    /// The memory card, handed back for the next visit.
+    pub fn card(&self) -> &MemCard {
+        &self.card
     }
 
     /// A sample screen for snapshots: one player per state.
@@ -266,17 +382,125 @@ impl Select {
         s
     }
 
+    /// Sample memory card screens for snapshots (`--screen select:<name>`):
+    /// `load` (overwrite prompt, no data, file list, loading), `save` (card
+    /// list, create prompt, file list, overwrite prompt), `result` (load and
+    /// save complete, file created, a ready player) and `char` (character
+    /// menu, quit confirm, a loaded hero's class pick).
+    pub fn demo_card(name: &str) -> Option<Select> {
+        let mut s = Select::new(Progress::default());
+        let mut vet = Carried::new_character();
+        vet.exp = 20000;
+        vet.bonus.armor = 40.0;
+        let mut hero = HeroSave::new("BOB", 3, 2);
+        hero.store(3, 2, &vet, &Default::default());
+        let mut card = MemCard::in_memory();
+        if name != "load" {
+            card.create();
+            card.write(0, &hero);
+            card.write(3, &HeroSave::new("ANN", 1, 0));
+        }
+        s.card = card.clone();
+        let names = card.names();
+        for col in 0..4 {
+            s.join(Source::Device(col as u64))?;
+            let p = s.players[col].as_mut()?;
+            p.name = ["BOB", "ANN", "SAM", "JO"][col].into();
+            p.character = [3, 1, 4, 5][col];
+            p.colour = col;
+            p.motion_save = Motion::Character;
+            match (name, col) {
+                ("load", 0) => {
+                    p.state = State::Selecting(Motion::CardLoad);
+                    p.step = 0;
+                    p.yes_no();
+                }
+                ("load", 1) => {
+                    p.state = State::Selecting(Motion::NoData);
+                    p.step = 30;
+                }
+                ("load", 2) => {
+                    let mut c = card.clone();
+                    c.create();
+                    c.write(1, &hero);
+                    p.goto_files(Motion::PickLoad, &c.names(), &[], true);
+                }
+                ("load", _) => {
+                    p.state = State::Selecting(Motion::Loading);
+                    p.step = 2;
+                }
+                ("save", 0) => p.goto_card(Motion::CardSave),
+                ("save", 1) => {
+                    p.state = State::Selecting(Motion::Create);
+                    p.step = 0;
+                    p.yes_no();
+                }
+                ("save", 2) => p.goto_files(Motion::PickSave, &names, &[3], false),
+                ("save", _) => {
+                    p.state = State::Selecting(Motion::Writing);
+                    p.save_file = 0;
+                    p.step = 0;
+                    p.yes_no();
+                }
+                ("result", 0) => {
+                    p.state = State::Selecting(Motion::Loading);
+                    p.step = 50;
+                }
+                ("result", 1) => {
+                    p.state = State::Selecting(Motion::Writing);
+                    p.step = 50;
+                }
+                ("result", 2) => {
+                    p.state = State::Selecting(Motion::Create);
+                    p.step = 50;
+                }
+                ("result", _) => {
+                    p.state = State::Ready;
+                    p.set_name_banner();
+                }
+                ("char", 0) => {
+                    p.carried = Some(vet.clone());
+                    p.open_character_menu(DONE);
+                }
+                ("char", 1) => {
+                    p.state = State::Selecting(Motion::QuitConfirm);
+                    p.yes_no();
+                }
+                ("char", 2) => {
+                    p.apply_hero(hero.clone());
+                    p.state = State::Selecting(Motion::Class);
+                    p.entered_class = true;
+                    p.update_class_spec(true);
+                }
+                ("char", _) => {
+                    p.state = State::Selecting(Motion::Writing);
+                    p.save_file = 3;
+                    p.step = 2;
+                }
+                _ => return None,
+            }
+            p.update_panel();
+            if p.state == State::Ready {
+                let weapon = format!("S12_WEAP_{}", CLASSES[p.character & 7]);
+                p.set(SlotId::Weapon, weapon);
+                p.slot(SlotId::Weapon).size = Some((128.0, 320.0));
+            }
+        }
+        for _ in 0..10 {
+            s.serve();
+        }
+        Some(s)
+    }
+
     /// assign_controller + new_player: the first free column.
     pub fn join(&mut self, src: Source) -> Option<usize> {
         let col = self.players.iter().position(|p| p.is_none())?;
-        let mut menu = OptMenu::new(
+        let menu = OptMenu::new(
             vec![Item::new("New", NEW), Item::new("Load", LOAD)],
             -(64.0 + 128.0 * col as f32),
             0.0,
             0.667,
         );
-        // No memory card: Load is disabled.
-        menu.items[1].enabled = false;
         let mut slots: [Slot; 11] = Default::default();
         slots[SlotId::Panel as usize].tex = Some(format!("S1_plyr{}", col + 1));
         slots[SlotId::PanelLo as usize].tex = Some(format!("S2_plyr{}", col + 1));
@@ -288,6 +512,7 @@ impl Select {
             s.hidden = true;
         }
         let mut p = Player {
+            col,
             source: src,
             state: State::Selecting(Motion::Top),
             motion_save: Motion::Top,
@@ -302,6 +527,12 @@ impl Select {
             in_tower: false,
             slots,
             entered_class: false,
+            hero: HeroSave::new("", DEFAULT_CLASS, col),
+            carried: None,
+            saved: -1,
+            step: 0,
+            file_cursor: -1,
+            save_file: 0,
         };
         p.center_menu();
         self.players[col] = Some(p);
@@ -339,14 +570,18 @@ impl Select {
             .collect()
     }
 
+    #[cfg(test)]
     fn known(&self, class: usize) -> bool {
-        class < 8 || (class < 16 && self.progress.class_unlock & (1 << (class - 8)) != 0)
+        known_of(class, self.progress.class_unlock)
     }
 
     /// One 60 Hz tick. Returns the chosen (class, colour) list once everyone has
     /// locked in.
     pub fn update(&mut self, inputs: &[(Source, PlayerInput)]) -> Option<Vec<(String, String)>> {
         self.ticks += 1;
+        if self.debounce > 0 {
+            self.debounce -= 1;
+        }
         // Join: START on a pad that isn't playing.
         for (src, inp) in inputs {
             if inp.start_pressed && !self.players.iter().flatten().any(|p| p.source == *src) {
@@ -404,9 +639,37 @@ impl Select {
             .iter()
             .enumerate()
             .any(|(i, p)| i != col && matches!(p, Some(p) if p.state != State::Ready));
+        // verify_vmu_file_ok: files other joined players have claimed.
+        let claimed: Vec<usize> = self
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != col)
+            .filter_map(|(_, p)| usize::try_from(p.as_ref()?.file_cursor).ok())
+            .collect();
+        // Waiting on the background loader takes a game frame per step.
+        let frame = self.ticks.is_multiple_of(2);
         let progress = self.progress;
+        let ticks = self.ticks;
         let mut remove = false;
+        let sfx = &mut self.sfx;
+        let card = &mut self.card;
+        let party = &self.party;
+        let debounce = &mut self.debounce;
         let p = self.players[col].as_mut().unwrap();
+        let unlock = progress.class_unlock | p.hero.class_unlock;
+        // do_optmenu's sounds: A plays the select sound, B the exit sound.
+        let ev = |sfx: &mut Vec<String>, e: Event| {
+            match e {
+                Event::Chose(_) => sfx.push("S_OPTMENUSEL".into()),
+                Event::Back => sfx.push("S_OPTMENUEXIT".into()),
+                Event::Moved => sfx.push("S_OPTMENUMOVVRT".into()),
+                Event::Refused => sfx.push("S_NO".into()),
+                _ => {}
+            }
+            e
+        };
+        p.update_panel();
         match p.state {
             State::Ready => {
                 p.set_name_banner();
@@ -417,33 +680,31 @@ impl Select {
             }
             State::Selecting(Motion::Top) => {
                 p.motion_save = Motion::Top;
-                match p.menu.update(inp, 1, true) {
+                match ev(sfx, p.menu.update(inp, 1, true)) {
                     Event::Chose(NEW) => {
-                        self.sfx.push("S_OPTMENUSEL".into());
+                        p.new_player();
                         p.state = State::Selecting(Motion::Name);
-                        p.name.clear();
                         p.cursor = '@';
                         p.name_timer = 0;
                     }
-                    Event::Moved => self.sfx.push("S_OPTMENUMOVVRT".into()),
-                    Event::Refused => self.sfx.push("S_NO".into()),
-                    Event::Back => {
-                        self.sfx.push("S_OPTMENUEXIT".into());
-                        remove = true;
+                    Event::Chose(LOAD) => {
+                        p.step = 1;
+                        p.goto_card(Motion::CardLoad);
                     }
+                    Event::Back => remove = true,
                     _ => {}
                 }
             }
             State::Selecting(Motion::Name) => {
                 p.hide_select_blits();
-                if p.update_name(inp, &mut self.sfx, self.ticks) {
+                if p.update_name(inp, sfx, ticks) {
                     p.class = DEFAULT_CLASS;
+                    p.hero.name = p.name.clone();
                     p.state = State::Selecting(Motion::Class);
                     p.entered_class = false;
                 } else if p.name_timer == 0 && inp.b_pressed && p.name.is_empty() {
                     // B with nothing typed goes back to New / Load.
-                    p.state = State::Selecting(p.motion_save);
-                    p.center_menu();
+                    p.back_to_save();
                 }
             }
             State::Selecting(Motion::Class) => {
@@ -452,7 +713,7 @@ impl Select {
                 p.entered_class = true;
                 let old = (p.class, p.colour);
                 if dx != 0 {
-                    p.class = step(p.class, dx, progress);
+                    p.class = step(p.class, dx, unlock);
                     changed = true;
                 }
                 if dy != 0 {
@@ -460,31 +721,41 @@ impl Select {
                     changed = true;
                 }
                 if changed {
-                    self.sfx.push("S_OPTMENUCHAR".into());
+                    sfx.push("S_OPTMENUCHAR".into());
                     if old != (p.class, p.colour) {
-                        p.fly_out(old.0, known_of(old.0, progress));
+                        p.fly_out(old.0, known_of(old.0, unlock));
                     }
                 }
-                let known_class = known_of(p.class, progress);
+                let known_class = known_of(p.class, unlock);
                 p.update_class_spec(known_class);
                 if inp.b_pressed {
-                    self.sfx.push("S_OPTMENUEXIT".into());
+                    sfx.push("S_OPTMENUEXIT".into());
                     p.slots[SlotId::Portrait as usize].hidden = true;
-                    p.state = State::Selecting(p.motion_save);
                     if p.motion_save == Motion::Top {
-                        p.reset_top();
+                        // new_player: back to a blank hero.
+                        p.new_player();
                     }
+                    p.back_to_save();
                 } else if inp.attack_pressed {
                     if !known_class {
-                        self.sfx.push("S_NO".into());
+                        sfx.push("S_NO".into());
                     } else {
-                        self.sfx.push("S_OPTMENUSEL".into());
-                        p.character = p.class;
+                        sfx.push("S_OPTMENUSEL".into());
+                        p.change_player(p.class, party);
+                        // AudioWelcomeBack (S_WELCOME) for a new character,
+                        // AudioWelcome (S_WELCOMEBACK) for one with experience.
+                        let exp = p.carried.as_ref().map_or(0, |c| c.exp);
                         let welcome = format!(
-                            "VOICE:S_WELCOME+S_{}{}1S",
-                            COLOURS[p.colour], CLASSES[p.character]
+                            "VOICE:{}+S_{}{}1S",
+                            if exp == 0 {
+                                "S_WELCOME"
+                            } else {
+                                "S_WELCOMEBACK"
+                            },
+                            COLOURS[p.colour],
+                            CLASSES[p.character]
                         );
-                        self.sfx.push(welcome);
+                        sfx.push(welcome);
                         p.lock_in();
                         if p.in_tower {
                             p.open_character_menu(DONE);
@@ -498,38 +769,215 @@ impl Select {
             State::Selecting(Motion::Character) => {
                 p.motion_save = Motion::Character;
                 p.set_name_banner();
-                match p.menu.update(inp, 1, true) {
-                    Event::Chose(DONE) => {
-                        self.sfx.push("S_OPTMENUSEL".into());
-                        p.state = State::Ready;
+                match ev(sfx, p.menu.update(inp, 1, true)) {
+                    Event::Chose(DONE) => p.state = State::Ready,
+                    Event::Chose(SAVE) => p.goto_card(Motion::CardSave),
+                    Event::Chose(LOAD) => {
+                        // An unsaved hero is asked first.
+                        p.step = if p.saved != 0 { 1 } else { 0 };
+                        if p.step == 0 {
+                            p.state = State::Selecting(Motion::CardLoad);
+                            p.yes_no();
+                        } else {
+                            p.goto_card(Motion::CardLoad);
+                        }
                     }
                     Event::Chose(CHANGE) => {
-                        self.sfx.push("S_OPTMENUSEL".into());
                         p.class = p.character;
                         p.entered_class = false;
                         p.state = State::Selecting(Motion::Class);
                     }
                     Event::Chose(QUIT) => {
-                        self.sfx.push("S_OPTMENUSEL".into());
-                        p.state = State::Selecting(Motion::QuitConfirm);
-                        p.yes_no();
+                        if p.saved != 0 {
+                            remove = true;
+                        } else {
+                            p.state = State::Selecting(Motion::QuitConfirm);
+                            p.yes_no();
+                        }
                     }
-                    Event::Moved => self.sfx.push("S_OPTMENUMOVVRT".into()),
-                    Event::Refused => self.sfx.push("S_NO".into()),
                     _ => {}
                 }
             }
-            State::Selecting(Motion::QuitConfirm) => match p.menu.update(inp, 1, true) {
-                Event::Chose(YES) => {
-                    self.sfx.push("S_OPTMENUSEL".into());
-                    remove = true;
-                }
-                Event::Chose(NO) | Event::Back => {
-                    self.sfx.push("S_OPTMENUEXIT".into());
-                    p.open_character_menu(QUIT);
-                }
-                Event::Moved => self.sfx.push("S_OPTMENUMOVVRT".into()),
+            State::Selecting(Motion::QuitConfirm) => match ev(sfx, p.menu.update(inp, 1, true)) {
+                Event::Chose(YES) => remove = true,
+                Event::Chose(NO) | Event::Back => p.open_character_menu(DONE),
                 _ => {}
+            },
+            State::Selecting(Motion::CardLoad) if p.step == 0 => {
+                match ev(sfx, p.menu.update(inp, 1, true)) {
+                    Event::Chose(YES) => {
+                        p.step = 1;
+                        p.goto_card(Motion::CardLoad);
+                    }
+                    Event::Chose(NO) | Event::Back => p.back_to_save(),
+                    _ => {}
+                }
+            }
+            State::Selecting(Motion::CardLoad) => match ev(sfx, p.menu.update(inp, 1, true)) {
+                Event::Back => p.back_to_save(),
+                // setup_file_entries(pl, 1): no Gauntlet file is "no data".
+                Event::Chose(ENTRY) if card.has_save_file() => {
+                    p.goto_files(Motion::PickLoad, &card.names(), &claimed, true)
+                }
+                Event::Chose(ENTRY) => {
+                    p.state = State::Selecting(Motion::NoData);
+                    p.step = 1;
+                }
+                _ => {}
+            },
+            State::Selecting(Motion::NoData) => {
+                p.step += 1;
+                if p.step >= 120 {
+                    p.step = 0;
+                    p.back_to_save();
+                }
+            }
+            State::Selecting(Motion::PickLoad) => {
+                p.file_enables(&card.names(), &claimed, true);
+                match ev(sfx, p.menu.update(inp, 1, true)) {
+                    Event::Back => p.goto_card(Motion::CardLoad),
+                    Event::Chose(c) if c >= ENTRY && !claimed.contains(&((c - ENTRY) as usize)) => {
+                        p.state = State::Selecting(Motion::Loading);
+                        p.save_file = (c - ENTRY) as usize;
+                        p.file_cursor = c - ENTRY;
+                        p.step = 0;
+                    }
+                    _ => {}
+                }
+            }
+            State::Selecting(Motion::Loading) => match p.step {
+                0..=2 => p.step += frame as i32,
+                3 => match card.load(p.save_file) {
+                    Some(h) => {
+                        p.apply_hero(h);
+                        p.step = 4;
+                    }
+                    None => p.step = -1,
+                },
+                t if t >= 0 => {
+                    p.step += 1;
+                    if p.step >= 120 {
+                        // The loaded hero picks a class (its own highlighted).
+                        p.class = p.character;
+                        p.entered_class = false;
+                        p.state = State::Selecting(Motion::Class);
+                        p.in_tower = true;
+                        p.step = -1;
+                    }
+                }
+                _ => {
+                    p.step -= 1;
+                    if p.step <= -120 {
+                        p.step = -1;
+                        p.back_to_save();
+                    }
+                }
+            },
+            State::Selecting(Motion::CardSave) => match ev(sfx, p.menu.update(inp, 1, true)) {
+                Event::Back => p.back_to_save(),
+                Event::Chose(ENTRY) if card.has_save_file() => {
+                    p.goto_files(Motion::PickSave, &card.names(), &claimed, false)
+                }
+                Event::Chose(ENTRY) => {
+                    p.state = State::Selecting(Motion::Create);
+                    p.step = 0;
+                    p.yes_no();
+                }
+                _ => {}
+            },
+            State::Selecting(Motion::Create) => match p.step {
+                0 => {
+                    let mut e = p.menu.update(inp, 1, true);
+                    if card.has_save_file() {
+                        e = Event::Back;
+                    }
+                    match ev(sfx, e) {
+                        Event::Chose(YES) => p.step = 1,
+                        Event::Chose(NO) | Event::Back => p.goto_card(Motion::CardSave),
+                        _ => {}
+                    }
+                }
+                1 | 2 => p.step += frame as i32,
+                3 => {
+                    p.step = if card.free_bytes() < crate::save::SAVE_FILE_SIZE {
+                        1000
+                    } else if card.create() {
+                        4
+                    } else {
+                        -1
+                    }
+                }
+                t if t >= 1000 => {
+                    p.step += 1;
+                    if p.step >= 0x460 {
+                        p.step = 0;
+                        p.back_to_save();
+                    }
+                }
+                t if t >= 0 => {
+                    p.step += 1;
+                    if p.step >= 120 {
+                        p.step = 0;
+                        p.goto_files(Motion::PickSave, &card.names(), &claimed, false);
+                    }
+                }
+                _ => {
+                    p.step -= 1;
+                    if p.step <= -120 {
+                        p.step = 0;
+                        p.back_to_save();
+                    }
+                }
+            },
+            State::Selecting(Motion::PickSave) => {
+                p.file_enables(&card.names(), &claimed, false);
+                match ev(sfx, p.menu.update(inp, 1, true)) {
+                    Event::Back => p.goto_card(Motion::CardSave),
+                    Event::Chose(c) if c >= ENTRY && *debounce == 0 => {
+                        let k = (c - ENTRY) as usize;
+                        p.state = State::Selecting(Motion::Writing);
+                        p.save_file = k;
+                        p.file_cursor = c - ENTRY;
+                        p.step = 0;
+                        *debounce = 30;
+                        if !card.is_empty(k) {
+                            p.yes_no();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            State::Selecting(Motion::Writing) => match p.step {
+                0 if card.is_empty(p.save_file) => p.step = 1,
+                0 => match ev(sfx, p.menu.update(inp, 1, true)) {
+                    Event::Chose(YES) => p.step = 1,
+                    Event::Chose(NO) | Event::Back => {
+                        p.file_cursor = -1;
+                        p.goto_files(Motion::PickSave, &card.names(), &claimed, false);
+                    }
+                    _ => {}
+                },
+                1 | 2 => p.step += frame as i32,
+                3 => {
+                    let ok = p.write(card, party);
+                    // PlayerWriteSaveFile marks the hero saved either way.
+                    p.saved = 1;
+                    p.step = if ok { 4 } else { -1 };
+                }
+                t if t >= 0 => {
+                    p.step += 1;
+                    if p.step >= 120 {
+                        p.step = 0;
+                        p.open_character_menu(DONE);
+                    }
+                }
+                _ => {
+                    p.step -= 1;
+                    if p.step <= -120 {
+                        p.step = 0;
+                        p.back_to_save();
+                    }
+                }
             },
         }
         if remove {
@@ -581,6 +1029,7 @@ impl Select {
 /// A column-holder used while placing returning players in their own columns.
 fn placeholder(src: Source) -> Player {
     Player {
+        col: 0,
         source: src,
         state: State::Ready,
         motion_save: Motion::Top,
@@ -595,18 +1044,24 @@ fn placeholder(src: Source) -> Player {
         in_tower: false,
         slots: Default::default(),
         entered_class: false,
+        hero: HeroSave::new("", 0, 0),
+        carried: None,
+        saved: -1,
+        step: 0,
+        file_cursor: -1,
+        save_file: 0,
     }
 }
 
-fn known_of(class: usize, progress: Progress) -> bool {
-    class < 8 || (class < 16 && progress.class_unlock & (1 << (class - 8)) != 0)
+fn known_of(class: usize, unlock: u16) -> bool {
+    class < 8 || (class < 16 && unlock & (1 << (class - 8)) != 0)
 }
 
-fn step(class: usize, dir: i32, progress: Progress) -> usize {
+fn step(class: usize, dir: i32, unlock: u16) -> usize {
     let mut c = class as i32;
     loop {
         c = (c + dir).rem_euclid(17);
-        if c != 16 || progress.class_unlock & 0x100 != 0 {
+        if c != 16 || unlock & 0x100 != 0 {
             return c as usize;
         }
     }
@@ -698,33 +1153,32 @@ impl Player {
         self.menu.y = 128.0 - (h / 2.0).floor();
     }
 
-    fn reset_top(&mut self) {
-        self.menu.items = vec![Item::new("New", NEW), Item::new("Load", LOAD)];
-        self.menu.items[1].enabled = false;
-        self.menu.sel = 0;
+    /// The menu template: items centred on the column at scale 0.667.
+    fn column_menu(&mut self, items: Vec<Item>, sel: usize) {
+        self.menu.items = items;
+        self.menu.x = -(64.0 + 128.0 * self.col as f32);
+        self.menu.scale = 0.667;
+        self.menu.dy = 0.0;
+        self.menu.sel = sel;
         self.center_menu();
+    }
+
+    fn reset_top(&mut self) {
+        self.column_menu(vec![Item::new("New", NEW), Item::new("Load", LOAD)], 0);
         self.hide_select_blits();
     }
 
     /// motion 1: Save / Change / Load / Quit / Done, with `sel` preselected.
     fn open_character_menu(&mut self, sel: i32) {
-        self.menu.items = vec![
+        let items = vec![
             Item::new("Save", SAVE),
             Item::new("Change", CHANGE),
             Item::new("Load", LOAD),
             Item::new("Quit", QUIT),
             Item::new("Done", DONE),
         ];
-        // No memory card: Save and Load are disabled.
-        self.menu.items[0].enabled = false;
-        self.menu.items[2].enabled = false;
-        self.menu.sel = self
-            .menu
-            .items
-            .iter()
-            .position(|i| i.code == sel)
-            .unwrap_or(4);
-        self.center_menu();
+        let sel = items.iter().position(|i| i.code == sel).unwrap_or(4);
+        self.column_menu(items, sel);
         self.state = State::Selecting(Motion::Character);
         self.motion_save = Motion::Character;
         let weapon = format!("S12_WEAP_{}", CLASSES[self.character & 7]);
@@ -736,11 +1190,134 @@ impl Player {
         self.set_name_banner();
     }
 
-    /// Quit confirm: Yes / No with No preselected, top at y = 164.
+    /// setup_sel_menu mode 15: Yes / No with No preselected, top at y = 164.
     fn yes_no(&mut self) {
-        self.menu.items = vec![Item::new("Yes", YES), Item::new("No", NO)];
-        self.menu.sel = 1;
+        self.column_menu(vec![Item::new("Yes", YES), Item::new("No", NO)], 1);
         self.menu.y = 164.0;
+    }
+
+    /// Back to motion_state_save's menu.
+    fn back_to_save(&mut self) {
+        match self.motion_save {
+            Motion::Character => self.open_character_menu(DONE),
+            _ => {
+                self.state = State::Selecting(Motion::Top);
+                self.reset_top();
+            }
+        }
+    }
+
+    /// new_player: a blank hero in this column.
+    fn new_player(&mut self) {
+        self.name.clear();
+        self.class = DEFAULT_CLASS;
+        self.character = DEFAULT_CLASS;
+        self.in_tower = false;
+        self.hero = HeroSave::new("", DEFAULT_CLASS, self.colour);
+        self.carried = None;
+        self.saved = -1;
+        self.file_cursor = -1;
+    }
+
+    /// Motions 5 and 10: the memory card list, left-aligned at x + 4, y 70,
+    /// scale 0.6.
+    fn goto_card(&mut self, m: Motion) {
+        self.state = State::Selecting(m);
+        self.menu.items = vec![Item::new(CARD_SLOT, ENTRY)];
+        self.menu.x = 128.0 * self.col as f32 + 4.0;
+        self.menu.y = 70.0;
+        self.menu.scale = 0.6;
+        self.menu.dy = 4.0;
+        self.menu.sel = 0;
+    }
+
+    /// Motions 8 and 13: the save file's entries at x + 8, y 70, scale 0.6,
+    /// this player's last file selected.
+    fn goto_files(&mut self, m: Motion, names: &[String], claimed: &[usize], load: bool) {
+        self.state = State::Selecting(m);
+        self.menu.items = names
+            .iter()
+            .enumerate()
+            .map(|(k, n)| Item::new(n, ENTRY + k as i32))
+            .collect();
+        self.menu.x = 128.0 * self.col as f32 + 8.0;
+        self.menu.y = 70.0;
+        self.menu.scale = 0.6;
+        self.menu.dy = 4.0;
+        self.menu.sel = self.file_cursor.max(0) as usize % names.len().max(1);
+        self.file_enables(names, claimed, load);
+    }
+
+    /// setup_file_entries: entries another player has claimed are disabled,
+    /// and so are empty ones when loading.
+    fn file_enables(&mut self, names: &[String], claimed: &[usize], load: bool) {
+        for (k, it) in self.menu.items.iter_mut().enumerate() {
+            let empty = names
+                .get(k)
+                .is_some_and(|n| n.starts_with(crate::save::EMPTY));
+            it.enabled = !claimed.contains(&k) && (!load || !empty);
+        }
+    }
+
+    /// PlayerLoadSaveFile: the hero's name, colour and last class, with that
+    /// class's state.
+    fn apply_hero(&mut self, h: HeroSave) {
+        self.name = h.name.clone();
+        self.colour = h.colour & 3;
+        self.character = h.character.min(15);
+        self.class = self.character;
+        self.carried = h.carried(self.character);
+        self.hero = h;
+        self.saved = 1;
+    }
+
+    /// change_player: the class being left keeps its state in the save image
+    /// and the new class takes its own slot (a class never played starts
+    /// over at level 1).
+    fn change_player(&mut self, class: usize, party: &crate::progress::Progress) {
+        if let Some(c) = self.carried.take() {
+            self.hero.store(self.character, self.colour, &c, party);
+        }
+        self.character = class;
+        self.carried = self.hero.carried(class);
+    }
+
+    /// PlayerWriteSaveFile: store the live state and write the image.
+    fn write(&mut self, card: &mut MemCard, party: &crate::progress::Progress) -> bool {
+        let c = self.carried.clone().unwrap_or_else(Carried::new_character);
+        self.hero.name = self.name.clone();
+        self.hero.store(self.character, self.colour, &c, party);
+        card.write(self.save_file, &self.hero)
+    }
+
+    /// The state a class would play with: the live one for the current class.
+    fn class_carried(&self, class: usize) -> Option<Carried> {
+        if class == self.character && self.carried.is_some() {
+            self.carried.clone()
+        } else {
+            self.hero.carried(class)
+        }
+    }
+
+    /// update_class_spec outside the class pick: the weapon art shows behind
+    /// the character menu, quit confirm and memory card screens; the name
+    /// banner only on the character menu.
+    fn update_panel(&mut self) {
+        let State::Selecting(m) = self.state else {
+            return;
+        };
+        if matches!(m, Motion::Top | Motion::Name | Motion::Class) {
+            return;
+        }
+        let weapon = format!("S12_WEAP_{}", CLASSES[self.character & 7]);
+        let w = self.slot(SlotId::Weapon);
+        w.tex = Some(weapon);
+        w.hidden = false;
+        w.size = Some((128.0, 320.0));
+        self.slot(SlotId::Question).hidden = true;
+        if m != Motion::Character {
+            self.slot(SlotId::Name).hidden = true;
+        }
     }
 
     fn set_name_banner(&mut self) {
@@ -901,24 +1478,158 @@ impl Player {
             .slots
             .iter()
             .any(|s| matches!(s.anim, Anim::FlyOut | Anim::FadeIn | Anim::DelayedFadeOut));
+        let unlock = sel.progress.class_unlock | self.hero.class_unlock;
+        // do_sel_menu's message block: font 0, scale 1.2, white, centred on
+        // the column, lines 10 apart (None skips a line).
+        let lines = |s: &mut Scr, y: f32, ls: &[Option<&str>]| {
+            for (k, l) in ls.iter().enumerate() {
+                if let Some(l) = l {
+                    s.text(1.2, -cx, y + 10.0 * k as f32, FONT_8X8, 0xFFFFFF, 0, l);
+                }
+            }
+        };
+        const DO_NOT_TOUCH: [Option<&str>; 5] = [
+            Some("Do not touch"),
+            Some("the POWER"),
+            Some("button"),
+            Some("or the"),
+            Some("Memory Card!"),
+        ];
+        let card_text = |s: &mut Scr| {
+            // Mode 10's text, 3 lines above the card list's y 70 (less 8).
+            let ls = [
+                "The",
+                "Memory",
+                "Card",
+                "in Slot A",
+                "will now be",
+                "accessed.",
+                "Do not touch",
+                "the",
+                "POWER Button",
+                "or the",
+                "Memory Card",
+            ];
+            lines(s, 70.0 - 8.0 - 30.0, &ls.map(Some));
+        };
+        // Progress / result screens (modes 9, 12 and 14 past their prompts).
+        let working = |s: &mut Scr, head: [&str; 3]| {
+            lines(s, 100.0, &head.map(Some));
+            lines(s, 140.0, &DO_NOT_TOUCH);
+        };
         match self.state {
             State::Selecting(Motion::Top) | State::Selecting(Motion::Character) => {
                 self.menu.draw(s, 0);
                 if self.state == State::Selecting(Motion::Character) {
-                    s.text(1.2, -cx, 292.0, FONT_8X8, 0xFFFFFF, 0, "Level 1");
+                    let exp = self.carried.as_ref().map_or(0, |c| c.exp);
+                    let level = format!("Level {}", crate::stats::exp_to_level(exp));
+                    s.text(1.2, -cx, 292.0, FONT_8X8, 0xFFFFFF, 0, &level);
                 }
                 footer(s, x, self.state == State::Selecting(Motion::Top));
             }
             State::Selecting(Motion::QuitConfirm) => {
-                for (k, l) in ["Character", "Not Saved.", "Quit Anyway?"]
-                    .iter()
-                    .enumerate()
-                {
-                    s.text(1.2, -cx, 100.0 + 10.0 * k as f32, FONT_8X8, 0xFFFFFF, 0, l);
-                }
+                lines(
+                    s,
+                    100.0,
+                    &[Some("Character"), Some("Not Saved."), Some("Quit Anyway?")],
+                );
                 self.menu.draw(s, 0);
                 footer(s, x, false);
             }
+            State::Selecting(Motion::CardLoad) if self.step == 0 => {
+                let ls = [
+                    "Current",
+                    "Character",
+                    "Not Saved.",
+                    "Load new",
+                    "Character",
+                    "Anyway?",
+                ];
+                lines(s, 164.0 - 8.0 - 60.0, &ls.map(Some));
+                self.menu.draw(s, 0);
+                footer(s, x, false);
+            }
+            State::Selecting(Motion::CardLoad) | State::Selecting(Motion::CardSave) => {
+                self.menu.draw(s, 0);
+                card_text(s);
+                footer(s, x, true);
+            }
+            State::Selecting(Motion::NoData) => {
+                let ls = ["No Gauntlet", "save data on", "Memory", "Card."];
+                lines(s, 100.0, &ls.map(Some));
+                footer(s, x, false);
+            }
+            State::Selecting(Motion::PickLoad) => {
+                self.menu.draw(s, 0);
+                lines(
+                    s,
+                    70.0 - 8.0 - 20.0,
+                    &[Some("Choose a"), Some("File to Load")],
+                );
+                footer(s, x, true);
+            }
+            State::Selecting(Motion::PickSave) => {
+                self.menu.draw(s, 0);
+                let ls = ["Choose a", "Location to", "Write to"];
+                lines(s, 70.0 - 8.0 - 30.0, &ls.map(Some));
+                footer(s, x, true);
+            }
+            State::Selecting(Motion::Loading) => match self.step {
+                0..=3 => working(s, ["Loading from", "Memory", "Card..."]),
+                t if t >= 4 => lines(s, 100.0, &[Some("Load"), Some("Complete")]),
+                -1 => {}
+                _ => lines(s, 100.0, &[Some("Load"), Some("Failed!")]),
+            },
+            State::Selecting(Motion::Writing) => match self.step {
+                0 => {
+                    lines(
+                        s,
+                        100.0,
+                        &[Some("Overwrite"), Some("Existing"), Some("File?")],
+                    );
+                    if !sel.card.is_empty(self.save_file) {
+                        self.menu.draw(s, 0);
+                    }
+                    footer(s, x, false);
+                }
+                1..=3 => working(s, ["Writing to", "Memory", "Card..."]),
+                t if t >= 4 => lines(s, 100.0, &[Some("Save"), Some("Complete")]),
+                -1 => {}
+                _ => lines(s, 100.0, &[Some("Save"), Some("Failed!")]),
+            },
+            State::Selecting(Motion::Create) => match self.step {
+                0 => {
+                    let need = format!(
+                        "{} Blocks",
+                        crate::save::SAVE_FILE_SIZE / crate::save::BLOCK
+                    );
+                    let free =
+                        format!("{} Blocks Free", sel.card.free_bytes() / crate::save::BLOCK);
+                    let ls = [
+                        Some("No Gauntlet"),
+                        Some("save data on"),
+                        Some("Memory"),
+                        Some("Card."),
+                        None,
+                        Some("Create"),
+                        Some(need.as_str()),
+                        Some("Save File?"),
+                        None,
+                        Some(free.as_str()),
+                    ];
+                    lines(s, 100.0 - 50.0, &ls);
+                    self.menu.draw(s, 0);
+                    footer(s, x, false);
+                }
+                1..=3 => working(s, ["Creating", "Gauntlet", "Save File..."]),
+                t if t >= 1000 => lines(s, 100.0, &[Some("Insufficient"), Some("Free Space.")]),
+                t if t >= 4 => lines(s, 100.0, &[Some("Save File"), Some("Created.")]),
+                _ => lines(
+                    s,
+                    100.0,
+                    &[Some("Create"), Some("Save File"), Some("Failed!")],
+                ),
+            },
             State::Selecting(Motion::Name) => {
                 for (k, l) in ["Enter", "Your", "Name"].iter().enumerate() {
                     s.text(0.8, -cx, 64.0 + 26.0 * k as f32, FONT_32, 0xFFFFFF, 0, l);
@@ -940,7 +1651,8 @@ impl Player {
                 self.draw_name(s, col, sel.ticks);
             }
             State::Selecting(Motion::Class) => {
-                if sel.known(self.class) {
+                let known = known_of(self.class, unlock);
+                if known {
                     self.draw_stats(s, x);
                 }
                 if let (Some(l), Some(r)) = (s.ui.get("BUTTON_L"), s.ui.get("BUTTON_R")) {
@@ -948,7 +1660,7 @@ impl Player {
                     s.blit(r, x + 29.0, 232.0, 19.0, 19.0, 0);
                 }
                 s.text(1.2, x + 56.0, 236.0, FONT_8X8, 0xFFFFFF, 0, "Change");
-                if sel.known(self.class) {
+                if known {
                     footer(s, x, false);
                 }
             }
@@ -1012,7 +1724,15 @@ impl Player {
         if self.class == 16 {
             return;
         }
-        let stats = BASE_STATS[self.class];
+        // The class's level and attribute bonuses from the save image.
+        let c = self.class_carried(self.class);
+        let exp = c.as_ref().map_or(0, |c| c.exp);
+        let lvl = crate::stats::exp_to_level(exp) as f32;
+        let b = c.map(|c| c.bonus).unwrap_or_default();
+        let add = [b.fight, b.speed, b.armor, b.magic];
+        let stats: [i32; 4] = std::array::from_fn(|r| {
+            ((add[r] + (BASE_STATS[self.class][r] as f32 + (lvl - 1.0) * 5.0)) as i32).min(999)
+        });
         let mut best = 0;
         for r in 1..4 {
             if stats[r] > stats[best] {
@@ -1031,10 +1751,15 @@ impl Player {
             } else {
                 s.text(0.5, x + 81.0 - lw, y - 2.0, FONT_32, 0xFFFFFF, 0, label);
             }
-            let v = format!("{:03}", stats[r].min(999));
+            let v = format!("{:03}", stats[r]);
             s.text(0.5, x + 84.0, y, FONT_INITIALS, 0xFFFFFF, 0, &v);
         }
-        s.text(1.2, -(64.0 + x), 292.0, FONT_8X8, 0xFFFFFF, 0, "NEW");
+        let level = if exp > 0 {
+            format!("Level {}", lvl as u32)
+        } else {
+            "NEW".to_string()
+        };
+        s.text(1.2, -(64.0 + x), 292.0, FONT_8X8, 0xFFFFFF, 0, &level);
     }
 }
 
@@ -1102,6 +1827,303 @@ mod tests {
         let sel = Select::new(Progress::default());
         assert!(sel.known(7));
         assert!(!sel.known(8));
-        assert_eq!(step(15, 1, Progress::default()), 0);
+        assert_eq!(step(15, 1, 0), 0);
+    }
+
+    fn a() -> PlayerInput {
+        PlayerInput {
+            attack_pressed: true,
+            ..Default::default()
+        }
+    }
+    fn b() -> PlayerInput {
+        PlayerInput {
+            b_pressed: true,
+            ..Default::default()
+        }
+    }
+    fn stick(x: f32, y: f32) -> PlayerInput {
+        PlayerInput {
+            stick: Vec2::new(x, y),
+            ..Default::default()
+        }
+    }
+    fn idle(sel: &mut Select, n: usize) -> Option<Vec<(String, String)>> {
+        let mut out = None;
+        for _ in 0..n {
+            out = out.or(tick(sel, PlayerInput::default()));
+        }
+        out
+    }
+    fn motion(sel: &Select, col: usize) -> State {
+        sel.players[col].as_ref().unwrap().state
+    }
+    fn pl(sel: &Select, col: usize) -> &Player {
+        sel.players[col].as_ref().unwrap()
+    }
+
+    /// A hero back from a level: a level-5-ish Warrior with gold, and a party
+    /// that has done a few things.
+    fn veteran() -> (Select, Carried, crate::progress::Progress) {
+        let mut c = Carried::new_character();
+        c.exp = 5000;
+        c.level = crate::stats::exp_to_level(5000);
+        c.gold = 999;
+        c.keys = 2;
+        c.potions = vec![1, 1];
+        let mut progress = crate::progress::Progress::default();
+        progress.runes = 0x6;
+        progress.crystals[3] = 2;
+        progress.beaten[1] = 0b11;
+        let panels = [crate::hud::PanelInfo {
+            slot: 0,
+            name: "BOB".into(),
+            colour: 2,
+            class: 0,
+        }];
+        let sel = Select::from_game(&panels, &[Source::Keyboard]).with_party(Party {
+            card: MemCard::in_memory(),
+            carry: [Some(c.clone()), None, None, None],
+            heroes: Default::default(),
+            progress: progress.clone(),
+        });
+        (sel, c, progress)
+    }
+
+    /// From the character menu (Done selected) up to Save, then through the
+    /// card list, the create prompt and the file list to a written file.
+    fn save_to(sel: &mut Select, file: usize) {
+        for _ in 0..4 {
+            tick(sel, stick(0.0, 1.0));
+        }
+        assert_eq!(pl(sel, 0).menu.items[pl(sel, 0).menu.sel].code, SAVE);
+        tick(sel, a());
+        assert_eq!(motion(sel, 0), State::Selecting(Motion::CardSave));
+        assert_eq!(pl(sel, 0).menu.items[0].text, " SLOT  1");
+        tick(sel, a());
+        if !sel.card.has_save_file() {
+            // "No Gauntlet save data ... Create 15 Blocks Save File?" No is
+            // preselected.
+            assert_eq!(motion(sel, 0), State::Selecting(Motion::Create));
+            assert_eq!(pl(sel, 0).menu.sel, 1);
+            tick(sel, stick(0.0, 1.0));
+            tick(sel, a());
+            assert!((1..4).contains(&pl(sel, 0).step), "Creating...");
+            idle(sel, 30);
+            assert!(sel.card.has_save_file());
+            assert!(pl(sel, 0).step >= 4, "Save File Created.");
+        }
+        idle(sel, 35);
+        assert_eq!(motion(sel, 0), State::Selecting(Motion::PickSave));
+        for _ in 0..file {
+            tick(sel, stick(0.0, -1.0));
+        }
+        // The 30-tick debounce from an earlier save may still be running.
+        idle(sel, 16);
+        tick(sel, a());
+        assert_eq!(motion(sel, 0), State::Selecting(Motion::Writing));
+    }
+
+    #[test]
+    fn save_then_load_restores_the_hero() {
+        let (mut sel, carried, progress) = veteran();
+        assert_eq!(pl(&sel, 0).saved, 0);
+        save_to(&mut sel, 2);
+        idle(&mut sel, 30);
+        assert!(pl(&sel, 0).step >= 4, "Save Complete");
+        idle(&mut sel, 35);
+        // Back to the character menu with Done selected.
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Character));
+        assert_eq!(pl(&sel, 0).menu.items[pl(&sel, 0).menu.sel].code, DONE);
+        assert_eq!(pl(&sel, 0).saved, 1);
+        assert_eq!(sel.card.names()[2], "BOB");
+        assert!(sel.card.is_empty(0));
+        let card = sel.card().clone();
+
+        // A new game: New / Load, down to Load.
+        let mut sel = Select::with_first(Source::Keyboard).with_party(Party {
+            card,
+            ..Default::default()
+        });
+        tick(&mut sel, stick(0.0, -1.0));
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::CardLoad));
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::PickLoad));
+        let menu = &pl(&sel, 0).menu;
+        assert_eq!(menu.items.len(), crate::save::FILES);
+        assert!(!menu.items[0].enabled, "Empty entries can't be loaded");
+        assert!(menu.items[2].enabled);
+        // The cursor skips the empty entries.
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Loading));
+        assert_eq!(pl(&sel, 0).save_file, 2);
+        idle(&mut sel, 30);
+        assert!(pl(&sel, 0).step >= 4, "Load Complete");
+        assert_eq!(pl(&sel, 0).name, "BOB");
+        assert_eq!(pl(&sel, 0).colour, 2);
+        assert_eq!(pl(&sel, 0).saved, 1);
+        idle(&mut sel, 35);
+        // The loaded hero picks a class, their own highlighted.
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Class));
+        assert_eq!(pl(&sel, 0).class, 0);
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Character));
+        assert!(sel.sfx.iter().any(|s| s.starts_with("VOICE:S_WELCOMEBACK")));
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Ready);
+        let out = idle(&mut sel, 60);
+        assert_eq!(out, Some(vec![("WAR".to_string(), "RED".to_string())]));
+        assert_eq!(sel.carried(0), Some(carried));
+        let mut party = crate::progress::Progress::default();
+        party.crystals[3] = 3;
+        sel.merge_progress(&mut party);
+        assert_eq!(party.runes, progress.runes);
+        assert_eq!(party.beaten[1], progress.beaten[1]);
+        assert_eq!(party.crystals[3], 3, "the party's larger count stays");
+    }
+
+    #[test]
+    fn load_with_no_save_file() {
+        let mut sel = Select::with_first(Source::Keyboard);
+        tick(&mut sel, stick(0.0, -1.0));
+        tick(&mut sel, a());
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::NoData));
+        idle(&mut sel, 50);
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::NoData));
+        idle(&mut sel, 15);
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Top));
+        // B from the card list goes back too.
+        tick(&mut sel, stick(0.0, -1.0));
+        tick(&mut sel, a());
+        tick(&mut sel, b());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Top));
+    }
+
+    #[test]
+    fn quit_asks_only_when_not_saved() {
+        let (mut sel, _, _) = veteran();
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::QuitConfirm));
+        assert_eq!(pl(&sel, 0).menu.sel, 1, "No preselected");
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Character));
+
+        save_to(&mut sel, 0);
+        idle(&mut sel, 130);
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, a());
+        assert!(sel.players[0].is_none(), "a saved hero quits at once");
+    }
+
+    #[test]
+    fn load_over_an_unsaved_hero_asks_first() {
+        let (mut sel, _, _) = veteran();
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, stick(0.0, 1.0));
+        assert_eq!(pl(&sel, 0).menu.items[pl(&sel, 0).menu.sel].code, LOAD);
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::CardLoad));
+        assert_eq!(pl(&sel, 0).step, 0, "Current Character Not Saved.");
+        tick(&mut sel, b());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Character));
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, a());
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, a());
+        assert_eq!(pl(&sel, 0).step, 1);
+        assert_eq!(pl(&sel, 0).menu.items[0].text, " SLOT  1");
+    }
+
+    #[test]
+    fn overwrite_prompt_and_claimed_files() {
+        let (mut sel, _, _) = veteran();
+        save_to(&mut sel, 0);
+        idle(&mut sel, 130);
+        // Saving to the same file again asks first; No goes back to the list.
+        save_to(&mut sel, 0);
+        assert_eq!(pl(&sel, 0).step, 0);
+        assert_eq!(pl(&sel, 0).menu.items[0].text, "Yes");
+        assert_eq!(pl(&sel, 0).menu.sel, 1);
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::PickSave));
+        assert_eq!(pl(&sel, 0).file_cursor, -1);
+        // Yes overwrites.
+        idle(&mut sel, 16);
+        tick(&mut sel, a());
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, a());
+        assert!(
+            (1..4).contains(&pl(&sel, 0).step),
+            "Writing to Memory Card..."
+        );
+        idle(&mut sel, 130);
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Character));
+
+        // A second player can't pick the file the first one saved to.
+        sel.join(Source::Device(1));
+        let names = sel.card.names();
+        let p1 = sel.players[1].as_mut().unwrap();
+        p1.goto_files(Motion::PickSave, &names, &[], false);
+        sel.update(&[]);
+        let items = &pl(&sel, 1).menu.items;
+        assert!(!items[0].enabled);
+        assert!(items[1].enabled, "empty entries can be saved to");
+    }
+
+    #[test]
+    fn changing_class_uses_that_class_slot() {
+        let (mut sel, carried, _) = veteran();
+        // Change: the Warrior's state goes into the save image and the
+        // Archer starts over.
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, stick(0.0, 1.0));
+        assert_eq!(pl(&sel, 0).menu.items[pl(&sel, 0).menu.sel].code, CHANGE);
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Class));
+        for _ in 0..3 {
+            tick(&mut sel, stick(1.0, 0.0));
+        }
+        assert_eq!(pl(&sel, 0).class, 3);
+        tick(&mut sel, a());
+        assert_eq!(pl(&sel, 0).character, 3);
+        assert!(pl(&sel, 0).carried.is_none(), "a new character");
+        assert_eq!(pl(&sel, 0).hero.carried(0), Some(carried.clone()));
+        // And back: the Warrior is as he was.
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, stick(0.0, 1.0));
+        tick(&mut sel, a());
+        for _ in 0..3 {
+            tick(&mut sel, stick(-1.0, 0.0));
+        }
+        tick(&mut sel, a());
+        assert_eq!(pl(&sel, 0).carried, Some(carried));
+        // The Archer was stored as a level 1 character.
+        assert_eq!(pl(&sel, 0).hero.carried(3).map(|c| c.exp), None);
+    }
+
+    #[test]
+    fn ready_start_returns_to_the_character_menu() {
+        let (mut sel, _, _) = veteran();
+        sel.join(Source::Device(1));
+        let both = |sel: &mut Select, inp: PlayerInput| {
+            sel.update(&[(Source::Keyboard, inp)]);
+            sel.update(&[]);
+        };
+        both(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Ready);
+        both(
+            &mut sel,
+            PlayerInput {
+                start_pressed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Character));
     }
 }

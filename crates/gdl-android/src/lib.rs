@@ -24,6 +24,8 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         level: "levelA1".into(),
         players: Vec::new(),
         mute: false,
+        // The memory card lives in the app's private storage.
+        save_dir: app.internal_data_path(),
     };
     if let Err(e) = app::run_android(cfg, app) {
         log::error!("fatal: {e:#}");

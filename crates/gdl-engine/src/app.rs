@@ -13,6 +13,7 @@ use crate::input::{Input, PlayerInput, Source};
 use crate::menu::{self, Title};
 use crate::options::{Options, OptionsAction, Prefs};
 use crate::progress::Progress;
+use crate::save::{HeroSave, MemCard};
 use crate::scene::{Scene, CLEAR};
 use crate::screen::Scr;
 use crate::select::{Select, CLASSES, COLOURS};
@@ -35,6 +36,9 @@ pub struct Config {
     /// Players chosen on the command line; empty shows the title and join screens.
     pub players: Vec<(String, String)>,
     pub mute: bool,
+    /// Where the memory card's save file is kept (None: saves last only
+    /// for this run).
+    pub save_dir: Option<std::path::PathBuf>,
 }
 
 struct Playing {
@@ -48,6 +52,46 @@ struct Playing {
 /// Health, score, keys and potions carried from one level to the next.
 /// Indexed by slot (column), so players keep their stats whoever joins.
 type Carry = [Option<crate::game::Carried>; 4];
+
+/// Each column's save image (Player.save), kept between visits to player
+/// select.
+type Heroes = [Option<HeroSave>; 4];
+
+/// What player select starts with: the card, each column's carried state and
+/// save image, and the party's progress.
+fn party_for(
+    card: &MemCard,
+    carry: &Option<Carry>,
+    heroes: &Heroes,
+    progress: &Progress,
+) -> crate::select::Party {
+    crate::select::Party {
+        card: card.clone(),
+        carry: carry.clone().unwrap_or_default(),
+        heroes: heroes.clone(),
+        progress: progress.clone(),
+    }
+}
+
+/// player select opened from the tower: the players as they are now.
+fn party_in_game(
+    play: &Playing,
+    card: &MemCard,
+    heroes: &Heroes,
+    progress: &Progress,
+) -> crate::select::Party {
+    let mut carry: Carry = Default::default();
+    for (info, p) in play.panels.iter().zip(&play.game.players) {
+        carry[info.slot % 4] = Some(p.carried());
+    }
+    let mut progress = progress.clone();
+    progress.crystals = play.game.crystals;
+    progress.garg_items = play.game.garg_items;
+    progress.shards = play.game.shards;
+    progress.runes |= play.game.runes;
+    progress.legend_items |= play.game.legend_items;
+    party_for(card, &Some(carry), heroes, &progress)
+}
 
 enum Screen {
     /// The licence screen shown at power-on, for this many more ticks.
@@ -116,6 +160,9 @@ struct Running {
     /// the current level started (restored for players who die in it).
     carry: Option<Carry>,
     checkpoint: Option<Carry>,
+    /// The memory card in Slot A, and each column's save image.
+    card: MemCard,
+    heroes: Heroes,
     /// The current movie frame's texture.
     movie_tex: Option<crate::ui::Tex>,
     /// The menus' 3D arrow.
@@ -225,6 +272,8 @@ impl App {
             suspended: None,
             carry: None,
             checkpoint: None,
+            card: MemCard::open(self.cfg.save_dir.as_deref()),
+            heroes: Default::default(),
             movie_tex: None,
             cursor,
             hud,
@@ -510,12 +559,14 @@ impl App {
                     }
                     if let Some(src) = picked {
                         // A new game from the title: a new party with nothing done
-                        // (there are no saves to load yet).
+                        // (loaded heroes bring theirs in player select).
                         r.progress = Progress::default();
                         r.carry = None;
                         r.checkpoint = None;
                         r.suspended = None;
-                        next = Some(Screen::Select(Select::with_first(src)));
+                        r.heroes = Default::default();
+                        let party = party_for(&r.card, &None, &r.heroes, &r.progress);
+                        next = Some(Screen::Select(Select::with_first(src).with_party(party)));
                     } else if t.timed_out {
                         r.audio.stop();
                         r.attract = std::mem::take(&mut r.attract).after_title();
@@ -530,21 +581,25 @@ impl App {
                         r.audio.play(fs, &snd);
                     }
                     if escape || sel.leave {
+                        r.card = sel.card().clone();
                         next = Some(Screen::Title(Title::default()));
                     } else if sel.update(&all).is_some() {
                         r.sources = sel.sources();
                         let panels = sel.panels();
-                        // New players start fresh; returning ones keep their stats.
-                        let old = r.carry.take().unwrap_or_default();
+                        // New players start fresh; returning ones keep their stats,
+                        // and loaded heroes take their class's saved state.
                         let mut carry: Carry = Default::default();
                         for info in &panels {
                             carry[info.slot % 4] = Some(
-                                old[info.slot % 4]
-                                    .clone()
+                                sel.carried(info.slot % 4)
                                     .unwrap_or_else(crate::game::Carried::new_character),
                             );
                         }
                         r.carry = Some(carry);
+                        // A loaded hero's achievements join the party's.
+                        sel.merge_progress(&mut r.progress);
+                        r.heroes = sel.heroes();
+                        r.card = sel.card().clone();
                         // Player select always leads into the tower.
                         next = Some(Screen::Loading {
                             level: "levelL1".into(),
@@ -644,7 +699,11 @@ impl App {
                                 r.audio.play_streams(fs, &["tower".into()]);
                                 Screen::Playing { play, pause: None }
                             }
-                            None => Screen::Select(Select::from_game(panels, &r.sources)),
+                            None => {
+                                Screen::Select(Select::from_game(panels, &r.sources).with_party(
+                                    party_for(&r.card, &r.carry, &r.heroes, &r.progress),
+                                ))
+                            }
                         });
                     }
                 }
@@ -688,10 +747,10 @@ impl App {
                                 play.game.level_end = Some(LevelEnd::AllDead);
                             }
                             OptionsAction::ManageCharacter => {
-                                next = Some(Screen::Select(Select::from_game(
-                                    &play.panels,
-                                    &r.sources,
-                                )));
+                                let party = party_in_game(play, &r.card, &r.heroes, &r.progress);
+                                next = Some(Screen::Select(
+                                    Select::from_game(&play.panels, &r.sources).with_party(party),
+                                ));
                             }
                             // TODO: the shop and the inventory screen (shop.c).
                             OptionsAction::Shop | OptionsAction::Inventory => {
@@ -744,7 +803,8 @@ impl App {
                     {
                         // check_active_players: a new pad joins in the tower, which
                         // opens player select for it (init_player_select(1)).
-                        let mut sel = Select::from_game(&play.panels, &r.sources);
+                        let party = party_in_game(play, &r.card, &r.heroes, &r.progress);
+                        let mut sel = Select::from_game(&play.panels, &r.sources).with_party(party);
                         sel.join(src);
                         next = Some(Screen::Select(sel));
                     } else if let Some(owner) = (0..inputs.len())
