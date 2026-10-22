@@ -103,6 +103,10 @@ pub struct Boss {
     pub entity: Option<u64>,
     /// gBossPos: where it was placed.
     pub pos: Vec3,
+    /// The boss critter's floor-snapped spawn position (crit_inst+0x418,
+    /// set from the matrix translation in CritterInitInst): the camera's
+    /// attention source unless it tracks the boss.
+    pub home: Vec3,
     pub active: bool,
     pub dying: bool,
     pub dead: bool,
@@ -400,8 +404,10 @@ impl Game {
         }
         self.boss = Some(boss);
         let id = self.spawn_critter(fs, wad, None, pos, yaw, num_players);
+        let home = self.boss_critter().map_or(pos, |(e, _)| e.pos);
         if let Some(b) = self.boss.as_mut() {
             b.entity = id;
+            b.home = home;
         }
         // The meters: one per part whose type has flags & 4.
         if let Some((_, c)) = self.boss_critter() {
@@ -1882,7 +1888,12 @@ impl Game {
             cam.started = true;
             cam.settling = true;
         }
-        let boss = self.boss_critter().map(|(e, c)| (e.pos, e.yaw, c.init_yaw));
+        // The boss's movevec (crit_inst+0x4C): its position raised by its
+        // type's y_attn (hdr+0xB4, ProcessCritter), and its radius (hdr+0x78).
+        let boss = self.boss_critter().map(|(e, c)| {
+            let t = &c.wad.types[c.parts[0].ty];
+            (e.pos + Vec3::Y * t.y_attn, t.hht, c.init_yaw)
+        });
         let wiz = b
             .wizard
             .as_ref()
@@ -1923,7 +1934,7 @@ impl Game {
                 (k + Vec3::from(def.keyattn) - offs, k, 5.0)
             } else if dying {
                 (cam.attn - offs, cam.attn, 5.0)
-            } else if let Some((bp, _, _)) = boss {
+            } else if let Some((bp, brad, _)) = boss {
                 let src = if def.flags & 0x10 != 0 {
                     // TRACKALL: the centre of the players and the boss.
                     let mut lo = bp;
@@ -1936,9 +1947,9 @@ impl Game {
                 } else if def.flags & 1 != 0 {
                     bp
                 } else {
-                    b.pos
+                    b.home
                 };
-                (src, bp, 7.5)
+                (src, bp, brad)
             } else {
                 (cam.attn - offs, cam.attn, 5.0)
             };
@@ -2311,6 +2322,35 @@ mod tests {
             assert!(g.boss.as_ref().unwrap().active, "{lvl}: never woke");
             assert!(moves.len() >= 3, "{lvl}: only {moves:?}");
         }
+    }
+
+    /// Skorne's camera aims at his movevec (y_attn 24 above his feet in the
+    /// lava pit) plus BCAM's attn offset: the eye stays above the arena floor
+    /// with the hero on the carpet in view.
+    #[test]
+    fn skorne_camera_frames_the_arena() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelE2", &[("WAR", "RED")]).unwrap();
+        let hp0 = g.players[0].health;
+        for _ in 0..450 {
+            g.players[0].health = hp0;
+            let input = g.bot_input(0);
+            g.update(1.0 / 60.0, &[input]);
+        }
+        assert!(g.boss.as_ref().unwrap().active, "Skorne never woke");
+        let (eye, at, _) = g.boss_camera_view().expect("boss camera");
+        let hero = g.players[0].pos;
+        let fwd = (at - eye).normalize();
+        eprintln!("E2: eye {eye:?} at {at:?} hero {hero:?}");
+        assert!(
+            eye.y > hero.y + 5.0,
+            "eye {eye:?} below the floor ({hero:?})"
+        );
+        assert!(at.y > hero.y - 5.0, "aimed into the pit: {at:?}");
+        assert!(
+            point_view_dist(eye, fwd, hero + Vec3::Y * 2.5, 0.0) > 0.0,
+            "hero {hero:?} out of view"
+        );
     }
 
     fn wake(g: &mut Game) {
