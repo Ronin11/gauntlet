@@ -4,3 +4,4 @@
 *.iso
 *.rvz
 *.gcm
+/dist
