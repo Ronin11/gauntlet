@@ -813,7 +813,7 @@ pub struct MonsterClass {
 }
 
 impl MonsterClass {
-    fn model(&self, strength: usize) -> Option<usize> {
+    pub(crate) fn model(&self, strength: usize) -> Option<usize> {
         if (4..=6).contains(&strength) {
             if let Some(m) = self.models[strength] {
                 return Some(m);
@@ -1379,7 +1379,7 @@ impl Game {
 
     /// Load (once) the models of monster type `etype` from its MONSTERS
     /// directory: tier trees `<DESC>0..3`, the A/B/S variants and the generators.
-    fn monster_class(
+    pub(crate) fn monster_class(
         &mut self,
         fs: &GameFs,
         cache: &mut HashMap<String, Option<AssetFile>>,
@@ -1549,7 +1549,7 @@ impl Game {
     }
 
     /// A new monster of `class` at a tier, as init_enemy sets it up.
-    fn new_enemy(&self, class: usize, strength: usize, state: EnemyState) -> Kind {
+    pub(crate) fn new_enemy(&self, class: usize, strength: usize, state: EnemyState) -> Kind {
         let etype = self.classes[class].etype;
         let t = &crate::enemies::TYPES[etype.min(33)];
         Kind::Enemy {
@@ -3459,6 +3459,7 @@ impl Game {
             .collect();
         let mut damage: Vec<(usize, f32, u32)> = Vec::new();
         let mut bursts: Vec<(usize, Vec3)> = Vec::new();
+        let mut adds: Vec<(Vec3, Vec3)> = Vec::new();
         // Monster melee hits: (monster, player, damage).
         let mut melee: Vec<(usize, usize, f32)> = Vec::new();
         let mut pickups: Vec<(usize, PickupKind)> = Vec::new();
@@ -3986,6 +3987,9 @@ impl Game {
                         if let Some(m) = hit_model {
                             bursts.push((*m, to));
                         }
+                        if *flags & crate::critter::SHOT_ADDS != 0 {
+                            adds.push((to, *vel));
+                        }
                         if *splash > 0.0 {
                             for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                                 if *alive && (*pp - to).length() < *splash + PLAYER_RADIUS {
@@ -4168,10 +4172,13 @@ impl Game {
             }
         }
         for (pi, dmg, flags) in damage {
-            self.damage_player(pi, dmg, flags & !0x1000);
+            self.damage_player(pi, dmg, flags & !(0x1000 | crate::critter::SHOT_ADDS));
         }
         for (m, pos) in bursts {
             self.spawn_effect(m, pos, 0.0);
+        }
+        for (pos, vel) in adds {
+            self.boss_generate_enemy(pos, vel);
         }
         for (ei, pi, dmg) in melee {
             let dmg = if shrunk { dmg * 0.5 } else { dmg };

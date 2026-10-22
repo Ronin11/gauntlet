@@ -77,6 +77,8 @@ const PLAYER_REHIT: f32 = 0.25;
 const WAVE_SPEED: f32 = 90.0;
 /// [CHOICE] A projectile effect lives this long when its SFXX gives no maxlen.
 const SHOT_LIFE: f32 = 5.0;
+/// An enemy shot that brings Garm's escorts where it lands.
+pub const SHOT_ADDS: u32 = 0x8000_0000;
 
 /// One entry of a part's target list (CritterTargetInfo).
 #[derive(Clone, Copy, Debug)]
@@ -195,6 +197,8 @@ pub struct Critter {
     pub deleted: bool,
     /// The death has started (boss: BossDying sent).
     pub dying_sent: bool,
+    /// Its model (in Game::models).
+    pub model: Option<usize>,
 }
 
 impl PartialEq for Critter {
@@ -524,6 +528,7 @@ impl Critter {
             hitnode: None,
             deleted: false,
             dying_sent: false,
+            model: None,
             wad,
         }
     }
@@ -1756,9 +1761,15 @@ impl Game {
 
     /// A FIREBALL: an aimed (or ballistic) projectile carrying the damage.
     fn critter_fireball(&mut self, c: &mut Critter, pi: usize, d: &Damage, amount: f32, yaw: f32) {
+        let at = c.parts[pi].node_pos;
+        self.critter_fireball_at(c, pi, d, amount, yaw, at);
+    }
+
+    /// A FIREBALL from `from` (the move node, or a breaking colnode).
+    fn critter_fireball_at(&mut self, c: &mut Critter, pi: usize, d: &Damage, amount: f32, yaw: f32, from: Vec3) {
         let p = &c.parts[pi];
         let rot = Mat4::from_rotation_y(yaw);
-        let origin = p.node_pos + rot.transform_vector3(Vec3::from(d.offset));
+        let origin = from + rot.transform_vector3(Vec3::from(d.offset));
         let speed = if d.speed_min > 0.0 {
             let k = p.difficulty.clamp(0.5, 1.5);
             0.75 * (k - 0.5) * (d.speed_max - d.speed_min) + d.speed_min
@@ -1816,6 +1827,12 @@ impl Game {
                 self.sfx.push(s.snddesc.replace("%c", &self.world_letter().to_string()));
             }
         }
+        // Garm's GAR2GEN shots bring two GARM2 where they land
+        // (BossGenerateEnemy; marked with a bit C_DMG doesn't use).
+        let adds = usize::try_from(d.fx)
+            .ok()
+            .and_then(|i| c.wad.sfx.get(i))
+            .is_some_and(|s| s.fxdesc.to_ascii_uppercase().starts_with("GAR2GEN"));
         self.spawn(
             Kind::EnemyShot {
                 vel,
@@ -1823,7 +1840,7 @@ impl Game {
                 life,
                 splash: d.radius.max(0.0),
                 gravity,
-                flags: d.dmgtype,
+                flags: d.dmgtype | if adds { SHOT_ADDS } else { 0 },
                 hit_model,
             },
             model,
@@ -2197,16 +2214,24 @@ impl Game {
     fn break_colnode(&mut self, c: &mut Critter, pi: usize, ci: usize) {
         let w = c.wad.clone();
         let cn = &w.type_colnodes(c.parts[pi].ty)[ci];
+        // The node's destroy DAMG runs from where the node is (Garm's plates
+        // fire a GAR2GEN shot that brings his escorts).
         if cn.destroyidx >= 0 {
             if let Some(d) = w.damage.get(cn.destroyidx as usize) {
-                if d.fx >= 0 {
-                    let at = c
-                        .parts[pi]
-                        .colnode_nodes
-                        .get(ci)
-                        .copied()
-                        .flatten()
-                        .map_or(c.parts[pi].node_pos, |n| c.nodes[n].w_axis.truncate());
+                let at = c
+                    .parts[pi]
+                    .colnode_nodes
+                    .get(ci)
+                    .copied()
+                    .flatten()
+                    .map_or(c.parts[pi].node_pos, |n| c.nodes[n].w_axis.truncate());
+                if d.kind == 1 {
+                    // (The body yaw isn't at hand here; the spawn yaw is
+                    // within maxyaw of it.)
+                    let yaw = c.init_yaw;
+                    let amount = d.amount * self.tuning.damage;
+                    self.critter_fireball_at(c, pi, d, amount, yaw, at);
+                } else if d.fx >= 0 {
                     self.critter_sfx(c, d.fx as usize, at);
                 }
             }
@@ -2217,10 +2242,7 @@ impl Game {
         c.swapped[node] = true;
         if cn.flags & 4 != 0 {
             // DESTROY_CHILDREN: the nodes below go, and moves on them.
-            let Some(model) = self.entities.iter().find_map(|e| match &e.kind {
-                Kind::Critter(k) if k.id == c.id => e.model,
-                _ => None,
-            }) else {
+            let Some(model) = c.model else {
                 c.removed[node] = true;
                 return;
             };

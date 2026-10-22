@@ -398,6 +398,11 @@ impl Game {
                 self.item_model_pub(fs, &mut cache, &mut known, &dirs, n);
             }
         }
+        // Garm's escorts.
+        if level.boss == 44 {
+            let mut mcache = Default::default();
+            self.monster_class(fs, &mut mcache, 27);
+        }
         self.merge_item_models(known);
         if let Some(b) = self.boss.as_mut() {
             b.coin_models = coins;
@@ -486,6 +491,7 @@ impl Game {
         }
         c.visrad = 0.0;
         let midx = self.add_model_pub(model);
+        c.model = Some(midx);
         // Placed on the floor (CritterInitGeo).
         let mut p = pos;
         if let Some(g) = self.collision.ground_height(pos, pos.y + 4.0) {
@@ -513,11 +519,53 @@ impl Game {
         }
     }
 
+    /// Testing aid: the boss wakes (if asleep) and takes a fatal hit.
+    pub fn kill_boss(&mut self) {
+        self.boss_activate();
+        let Some((ei, _)) = self.boss_critter_mut() else { return };
+        let Kind::Critter(mut c) = std::mem::replace(&mut self.entities[ei].kind, Kind::Prop) else {
+            return;
+        };
+        for p in &mut c.parts {
+            if p.state == 0 {
+                p.state = 3;
+            }
+        }
+        let hp = c.parts[0].health.max(1.0);
+        self.critter_damage(&mut c, 0, hp * 100.0 + 1000.0, None, crate::critter::DMG_SUPER, Vec3::ZERO, None);
+        self.entities[ei].kind = Kind::Critter(c);
+    }
+
     /// The boss's model directory (for its health-meter textures).
     pub fn boss_model_dir(&self) -> Option<String> {
         let (_, c) = self.boss_critter()?;
         let d = &c.wad.descs[c.wad.types[c.parts[0].ty].descidx.max(0) as usize];
         Some(format!("MONSTERS/{}", d.name.to_ascii_uppercase()))
+    }
+
+    /// BossGenerateEnemy: Garm's shot landed; two GARM2 (strength 3) come
+    /// out of it, 3 units out at +-45 degrees, facing away.
+    pub(crate) fn boss_generate_enemy(&mut self, pos: Vec3, dir: Vec3) {
+        if self.boss.as_ref().is_none_or(|b| b.boss_type != 44 || b.dying) {
+            return;
+        }
+        let Some(class) = self.classes.iter().position(|c| c.etype == 27) else {
+            return;
+        };
+        let yaw = if dir.x.abs() + dir.z.abs() > 1e-3 { dir.x.atan2(dir.z) } else { 0.0 };
+        for a in [-FRAC_PI_2 * 0.5, FRAC_PI_2 * 0.5] {
+            let y = yaw + a;
+            let mut p = pos + Vec3::new(y.sin(), 0.0, y.cos()) * 3.0;
+            if let Some(g) = self.collision.ground_height(p, p.y + 4.0) {
+                p.y = g;
+            }
+            let model = self.classes[class].model(3);
+            let mut kind = self.new_enemy(class, 3, crate::game::EnemyState::Chase);
+            if let Kind::Enemy { recognized, .. } = &mut kind {
+                *recognized = true;
+            }
+            self.spawn(kind, model, p, y);
+        }
     }
 
     /// BossActivate: the fight starts (the boss becomes a target and the
@@ -1527,5 +1575,65 @@ mod tests {
         let (_, c) = g.boss_critter().unwrap();
         assert!(c.parts[2].health <= 0.0, "the lion's head: {}", c.parts[2].health);
         assert_eq!(g.legend_held & 2, 0, "the scimitar is used up");
+    }
+
+    /// Garm's armour plates take at most their share of its health, then
+    /// break (GARMD<node>); the left arm's hand attacks go with it. His
+    /// GAR2GEN shots bring GARM2 escorts.
+    #[test]
+    fn garm_plates_break_and_escorts_come() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelH4", &[("WAR", "RED")]).unwrap();
+        face_boss(&mut g, 25.0);
+        wake(&mut g);
+        let plate = |g: &Game| {
+            let (_, c) = g.boss_critter().unwrap();
+            let ci = c.wad.type_colnodes(0).iter().position(|n| n.node == "L_ARM").unwrap();
+            (ci, c.colliders().into_iter().find(|x| x.1 == ci).map(|x| x.2), c.parts[0].node_damage[ci])
+        };
+        let (ci, at, (_, cap)) = plate(&g);
+        let at = at.expect("L_ARM is hittable");
+        let hp0 = boss_health(&g);
+        for _ in 0..30 {
+            if plate(&g).1.is_none() {
+                break;
+            }
+            g.hit_from = plate(&g).1;
+            let t = boss_index(&g);
+            g.hit_entity(0, t, 60.0, Vec2::ZERO, false);
+        }
+        let (_, c) = g.boss_critter().unwrap();
+        // The plate absorbed at most its cap, then broke and was swapped.
+        assert!((c.parts[0].node_damage[ci].0 - cap).abs() < 1e-3);
+        assert!(hp0 - boss_health(&g) <= cap + 1e-3);
+        let node = c.parts[0].colnode_nodes[ci].unwrap();
+        assert!(c.swapped[node], "the L_ARM plate is broken");
+        let _ = at;
+        // Moves on the left hand (flag 0x10) are gone.
+        let moves = c.parts[0].moves(&c.wad);
+        let lost: Vec<String> = moves
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.flags & 0x10 != 0
+                    && c.parts[0].move_nodes[*i].is_some_and(|n| c.removed[n])
+            })
+            .map(|(_, m)| m.name.clone())
+            .collect();
+        assert!(!lost.is_empty(), "no hand attack lost");
+        // Escorts.
+        let mut escorts = 0;
+        for _ in 0..3600 {
+            g.players[0].health = 500.0;
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            escorts = escorts.max(
+                g.entities
+                    .iter()
+                    .filter(|e| matches!(e.kind, Kind::Enemy { etype: 27, .. }))
+                    .count(),
+            );
+        }
+        eprintln!("H4: lost {lost:?}, escorts {escorts}");
+        assert!(escorts >= 2, "no GARM2 escorts");
     }
 }
