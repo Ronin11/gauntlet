@@ -113,6 +113,16 @@ pub enum PlayerState {
     InTower,
 }
 
+/// A character's running totals (PlayerShopStat).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlayStats {
+    pub enemies_killed: u32,
+    pub generators_destroyed: u32,
+    pub gold_found: u32,
+    /// Seconds played.
+    pub playtime: f32,
+}
+
 /// What a player keeps from one level to the next (player_store_in_save).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Carried {
@@ -124,6 +134,7 @@ pub struct Carried {
     pub exp: u32,
     pub bonus: crate::stats::Atts,
     pub powerups: crate::powerups::Powerups,
+    pub stats: PlayStats,
 }
 
 impl Carried {
@@ -148,6 +159,7 @@ impl Player {
             exp: self.exp,
             bonus: self.bonus,
             powerups: self.powerups.clone(),
+            stats: self.stats,
         }
     }
 
@@ -161,6 +173,7 @@ impl Player {
         self.exp = c.exp;
         self.bonus = c.bonus;
         self.powerups = c.powerups.clone();
+        self.stats = c.stats;
         self.refresh_stats();
     }
 
@@ -271,6 +284,8 @@ pub struct Player {
     /// Each carried potion's colour, used last in first out.
     pub potion_colours: Vec<u8>,
     pub powerups: crate::powerups::Powerups,
+    /// Lifetime totals for the shop's tally and Final Stats (PlayerShopStat).
+    pub stats: PlayStats,
     /// What the active power-ups add up to this frame.
     pub fx: crate::powerups::Effects,
     pub keys: u32,
@@ -914,6 +929,7 @@ impl Game {
                 power: 0.0,
                 potion_colours: Vec::new(),
                 powerups: Default::default(),
+                stats: Default::default(),
                 fx: Default::default(),
                 keys: 0,
                 potions: 0,
@@ -1590,6 +1606,9 @@ impl Game {
                 p.powerups.tick(dt);
             }
             p.fx = p.powerups.effects();
+            if !in_tower {
+                p.stats.playtime += dt;
+            }
             p.refresh_stats();
             p.derived.speed = (p.derived.speed + p.fx.speed).min(12.5);
             p.derived.magic_power = (p.derived.magic_power + p.fx.magic).min(32.0);
@@ -2182,6 +2201,14 @@ impl Game {
         let e = &self.entities[t];
         if let Some(snd) = self.hit_sound(e, Self::is_destroyed(e)) {
             self.sfx.push(snd);
+        }
+        if r.killed {
+            let st = &mut self.players[pi].stats;
+            if r.generator {
+                st.generators_destroyed += 1;
+            } else {
+                st.enemies_killed += 1;
+            }
         }
         if r.hit {
             // PlayerDamagedEnemy / Item: exp by the monster's tier, five times as
@@ -2947,7 +2974,10 @@ impl Game {
                 }
                 PickupKind::Food(hp) => poisoned.push((pi, -hp)),
                 PickupKind::Key(n) => p.keys = (p.keys + n).min(MAX_KEYS),
-                PickupKind::Gold(v) => p.gold = (p.gold + v).min(99_999),
+                PickupKind::Gold(v) => {
+                    p.gold = (p.gold + v).min(99_999);
+                    p.stats.gold_found += v;
+                }
                 // Potions are used last in, first out.
                 PickupKind::Potion(c) => {
                     p.potions += 1;
