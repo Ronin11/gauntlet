@@ -32,8 +32,6 @@ const MAGIC_DAMAGE: f32 = 40.0;
 const MAGIC_TIME: f32 = 1.0;
 /// Turbo meter: fill per second, and the costs of the PWRB / PWRC moves.
 const TURBO_FILL: f32 = 2.0;
-const TURBO_B_COST: f32 = 40.0;
-const TURBO_C_COST: f32 = 100.0;
 /// player_max_health: 100 per level above 1 plus 500, at most 9999. A new
 /// character starts full at level 1.
 pub fn max_health(level: u32) -> f32 {
@@ -65,40 +63,11 @@ impl Rng {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum AttackPhase {
-    Windup,
-    Strike,
-    Recover,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PlayerState {
+    /// In play; what the hero does is the action machine's (`Player::act`).
     Normal,
-    /// An attack in progress, played at the animations' native rate like the original
-    /// (action.c): throws go wind-up -> release -> recover; melee swings chain through the
-    /// quick combo while attack is pressed, otherwise recover.
-    Attacking {
-        phase: AttackPhase,
-        ranged: bool,
-        /// Index into the quick-attack combo (melee only).
-        combo: u8,
-        hit_done: bool,
-        /// Attack pressed again during the strike: chain the next swing.
-        queued: bool,
-    },
     Dead {
         timer: f32,
-    },
-    /// B held: DEFEND1 then DEFEND2; hits taken are halved.
-    Defending,
-    /// A turbo attack (ATTPWRB / ATTPWRC); the player can't be hurt meanwhile.
-    Turbo {
-        full: bool,
-        hit_done: bool,
-    },
-    /// Using a potion: MAGICS, then the blast as MAGICR starts.
-    Magic {
-        released: bool,
     },
     /// do_exit: sinking and spinning into an exit (50 ticks), then gone.
     Exiting {
@@ -188,14 +157,7 @@ impl Player {
 impl PlayerState {
     /// In play: walking or attacking (state 1).
     pub fn active(&self) -> bool {
-        matches!(
-            self,
-            PlayerState::Normal
-                | PlayerState::Attacking { .. }
-                | PlayerState::Defending
-                | PlayerState::Turbo { .. }
-                | PlayerState::Magic { .. }
-        )
+        matches!(self, PlayerState::Normal)
     }
 }
 
@@ -393,51 +355,24 @@ pub struct Player {
     pub sumner_exp: u32,
     /// The power-up mini-inventory box.
     pub inv: crate::powerups::MiniInv,
-    walk_phase: u8,
+    /// The action machine: what the hero is doing and animating.
+    pub act: crate::paction::Action,
 }
 
 /// Animation sequence indices for a player model.
 pub struct PlayerSeqs {
     ready: usize,
-    walk: [usize; 2],
-    run: [usize; 2],
-    /// Quick-attack combo swings and the recovery played after each.
-    attack: Vec<(usize, Option<usize>)>,
     falling: Option<usize>,
     death: Option<usize>,
-    /// Throw: wind-up, release, recovery.
-    throw: Option<(Option<usize>, usize, Option<usize>)>,
-    defend: (Option<usize>, Option<usize>),
-    turbo: (Option<usize>, Option<usize>),
-    magic: (Option<usize>, Option<usize>),
 }
 
 impl PlayerSeqs {
     fn find(m: &Model) -> PlayerSeqs {
         let s = |n: &str| m.sequence(n);
-        let ready = s("READY").unwrap_or(0);
         PlayerSeqs {
-            ready,
-            walk: [s("WALK1").unwrap_or(ready), s("WALK2").unwrap_or(ready)],
-            run: [s("RUN1").unwrap_or(ready), s("RUN2").unwrap_or(ready)],
-            // As in action.c, the first and third swings share ATTQUICK3R.
-            attack: [
-                ("ATTQUICK1", "ATTQUICK3R"),
-                ("ATTQUICK2", "ATTQUICK2R"),
-                ("ATTQUICK3", "ATTQUICK3R"),
-            ]
-            .iter()
-            .filter_map(|(a, r)| Some((s(a)?, s(r))))
-            .collect(),
+            ready: s("READY").unwrap_or(0),
             falling: s("FALLING"),
             death: s("DEATH"),
-            throw: match s("THROW1") {
-                Some(t) => Some((s("THROW1S"), t, s("THROW1R"))),
-                None => s("SSHOT1").or(s("MAGICS")).map(|t| (None, t, None)),
-            },
-            defend: (s("DEFEND1"), s("DEFEND2")),
-            turbo: (s("ATTPWRB"), s("ATTPWRC")),
-            magic: (s("MAGICS"), s("MAGICR")),
         }
     }
 }
@@ -684,6 +619,17 @@ pub const CRYSTALS_NEEDED: [i32; 9] = [0, 15, 100, 125, 150, 175, 200, 225, 250]
 /// Gargoyle items the tower's snake, eagle and lion gates need.
 pub const GARG_NEEDED: [i32; 3] = [12, 20, 28];
 
+/// An angle wrapped into (-pi, pi].
+pub fn wrap_angle(a: f32) -> f32 {
+    let mut a = a % std::f32::consts::TAU;
+    if a > std::f32::consts::PI {
+        a -= std::f32::consts::TAU;
+    } else if a <= -std::f32::consts::PI {
+        a += std::f32::consts::TAU;
+    }
+    a
+}
+
 /// towerAllPlayersMetBossReq: enough of a colour found, or that colour done (-1).
 pub fn crystals_met(crystals: &[i32; 9], c: usize) -> bool {
     let n = crystals.get(c).copied().unwrap_or(0);
@@ -929,6 +875,13 @@ pub struct Game {
     pub rings: Vec<Ring>,
     /// Lightning-shield strikes waiting out their second, by (player, monster).
     shield_cooldown: HashMap<(usize, u64), f32>,
+    /// Damage-row re-hits waiting out their delay, by (player, target).
+    damg_cooldown: HashMap<(usize, u64), f32>,
+    /// 0 Easy, 1 Medium, 2 Hard.
+    pub difficulty: usize,
+    /// Each player model's action slots (InitActions) and class PDATA.
+    action_seqs: Vec<crate::paction::ActionSeqs>,
+    pdata: Vec<gdl_formats::pdata::PlayerData>,
     /// Item models loaded for the level, by item name.
     item_models: HashMap<String, Option<usize>>,
     /// A secret level's countdown: (total, seconds left).
@@ -1328,6 +1281,10 @@ impl Game {
             it_holder: None,
             rings: Vec::new(),
             shield_cooldown: HashMap::new(),
+            damg_cooldown: HashMap::new(),
+            difficulty,
+            action_seqs: Vec::new(),
+            pdata: Vec::new(),
             item_models: HashMap::new(),
             secret_timer: None,
             shards: 0,
@@ -1405,6 +1362,14 @@ impl Game {
         for (class, color) in classes {
             let m = Model::load_player(fs, class, color)?;
             game.player_seqs.push(PlayerSeqs::find(&m));
+            game.action_seqs
+                .push(crate::paction::ActionSeqs::new(&m.skeleton));
+            game.pdata.push(
+                fs.read(&format!("PDATA/{class}.WAD"))
+                    .ok()
+                    .and_then(|d| gdl_formats::pdata::PlayerData::parse(&d).ok())
+                    .unwrap_or_default(),
+            );
             game.models.push(m);
         }
         let starts = game.level.start_positions();
@@ -1452,7 +1417,7 @@ impl Game {
                 color: classes[i].1.to_string(),
                 sumner_exp: 0,
                 inv: Default::default(),
-                walk_phase: 0,
+                act: crate::paction::Action::new(),
             });
         }
         // Ranged-attack projectile: the class's throw model, else its weapon.
@@ -2403,10 +2368,15 @@ impl Game {
 
     fn update_players(&mut self, dt: f32, inputs: &[PlayerInput]) {
         let (fwd, right) = self.camera_basis();
-        let mut attacks: Vec<(usize, Vec3, f32)> = Vec::new();
-        let mut throws: Vec<(usize, Vec3, f32)> = Vec::new();
+        // Swings landing (player, damage multiplier, knockdown), throws (x size),
+        // potion blasts, breath and hammer power-ups, damage rows firing.
+        let mut swings: Vec<(usize, f32, bool)> = Vec::new();
+        let mut throws: Vec<(usize, Vec3, f32, f32)> = Vec::new();
         let mut rings: Vec<(usize, Vec3, u8)> = Vec::new();
-        let mut turbos: Vec<(usize, Vec3, f32, bool)> = Vec::new();
+        let mut breaths: Vec<usize> = Vec::new();
+        let mut hammers: Vec<usize> = Vec::new();
+        let mut damg: Vec<(usize, gdl_formats::pdata::DamageRow)> = Vec::new();
+        let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
         let in_tower = self.wave == Some(gdl_formats::wdata::TOWER_WAVE);
         let pu_rate = if self.boss.as_ref().is_some_and(|b| b.active && !b.dead) {
@@ -2416,11 +2386,21 @@ impl Game {
         };
         let mut it_cleared = false;
         // Things an attack can be aimed at, with their radius.
-        let mut targets: Vec<(Vec3, f32)> = self
+        // "Short" targets (small monsters, breakables) get kicks and low swings.
+        let mut targets: Vec<(Vec3, f32, bool)> = self
             .entities
             .iter()
             .filter(|e| e.alive && !matches!(e.kind, Kind::Critter(_)))
-            .filter_map(|e| Some((e.pos, Self::target_radius(e)?)))
+            .filter_map(|e| {
+                let short = match &e.kind {
+                    Kind::Enemy { etype, .. } => {
+                        crate::enemies::TYPES[(*etype).min(33)].height * 0.5 <= 2.0
+                    }
+                    Kind::Container { .. } => true,
+                    _ => false,
+                };
+                Some((e.pos, Self::target_radius(e)?, short))
+            })
             .collect();
         // Critters are aimed at by their colnodes (at the players' height).
         for e in self.entities.iter().filter(|e| e.alive) {
@@ -2430,10 +2410,14 @@ impl Game {
                 }
                 let feet = self.players.first().map_or(e.pos.y, |p| p.pos.y);
                 for (_, _, p, r) in c.colliders() {
-                    targets.push((Vec3::new(p.x, feet, p.z), r));
+                    targets.push((Vec3::new(p.x, feet, p.z), r, false));
                 }
                 let cp = c.coll_pos(0, e.pos, e.yaw);
-                targets.push((Vec3::new(cp.x, feet, cp.z), c.wad.types[c.parts[0].ty].rad));
+                targets.push((
+                    Vec3::new(cp.x, feet, cp.z),
+                    c.wad.types[c.parts[0].ty].rad,
+                    false,
+                ));
             }
         }
         for (i, p) in self.players.iter_mut().enumerate() {
@@ -2530,225 +2514,207 @@ impl Game {
                 }
                 continue;
             }
-            // The turbo meter fills slowly by itself (turbo moves spend it).
-            if !matches!(p.state, PlayerState::Turbo { .. }) {
-                p.power = (p.power + TURBO_FILL * dt).min(100.0);
+            use crate::paction::{act, bits, p as pa};
+            let ct = (p.class_id % 8) as u8;
+            // The stick as a world direction (camera relative), and the
+            // logical buttons (controls.c): held levels and new edges.
+            let wish = fwd * inp.stick.y + right * inp.stick.x;
+            let joymag = wish.length().min(1.0);
+            let joyang = if joymag > 0.0 {
+                wish.x.atan2(wish.y)
+            } else {
+                p.yaw
+            };
+            let mut levels = 0;
+            let mut edges = 0;
+            for (held, press, b) in [
+                (inp.attack, inp.attack_pressed, bits::ATK_QUICK),
+                (inp.slow, inp.slow_pressed, bits::ATK_SLOW),
+                (inp.turbo, inp.b_pressed, bits::TURBO | bits::DEFEND),
+                (inp.magic, inp.magic_pressed, bits::MAGIC),
+                (false, inp.charge_pressed, bits::CHARGE),
+                (inp.strafe, false, bits::STRAFE),
+                (inp.combo, false, bits::COMBO),
+            ] {
+                if held || press {
+                    levels |= b;
+                }
+                if press {
+                    edges |= b;
+                }
             }
+            let mut ctx = crate::paction::Ctx {
+                joymag,
+                stick_yaw: wrap_angle(joyang - p.yaw),
+                power: p.power,
+                potions: p.potions,
+                weapon: p.fx.weapon,
+                special: p.fx.special,
+                shield: p.fx.armor,
+                stat_armor: p.derived.armor,
+                char_type: ct,
+                // (Two-player combos need the partner's side; not yet.)
+                partner: false,
+                ..Default::default()
+            };
+            let ms = p.act.motion_state(levels, edges, &ctx);
+            p.act.tick_idle(1);
 
-            // Moves in progress.
-            match p.state {
-                PlayerState::Defending => {
-                    if !inp.turbo {
-                        p.state = PlayerState::Normal;
-                    } else if p.animator.finished {
-                        if let Some(d2) = seqs.defend.1 {
-                            p.animator.play(d2);
-                        }
-                    }
-                }
-                PlayerState::Turbo { full, hit_done } => {
-                    let frames = model.skeleton.sequences[p.animator.seq].frame_count.max(1) as f32;
-                    if !hit_done && p.animator.frame >= frames * 0.4 {
-                        p.state = PlayerState::Turbo {
-                            full,
-                            hit_done: true,
-                        };
-                        turbos.push((i, p.pos, p.yaw, full));
-                        p.power -= if full { TURBO_C_COST } else { TURBO_B_COST };
-                        p.power = p.power.max(0.0);
-                    }
-                    if p.animator.finished {
-                        p.state = PlayerState::Normal;
-                    }
-                }
-                PlayerState::Magic { released } => {
-                    if !released && p.animator.finished {
-                        // The blast goes off as the release begins.
-                        p.state = PlayerState::Magic { released: true };
-                        let colour = p.potion_colours.pop().unwrap_or(0);
-                        rings.push((i, p.pos, colour));
-                        match seqs.magic.1 {
-                            Some(r) => p.animator.restart(r),
-                            None => p.state = PlayerState::Normal,
-                        }
-                    } else if released && p.animator.finished {
-                        p.state = PlayerState::Normal;
-                    }
-                }
-                _ => {}
+            // PlayerGetTarget: the nearest thing in the cone around the heading
+            // (the stick, else the facing), measured to its surface.
+            let heading = if joymag > 0.0 { joyang } else { p.yaw };
+            let hdir = Vec2::new(heading.sin(), heading.cos());
+            let cone = if self.difficulty == 0 { 0.5 } else { 0.707 };
+            let found = targets
+                .iter()
+                .filter(|(t, _, _)| (t.y - p.pos.y).abs() < 5.0)
+                .filter_map(|(t, r, short)| {
+                    let d = Vec2::new(t.x - p.pos.x, t.z - p.pos.z);
+                    let surf = d.length() - r;
+                    (surf < TARGET_RANGE && (d.length() < 0.5 || d.normalize().dot(hdir) >= cone))
+                        .then_some((surf, d, *short))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let (tdist, attack_yaw, short) = match found {
+                Some((dist, d, short)) => (dist, d.x.atan2(d.y), short),
+                None => (TARGET_RANGE, p.yaw, false),
+            };
+            // Strafing and blocking keep the stick's direction.
+            let attack_yaw =
+                if p.act.hud & 0xC000 != 0 || levels & (bits::STRAFE | bits::DEFEND) != 0 {
+                    heading
+                } else {
+                    attack_yaw
+                };
+            ctx.melee_yaw = wrap_angle(attack_yaw - p.yaw);
+            let r = PLAYER_RADIUS;
+            let bias = if matches!(ms, 0x0F | 0x10) { 1.0 } else { 0.0 };
+            let mut coll = if short && tdist < 2.0 + r { 2 } else { 0 };
+            coll |= if tdist < 1.0 + r + bias {
+                1
+            } else if tdist < 2.0 + r + bias {
+                4
+            } else {
+                8
+            };
+            ctx.coll = coll;
+            if let Some(m) = p.act.request(ms, &ctx) {
+                posts.push((m, i));
             }
-            let free = matches!(p.state, PlayerState::Normal | PlayerState::Defending);
+            // A step swing turns by the stick, not the target.
+            if p.act.next == pa::STEP {
+                ctx.melee_yaw = ctx.stick_yaw;
+            }
+            p.act.do_action(&self.action_seqs[p.model], &ctx, dt);
 
-            // X: use a potion (P_USE_MAGIC).
-            if inp.magic_pressed && free && p.potions > 0 {
+            // The bits the action fired.
+            let bits_now = std::mem::take(&mut p.act.act_bits);
+            if bits_now & 0xFE != 0 {
+                let (mult, knock) = if bits_now & 0xF0 != 0 {
+                    // Power swings: x3 and knockdown; the move's turbo is paid.
+                    p.power = (p.power - p.act.coll_score).max(0.0);
+                    p.act.coll_score = 0.0;
+                    (3.0, true)
+                } else if bits_now & act::HIT2 != 0 {
+                    (2.0, true)
+                } else {
+                    (1.0, bits_now & act::KICK != 0)
+                };
+                swings.push((i, mult, knock));
+            }
+            if bits_now & act::THROW != 0 {
+                throws.push((i, p.pos, attack_yaw, 1.0));
+            }
+            if bits_now & act::PWRA_THROW != 0 {
+                throws.push((i, p.pos, attack_yaw, 2.0));
+            }
+            if bits_now & (act::SUPER_SHOT | act::FIREL | act::FIRER) != 0 {
+                throws.push((i, p.pos, attack_yaw, 1.0));
+            }
+            if bits_now & act::USE_MAGIC != 0 && p.potions > 0 {
                 p.potions -= 1;
                 self.sfx.push("S_POTION1".into());
-                match seqs.magic.0 {
-                    Some(m) => {
-                        p.state = PlayerState::Magic { released: false };
-                        p.animator.restart(m);
-                        p.animator.speed = 1.0;
-                    }
-                    None => {
-                        let colour = p.potion_colours.pop().unwrap_or(0);
-                        rings.push((i, p.pos, colour));
-                    }
-                }
             }
-            // B held + A: a turbo attack, if the meter allows (PWRC at 100, PWRB
-            // from 40); B alone blocks.
-            if inp.turbo && inp.attack_pressed && free && p.power >= TURBO_B_COST {
-                let full = p.power >= TURBO_C_COST;
-                let seq = if full {
-                    seqs.turbo.1.or(seqs.turbo.0)
-                } else {
-                    seqs.turbo.0
-                };
-                if let Some(seq) = seq {
-                    p.state = PlayerState::Turbo {
-                        full,
-                        hit_done: false,
+            if bits_now & (act::MAGIC_RELEASE | act::THROW_MAGIC_RELEASE) != 0 {
+                let colour = p.potion_colours.pop().unwrap_or(0);
+                rings.push((i, p.pos, colour));
+            }
+            if bits_now & act::BREATHE != 0 {
+                breaths.push(i);
+            }
+            if bits_now & act::HAMMER != 0 {
+                hammers.push(i);
+            }
+            // PWRA / 360 / PWRB / PWRC damage rows fire on their frames.
+            let frame = p.act.anim.frame;
+            let rows = &self.pdata[p.model].rows;
+            let firing: Vec<i16> = match p.act.cur {
+                pa::PWRA_CLOSE => vec![rows.turbo_a_close],
+                pa::PWRA_LOW => vec![rows.turbo_a_low],
+                pa::PWRA_MED => vec![rows.turbo_a_step],
+                pa::A360 => vec![rows.turbo_a_360],
+                pa::PWRA_THROW => vec![rows.turbo_a_throw],
+                pa::PWRB => vec![rows.turbo_b],
+                pa::PWRC => vec![rows.turbo_c1, rows.turbo_c2],
+                _ => vec![],
+            };
+            let (t0, t1) = (p.act.prev_frame, frame);
+            for first in firing {
+                for row in self.pdata[p.model].chain(first) {
+                    let sf = row.startframe as f32;
+                    let ef = if row.endframe < 0 || row.flags & 0x80 != 0 {
+                        sf
+                    } else {
+                        row.endframe as f32 + 1.0
                     };
-                    p.animator.restart(seq);
-                    p.animator.speed = 1.0;
+                    if t1 >= sf && t0 < ef {
+                        if row.amount != 0.0 {
+                            p.power = (p.power - p.act.coll_score).max(0.0);
+                            p.act.coll_score = 0.0;
+                        }
+                        damg.push((i, row.clone()));
+                    }
                 }
-            } else if inp.turbo && p.state == PlayerState::Normal {
-                if let Some(d1) = seqs.defend.0 {
-                    p.state = PlayerState::Defending;
-                    p.animator.restart(d1);
-                    p.animator.speed = 1.0;
-                }
+            }
+            p.act.prev_frame = frame;
+            // The meter fills while not in a turbo move; a charge drains it.
+            if p.act.action < 11 {
+                p.power = (p.power + TURBO_FILL * dt).min(100.0);
+            }
+            if p.act.cur == pa::SHOVE {
+                p.power = (p.power - 20.0 * dt).max(0.0);
             }
 
-            // Attacks interrupt movement until the swing finishes.
-            let wants_attack = (inp.attack_pressed || inp.attack) && !inp.turbo;
-            let mut start_combo = None;
-            if let PlayerState::Attacking {
-                phase,
-                ranged,
-                combo,
-                hit_done,
-                queued,
-            } = &mut p.state
-            {
-                let frames = model.skeleton.sequences[p.animator.seq].frame_count.max(1) as f32;
-                match *phase {
-                    AttackPhase::Windup => {
-                        if p.animator.finished {
-                            if let Some((_, release, _)) = seqs.throw {
-                                *phase = AttackPhase::Strike;
-                                p.animator.restart(release);
-                            }
-                        }
-                    }
-                    AttackPhase::Strike => {
-                        if inp.attack_pressed {
-                            *queued = true;
-                        }
-                        // Thrown weapons leave the hand as the release begins; swings
-                        // connect partway through.
-                        let hit_at = if *ranged { 0.0 } else { frames * 0.4 };
-                        if !*hit_done && p.animator.frame >= hit_at {
-                            *hit_done = true;
-                            if *ranged {
-                                throws.push((i, p.pos, p.yaw));
-                            } else {
-                                attacks.push((i, p.pos, p.yaw));
-                            }
-                        }
-                        if p.animator.finished {
-                            let recover = if *ranged {
-                                seqs.throw.and_then(|t| t.2)
-                            } else {
-                                seqs.attack.get(*combo as usize).and_then(|a| a.1)
-                            };
-                            if !*ranged && (*queued || inp.attack) {
-                                start_combo = Some(*combo + 1);
-                            } else if let Some(r) = recover {
-                                *phase = AttackPhase::Recover;
-                                p.animator.restart(r);
-                            } else {
-                                p.state = PlayerState::Normal;
-                            }
-                        }
-                    }
-                    AttackPhase::Recover => {
-                        // A new attack cuts the recovery short.
-                        if wants_attack {
-                            start_combo = Some(if *ranged { 0 } else { *combo + 1 });
-                        } else if p.animator.finished {
-                            p.state = PlayerState::Normal;
-                        }
-                    }
-                }
-                if start_combo.is_some() {
-                    p.state = PlayerState::Normal;
+            // PlayerMotion: move and turn with the scales the action set.
+            let a = &p.act;
+            let mut movement = joymag * a.stick_scale;
+            let mut mdir = joyang;
+            if a.cur == pa::SHOVE {
+                movement = 1.0;
+                if joymag < 0.25 {
+                    mdir = p.yaw;
                 }
             }
-            if wants_attack && p.state == PlayerState::Normal && !seqs.attack.is_empty() {
-                // Aim with the stick if it's held, then melee the target in reach or
-                // throw (PlayerGetTarget: the nearest thing in the forward cone,
-                // measured from its surface).
-                let aim = fwd * inp.stick.y + right * inp.stick.x;
-                if aim.length() > 0.3 {
-                    p.yaw = aim.x.atan2(aim.y);
-                }
-                let facing = Vec2::new(p.yaw.sin(), p.yaw.cos());
-                let near = targets
-                    .iter()
-                    .filter(|(t, _)| (t.y - p.pos.y).abs() < 5.0)
-                    .filter_map(|(t, r)| {
-                        let d = Vec2::new(t.x - p.pos.x, t.z - p.pos.z);
-                        let surf = d.length() - r;
-                        (surf < TARGET_RANGE
-                            && (d.length() < 0.5 || d.normalize().dot(facing) >= AIM_CONE))
-                            .then_some(surf)
-                    })
-                    .fold(f32::MAX, f32::min);
-                let in_reach = near < MELEE_REACH;
-                let throw = seqs.throw.filter(|_| !in_reach && p.proj_model.is_some());
-                let (phase, seq, combo) = match throw {
-                    Some((Some(windup), _, _)) => (AttackPhase::Windup, windup, 0),
-                    Some((None, release, _)) => (AttackPhase::Strike, release, 0),
-                    None => {
-                        // Chained swings alternate 2 and 3 after the opener, as in the original.
-                        let n = seqs.attack.len() as u8;
-                        let c = match start_combo.unwrap_or(0) {
-                            c if c < n => c,
-                            c => 1 + (c - 1) % (n - 1).max(1),
-                        }
-                        .min(n - 1);
-                        (AttackPhase::Strike, seqs.attack[c as usize].0, c)
-                    }
-                };
-                p.state = PlayerState::Attacking {
-                    phase,
-                    ranged: throw.is_some(),
-                    combo,
-                    hit_done: false,
-                    queued: false,
-                };
-                p.animator.restart(seq);
-                // Rapid fire plays the throw at 1 / 0.75 speed.
-                p.animator.speed = if throw.is_some() && p.fx.weapon & crate::powerups::W_RAPID != 0
-                {
-                    1.0 / 0.75
-                } else {
-                    1.0
-                };
+            let lunge = joymag == 0.0
+                && ((ct == 0 && matches!(a.cur, pa::PWRA_CLOSE | pa::PWRA_MED))
+                    || (pa::STEP..=pa::STRAFE_ATKR2).contains(&a.cur));
+            if lunge {
+                movement = 0.5;
+                mdir = p.yaw;
             }
-
-            let wish = fwd * inp.stick.y + right * inp.stick.x;
-            let mag = wish.length().min(1.0);
-            let moving = mag > 0.05 && p.state == PlayerState::Normal;
-            if mag > 0.05 && matches!(p.state, PlayerState::Normal | PlayerState::Defending) {
-                p.yaw = wish.x.atan2(wish.y);
+            // Blocking and strafing don't turn; attacks face their target.
+            let mut head = if movement > 0.0 { mdir } else { p.yaw };
+            if matches!(ms, 2..=6 | 9..=12 | 0x11..=0x14) {
+                head = p.yaw;
             }
+            if (1..=10).contains(&a.action) && a.action != 7 && movement == 0.0 {
+                head = attack_yaw;
+            }
+            let turn = 15.707_963 * dt * a.turn_scale;
+            p.yaw += wrap_angle(head - p.yaw).clamp(-turn, turn);
+            let speed = a.move_scale * p.derived.speed * movement;
+            let moving = speed > 0.0;
             if moving {
-                // PlayerMotion: the speed stat in units/s times the stick, 1.3x when
-                // running (stick past 0.75).
-                let run = if mag > 0.75 { 1.3 } else { 1.0 };
-                let speed = p.derived.speed * mag * run;
                 let dir = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
                 let target = p.pos + dir * speed * dt;
                 // Don't walk off into the void: require ground within reach.
@@ -2766,28 +2732,14 @@ impl Game {
                 p.pos = self.cam_focus + Vec3::Y * 2.0;
                 p.vy = 0.0;
             }
-
-            if p.state == PlayerState::Normal {
-                if !p.on_ground && p.vy < -15.0 {
-                    if let Some(f) = seqs.falling {
-                        p.animator.play(f);
-                    }
-                } else if moving {
-                    let set = if mag > 0.75 { seqs.run } else { seqs.walk };
-                    if !set.contains(&p.animator.seq) {
-                        p.walk_phase = 0;
-                        p.animator.restart(set[0]);
-                    } else if p.animator.finished {
-                        p.walk_phase ^= 1;
-                        p.animator.restart(set[p.walk_phase as usize]);
-                    }
-                    p.animator.speed = 1.0;
-                } else {
-                    p.animator.play(seqs.ready);
-                    p.animator.speed = 1.0;
-                }
+            // The model shows the action's animation (falling while airborne).
+            if !p.on_ground && p.vy < -15.0 && seqs.falling.is_some() {
+                p.animator.play(seqs.falling.unwrap_or(0));
+                p.animator.update(&model.skeleton, dt);
+            } else {
+                p.animator.seq = p.act.anim.seq;
+                p.animator.frame = p.act.anim.frame;
             }
-            p.animator.update(&model.skeleton, dt);
         }
         // Players don't overlap each other.
         for a in 0..self.players.len() {
@@ -2829,8 +2781,35 @@ impl Game {
         if it_cleared {
             self.it_holder = None;
         }
-        for (pi, pos, yaw) in attacks {
-            self.player_attack(pi, pos, yaw);
+        for (m, pi) in posts {
+            self.post(m, Some(pi), &[]);
+        }
+        for (pi, mult, knock) in swings {
+            let (pos, yaw) = (self.players[pi].pos, self.players[pi].yaw);
+            self.player_attack(pi, pos, yaw, mult, knock);
+        }
+        for pi in breaths {
+            use crate::powerups as pu;
+            if self.players[pi].powerups.use_one(pu::SPECIAL, pu::S_BREATH)
+                || self.players[pi].fx.special & 0x400 != 0
+            {
+                let (pos, yaw) = (self.players[pi].pos, self.players[pi].yaw);
+                let front = pos + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 10.0;
+                self.area_hit(pi, front, 20.0, 40.0 * ELEMENT_BONUS);
+            }
+        }
+        for pi in hammers {
+            if self.players[pi]
+                .powerups
+                .use_one(crate::powerups::WEAPON, crate::powerups::W_HAMMER)
+            {
+                self.sfx.push("S_HAMMER|S_EXPLODE1".into());
+                let pos = self.players[pi].pos;
+                self.area_hit(pi, pos, 35.0, 100.0);
+            }
+        }
+        for (pi, row) in damg {
+            self.fire_damage_row(pi, &row);
         }
         self.shield_contact(dt);
         // start_magic: the potion's ring spreads out from where it was used.
@@ -2846,30 +2825,7 @@ impl Game {
                 hit: Vec::new(),
             });
         }
-        // Turbo attacks (DAMG rows B and C1): an area hit around the player in the
-        // class's element; PWRC also throws a super shot.
-        for (pi, pos, yaw, full) in turbos {
-            let (dmg, radius) = if full { (25.0, 8.0) } else { (50.0, 12.0) };
-            self.area_hit(pi, pos, radius, dmg * ELEMENT_BONUS);
-            if full {
-                let p = &self.players[pi];
-                let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
-                let speed = 30.0;
-                let model = p.proj_model;
-                self.spawn(
-                    Kind::Projectile {
-                        owner: pi,
-                        vel: dir * speed,
-                        life: PROJECTILE_LIFE,
-                        damage: 70.0 * ELEMENT_BONUS,
-                    },
-                    model,
-                    pos + Vec3::Y * 2.5 + dir * 1.2,
-                    yaw,
-                );
-            }
-        }
-        for (pi, pos, yaw) in throws {
+        for (pi, pos, yaw, size) in throws {
             use crate::powerups as pu;
             self.sfx.push(format!("S_{}THROW", self.players[pi].class));
             let p = &self.players[pi];
@@ -2882,10 +2838,12 @@ impl Game {
             if w & pu::W_ELEMENT != 0 {
                 damage *= ELEMENT_BONUS;
             }
-            // A super shot doubles the damage, one use a throw.
+            // A super shot doubles the damage, one use a throw; the power-A
+            // throw is a double-size missile.
             if self.players[pi].powerups.use_one(pu::WEAPON, pu::W_SUPER) {
                 damage *= 2.0;
             }
+            damage *= size;
             // 3-way and 5-way shots fan out 15 degrees apart.
             let spread: &[f32] = if w & pu::W_5WAY != 0 {
                 &[0.0, 15.0, -15.0, 30.0, -30.0]
@@ -2929,6 +2887,10 @@ impl Game {
     fn shield_contact(&mut self, dt: f32) {
         use crate::powerups as pu;
         self.shield_cooldown.retain(|_, t| {
+            *t -= dt;
+            *t > 0.0
+        });
+        self.damg_cooldown.retain(|_, t| {
             *t -= dt;
             *t > 0.0
         });
@@ -3004,20 +2966,10 @@ impl Game {
 
     /// A melee swing (PlayerMotion_DamageTarget): one target, the nearest in the
     /// forward cone within reach of its surface, takes the player's damage.
-    fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32) {
-        use crate::powerups as pu;
+    /// A swing lands (pmotion.c:2621): the one target in the facing cone within
+    /// 3.5, for the melee damage times `mult` (x2 slow / step, x3 power).
+    fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, _knock: bool) {
         let dir = Vec2::new(yaw.sin(), yaw.cos());
-        // The hammer and breath power-ups replace the swing while they have uses.
-        if self.players[pi].powerups.use_one(pu::WEAPON, pu::W_HAMMER) {
-            self.sfx.push("S_HAMMER|S_EXPLODE1".into());
-            self.area_hit(pi, pos, 35.0, 100.0);
-            return;
-        }
-        if self.players[pi].powerups.use_one(pu::SPECIAL, pu::S_BREATH) {
-            let front = pos + Vec3::new(dir.x, 0.0, dir.y) * 10.0;
-            self.area_hit(pi, front, 20.0, 40.0 * ELEMENT_BONUS);
-            return;
-        }
         let target = self
             .entities
             .iter()
@@ -3040,7 +2992,7 @@ impl Game {
             return;
         }
         let p = &self.players[pi];
-        let mut dmg = p.derived.damage;
+        let mut dmg = p.derived.damage * mult;
         // Growth doubles melee; an amulet gives every hit its element.
         if p.fx.special & crate::powerups::S_GROWTH != 0 {
             dmg *= 2.0;
@@ -3078,6 +3030,94 @@ impl Game {
             .collect();
         for (i, push) in hits {
             self.hit_entity(pi, i, dmg, push, false);
+        }
+    }
+
+    /// PlyrSfxDoDamage for one PDATA damage row of a power or turbo move:
+    /// projectiles fly from the player, effect rows hurt what is within their
+    /// radius (and arc, when given) around the player, each target at most
+    /// once per the row's re-hit delay.
+    fn fire_damage_row(&mut self, pi: usize, row: &gdl_formats::pdata::DamageRow) {
+        let p = &self.players[pi];
+        let (pos, yaw) = (p.pos, p.yaw);
+        let mut dmg = if row.amount < 0.0 {
+            -row.amount * p.derived.damage
+        } else {
+            row.amount
+        };
+        // The class colour (dmgtype's element) is worth x1.5 on neutral monsters.
+        if row.dmgtype & 0xF != 0 {
+            dmg *= ELEMENT_BONUS;
+        }
+        if dmg <= 0.0 {
+            return;
+        }
+        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let side = Vec3::new(fwd.z, 0.0, -fwd.x);
+        match row.kind {
+            0 | 5 => {}
+            2 | 10 => {
+                // A projectile (type 10: a burst either side, at +-angle).
+                let angles: &[f32] = if row.kind == 10 && row.angle != 0.0 {
+                    &[1.0, -1.0]
+                } else {
+                    &[0.0]
+                };
+                let speed = row.speed_max.max(row.speed_min).max(10.0);
+                for k in angles {
+                    let y = yaw + k * row.angle.to_radians();
+                    let dir = Vec3::new(y.sin(), 0.0, y.cos());
+                    let model = self.players[pi].proj_model;
+                    self.spawn(
+                        Kind::Projectile {
+                            owner: pi,
+                            vel: dir * speed,
+                            life: PROJECTILE_LIFE,
+                            damage: dmg,
+                        },
+                        model,
+                        pos + Vec3::Y * 2.5 + dir * 1.2,
+                        y,
+                    );
+                }
+            }
+            _ => {
+                let o = row.offset;
+                let at = pos + side * o[0] + Vec3::Y * o[1] + fwd * o[2];
+                let delay = row.delay.max(1.0 / 60.0);
+                let hits: Vec<(usize, Vec2)> = self
+                    .entities
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e.alive
+                            && matches!(
+                                e.kind,
+                                Kind::Enemy { .. }
+                                    | Kind::Generator { .. }
+                                    | Kind::Container { chest: false, .. }
+                                    | Kind::Critter(_)
+                            )
+                            && !self.damg_cooldown.contains_key(&(pi, e.id))
+                    })
+                    .filter_map(|(i, e)| {
+                        let (pt, r) = match &e.kind {
+                            Kind::Critter(_) => Self::aim_point(e, at)?,
+                            _ => (e.pos, 0.0),
+                        };
+                        let d = Vec2::new(pt.x - at.x, pt.z - at.z);
+                        let dist = d.length() - r;
+                        let n = d.normalize_or_zero();
+                        let in_arc = row.arc == 0.0 || n.dot(Vec2::new(fwd.x, fwd.z)) >= row.arc;
+                        (dist < row.radius && dist >= row.minrad && in_arc).then_some((i, n))
+                    })
+                    .collect();
+                for (i, push) in hits {
+                    let id = self.entities[i].id;
+                    self.damg_cooldown.insert((pi, id), delay);
+                    self.hit_entity(pi, i, dmg, push, false);
+                }
+            }
         }
     }
 
@@ -3295,8 +3335,8 @@ impl Game {
                 return;
             }
         }
-        // PWRB / PWRC turbo moves can't be interrupted.
-        if matches!(p.state, PlayerState::Turbo { .. }) {
+        // Turbo moves, combos and the like (action >= 11) can't be hurt.
+        if p.act.action >= 11 {
             return;
         }
         let mut dmg = dmg;
@@ -3316,7 +3356,10 @@ impl Game {
         if flags & (DmgType::POISON_GAS | DmgType::NO_ARMOR) == 0 {
             dmg = (dmg - p.derived.armor).max(0.0);
         }
-        if dmg > 1.0 && p.state == PlayerState::Defending {
+        // damage_player: a block (DEFEND2) stops the hit; a charge halves it.
+        if p.act.hud & crate::paction::hud::BLOCK != 0 {
+            dmg = 0.0;
+        } else if p.act.hud & crate::paction::hud::CHARGE != 0 {
             dmg *= 0.5;
         }
         let old = (p.health + 0.5) as i32;
@@ -4878,6 +4921,48 @@ mod tests {
     }
 
     #[test]
+    fn held_attack_chains_swings_on_a_grunt_in_reach() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = g.players[0].pos;
+        let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
+        let model = g.classes[class].model(1);
+        let mut kind = g.new_enemy(class, 3, EnemyState::Idle);
+        if let Kind::Enemy {
+            cooldown, speed, ..
+        } = &mut kind
+        {
+            *cooldown = 99.0;
+            *speed = 0.0;
+        }
+        // In hit range in front (the hero faces +z).
+        g.spawn(kind, model, p + Vec3::new(0.0, 0.0, 2.5), 0.0);
+        let hold = PlayerInput {
+            attack: true,
+            attack_pressed: true,
+            ..Default::default()
+        };
+        use crate::paction::p as pa;
+        let mut seen = Vec::new();
+        for _ in 0..90 {
+            g.update(1.0 / 60.0, &[hold]);
+            let cur = g.players[0].act.cur;
+            if seen.last() != Some(&cur) {
+                seen.push(cur);
+            }
+        }
+        assert!(
+            seen.contains(&pa::QUICK) && seen.contains(&pa::QUICK2) && seen.contains(&pa::QUICK3),
+            "{seen:?}"
+        );
+        assert!(g.players[0].exp > 0, "the swings landed");
+    }
+
+    #[test]
     fn holding_attack_throws_at_original_rate() {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
@@ -5106,8 +5191,13 @@ mod tests {
     fn three_way_throws_three() {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelA1", &[("ARC", "GRE")]).unwrap();
-        g.entities
-            .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
+        // Nothing to aim at (throws turn toward the nearest target).
+        g.entities.retain(|e| {
+            !matches!(
+                e.kind,
+                Kind::Enemy { .. } | Kind::Generator { .. } | Kind::Container { .. }
+            )
+        });
         g.players[0]
             .powerups
             .add(crate::powerups::WEAPON, crate::powerups::W_3WAY, 0.0, 45.0);

@@ -31,7 +31,9 @@ counts as a controller (Enter). In the tower, a new controller can join with Sta
 |---|---|---|---|
 | Move (run past 3/4 of the stick) | stick | Left stick | WASD / arrows |
 | Attack (melee in reach, else throw) | A | A (South) | J / Space |
+| Slow attack (after A: power swings) | Y | Y (North) | I |
 | Turbo attack (hold, then A) / block | B | B (East) | K / Shift |
+| Charge / strafe (hold) / 2-player combo (hold) | L / R / Z | LT / RT / RB | H / U / O |
 | Magic (use a potion) | X | X (West) | L |
 | Power-up inventory: open / switch on-off | D-pad up | D-pad up | Tab |
 | Inventory: previous / next / close | D-pad left / right / down | D-pad | Q / E / R |
@@ -96,8 +98,7 @@ in `~/.android/gauntlet-rs.keystore`.
 
 ## Not done yet (roadmap)
 
-- The full melee chain (slow attack, step and 360 attacks, power-A moves), charge, strafe
-  and two-player combos
+- Two-player combos (the partner's side), player knockback reactions
 - Bosses and their arenas (in progress), attract-mode level flybys
 - Texture animations (flowing water, flames), particle effects
 - Save games (load game)

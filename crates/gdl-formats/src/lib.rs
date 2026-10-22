@@ -11,6 +11,7 @@ pub mod dol;
 pub mod mesh;
 pub mod movie;
 pub mod objects;
+pub mod pdata;
 pub mod sequence;
 pub mod text;
 pub mod texture;

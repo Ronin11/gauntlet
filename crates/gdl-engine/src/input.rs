@@ -20,8 +20,15 @@ pub struct PlayerInput {
     pub turbo: bool,
     /// B newly pressed: back in menus, "Quit Game" when dead.
     pub b_pressed: bool,
-    /// Y: slow attack.
+    /// Y: slow attack (newly pressed, and held).
     pub slow_pressed: bool,
+    pub slow: bool,
+    /// X held.
+    pub magic: bool,
+    /// GameCube L: charge; R held: strafe; Z held: two-player combo.
+    pub charge_pressed: bool,
+    pub strafe: bool,
+    pub combo: bool,
     pub start_pressed: bool,
     /// The d-pad's share of `stick` (menus move with either; in play the d-pad
     /// runs the mini-inventory instead of walking).
@@ -56,7 +63,9 @@ pub mod android_keys {
     pub const BUTTON_B: u32 = 97;
     pub const BUTTON_X: u32 = 99;
     pub const BUTTON_Y: u32 = 100;
+    pub const BUTTON_L1: u32 = 102;
     pub const BUTTON_R1: u32 = 103;
+    pub const BUTTON_L2: u32 = 104;
     pub const BUTTON_R2: u32 = 105;
     pub const BUTTON_START: u32 = 108;
 }
@@ -218,6 +227,11 @@ impl Input {
                     b_pressed: self.just_pressed(KeyCode::KeyK)
                         || self.just_pressed(KeyCode::Backspace),
                     slow_pressed: self.just_pressed(KeyCode::KeyI),
+                    slow: self.held(KeyCode::KeyI),
+                    magic: self.held(KeyCode::KeyL),
+                    charge_pressed: self.just_pressed(KeyCode::KeyH),
+                    strafe: self.held(KeyCode::KeyU),
+                    combo: self.held(KeyCode::KeyO),
                     start_pressed: self.just_pressed(KeyCode::Enter),
                     dpad: Vec2::ZERO,
                     // Tab / Q / E / R stand in for the d-pad.
@@ -279,6 +293,11 @@ impl Input {
                     turbo: h(BUTTON_B),
                     b_pressed: p(BUTTON_B),
                     slow_pressed: p(BUTTON_Y),
+                    slow: h(BUTTON_Y),
+                    magic: h(BUTTON_X),
+                    charge_pressed: p(BUTTON_L1) || p(BUTTON_L2),
+                    strafe: h(BUTTON_R2),
+                    combo: h(BUTTON_R1),
                     start_pressed: p(BUTTON_START),
                 }
             }
@@ -326,6 +345,11 @@ impl Input {
                     turbo: pad.is_pressed(Button::East),
                     b_pressed: pressed(Button::East),
                     slow_pressed: pressed(Button::North),
+                    slow: pad.is_pressed(Button::North),
+                    magic: pad.is_pressed(Button::West),
+                    charge_pressed: pressed(Button::LeftTrigger2) || pressed(Button::LeftTrigger),
+                    strafe: pad.is_pressed(Button::RightTrigger2),
+                    combo: pad.is_pressed(Button::RightTrigger),
                     start_pressed: pressed(Button::Start),
                 }
             }

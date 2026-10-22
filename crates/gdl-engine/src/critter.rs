@@ -15,7 +15,7 @@
 //! effect atrees of the monster directory played once.
 
 use crate::character::{Animator, Model};
-use crate::game::{Game, Kind, PlayerState};
+use crate::game::{Game, Kind};
 use gdl_formats::critter::{CritterWad, Damage, Move, Vis};
 use glam::{Mat4, Vec2, Vec3};
 use std::sync::Arc;
@@ -673,10 +673,7 @@ impl Game {
                     col: p.pos + Vec3::Y * 2.5,
                     active: p.state.active(),
                     hidden: p.fx.special & crate::powerups::S_INVISIBLE != 0,
-                    attacking: matches!(
-                        p.state,
-                        PlayerState::Attacking { .. } | PlayerState::Turbo { .. }
-                    ),
+                    attacking: (2..=12).contains(&p.act.action),
                 },
                 None => PInfo {
                     pos: Vec3::ZERO,
@@ -2595,7 +2592,7 @@ mod tests {
                 g.cam_focus = g.players[0].pos;
                 let mut hurt = 0.0;
                 let mut moves = std::collections::BTreeSet::new();
-                g.players[0].state = PlayerState::Normal;
+                g.players[0].state = crate::game::PlayerState::Normal;
                 for _ in 0..600 {
                     g.players[0].health = 500.0;
                     if let Some(e) = g.entities.iter().find(|e| e.id == id) {
