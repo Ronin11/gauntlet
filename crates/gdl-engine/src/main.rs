@@ -269,6 +269,20 @@ fn snapshot_game(args: &Args) -> Result<()> {
         let s = gdl_engine::tower::Sumner::new(&fs, &mut g, entry);
         g.sumner = Some(Box::new(s));
     }
+    // GDL_INV=1: player 0 holds a 3-way shot and levitation, the inventory
+    // open on levitation and switched on.
+    if std::env::var_os("GDL_INV").is_some() {
+        use gdl_engine::powerups as pu;
+        let p = &mut g.players[0];
+        p.powerups.add(pu::WEAPON, pu::W_3WAY, 0.0, 45.0);
+        p.powerups.add(pu::SPECIAL, pu::S_LEVITATE, 0.0, 30.0);
+        p.powerups.slots[1].state = pu::ON;
+        p.inv = pu::MiniInv {
+            state: 1,
+            sel: 1,
+            slide: 128,
+        };
+    }
     let box_close: Option<u32> = std::env::var("GDL_BOX_CLOSE")
         .ok()
         .and_then(|v| v.parse().ok());

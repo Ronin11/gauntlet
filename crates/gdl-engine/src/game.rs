@@ -391,6 +391,8 @@ pub struct Player {
     pub color: String,
     /// The experience at Sumner's last level-up check (Player+0x1EDC).
     pub sumner_exp: u32,
+    /// The power-up mini-inventory box.
+    pub inv: crate::powerups::MiniInv,
     walk_phase: u8,
 }
 
@@ -1413,6 +1415,7 @@ impl Game {
                 class: classes[i].0.to_string(),
                 color: classes[i].1.to_string(),
                 sumner_exp: 0,
+                inv: Default::default(),
                 walk_phase: 0,
             });
         }
@@ -2298,10 +2301,27 @@ impl Game {
             .filter_map(|e| Some((e.pos, Self::target_radius(e)?)))
             .collect();
         for (i, p) in self.players.iter_mut().enumerate() {
-            let inp = inputs.get(i).copied().unwrap_or_default();
+            let mut inp = inputs.get(i).copied().unwrap_or_default();
+            // The d-pad runs the mini-inventory; only the stick walks.
+            inp.stick -= inp.dpad;
             let seqs = &self.player_seqs[p.model];
             let model = &self.models[p.model];
             p.hurt_flash = (p.hurt_flash - dt * 3.0).max(0.0);
+            for snd in p.inv.update(&mut p.powerups, inp.inv) {
+                self.sfx.push(snd.into());
+            }
+            // A turbo boost switched on fills the meter and is used up.
+            for sl in &mut p.powerups.slots {
+                if sl.state == crate::powerups::ON
+                    && sl.kind == crate::powerups::SPECIAL
+                    && sl.flags & crate::powerups::S_TURBO != 0
+                {
+                    p.power = 100.0;
+                    if sl.time >= 0.0 {
+                        *sl = Default::default();
+                    }
+                }
+            }
             // PlayerProcessPowerups: timed power-ups run down outside the tower.
             if !in_tower {
                 p.powerups.tick(dt);
@@ -4141,20 +4161,16 @@ impl Game {
                         ));
                     }
                 }
-                // PlayerAddPowerup, for the class's powerup_time; the turbo
-                // pick-up fills the meter at once.
+                // PlayerAddPowerup, for the class's powerup_time; it waits in
+                // the mini-inventory until switched on.
                 PickupKind::Powerup {
                     kind,
                     flags,
                     amount,
                     seconds,
                 } => {
-                    if kind == crate::powerups::SPECIAL && flags & crate::powerups::S_TURBO != 0 {
-                        p.power = 100.0;
-                    } else {
-                        let t = seconds * crate::stats::powerup_time(p.class_id);
-                        p.powerups.add(kind, flags, amount, t);
-                    }
+                    let t = seconds * crate::stats::powerup_time(p.class_id);
+                    p.powerups.add(kind, flags, amount, t);
                 }
                 // PlayerGiveShard: every player gets the runestone.
                 PickupKind::Shard(bit) => {
@@ -4295,6 +4311,46 @@ impl Game {
     /// Simple bot: walk towards the nearest enemy, generator or pickup and attack when close.
     /// Used for the attract/demo mode and for headless testing.
     pub fn bot_input(&self, pi: usize) -> PlayerInput {
+        let mut inp = self.bot_moves(pi);
+        inp.inv = self.bot_inventory(pi);
+        inp
+    }
+
+    /// The bot switches on whatever it picks up, a press every half second.
+    fn bot_inventory(&self, pi: usize) -> crate::powerups::DPad {
+        use crate::powerups::{DPad, FRESH};
+        let Some(p) = self.players.get(pi) else {
+            return DPad::default();
+        };
+        if self.frame % 30 != 0 {
+            return DPad::default();
+        }
+        let fresh = p.powerups.slots[..10]
+            .iter()
+            .any(|s| s.time != 0.0 && s.state == FRESH);
+        let sel_fresh = p.inv.sel >= 0 && p.powerups.slots[p.inv.sel as usize].state == FRESH;
+        match p.inv.state {
+            0 if fresh => DPad {
+                up: true,
+                ..Default::default()
+            },
+            1 if sel_fresh => DPad {
+                up: true,
+                ..Default::default()
+            },
+            1 if fresh => DPad {
+                left: true,
+                ..Default::default()
+            },
+            1 => DPad {
+                down: true,
+                ..Default::default()
+            },
+            _ => DPad::default(),
+        }
+    }
+
+    fn bot_moves(&self, pi: usize) -> PlayerInput {
         let Some(p) = self.players.get(pi) else {
             return PlayerInput::default();
         };
@@ -4659,6 +4715,8 @@ mod tests {
         g.players[0]
             .powerups
             .add(crate::powerups::WEAPON, crate::powerups::W_3WAY, 0.0, 45.0);
+        // Switched on from the mini-inventory.
+        g.players[0].powerups.slots[0].state = crate::powerups::ON;
         let attack = PlayerInput {
             attack_pressed: true,
             attack: true,

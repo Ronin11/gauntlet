@@ -573,6 +573,18 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
         let w = s.text_width(FONT_SCORE, 1.0, &health);
         s.text(1.0, x0 + 116.0 - w, 359.0, FONT_SCORE, pal, 0, &health);
         s.text(0.667, -xc, 339.0, FONT_INITIALS, pal, 0, &info.name);
+        // The mini-inventory, fully open: the power-up's name above the panel,
+        // glowing while it is on.
+        if p.inv.state == 1 && p.inv.sel >= 0 {
+            let sl = &p.powerups.slots[p.inv.sel as usize];
+            let label = crate::powerups::label(sl);
+            let y = 310.0 + 128.0 - p.inv.slide as f32;
+            if sl.state == crate::powerups::ON {
+                s.glow_text(0.45, x0 + 24.0, y, label);
+            } else {
+                s.text(0.45, x0 + 24.0, y, crate::ui::FONT_32, 0xFFFFFF, 0, label);
+            }
+        }
         s.text(
             1.0,
             -xc,

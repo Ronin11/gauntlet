@@ -23,6 +23,12 @@ pub struct PlayerInput {
     /// Y: slow attack.
     pub slow_pressed: bool,
     pub start_pressed: bool,
+    /// The d-pad's share of `stick` (menus move with either; in play the d-pad
+    /// runs the mini-inventory instead of walking).
+    pub dpad: Vec2,
+    /// D-pad presses: the mini-inventory (up opens / switches on, left and
+    /// right choose, down closes).
+    pub inv: crate::powerups::DPad,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -204,6 +210,14 @@ impl Input {
                         || self.just_pressed(KeyCode::Backspace),
                     slow_pressed: self.just_pressed(KeyCode::KeyI),
                     start_pressed: self.just_pressed(KeyCode::Enter),
+                    dpad: Vec2::ZERO,
+                    // Tab / Q / E / R stand in for the d-pad.
+                    inv: crate::powerups::DPad {
+                        up: self.just_pressed(KeyCode::Tab),
+                        left: self.just_pressed(KeyCode::KeyQ),
+                        right: self.just_pressed(KeyCode::KeyE),
+                        down: self.just_pressed(KeyCode::KeyR),
+                    },
                 }
             }
             Source::Device(dev) => {
@@ -234,6 +248,9 @@ impl Input {
                     b_pressed: p(BUTTON_B),
                     slow_pressed: p(BUTTON_Y),
                     start_pressed: p(BUTTON_START),
+                    // Key-event pads walk with the d-pad until their sticks are
+                    // read; no mini-inventory for them yet.
+                    ..Default::default()
                 }
             }
             #[cfg(not(target_os = "android"))]
@@ -242,19 +259,7 @@ impl Input {
                     return PlayerInput::default();
                 };
                 let pad = g.gamepad(id);
-                let mut v = Vec2::new(pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
-                if pad.is_pressed(Button::DPadUp) {
-                    v.y = 1.0;
-                }
-                if pad.is_pressed(Button::DPadDown) {
-                    v.y = -1.0;
-                }
-                if pad.is_pressed(Button::DPadLeft) {
-                    v.x = -1.0;
-                }
-                if pad.is_pressed(Button::DPadRight) {
-                    v.x = 1.0;
-                }
+                let v = Vec2::new(pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
                 // Radial dead zone.
                 let mag = v.length();
                 let v = if mag < 0.2 {
@@ -262,10 +267,30 @@ impl Input {
                 } else {
                     v / mag * ((mag - 0.2) / 0.8).min(1.0)
                 };
+                let mut dpad = Vec2::ZERO;
+                if pad.is_pressed(Button::DPadUp) {
+                    dpad.y = 1.0;
+                }
+                if pad.is_pressed(Button::DPadDown) {
+                    dpad.y = -1.0;
+                }
+                if pad.is_pressed(Button::DPadLeft) {
+                    dpad.x = -1.0;
+                }
+                if pad.is_pressed(Button::DPadRight) {
+                    dpad.x = 1.0;
+                }
                 let pressed =
                     |b: Button| self.pad_pressed.iter().any(|&(i, bb)| i == id && bb == b);
                 PlayerInput {
-                    stick: v,
+                    stick: (v + dpad).clamp_length_max(1.0),
+                    dpad,
+                    inv: crate::powerups::DPad {
+                        up: pressed(Button::DPadUp),
+                        down: pressed(Button::DPadDown),
+                        left: pressed(Button::DPadLeft),
+                        right: pressed(Button::DPadRight),
+                    },
                     attack: pad.is_pressed(Button::South),
                     attack_pressed: pressed(Button::South),
                     magic_pressed: pressed(Button::West),
