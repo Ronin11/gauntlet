@@ -213,6 +213,15 @@ impl DmgType {
     pub const POISON_GAS: u32 = 0x800;
     /// Death's drain: armour doesn't stop it.
     pub const NO_ARMOR: u32 = 0x1000;
+    pub const KNOCKBACK: u32 = 0x10;
+    pub const KNOCKDOWN: u32 = 0x20;
+    pub const BLOWNAWAY: u32 = 0x40;
+    pub const STUN: u32 = 0x80;
+    pub const KNOCKOVER: u32 = 0x100;
+    pub const SPIKE: u32 = 0x2000;
+    pub const WHIRLWIND: u32 = 0x10000;
+    /// A low blow (short monsters): levitation dodges it.
+    pub const LOW: u32 = 0x4000_0000;
 }
 
 /// ModifyDamage: an elemental hit on a target with no affinity does 1.5x. Every
@@ -357,6 +366,12 @@ pub struct Player {
     pub inv: crate::powerups::MiniInv,
     /// The action machine: what the hero is doing and animating.
     pub act: crate::paction::Action,
+    /// This frame's hits for PlayerKnockback: damage, flags and the push
+    /// direction; and the knock velocity they give.
+    hit_damage: f32,
+    hit_flags: u32,
+    hit_force: Vec3,
+    knock_vel: Vec3,
 }
 
 /// Animation sequence indices for a player model.
@@ -863,6 +878,8 @@ pub struct Game {
     pub fixed_camera: Option<(Vec3, Vec3)>,
     /// Placed monsters not yet in view.
     pending_enemies: Vec<PendingEnemy>,
+    /// Where the next damage_player hit comes from (for its push).
+    pub damage_from: Option<Vec3>,
     /// The party's boss shards (bit = world order 1..11, as Progress::runes).
     pub runes: u16,
     /// Players who died in this level (inactivate_player outside the tower).
@@ -1291,6 +1308,7 @@ impl Game {
             world_changed: false,
             fixed_camera: None,
             pending_enemies: Vec::new(),
+            damage_from: None,
             runes: 0,
             deaths: 0,
             roster: Default::default(),
@@ -1437,6 +1455,10 @@ impl Game {
                 sumner_exp: 0,
                 inv: Default::default(),
                 act: crate::paction::Action::new(),
+                hit_damage: 0.0,
+                hit_flags: 0,
+                hit_force: Vec3::ZERO,
+                knock_vel: Vec3::ZERO,
             });
         }
         // Ranged-attack projectile: the class's throw model, else its weapon.
@@ -2607,6 +2629,41 @@ impl Game {
             };
             let ms = p.act.motion_state(levels, edges, &ctx);
             p.act.tick_idle(1);
+            // PlayerKnockback: this frame's hits push and pick a reaction, unless
+            // the hero is in an untouchable move.
+            let mut reaction = 0u8;
+            if p.hit_damage > 1.0 && p.act.action < 11 {
+                let f = p.hit_flags;
+                let pojo = p.fx.special & 0x400 != 0;
+                let (k, r) = if f & DmgType::WHIRLWIND != 0 {
+                    (100.0, 30)
+                } else if f & DmgType::BLOWNAWAY != 0 {
+                    (100.0, 20)
+                } else if f & (DmgType::KNOCKDOWN | DmgType::KNOCKOVER) != 0 {
+                    (if pojo { 80.0 } else { 32.0 }, 20)
+                } else if f & DmgType::KNOCKBACK != 0 {
+                    (16.0, 10)
+                } else if f & DmgType::SPIKE != 0 {
+                    (0.0, 3)
+                } else if f & DmgType::STUN != 0 {
+                    (0.0, 2)
+                } else {
+                    (0.0, 1)
+                };
+                p.knock_vel += p.hit_force * k;
+                reaction = r;
+                // Hit from behind: the forward fall.
+                if r >= 10 && p.hit_force.length() > 0.0 {
+                    let from = (-p.hit_force.x).atan2(-p.hit_force.z);
+                    if wrap_angle(from - p.yaw).abs() > std::f32::consts::FRAC_PI_2 {
+                        reaction += 1;
+                    }
+                }
+            }
+            p.hit_damage = 0.0;
+            p.hit_flags = 0;
+            p.hit_force = Vec3::ZERO;
+            ctx.reaction = reaction;
 
             // PlayerGetTarget: the nearest thing in the cone around the heading
             // (the stick, else the facing), measured to its surface.
@@ -2771,6 +2828,13 @@ impl Game {
                     p.pos = target;
                 }
             }
+            // The knock velocity carries the hero (none in untouchable moves),
+            // decaying x0.667 a 30 Hz frame.
+            if p.act.action >= 11 {
+                p.knock_vel = Vec3::ZERO;
+            }
+            p.pos += p.knock_vel * dt;
+            p.knock_vel *= 0.667f32.powf(dt * 30.0);
             p.pos = self
                 .collision
                 .resolve_walls(p.pos, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT);
@@ -3404,11 +3468,31 @@ impl Game {
         if flags & (DmgType::POISON_GAS | DmgType::NO_ARMOR) == 0 {
             dmg = (dmg - p.derived.armor).max(0.0);
         }
-        // damage_player: a block (DEFEND2) stops the hit; a charge halves it.
-        if p.act.hud & crate::paction::hud::BLOCK != 0 {
+        // Levitation lifts the hero over low blows.
+        let mut flags = flags;
+        if flags & DmgType::LOW != 0 && p.fx.special & crate::powerups::S_LEVITATE != 0 {
             dmg = 0.0;
-        } else if p.act.hud & crate::paction::hud::CHARGE != 0 {
-            dmg *= 0.5;
+        }
+        // damage_player: a block (DEFEND2) stops the hit; a charge halves it;
+        // either way a heavy knock becomes a plain knockback.
+        if dmg > 1.0 && p.act.hud & (crate::paction::hud::BLOCK | crate::paction::hud::CHARGE) != 0
+        {
+            if p.act.hud & crate::paction::hud::BLOCK != 0 {
+                dmg = 0.0;
+            } else {
+                dmg *= 0.5;
+            }
+            if flags & 0x10160 != 0 {
+                flags = (flags & !0x10160) | DmgType::KNOCKBACK;
+            }
+        }
+        // For PlayerKnockback: the damage, its flags and the push away from
+        // where it came from.
+        p.hit_damage += dmg;
+        p.hit_flags |= flags;
+        if let Some(src) = self.damage_from.take() {
+            let d = p.pos - src;
+            p.hit_force += Vec3::new(d.x, 0.0, d.z).normalize_or_zero();
         }
         let old = (p.health + 0.5) as i32;
         p.health -= dmg;
@@ -4516,7 +4600,15 @@ impl Game {
                     p.health = (p.health + dmg).min(max_health(p.level));
                 }
             } else {
-                self.damage_player(pi, dmg, 0);
+                // Short monsters' blows are low.
+                let (from, low) = self.entities.get(ei).map_or((None, false), |e| {
+                    let low = matches!(e.kind, Kind::Enemy { etype, .. }
+                        if crate::enemies::TYPES[etype.min(33)].height * 0.5 <= 2.0);
+                    (Some(e.pos), low)
+                });
+                self.damage_from = from;
+                self.damage_player(pi, dmg, if low { DmgType::LOW } else { 0 });
+                self.damage_from = None;
             }
         }
         let mut poisoned: Vec<(usize, f32)> = Vec::new();
@@ -4653,7 +4745,9 @@ impl Game {
             self.sfx.push("S_EXPLODE1|S_SUICIDEEXP".into());
             for pi in 0..self.players.len() {
                 if (self.players[pi].pos - pos).length() < 8.0 {
+                    self.damage_from = Some(pos);
                     self.damage_player(pi, dmg, 0);
+                    self.damage_from = None;
                 }
             }
         }
@@ -5069,6 +5163,43 @@ mod tests {
             "{seen:?}"
         );
         assert!(g.players[0].exp > 0, "the swings landed");
+    }
+
+    #[test]
+    fn hits_stagger_and_knock_down() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        g.pending_enemies.clear();
+        let idle = [PlayerInput::default()];
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &idle);
+        }
+        use crate::paction::p as pa;
+        let p0 = g.players[0].pos;
+        g.damage_player(0, 10.0, 0);
+        g.update(1.0 / 60.0, &idle);
+        assert_eq!(g.players[0].act.cur, pa::HIT_REACT);
+        for _ in 0..60 {
+            g.update(1.0 / 60.0, &idle);
+        }
+        // Knocked down from behind (the hero faces +z): the forward fall, a push
+        // forward, then up again.
+        g.damage_from = Some(p0 - Vec3::Z * 3.0);
+        g.damage_player(0, 10.0, DmgType::KNOCKDOWN);
+        let mut seen = vec![];
+        for _ in 0..180 {
+            g.update(1.0 / 60.0, &idle);
+            let c = g.players[0].act.cur;
+            if seen.last() != Some(&c) {
+                seen.push(c);
+            }
+        }
+        assert!(
+            seen.starts_with(&[pa::FALL_DOWN_FWD, pa::GET_UP_FWD]),
+            "{seen:?}"
+        );
+        assert!(g.players[0].pos.z > p0.z + 0.5, "pushed forward");
     }
 
     #[test]

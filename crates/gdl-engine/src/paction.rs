@@ -596,6 +596,9 @@ pub struct Ctx {
     pub char_type: u8,
     /// A combo partner stands in reach (fn_80088EF4).
     pub partner: bool,
+    /// PlayerKnockback's reaction this frame: 1 hit, 2 stun, 3 spike, 10/11
+    /// knockback, 20/21 knocked down (from behind: forward), 30/31 whirlwind.
+    pub reaction: u8,
 }
 
 /// One player's action state.
@@ -794,6 +797,18 @@ impl Action {
                 }
             }
             _ => p::READY,
+        };
+        // A reaction takes over the motion (pmotion.c:1476-1563, 1838-2089); a
+        // plain hit only staggers a hero who is standing, walking or running.
+        self.next = match ctx.reaction {
+            1 if matches!(ms, 1 | 8 | 0x0D) => p::HIT_REACT,
+            2 => p::STUN_REACT,
+            3 => p::SPIKE_HIT,
+            10 | 11 => p::KNOCKBACK,
+            20 => p::FALL_DOWN,
+            21 => p::FALL_DOWN_FWD,
+            30 | 31 => p::WHIRLWIND,
+            _ => self.next,
         };
         msg
     }
