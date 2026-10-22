@@ -160,9 +160,10 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
     let fs = open_fs(args)?;
     let (class, color) = spec.split_once('/').unwrap_or((spec, "RED"));
     let cm = if class.eq_ignore_ascii_case("monster") {
-        character::CharacterModel::load_monster(&fs, color)?
+        let (dir, tree) = color.split_once(':').map(|(d, t)| (d, Some(t))).unwrap_or((color, None));
+        character::Model::load_monster(&fs, dir, tree)?
     } else {
-        character::CharacterModel::load_player(&fs, class, color)?
+        character::Model::load_player(&fs, class, color)?
     };
     let names: Vec<_> = cm
         .skeleton
@@ -178,9 +179,7 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
     let seq = cm
         .sequence(&args.seq)
         .with_context(|| format!("no sequence {}", args.seq))?;
-    let mut an = character::Animator::new(seq);
-    an.frame = args.frame;
-    inst.parts = cm.part_transforms(&an.poses(&cm.skeleton));
+    (inst.parts, inst.hidden) = cm.evaluate(seq, args.frame);
 
     let at = args.at.unwrap_or(Vec3::new(0.0, 2.5, 0.0));
     let eye = args.eye.unwrap_or(Vec3::new(0.0, 3.0, 9.0));

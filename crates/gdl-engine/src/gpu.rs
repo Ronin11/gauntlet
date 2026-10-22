@@ -66,6 +66,8 @@ pub struct Instance {
     pub transform: Mat4,
     /// Per-part transforms for rigid-part models (applied before `transform`).
     pub parts: Vec<Mat4>,
+    /// Parts not drawn this frame (mesh-swap animation frames).
+    pub hidden: Vec<bool>,
     pub tint: Vec4,
     pub visible: bool,
 }
@@ -331,6 +333,7 @@ impl Gpu {
             bufs,
             transform: Mat4::IDENTITY,
             parts: Vec::new(),
+            hidden: Vec::new(),
             tint: Vec4::ONE,
             visible: true,
         }
@@ -367,7 +370,13 @@ impl Gpu {
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(globals));
         for (mesh, inst) in draws {
+            if !inst.visible {
+                continue;
+            }
             for (b, (buf, _)) in mesh.batches.iter().zip(&inst.bufs) {
+                if inst.hidden.get(b.part as usize).copied().unwrap_or(false) {
+                    continue;
+                }
                 let u = ModelUniform {
                     transform: (inst.transform
                         * inst
@@ -424,7 +433,10 @@ impl Gpu {
                     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
                     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     for (b, (_, bg)) in mesh.batches.iter().zip(&inst.bufs) {
-                        if b.blend != pass_blend || b.count == 0 {
+                        if b.blend != pass_blend
+                            || b.count == 0
+                            || inst.hidden.get(b.part as usize).copied().unwrap_or(false)
+                        {
                             continue;
                         }
                         pass.set_bind_group(1, &mesh.materials[b.material], &[]);

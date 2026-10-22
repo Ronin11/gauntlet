@@ -1,6 +1,6 @@
 //! Game state and simulation (independent of rendering).
 
-use crate::character::{Animator, CharacterModel};
+use crate::character::{Animator, Model};
 use crate::collision::{Collision, Tri};
 use crate::fs::GameFs;
 use crate::input::PlayerInput;
@@ -45,7 +45,7 @@ pub struct Seqs {
 }
 
 impl Seqs {
-    fn find(m: &CharacterModel) -> Seqs {
+    fn find(m: &Model) -> Seqs {
         let s = |n: &str| m.sequence(n);
         let ready = s("READY").unwrap_or(0);
         Seqs {
@@ -64,7 +64,7 @@ impl Seqs {
 pub struct Game {
     pub level: Level,
     pub collision: Collision,
-    pub models: Vec<CharacterModel>,
+    pub models: Vec<Model>,
     pub seqs: Vec<Seqs>,
     pub players: Vec<Player>,
     /// Smoothed camera focus point.
@@ -89,7 +89,7 @@ impl Game {
         let mut models = Vec::new();
         let mut seqs = Vec::new();
         for (class, color) in classes {
-            let m = CharacterModel::load_player(fs, class, color)?;
+            let m = Model::load_player(fs, class, color)?;
             seqs.push(Seqs::find(&m));
             models.push(m);
         }

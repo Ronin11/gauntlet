@@ -47,7 +47,7 @@ impl Scene {
             let model = &game.models[p.model];
             inst.transform =
                 mirror() * Mat4::from_translation(p.pos) * Mat4::from_rotation_y(p.yaw);
-            inst.parts = model.part_transforms(&p.animator.poses(&model.skeleton));
+            (inst.parts, inst.hidden) = model.evaluate(p.animator.seq, p.animator.frame);
         }
     }
 

@@ -26,6 +26,28 @@ pub struct ANode {
     pub mb_flags: u32,
     pub parent: i32,
     seq_info_offset: u32,
+    /// For object-animation nodes: index of this node's first entry in `ATree::obj_anims`
+    /// (one entry per sequence follows).
+    pub obj_anim_first: Option<usize>,
+}
+
+/// Object ("vertex") animation: a run of whole meshes swapped per frame.
+#[derive(Debug, Clone)]
+pub struct ObjAnim {
+    /// Name of the first frame's object, e.g. `GRU1WALK20F02`.
+    pub name: String,
+    pub frame_count: i16,
+    pub start_frame: i16,
+}
+
+impl ObjAnim {
+    /// Object-name prefix shared by every frame of this animation (`GRU1WALK20`).
+    pub fn prefix(&self) -> &str {
+        match self.name.rfind('F') {
+            Some(i) if i > 0 => &self.name[..i],
+            _ => &self.name,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +96,7 @@ pub struct ATree {
     pub sequences: Vec<Sequence>,
     /// tracks[node][sequence]; None when the node has no data for that sequence.
     pub tracks: Vec<Vec<Option<Track>>>,
+    pub obj_anims: Vec<ObjAnim>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +136,7 @@ impl Anim {
 fn parse_atree(r: Le, name: String, h: usize) -> Result<ATree> {
     let seq_ptr = h + r.u32(h)? as usize;
     let anim_hdr_ptr = r.u32(h + 4)? as usize;
+    let obj_hdr_ptr = r.u32(h + 8)? as usize;
     let anode_ptr = h + r.u32(h + 12)? as usize;
     let anode_count = r.i32(h + 16)?.max(0) as usize;
     let seq_count = r.i32(h + 20)?.max(0) as usize;
@@ -141,7 +165,31 @@ fn parse_atree(r: Le, name: String, h: usize) -> Result<ATree> {
             mb_flags: r.u32(o + 48)?,
             seq_info_offset: r.u32(o + 52)?,
             parent: r.i32(o + 56)?,
+            obj_anim_first: None,
         });
+    }
+
+    // Object animation header: { entries pointer, count }, pointers relative to itself.
+    let mut obj_anims = Vec::new();
+    if obj_hdr_ptr != 0 && h + obj_hdr_ptr + 8 <= r.data.len() {
+        let oh = h + obj_hdr_ptr;
+        let ptr = r.u32(oh)? as usize;
+        let count = r.u32(oh + 4)? as usize;
+        if count < 10_000 {
+            for i in 0..count {
+                let o = oh + ptr + i * 40;
+                obj_anims.push(ObjAnim {
+                    name: r.str(o, 32)?,
+                    frame_count: r.i16(o + 36)?,
+                    start_frame: r.i16(o + 38)?,
+                });
+            }
+            for n in nodes.iter_mut() {
+                if n.anim_type == ANIM_OBJECT && n.seq_info_offset as usize >= ptr {
+                    n.obj_anim_first = Some((n.seq_info_offset as usize - ptr) / 40);
+                }
+            }
+        }
     }
 
     // Skeletal animation header; its pointers (and the nodes' sequence-info
@@ -201,6 +249,7 @@ fn parse_atree(r: Le, name: String, h: usize) -> Result<ATree> {
         nodes,
         sequences,
         tracks,
+        obj_anims,
     })
 }
 
