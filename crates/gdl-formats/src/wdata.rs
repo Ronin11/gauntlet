@@ -46,6 +46,8 @@ pub struct LevelDef {
     /// Boss type for the realm's last level, else 0.
     pub boss: i32,
     pub map_index: i16,
+    /// Index into the realm's AUDS table.
+    pub audio_index: i16,
     pub max_enemies: i16,
     pub rune: i16,
     pub legend: i16,
@@ -57,11 +59,46 @@ pub struct LevelDef {
     pub shop_max: [i32; 3],
 }
 
+/// One AUDS record (audio_data, 60 bytes): the level's sound bank and music.
+#[derive(Clone, Debug, Default)]
+pub struct AudioDef {
+    pub bank: String,
+    /// Music stream name, or prefix when there are several areas or parts.
+    pub stream: String,
+    /// Music areas (streams `<stream>a`, `<stream>b`, ...).
+    pub areas: i16,
+    pub channels: i16,
+    /// Sequential parts per area (`<name>_1`, `<name>_2`, ...).
+    pub parts: [i16; 8],
+}
+
+impl AudioDef {
+    /// AudioSetupLevelStreams: the stream files of an area, in play order.
+    pub fn streams(&self, area: usize) -> Vec<String> {
+        if self.stream.is_empty() {
+            return Vec::new();
+        }
+        let area = area.min(self.areas.max(1) as usize - 1);
+        let base = if self.areas <= 1 {
+            self.stream.clone()
+        } else {
+            format!("{}{}", self.stream, (b'a' + area as u8) as char)
+        };
+        let parts = self.parts.get(area).copied().unwrap_or(1);
+        if parts > 1 {
+            (1..=parts).map(|n| format!("{base}_{n}")).collect()
+        } else {
+            vec![base]
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Realm {
     pub realm_type: u32,
     pub letter: char,
     pub levels: Vec<LevelDef>,
+    pub audio: Vec<AudioDef>,
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -116,6 +153,7 @@ impl Realm {
                 movie: cstr(&d[o + 0x34..o + 0x44]),
                 boss: i32_at(o + 0x44),
                 map_index: i16_at(o + 0x5C),
+                audio_index: i16_at(o + 0x5A),
                 max_enemies: i16_at(o + 0x8E),
                 rune: i16_at(o + 0x90),
                 legend: i16_at(o + 0x92),
@@ -126,10 +164,35 @@ impl Realm {
                 shop_max: [i32_at(o + 0xE0), i32_at(o + 0xE4), i32_at(o + 0xE8)],
             });
         }
+        let mut audio = Vec::new();
+        if let Some(ao) = find("AUDS") {
+            let n = dir
+                .iter()
+                .find(|(t, _)| t == "AUDS")
+                .map_or(0, |_| levels.len().max(1));
+            for k in 0..n {
+                let o = ao + k * 60;
+                if o + 60 > d.len() {
+                    break;
+                }
+                let mut parts = [0i16; 8];
+                for (j, p) in parts.iter_mut().enumerate() {
+                    *p = i16_at(o + 0x2C + 2 * j);
+                }
+                audio.push(AudioDef {
+                    bank: cstr(&d[o..o + 16]),
+                    stream: cstr(&d[o + 0x18..o + 0x28]),
+                    areas: i16_at(o + 0x28),
+                    channels: i16_at(o + 0x2A),
+                    parts,
+                });
+            }
+        }
         Ok(Realm {
             realm_type,
             letter,
             levels,
+            audio,
         })
     }
 }
@@ -174,9 +237,27 @@ impl Worlds {
     pub fn wave_of_dir(&self, dir: &str) -> Option<u32> {
         let code = dir.trim_start_matches("level");
         self.realms.iter().find_map(|r| {
-            let i = r.levels.iter().position(|l| l.name.eq_ignore_ascii_case(code))?;
+            let i = r
+                .levels
+                .iter()
+                .position(|l| l.name.eq_ignore_ascii_case(code))?;
             Some((r.realm_type << 8) | i as u32)
         })
+    }
+
+    /// The music stream files for a wave's first area, in play order.
+    pub fn music(&self, wave: u32) -> Vec<String> {
+        let Some(realm) = self.realm(wave >> 8) else {
+            return Vec::new();
+        };
+        let Some(level) = realm.levels.get((wave & 0xFF) as usize) else {
+            return Vec::new();
+        };
+        realm
+            .audio
+            .get(level.audio_index.max(0) as usize)
+            .map(|a| a.streams(0))
+            .unwrap_or_default()
     }
 
     /// The level directory for a wave ("levelA6").

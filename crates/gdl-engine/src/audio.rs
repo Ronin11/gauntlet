@@ -41,6 +41,8 @@ type Pcm = Arc<Vec<i16>>;
 
 enum Cmd {
     Music(Vec<i16>, u16, u32),
+    /// Streams played in order, the last one looping (a level's music parts).
+    MusicParts(Vec<(Vec<i16>, u16, u32)>),
     /// Stereo PCM played once, then looped from a frame index.
     MusicLoop(Vec<i16>, u32, Option<usize>),
     /// Played once on the music channel (a movie soundtrack).
@@ -177,16 +179,36 @@ impl Audio {
                         Cmd::MusicLoop(pcm, rate, loop_start) => {
                             if let Ok(s) = rodio::Sink::try_new(&handle) {
                                 s.set_volume(0.5);
-                                let split = loop_start.map_or(pcm.len(), |f| (2 * f).min(pcm.len()));
+                                let split =
+                                    loop_start.map_or(pcm.len(), |f| (2 * f).min(pcm.len()));
                                 let (intro, body) = pcm.split_at(split);
                                 if !intro.is_empty() {
-                                    s.append(rodio::buffer::SamplesBuffer::new(2, rate, intro.to_vec()));
+                                    s.append(rodio::buffer::SamplesBuffer::new(
+                                        2,
+                                        rate,
+                                        intro.to_vec(),
+                                    ));
                                 }
                                 if !body.is_empty() {
                                     s.append(
                                         rodio::buffer::SamplesBuffer::new(2, rate, body.to_vec())
                                             .repeat_infinite(),
                                     );
+                                }
+                                _music = Some(s);
+                            }
+                        }
+                        Cmd::MusicParts(parts) => {
+                            if let Ok(s) = rodio::Sink::try_new(&handle) {
+                                s.set_volume(0.5);
+                                let n = parts.len();
+                                for (i, (pcm, ch, rate)) in parts.into_iter().enumerate() {
+                                    let b = rodio::buffer::SamplesBuffer::new(ch, rate, pcm);
+                                    if i + 1 == n {
+                                        s.append(b.repeat_infinite());
+                                    } else {
+                                        s.append(b);
+                                    }
                                 }
                                 _music = Some(s);
                             }
@@ -266,6 +288,49 @@ impl Audio {
         } else {
             Cmd::Sfx(all, vol * 0.8)
         });
+    }
+
+    /// Play a level's music streams (`STREAMS/<name>.ads`) one after another,
+    /// looping the last, as AudioSetupLevelStreams does for an area's parts.
+    /// No-op if the same music is already playing.
+    pub fn play_streams(&mut self, fs: &GameFs, names: &[String]) -> bool {
+        let Some(tx) = &self.tx else { return true };
+        let key = names.join("+");
+        if names.is_empty() {
+            return false;
+        }
+        if self.current == key {
+            return true;
+        }
+        let mut files = Vec::new();
+        for n in names {
+            match fs.read(&format!("STREAMS/{n}.ads")) {
+                Ok(b) => files.push((n.clone(), b)),
+                Err(_) => {
+                    log::warn!("no music stream {n}");
+                    return false;
+                }
+            }
+        }
+        self.current = key;
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut parts = Vec::new();
+            for (name, bytes) in files {
+                match Ads::parse(&bytes) {
+                    Ok(ads) => {
+                        let pcm = ads.decode_all(&bytes);
+                        parts.push((pcm, ads.channels as u16, ads.sample_rate));
+                    }
+                    Err(e) => {
+                        log::warn!("music {name}: {e:#}");
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(Cmd::MusicParts(parts));
+        });
+        true
     }
 
     /// Start the music for `level` (no-op if it is already playing).

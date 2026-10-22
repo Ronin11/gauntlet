@@ -19,6 +19,12 @@ fn main() -> anyhow::Result<()> {
             );
         }
     }
+    for r in &w.realms {
+        for i in 0..r.levels.len() {
+            let wave = (r.realm_type << 8) | i as u32;
+            println!("{wave:#05x} music {:?}", w.music(wave));
+        }
+    }
     println!("a2 -> {:x?}", w.find_wave("a2"));
     Ok(())
 }

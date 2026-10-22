@@ -5,16 +5,19 @@ use crate::attract::{self, Attract};
 use crate::audio::Audio;
 use crate::fs::GameFs;
 use crate::game::Game;
+use crate::game::{LevelEnd, PlayerState};
 use crate::gpu::Gpu;
 use crate::hud::PanelInfo;
 use crate::hud::{self, Hud, Style};
 use crate::input::{Input, PlayerInput, Source};
 use crate::menu::{self, Pause, PauseAction, Title};
+use crate::progress::Progress;
 use crate::scene::{Scene, CLEAR};
 use crate::screen::Scr;
 use crate::select::{Select, CLASSES, COLOURS};
 use crate::ui::UiAssets;
 use anyhow::{Context, Result};
+use gdl_formats::wdata::TOWER_WAVE;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -55,8 +58,13 @@ enum Screen {
     Loading {
         level: String,
         panels: Vec<PanelInfo>,
-        carry: Option<Carry>,
         shown: bool,
+    },
+    /// A level's intro movie (init_gamemovie), then the level.
+    Intro {
+        movie: Box<crate::movie::Movie>,
+        level: String,
+        panels: Vec<PanelInfo>,
     },
     Playing {
         play: Box<Playing>,
@@ -73,6 +81,12 @@ struct Running {
     screen: Screen,
     /// The attract sequence, kept across visits to the title screen.
     attract: Attract,
+    /// The party's realm progress.
+    progress: Progress,
+    /// Each player's health, gold, keys and potions now, and as they were when
+    /// the current level started (restored for players who die in it).
+    carry: Option<Carry>,
+    checkpoint: Option<Carry>,
     /// The current movie frame's texture.
     movie_tex: Option<crate::ui::Tex>,
     hud: Hud,
@@ -161,7 +175,6 @@ impl App {
             let screen = Screen::Loading {
                 level: self.cfg.level.clone(),
                 panels: panels_for(&self.cfg.players),
-                carry: None,
                 shown: false,
             };
             (screen, sources)
@@ -173,6 +186,9 @@ impl App {
             depth,
             screen,
             attract: Attract::new(),
+            progress: Progress::default(),
+            carry: None,
+            checkpoint: None,
             movie_tex: None,
             hud,
             audio,
@@ -293,21 +309,39 @@ impl App {
         if let Screen::Loading {
             level,
             panels,
-            carry,
             shown: true,
         } = &mut r.screen
         {
-            let (level, panels, carry) = (level.clone(), panels.clone(), carry.take());
+            let (level, panels) = (level.clone(), panels.clone());
             match start_game(fs, &r.gpu, &level, panels) {
                 Ok(mut p) => {
-                    if let Some(carry) = carry {
+                    if let Some(carry) = &r.carry {
                         for (a, b) in p.game.players.iter_mut().zip(carry) {
                             a.health = b.0;
                             (a.score, a.keys, a.potions) = (b.1, b.2, b.3);
                         }
                     }
+                    r.checkpoint = r.carry.clone();
+                    match p.game.wave {
+                        Some(TOWER_WAVE) => {
+                            let progress = r.progress.clone();
+                            p.game.close_portals(|w| progress.portal_open(w));
+                            p.game.set_start(progress.tower_start());
+                            // Closed portals' glows are hidden from the world mesh.
+                            p.scene = Scene::new(&r.gpu, &p.game).unwrap_or(p.scene);
+                        }
+                        Some(w) => r.progress.last_realm = Some(w >> 8),
+                        None => {}
+                    }
                     log::info!("entering {level}");
-                    r.audio.play_level_music(fs, &level);
+                    let streams = p
+                        .game
+                        .wave
+                        .map(|w| p.game.worlds.music(w))
+                        .unwrap_or_default();
+                    if !r.audio.play_streams(fs, &streams) {
+                        r.audio.play_level_music(fs, &level);
+                    }
                     r.screen = Screen::Playing {
                         play: Box::new(p),
                         pause: None,
@@ -403,15 +437,46 @@ impl App {
                     } else if sel.update(&all).is_some() {
                         r.sources = sel.sources();
                         let panels = sel.panels();
+                        // New players start fresh; returning ones keep their stats.
+                        let old = r.carry.take().unwrap_or_default();
+                        r.carry = Some(
+                            panels
+                                .iter()
+                                .enumerate()
+                                .map(|(i, _)| {
+                                    old.get(i).copied().unwrap_or((
+                                        crate::game::max_health(1),
+                                        0,
+                                        0,
+                                        0,
+                                    ))
+                                })
+                                .collect(),
+                        );
+                        // Player select always leads into the tower.
                         next = Some(Screen::Loading {
-                            level: self.cfg.level.clone(),
+                            level: "levelL1".into(),
                             panels,
-                            carry: None,
                             shown: false,
                         });
                     }
                 }
                 Screen::Loading { .. } => {}
+                Screen::Intro {
+                    movie,
+                    level,
+                    panels,
+                } => {
+                    let inputs: Vec<PlayerInput> = all.iter().map(|(_, i)| *i).collect();
+                    if escape || movie.update(TICK, &inputs) {
+                        r.audio.stop();
+                        next = Some(Screen::Loading {
+                            level: level.clone(),
+                            panels: panels.clone(),
+                            shown: false,
+                        });
+                    }
+                }
                 Screen::Playing { play, pause } => {
                     if let Some(menu) = pause {
                         let action = if escape {
@@ -422,7 +487,10 @@ impl App {
                         match action {
                             Some(PauseAction::Resume) => *pause = None,
                             Some(PauseAction::ChangeHeroes) => {
-                                next = Some(Screen::Select(Select::new(Default::default())));
+                                next = Some(Screen::Select(Select::from_game(
+                                    &play.panels,
+                                    &r.sources,
+                                )));
                             }
                             Some(PauseAction::QuitToTitle) => {
                                 next = Some(Screen::Title(Title::default()));
@@ -472,6 +540,20 @@ impl App {
                 }
                 r.attract
                     .draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), r.movie_tex);
+            }
+            Screen::Intro { movie, .. } => {
+                if movie.dirty {
+                    movie.dirty = false;
+                    let (w, h) = movie.size();
+                    let rgba = movie.rgba();
+                    r.movie_tex =
+                        Some(r.hud.stream_frame(&r.gpu.device, &r.gpu.queue, w, h, &rgba));
+                }
+                let mut s = Scr::new(&mut canvas, &r.hud.ui, ticks);
+                s.bars(1.0);
+                if let Some(t) = r.movie_tex {
+                    s.blit(t, 0.0, 0.0, 512.0, 384.0, 0);
+                }
             }
             Screen::Title(t) => t.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Select(sel) => sel.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
@@ -530,27 +612,81 @@ impl App {
         r.hud.draw(&r.gpu.device, &r.gpu.queue, &view, &canvas);
         frame.present();
 
-        // Reaching an exit loads the next level, keeping each player's progress.
+        // A finished level: tower portals lead to their level (after its intro
+        // movie); a level leads back to the tower through player select.
         if let Screen::Playing { play, .. } = &mut r.screen {
-            if let Some(next) = play.game.exit_to.take() {
-                let carry = play
+            if let Some(end) = play.game.level_end.take() {
+                let checkpoint = r.checkpoint.clone().unwrap_or_default();
+                // Players who died in the level get back what they had at its start.
+                let carry: Carry = play
                     .game
                     .players
                     .iter()
-                    .map(|p| (p.health, p.score, p.keys, p.potions))
+                    .enumerate()
+                    .map(|(i, p)| match (p.state, checkpoint.get(i)) {
+                        (PlayerState::InTower, Some(c)) => *c,
+                        _ => (p.health.max(1.0), p.score, p.keys, p.potions),
+                    })
                     .collect();
-                if fs.exists(&format!("LEVELS/{next}/WORLDS.PS2")) {
-                    r.screen = Screen::Loading {
-                        level: next,
-                        panels: play.panels.clone(),
-                        carry: Some(carry),
+                r.carry = Some(carry);
+                let panels = play.panels.clone();
+                let wave = play.game.wave;
+                let worlds = std::mem::take(&mut play.game.worlds);
+                let tower = "levelL1".to_string();
+                r.screen = match (wave, end) {
+                    (Some(TOWER_WAVE), LevelEnd::Exit(Some(w))) => {
+                        let level = worlds.dir(w).unwrap_or(tower);
+                        let intro = worlds
+                            .level(w)
+                            .filter(|l| !l.movie.is_empty())
+                            .and_then(|l| crate::movie::Movie::open(fs, &l.movie).ok());
+                        match intro {
+                            Some(mut movie) => {
+                                if let Some(a) = movie.audio.take() {
+                                    r.audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
+                                }
+                                Screen::Intro {
+                                    movie: Box::new(movie),
+                                    level,
+                                    panels,
+                                }
+                            }
+                            None => Screen::Loading {
+                                level,
+                                panels,
+                                shown: false,
+                            },
+                        }
+                    }
+                    (Some(TOWER_WAVE), _) => Screen::Loading {
+                        level: tower,
+                        panels,
                         shown: false,
-                    };
-                } else {
-                    play.game
-                        .messages
-                        .push((format!("{next} not available"), 3.0));
-                }
+                    },
+                    (_, LevelEnd::AllDead) => Screen::Loading {
+                        level: tower,
+                        panels,
+                        shown: false,
+                    },
+                    (w, LevelEnd::Exit(dest)) => {
+                        if let Some(w) = w {
+                            r.progress.record_beaten(w);
+                        }
+                        match dest.and_then(|d| worlds.dir(d)) {
+                            // E1 -> E2 and F1 -> F2 chain straight on.
+                            Some(level) => Screen::Loading {
+                                level,
+                                panels,
+                                shown: false,
+                            },
+                            // TODO: the shop comes first (init_shop(0)).
+                            None => {
+                                r.audio.play_select_music(fs);
+                                Screen::Select(Select::from_game(&panels, &r.sources))
+                            }
+                        }
+                    }
+                };
             }
         }
         Ok(())

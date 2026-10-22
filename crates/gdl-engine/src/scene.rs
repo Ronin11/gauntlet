@@ -32,6 +32,7 @@ impl Scene {
             .movers
             .iter()
             .flat_map(|m| m.objects.iter().copied())
+            .chain(game.hidden.iter().copied())
             .collect();
         let world = gpu.upload_mesh(&game.level.world_mesh(&moving))?;
         let mut world_inst = gpu.new_instance(&world);
@@ -81,7 +82,11 @@ impl Scene {
             (inst.parts, inst.hidden) = model.evaluate(p.animator.seq, p.animator.frame);
             let flash = p.hurt_flash;
             inst.tint = Vec4::new(1.0 + flash, 1.0 - flash * 0.5, 1.0 - flash * 0.5, 1.0);
-            inst.visible = !matches!(p.state, PlayerState::Dead { timer } if timer < 2.0 && (timer * 8.0).fract() < 0.5);
+            inst.visible = match p.state {
+                PlayerState::Dead { timer } => !(timer < 2.0 && (timer * 8.0).fract() < 0.5),
+                PlayerState::Exited | PlayerState::InTower => false,
+                _ => true,
+            };
         }
 
         let focus = game.cam_focus;

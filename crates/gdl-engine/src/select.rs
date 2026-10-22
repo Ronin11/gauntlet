@@ -206,6 +206,35 @@ impl Select {
         s
     }
 
+    /// Back from a level (init_player_select(2)): each player who was in the game
+    /// comes straight to their character menu, Done preselected.
+    pub fn from_game(panels: &[crate::hud::PanelInfo], sources: &[Source]) -> Select {
+        let mut s = Select::new(Progress::default());
+        for (info, src) in panels.iter().zip(sources) {
+            if s.players[info.slot].is_some() {
+                continue;
+            }
+            // join() takes the first free column; fill the panel's own column.
+            let taken: Vec<usize> = (0..info.slot).filter(|&c| s.players[c].is_none()).collect();
+            for &c in &taken {
+                s.players[c] = Some(placeholder(*src));
+            }
+            let col = s.join(*src).unwrap();
+            for &c in &taken {
+                s.players[c] = None;
+            }
+            let p = s.players[col].as_mut().unwrap();
+            p.name = info.name.clone();
+            p.colour = info.colour;
+            p.character = info.class;
+            p.class = info.class;
+            p.in_tower = true;
+            p.open_character_menu(DONE);
+        }
+        // Players joining here pass through the class pick as usual.
+        s
+    }
+
     /// A sample screen for snapshots: one player per state.
     pub fn demo() -> Select {
         let mut s = Select::new(Progress::default());
@@ -546,6 +575,26 @@ impl Select {
                 }
             }
         }
+    }
+}
+
+/// A column-holder used while placing returning players in their own columns.
+fn placeholder(src: Source) -> Player {
+    Player {
+        source: src,
+        state: State::Ready,
+        motion_save: Motion::Top,
+        menu: OptMenu::new(Vec::new(), 0.0, 0.0, 1.0),
+        rep: Repeat::default(),
+        name: String::new(),
+        cursor: '@',
+        name_timer: 0,
+        class: 0,
+        character: 0,
+        colour: 0,
+        in_tower: false,
+        slots: Default::default(),
+        entered_class: false,
     }
 }
 

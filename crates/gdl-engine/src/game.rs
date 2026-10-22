@@ -11,7 +11,7 @@ use gdl_formats::anim::Anim;
 use gdl_formats::worlds::ItemType;
 use gdl_formats::Objects;
 use glam::{Vec2, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
 pub const PLAYER_COLORS: [&str; 4] = ["RED", "BLU", "YEL", "GRE"];
@@ -83,6 +83,30 @@ pub enum PlayerState {
     Dead {
         timer: f32,
     },
+    /// do_exit: sinking and spinning into an exit (50 ticks), then gone.
+    Exiting {
+        timer: f32,
+    },
+    /// Left the level through an exit.
+    Exited,
+    /// Dead and out of the level: the panel reads "IN TOWER" (state 0xB).
+    InTower,
+}
+
+impl PlayerState {
+    /// In play: walking or attacking (state 1).
+    pub fn active(&self) -> bool {
+        matches!(self, PlayerState::Normal | PlayerState::Attacking { .. })
+    }
+}
+
+/// How a level finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelEnd {
+    /// Everyone left through exits: the wave they chose, or None for the tower.
+    Exit(Option<u32>),
+    /// Every player died.
+    AllDead,
 }
 
 pub struct Player {
@@ -100,6 +124,8 @@ pub struct Player {
     pub potions: u32,
     pub score: u32,
     pub hurt_flash: f32,
+    /// Where this player's exit leads (None = the tower).
+    pub exit_dest: Option<u32>,
     /// Model thrown by this hero's ranged attack.
     pub proj_model: Option<usize>,
     /// Display name ("WARRIOR"), for announcer messages.
@@ -228,7 +254,9 @@ pub enum Kind {
     },
     Exit {
         radius: f32,
-        next: String,
+        /// The wave this exit leads to, or None for the tower.
+        dest: Option<u32>,
+        open: bool,
     },
     Hazard {
         radius: f32,
@@ -329,8 +357,13 @@ pub struct Game {
     /// Ticks until the next low-health heartbeat.
     heartbeat: i32,
     pub rng: Rng,
-    /// Set when a player reaches the exit.
-    pub exit_to: Option<String>,
+    /// The level's wave, when a realm table lists it.
+    pub wave: Option<u32>,
+    pub worlds: gdl_formats::wdata::Worlds,
+    /// World objects hidden for good (closed tower portals).
+    pub hidden: HashSet<usize>,
+    /// Set once every player has left or died.
+    pub level_end: Option<LevelEnd>,
     pub messages: Vec<(String, f32)>,
     /// Sound effects requested this frame (names from AUDATPS2.ROM); drained by the app.
     pub sfx: Vec<String>,
@@ -429,21 +462,83 @@ fn item_shape(info: &gdl_formats::worlds::ItemInfo) -> Shape {
     }
 }
 
-/// Next level name: `levelA1` -> `levelA2`.
-fn next_level_name(cur: &str) -> String {
-    let digits: String = cur
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let n: u32 = digits.parse().unwrap_or(0);
-    format!("{}{}", &cur[..cur.len() - digits.len()], n + 1)
-}
-
 impl Game {
+    /// Where an EXIT item leads (items.c / gamemain.c): a nonzero first word
+    /// returns to the tower; in the tower the 2-character code names a portal's
+    /// level (FindWave). Elsewhere every exit leads back to the tower, except that
+    /// the Temple and Hell realms chain E1 -> E2 and F1 -> F2.
+    fn exit_dest(&self, params: &[u8]) -> Option<u32> {
+        let back = params.get(0..4).is_some_and(|b| b != [0, 0, 0, 0]);
+        if back {
+            return None;
+        }
+        match self.wave {
+            Some(gdl_formats::wdata::TOWER_WAVE) => {
+                let code = String::from_utf8_lossy(params.get(4..8)?)
+                    .trim_end_matches('\0')
+                    .to_string();
+                self.worlds.find_wave(&code)
+            }
+            Some(0x500) => Some(0x501),
+            Some(0x600) => Some(0x601),
+            _ => None,
+        }
+    }
+
+    /// Hide a world object (and its children) by name; false if there is none.
+    pub fn hide_object(&mut self, name: &str) -> bool {
+        let objs = &self.level.worlds.world_objects;
+        let Some(i) = objs.iter().position(|o| o.name.eq_ignore_ascii_case(name)) else {
+            return false;
+        };
+        let sub = self.level.subtree(i);
+        self.hidden.extend(sub);
+        true
+    }
+
+    /// Close the tower portals whose level isn't open (fn_8005B5B8): the portal
+    /// stops being an exit and its "_ACTIVE" glow object is hidden.
+    pub fn close_portals(&mut self, open: impl Fn(u32) -> bool) {
+        let mut glows = Vec::new();
+        for e in &mut self.entities {
+            if let Kind::Exit {
+                dest: Some(w),
+                open: o,
+                ..
+            } = &mut e.kind
+            {
+                if !open(*w) {
+                    *o = false;
+                    let letter = self.worlds.realm(*w >> 8).map_or('?', |r| r.letter);
+                    glows.push(format!("L1NSNC{letter}{}_ACTIVE", (*w & 0xFF) + 1));
+                }
+            }
+        }
+        for g in glows {
+            if !self.hide_object(&g) {
+                log::warn!("No Exit Obj: {g}");
+            }
+        }
+    }
+
+    /// Put the party at start locator `index` (the locator's `next` field), if any.
+    pub fn set_start(&mut self, index: u16) {
+        let Some(l) = self
+            .level
+            .worlds
+            .locators
+            .iter()
+            .find(|l| l.kind == gdl_formats::worlds::LocatorType::Start && l.next == index)
+        else {
+            return;
+        };
+        let base = Vec3::from(l.pos);
+        for (i, p) in self.players.iter_mut().enumerate() {
+            p.pos = base + Vec3::new((i as f32 - 1.5) * 2.5, 0.5, 0.0);
+        }
+        self.cam_focus = base;
+    }
+
     pub fn new(fs: &GameFs, level_name: &str, classes: &[(&str, &str)]) -> Result<Game> {
         let level = Level::load(fs, level_name)?;
         let collision = Collision::new(build_collision(&level));
@@ -466,10 +561,20 @@ impl Game {
             frame: 0,
             heartbeat: 0,
             rng: Rng(0x9E37_79B9_7F4A_7C15),
-            exit_to: None,
+            wave: None,
+            worlds: Default::default(),
+            hidden: HashSet::new(),
+            level_end: None,
             messages: Vec::new(),
             sfx: vec!["S_ENTRANCE".into()],
         };
+        match gdl_formats::wdata::Worlds::load(|p| fs.read(p)) {
+            Ok(w) => {
+                game.wave = w.wave_of_dir(level_name);
+                game.worlds = w;
+            }
+            Err(e) => log::warn!("realm tables: {e:#}"),
+        }
 
         for (class, color) in classes {
             let m = Model::load_player(fs, class, color)?;
@@ -494,6 +599,7 @@ impl Game {
                 potions: 0,
                 score: 0,
                 hurt_flash: 0.0,
+                exit_dest: None,
                 proj_model: None,
                 name: crate::select::HEROES
                     .iter()
@@ -895,18 +1001,12 @@ impl Game {
                 }
                 ItemType::Exit => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
-                    let name = String::from_utf8_lossy(&inst.params[4..8])
-                        .trim_end_matches('\0')
-                        .to_string();
-                    let next = if name.is_empty() {
-                        next_level_name(&self.level.name)
-                    } else {
-                        format!("level{name}")
-                    };
+                    let dest = self.exit_dest(&inst.params);
                     self.spawn(
                         Kind::Exit {
                             radius: info.radius.max(2.0) + 0.5,
-                            next,
+                            dest,
+                            open: true,
                         },
                         model,
                         pos,
@@ -1027,11 +1127,34 @@ impl Game {
     /// do_weakening's heartbeat (S_WARN): for the living player with the least
     /// health, while it is 200 or less, every 120 ticks above 100, 60 above 25 and
     /// 30 below.
+    /// do_players: the level is over once nobody is still playing. If anyone left
+    /// through an exit the party follows them; otherwise everyone died.
+    fn check_level_end(&mut self) {
+        if self.level_end.is_some()
+            || self.players.is_empty()
+            || self.players.iter().any(|p| {
+                p.state.active()
+                    || matches!(
+                        p.state,
+                        PlayerState::Exiting { .. } | PlayerState::Dead { .. }
+                    )
+            })
+        {
+            return;
+        }
+        self.level_end = Some(
+            match self.players.iter().find(|p| p.state == PlayerState::Exited) {
+                Some(p) => LevelEnd::Exit(p.exit_dest),
+                None => LevelEnd::AllDead,
+            },
+        );
+    }
+
     fn heartbeat(&mut self) {
         let low = self
             .players
             .iter()
-            .filter(|p| !matches!(p.state, PlayerState::Dead { .. }) && p.health > 1.0)
+            .filter(|p| p.state.active() && p.health > 1.0)
             .map(|p| p.health)
             .min_by(|a, b| a.total_cmp(b));
         match low {
@@ -1062,12 +1185,13 @@ impl Game {
         self.update_players(dt, inputs);
         self.update_entities(dt);
         self.heartbeat();
+        self.check_level_end();
 
         // Camera follows the centroid of living players.
         let alive: Vec<Vec3> = self
             .players
             .iter()
-            .filter(|p| !matches!(p.state, PlayerState::Dead { .. }))
+            .filter(|p| p.state.active())
             .map(|p| p.pos)
             .collect();
         let pts = if alive.is_empty() {
@@ -1117,18 +1241,30 @@ impl Game {
             let model = &self.models[p.model];
             p.hurt_flash = (p.hurt_flash - dt * 3.0).max(0.0);
 
-            if let PlayerState::Dead { timer } = &mut p.state {
-                *timer -= dt;
-                if *timer <= 0.0 {
-                    // Respawn next to the camera focus with fresh health (kid-friendly rules).
-                    p.state = PlayerState::Normal;
-                    p.health = max_health(p.level);
-                    p.pos = self.cam_focus + Vec3::Y * 2.0;
-                    p.vy = 0.0;
-                    p.animator.restart(seqs.ready);
+            match &mut p.state {
+                PlayerState::Dead { timer } => {
+                    // The death animation plays out, then inactivate_player: the
+                    // player waits "in tower" until the level ends.
+                    *timer -= dt;
+                    if *timer <= 0.0 {
+                        p.state = PlayerState::InTower;
+                    }
+                    p.animator.update(&model.skeleton, dt);
+                    continue;
                 }
-                p.animator.update(&model.skeleton, dt);
-                continue;
+                PlayerState::Exiting { timer } => {
+                    // do_exit: sink and spin into the exit.
+                    *timer -= dt;
+                    p.pos.y -= dt * 2.4;
+                    p.yaw += dt * 12.0;
+                    if *timer <= 0.0 {
+                        p.state = PlayerState::Exited;
+                    }
+                    p.animator.update(&model.skeleton, dt);
+                    continue;
+                }
+                PlayerState::Exited | PlayerState::InTower => continue,
+                _ => {}
             }
 
             if inp.magic_pressed && p.potions > 0 {
@@ -1322,7 +1458,7 @@ impl Game {
         }
         // Keep the party together: nobody may wander too far from the group's centre.
         let alive: Vec<usize> = (0..self.players.len())
-            .filter(|&i| !matches!(self.players[i].state, PlayerState::Dead { .. }))
+            .filter(|&i| self.players[i].state.active())
             .collect();
         if alive.len() > 1 {
             let c = alive.iter().map(|&i| self.players[i].pos).sum::<Vec3>() / alive.len() as f32;
@@ -1543,7 +1679,7 @@ impl Game {
         let player_pos: Vec<(Vec3, bool)> = self
             .players
             .iter()
-            .map(|p| (p.pos, !matches!(p.state, PlayerState::Dead { .. })))
+            .map(|p| (p.pos, p.state.active()))
             .collect();
         let nearest = |pos: Vec3| -> Option<(usize, f32)> {
             player_pos
@@ -1563,7 +1699,7 @@ impl Game {
         let mut pickups: Vec<(usize, PickupKind)> = Vec::new();
         let mut opened: Vec<(usize, usize)> = Vec::new();
         let mut key_used: Vec<usize> = Vec::new();
-        let mut exit: Option<String> = None;
+        let mut exits: Vec<(usize, Option<u32>)> = Vec::new();
         let mut proj_hits: Vec<(usize, usize, f32, Vec2)> = Vec::new();
 
         for ei in 0..self.entities.len() {
@@ -1764,12 +1900,11 @@ impl Game {
                     }
                     *pressed = on;
                 }
-                Kind::Exit { radius, next } => {
-                    if player_pos
-                        .iter()
-                        .any(|(pp, alive)| *alive && (*pp - e.pos).length() < *radius)
-                    {
-                        exit = Some(next.clone());
+                Kind::Exit { radius, dest, open } => {
+                    for (pi, (pp, alive)) in player_pos.iter().enumerate() {
+                        if *open && *alive && (*pp - e.pos).length() < *radius {
+                            exits.push((pi, *dest));
+                        }
                     }
                 }
                 Kind::Projectile {
@@ -1923,7 +2058,7 @@ impl Game {
         }
         for (pi, dmg) in damage {
             let p = &mut self.players[pi];
-            if matches!(p.state, PlayerState::Dead { .. }) {
+            if !p.state.active() {
                 continue;
             }
             // damage_player: the announcer speaks as health crosses 150 and 50
@@ -2008,8 +2143,13 @@ impl Game {
             }
         }
         self.entities.retain(|e| e.alive);
-        if exit.is_some() {
-            self.exit_to = exit;
+        for (pi, dest) in exits {
+            let p = &mut self.players[pi];
+            if p.state.active() {
+                p.state = PlayerState::Exiting { timer: 50.0 / 60.0 };
+                p.exit_dest = dest;
+                self.sfx.push("S_EXIT|S_PICKUPSPECIAL".into());
+            }
         }
     }
 
@@ -2313,6 +2453,35 @@ mod tests {
             before == 0 || after < before,
             "before {before} after {after}"
         );
+    }
+
+    #[test]
+    fn tower_portals_follow_progress() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
+        assert_eq!(g.wave, Some(0xD00));
+        let progress = crate::progress::Progress::default();
+        g.close_portals(|w| progress.portal_open(w));
+        let open: Vec<u32> = g
+            .entities
+            .iter()
+            .filter_map(|e| match e.kind {
+                Kind::Exit {
+                    dest: Some(w),
+                    open: true,
+                    ..
+                } => Some(w),
+                _ => None,
+            })
+            .collect();
+        // Every realm's first level is open; nothing else.
+        assert!(!open.is_empty());
+        assert!(
+            open.iter()
+                .all(|w| w & 0xFF == 0 && ![5, 6, 8].contains(&(w >> 8))),
+            "{open:x?}"
+        );
+        assert!(!g.hidden.is_empty(), "closed portals hide their glow");
     }
 
     #[test]

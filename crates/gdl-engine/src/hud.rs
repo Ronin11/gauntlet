@@ -439,6 +439,20 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
         };
         let pal = PLAYER_PAL[info.colour % 4];
         let dead = matches!(p.state, PlayerState::Dead { .. });
+        if p.state == PlayerState::InTower {
+            // Display mode 10: the plain panel, gold and health, "IN TOWER".
+            for (name, y, h, color) in [
+                ("S3", 304.0, 16.0, [1.0; 4]),
+                ("S4", 320.0, 64.0, tint(PLAYER_TINT[info.colour % 4])),
+                ("S4_FRAME", 320.0, 64.0, [1.0; 4]),
+            ] {
+                if let Some(t) = s.ui.get(name) {
+                    s.blit_tint(t, x0, y, 128.0, h, color);
+                }
+            }
+            s.text(1.2, -xc, 340.0, FONT_8HI, pal, 0, "IN TOWER");
+            continue;
+        }
         // Display mode 1: the rune-stone strip and the class portrait.
         let portrait = format!("S4_{}", crate::select::CLASSES[info.class.min(16)]);
         for (name, y, h, color) in [
