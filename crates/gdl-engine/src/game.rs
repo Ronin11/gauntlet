@@ -675,6 +675,50 @@ pub fn crystals_met(crystals: &[i32; 9], c: usize) -> bool {
     n < 0 || n >= CRYSTALS_NEEDED.get(c).copied().unwrap_or(0)
 }
 
+/// fn_8009DB24's argument: a selector (5 the level's hit sound, 6/7 the
+/// 3/5-way burst) or, from a plyr_sfx hit record (SfxSetHit), its sound.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WallSound {
+    None,
+    Sel(u8),
+    Sound(String),
+}
+
+/// A plyr_sfx record resolved for one hero (fn_8008A678): whether its effect
+/// was found (InitCustomEffect), the effect's model if it has geometry, and
+/// its sound (AudioFindSound).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PlyrSfx {
+    effect: bool,
+    model: Option<usize>,
+    sound: Option<String>,
+}
+
+/// An effect parented to a hero's model (DoPlyrSfx's SfxSetParent): it keeps
+/// its place in the hero's frame.
+struct FxFollow {
+    id: u64,
+    player: usize,
+    local: Vec3,
+    yaw: f32,
+}
+
+/// One effect DoPlyrSfx started.
+#[derive(Clone, Copy)]
+struct PlyrFx {
+    id: u64,
+    pos: Vec3,
+}
+
+/// A damage row due this frame: (player, row, frame window, grab partner).
+type DamgFire = (
+    usize,
+    gdl_formats::pdata::DamageRow,
+    f32,
+    f32,
+    Option<usize>,
+);
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Enemy {
@@ -773,9 +817,13 @@ pub enum Kind {
         reflect: bool,
         /// A super shot passes through what it hits, each once.
         pierced: Option<Vec<u64>>,
-        /// fn_8009DB24 selector played when it bursts on a wall: 5 the
-        /// level's hit sound, 6/7 the 3/5-way burst (first shot only).
-        wall_sound: u8,
+        /// Played when it bursts on a wall (fn_8009DB24).
+        wall_sound: WallSound,
+        /// minendtime: seconds left in which a wall stops it without
+        /// bursting it.
+        hold: f32,
+        /// SfxSetMorph: at this much life left it changes to this model.
+        morph: Option<(f32, Option<usize>)>,
     },
     /// A monster's arrow, bomb or fireball.
     EnemyShot {
@@ -998,6 +1046,9 @@ pub struct Game {
     /// Each player model's action slots (InitActions) and class PDATA.
     action_seqs: Vec<crate::paction::ActionSeqs>,
     pdata: Vec<gdl_formats::pdata::PlayerData>,
+    /// Each player model's plyr_sfx records, resolved.
+    psfx: Vec<Vec<PlyrSfx>>,
+    fx_follow: Vec<FxFollow>,
     /// Item models loaded for the level, by item name.
     item_models: HashMap<String, Option<usize>>,
     /// A secret level's countdown: (total, seconds left).
@@ -1535,6 +1586,8 @@ impl Game {
             friendly_fire: 0,
             action_seqs: Vec::new(),
             pdata: Vec::new(),
+            psfx: Vec::new(),
+            fx_follow: Vec::new(),
             item_models: HashMap::new(),
             secret_timer: None,
             shards: 0,
@@ -1712,12 +1765,68 @@ impl Game {
                 }
             }
         }
+        // PlayerSfxInitData: each record's effect from the hero's SFX tree
+        // (players/<class>/sfx<colour>; a secret hero's base class), else
+        // WEAPONS or POWERUPS (InitCustomEffectSub), and its sound.
+        let mut cache: HashMap<String, Option<AssetFile>> = HashMap::new();
+        for (i, (_, color)) in classes.iter().enumerate() {
+            let ct = game.players[i].class_id;
+            let base = crate::select::CLASSES[if (8..16).contains(&ct) { ct - 8 } else { ct }];
+            let dirs = [
+                format!("PLAYERS/{base}/SFX{}", color.get(..3).unwrap_or(color)),
+                "WEAPONS".to_string(),
+                "POWERUPS".to_string(),
+            ];
+            let mut known = HashMap::new();
+            let recs = game.pdata[i].sfx.clone();
+            let res = recs
+                .iter()
+                .map(|r| game.resolve_plyr_sfx(fs, &mut cache, &mut known, &dirs, r))
+                .collect();
+            game.psfx.push(res);
+        }
         game.cam_focus = game.players.first().map(|p| p.pos).unwrap_or(Vec3::ZERO);
         for p in &mut game.players {
             p.refresh_stats();
         }
         game.populate(fs, classes.len());
         Ok(game)
+    }
+
+    /// fn_8008A678: a particle or skin record (flags & 0x0F000100) names a
+    /// texture, anything else an effect tree; a particle's snddesc is the
+    /// node it hangs from, not a sound.
+    fn resolve_plyr_sfx(
+        &mut self,
+        fs: &GameFs,
+        cache: &mut HashMap<String, Option<AssetFile>>,
+        known: &mut HashMap<String, Option<usize>>,
+        dirs: &[String],
+        r: &gdl_formats::pdata::SfxRecord,
+    ) -> PlyrSfx {
+        let name = &r.fxdesc;
+        let effect = r.flags & 0x0F00_0100 == 0
+            && !name.is_empty()
+            && dirs.iter().any(|d| {
+                cache
+                    .entry(d.clone())
+                    .or_insert_with(|| load_asset(fs, d))
+                    .as_ref()
+                    .and_then(|a| a.anim.as_ref())
+                    .is_some_and(|a| a.atrees.iter().any(|t| t.name.eq_ignore_ascii_case(name)))
+            });
+        let model = if effect {
+            self.item_model(fs, cache, known, dirs, name)
+        } else {
+            None
+        };
+        let sound =
+            (r.flags & 0x0F00_0000 == 0 && !r.snddesc.is_empty()).then(|| r.snddesc.clone());
+        PlyrSfx {
+            effect,
+            model,
+            sound,
+        }
     }
 
     fn add_model(&mut self, m: Model) -> usize {
@@ -2932,7 +3041,7 @@ impl Game {
         let mut rings: Vec<(usize, Vec3, u8)> = Vec::new();
         let mut breaths: Vec<usize> = Vec::new();
         let mut hammers: Vec<usize> = Vec::new();
-        let mut damg: Vec<(usize, gdl_formats::pdata::DamageRow)> = Vec::new();
+        let mut damg: Vec<DamgFire> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
         let mut floor_fx: Vec<(usize, i32, Vec3)> = Vec::new();
@@ -3317,7 +3426,7 @@ impl Game {
             if bits_now & act::HAMMER != 0 {
                 hammers.push(i);
             }
-            // PWRA / 360 / PWRB / PWRC damage rows fire on their frames.
+            // PWRA / 360 / PWRB / PWRC / combo / victory rows fire on their frames.
             let frame = p.act.anim.frame;
             let rows = &self.pdata[p.model].rows;
             let firing: Vec<i16> = match p.act.cur {
@@ -3330,6 +3439,7 @@ impl Game {
                 pa::PWRC => vec![rows.turbo_c1, rows.turbo_c2],
                 pa::COMBO_ACTIVE1 if p.grab_partner.is_some() => vec![rows.combo1],
                 pa::COMBO_ACTIVE3 if p.grab_partner.is_some() => vec![rows.combo2],
+                pa::VICTORY => vec![rows.victory],
                 _ => vec![],
             };
             let (t0, t1) = (p.act.prev_frame, frame);
@@ -3346,7 +3456,7 @@ impl Game {
                             p.power = (p.power - p.act.coll_score).max(0.0);
                             p.act.coll_score = 0.0;
                         }
-                        damg.push((i, row.clone()));
+                        damg.push((i, row.clone(), t0, t1, p.grab_partner));
                     }
                 }
             }
@@ -3512,9 +3622,10 @@ impl Game {
                 self.area_hit(pi, pos, 35.0, 100.0);
             }
         }
-        for (pi, row) in damg {
-            self.fire_damage_row(pi, &row);
+        for (pi, row, t0, t1, partner) in damg {
+            self.fire_damage_row(pi, &row, t0, t1, partner);
         }
+        self.update_fx_follow();
         self.shield_contact(dt);
         // start_magic: the potion's ring spreads out from where it was used.
         for (pi, pos, colour) in rings {
@@ -3558,12 +3669,7 @@ impl Game {
         self.sfx.push(format!("S_{}THROW", self.players[pi].class));
         let p = &self.players[pi];
         let ct = p.class_id % 8;
-        let (speed, mut damage, model, w) = (
-            p.derived.missile_speed,
-            p.derived.missile_damage,
-            p.proj_model,
-            p.fx.weapon,
-        );
+        let (mut damage, w) = (p.derived.missile_damage, p.fx.weapon);
         let mut flags = w & (pu::W_ELEMENT | pu::W_3WAY | pu::W_5WAY | pu::W_REFLECT);
         let pdata = self.pdata.get(p.model);
         // FIREL/R and the power-A throw have a fixed charge; the power-A
@@ -3587,15 +3693,47 @@ impl Game {
             damage *= 2.0;
             flags |= m::DMG_SUPER;
         }
-        damage *= scale;
-        let level = self.players[pi].level;
-        let desc = m::MissileInfo::for_shot(ct, flags);
         let from = Vec3::new(t.yaw.sin(), 0.0, t.yaw.cos());
         let mut dir = t.aim;
         let reach = m::modify_dpos(from, &mut dir, 0.0, ct, flags, t.target, charge);
         let hand = t.pos
             + Vec3::Y * (PLAYER_HEIGHT * 0.5)
             + offset.map_or(Vec3::ZERO, |o| m::rotate_offset(o, t.yaw));
+        self.start_missile_fan(pi, hand, dir, reach, damage, flags, scale, 1.0);
+    }
+
+    /// PlayerStartMissile from the launch point on: the sweep (a wall in the
+    /// way bursts it, a barrel or generator there takes the hit), then a
+    /// missile per shot of the fan (StartMissile), each falling at the
+    /// class's weight x `weight_mul`. Returns the shots started.
+    #[allow(clippy::too_many_arguments)]
+    fn start_missile_fan(
+        &mut self,
+        pi: usize,
+        hand: Vec3,
+        dir: Vec3,
+        speed_arg: f32,
+        mut damage: f32,
+        flags: u32,
+        scale: f32,
+        weight_mul: f32,
+    ) -> usize {
+        use crate::missile as m;
+        let p = &self.players[pi];
+        let (ct, speed, model, level) = (
+            p.class_id % 8,
+            p.derived.missile_speed,
+            p.proj_model,
+            p.level,
+        );
+        damage *= scale;
+        let desc = m::MissileInfo::for_shot(ct, flags);
+        // PlyrSfxDoDamage scales the started missiles' weight.
+        let weight = if weight_mul > 0.0 {
+            desc.weight * weight_mul
+        } else {
+            desc.weight
+        };
         let pt0 = hand + dir * m::SWEEP_BACK;
         let mut pt1 = hand + dir * m::SWEEP_AHEAD;
         let r = desc.collision_radius;
@@ -3607,7 +3745,7 @@ impl Game {
             .is_some_and(|(_, n)| n.dot(pt1 - pt0) < 0.0);
         if flags & m::DMG_SUPER == 0 && wall {
             if flags & m::DMG_REFLECT == 0 {
-                return;
+                return 0;
             }
             pt1 = pt0;
         }
@@ -3636,12 +3774,13 @@ impl Game {
             self.hit_entity(pi, i, damage, push, false);
             self.hit_from = None;
             if flags & m::DMG_SUPER == 0 {
-                return;
+                return 0;
             }
         }
-        let vel = m::launch_velocity(dir, speed, reach, desc.weight, flags);
+        let vel = m::launch_velocity(dir, speed, speed_arg, desc.weight, flags);
         let size = m::model_scale(scale, level, flags);
-        for i in 0..m::shot_count(flags) {
+        let shots = m::shot_count(flags);
+        for i in 0..shots {
             let v = m::spread(vel, i);
             let id = self.spawn(
                 Kind::Projectile {
@@ -3649,18 +3788,20 @@ impl Game {
                     vel: v,
                     life: m::lifetime(flags),
                     damage,
-                    weight: desc.weight,
+                    weight,
                     radius: desc.radius(flags),
                     tumble: desc.angular_velocity[0],
                     reflect: flags & m::DMG_REFLECT != 0,
                     pierced: (flags & m::DMG_SUPER != 0).then(Vec::new),
                     // StartMissile: the fan's first shot has its own sound.
                     wall_sound: match (flags & 0x480000 != 0, i) {
-                        (false, _) => 5,
-                        (true, 0) if flags & 0x400000 != 0 => 7,
-                        (true, 0) => 6,
-                        _ => 0,
+                        (false, _) => WallSound::Sel(5),
+                        (true, 0) if flags & 0x400000 != 0 => WallSound::Sel(7),
+                        (true, 0) => WallSound::Sel(6),
+                        _ => WallSound::None,
                     },
+                    hold: 0.0,
+                    morph: None,
                 },
                 model,
                 pt1,
@@ -3671,6 +3812,7 @@ impl Game {
                 e.pitch = Self::missile_pitch(v, desc.angular_velocity[0], 0.0);
             }
         }
+        shots
     }
 
     /// A missile's pitch: a tumbler turns by its pyrvel, anything else points
@@ -4029,109 +4171,373 @@ impl Game {
         }
     }
 
-    /// PlyrSfxDoDamage for one PDATA damage row of a power or turbo move:
-    /// projectiles fly from the player, effect rows hurt what is within their
-    /// radius (and arc, when given) around the player, each target at most
-    /// once per the row's re-hit delay.
-    fn fire_damage_row(&mut self, pi: usize, row: &gdl_formats::pdata::DamageRow) {
+    /// PlyrSfxDoDamage for one PDATA damage row due in the frame window
+    /// [t0, t1): type 10 fires the class's missiles, 0 and 5 nothing, the
+    /// rest start the row's effect (PlyrSfxDoDamageSub; type 2 in the world,
+    /// the others riding the hero).
+    fn fire_damage_row(
+        &mut self,
+        pi: usize,
+        row: &gdl_formats::pdata::DamageRow,
+        t0: f32,
+        t1: f32,
+        partner: Option<usize>,
+    ) {
+        match row.kind {
+            0 | 5 => {}
+            10 => self.damage_row_missiles(pi, row, t0, t1),
+            k => self.plyr_sfx_do_damage_sub(pi, row, k != 2, partner),
+        }
+    }
+
+    /// PlyrSfxDoDamage's type 10, PlayerStartMissile unaimed at x2 damage
+    /// without the 3/5-way spread: on a single frame, a missile along the
+    /// facing turned by the row's angle; over a window, one every `delay`
+    /// frames, the angle swept in (0x100) or out (0x200) across it and the
+    /// direction scaled by the row's offset, falling at x`weight`.
+    fn damage_row_missiles(
+        &mut self,
+        pi: usize,
+        row: &gdl_formats::pdata::DamageRow,
+        t0: f32,
+        t1: f32,
+    ) {
+        use crate::powerups as pu;
+        if t1 == t0 {
+            return;
+        }
         let p = &self.players[pi];
-        let (pos, yaw) = (p.pos, p.yaw);
+        let flags = p.fx.weapon & (pu::W_ELEMENT | pu::W_REFLECT);
+        let mut damage = p.derived.missile_damage;
+        if flags & pu::W_ELEMENT != 0 {
+            damage *= ELEMENT_BONUS;
+        }
+        let hand = p.pos + Vec3::Y * (PLAYER_HEIGHT * 0.5);
+        let yaw = p.yaw;
+        let dir = |a: f32| Vec3::new((yaw + a).sin(), 0.0, (yaw + a).cos());
+        let sf = row.startframe as f32;
+        let ef = if row.endframe < 0 || row.flags & 0x80 != 0 {
+            sf
+        } else {
+            row.endframe as f32 + 1.0
+        };
+        if sf == ef {
+            if row.delay == 0.0 {
+                self.start_missile_fan(pi, hand, dir(row.angle), -1.0, damage, flags, 2.0, 1.0);
+            } else if row.delay > 0.0 {
+                // A fan of 1/delay steps, lobbed 5 ahead.
+                let mut acc = 0.0;
+                while acc < 1.0 {
+                    let d = dir(row.angle * acc) * Vec3::new(0.3, 1.5, 0.3);
+                    self.start_missile_fan(pi, hand, d, 5.0, damage, flags, 2.0, 1.0);
+                    acc += 1.0 / row.delay;
+                }
+            }
+            return;
+        }
+        // PlyrSfxWrapTime: only on the frame each `delay` begins.
+        let rate = row.delay;
+        let frac = t1 - sf;
+        if rate > 0.0 {
+            let w = if rate.abs() > frac.abs() {
+                frac
+            } else {
+                frac - rate * (frac / rate).trunc()
+            };
+            if w as i32 != 0 {
+                return;
+            }
+        }
+        let mut angle = row.angle;
+        if row.flags & 0x300 != 0 {
+            let mut k = if ef > sf { (t1 - sf) / (ef - sf) } else { 1.0 };
+            if row.flags & 0x200 != 0 {
+                k = 1.0 - k;
+            }
+            angle *= k;
+        }
+        let (d, o) = (dir(angle), row.offset);
+        let d = Vec3::new(d.x * o[0], o[1], d.z * o[2]);
+        self.start_missile_fan(pi, hand, d, -1.0, damage, flags, 2.0, row.weight);
+    }
+
+    /// PlyrSfxDoDamageSub: start the row's effect at its offset (in the
+    /// hero's frame when `riding`, else placed in the world), then arm it. A
+    /// type-2 row flies off at the mean of its speeds along the facing turned
+    /// by its angle (SfxSetPhysics), falling at its weight with its hitrad;
+    /// the others hurt what is within their radius (and arc) of it, each
+    /// target once per the row's delay. No effect started, no damage.
+    fn plyr_sfx_do_damage_sub(
+        &mut self,
+        pi: usize,
+        row: &gdl_formats::pdata::DamageRow,
+        riding: bool,
+        partner: Option<usize>,
+    ) {
+        use crate::missile as m;
+        let p = &self.players[pi];
+        let (pos, yaw, model) = (p.pos, p.yaw, p.model);
+        let at = if riding {
+            Vec3::from(row.offset)
+        } else {
+            pos + m::rotate_offset(row.offset, yaw)
+        };
+        let Some(fx) = self.do_plyr_sfx_sub(pi, row.fxidx as i32, Some(at), riding, partner, 0)
+        else {
+            return;
+        };
+        let fx_flags = self.pdata[model]
+            .sfx
+            .get(row.fxidx as usize)
+            .map_or(0, |r| r.flags);
+        let ei = self.entities.iter().position(|e| e.id == fx.id);
+        if let Some(e) = ei.map(|i| &mut self.entities[i]) {
+            // PlaceEffectOnFloor, then YawMat3 by the row's angle.
+            if fx_flags & 0x10 != 0 && row.hitfxidx < 0 {
+                if let Some(g) = self.collision.ground_height(e.pos, e.pos.y + 1.0) {
+                    e.pos.y = g;
+                }
+            }
+            e.yaw += row.angle;
+        }
+        if let Some(f) = self.fx_follow.iter_mut().find(|f| f.id == fx.id) {
+            f.yaw += row.angle;
+        }
         let mut dmg = if row.amount < 0.0 {
-            -row.amount * p.derived.damage
+            -row.amount * self.players[pi].derived.damage
         } else {
             row.amount
         };
+        if dmg <= 0.0 {
+            return;
+        }
         // The class colour (dmgtype's element) is worth x1.5 on neutral monsters.
         if row.dmgtype & 0xF != 0 {
             dmg *= ELEMENT_BONUS;
         }
-        if dmg <= 0.0 {
+        if row.kind == 2 && row.speed_min > 0.0 {
+            let spd = 0.5 * (row.speed_max - row.speed_min) + row.speed_min;
+            let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+            // Level: the floor's slope (field_8BC) is not tracked. Flag 8's
+            // PitchVec3 is set by no shipped row.
+            let vel = if row.flags & 4 != 0 { fwd } else { fwd * spd };
+            let vel = glam::Quat::from_rotation_y(row.angle) * vel;
+            // SfxSetHit: the hit record's sound plays on walls.
+            let wall_sound = (row.hitfxidx >= 0)
+                .then(|| self.psfx[model].get(row.hitfxidx as usize))
+                .flatten()
+                .and_then(|h| h.sound.clone())
+                .map_or(WallSound::None, WallSound::Sound);
+            // It lasts its animation, then (SfxSetMorph) becomes the loop
+            // record's effect for maxtime; walls only stop it for mintime.
+            let morph = (row.loopfxidx >= 0)
+                .then(|| self.psfx[model].get(row.loopfxidx as usize).cloned())
+                .flatten()
+                .filter(|l| l.effect)
+                .map(|l| {
+                    let t = if row.maxtime > 0.0 {
+                        row.maxtime
+                    } else {
+                        self.fx_life(l.model, 0.0)
+                    };
+                    (t, l.model)
+                });
+            if let Some(e) = ei.map(|i| &mut self.entities[i]) {
+                let first = match e.kind {
+                    Kind::Effect { life } => life,
+                    _ => PROJECTILE_LIFE,
+                };
+                e.kind = Kind::Projectile {
+                    owner: pi,
+                    vel,
+                    life: first + morph.map_or(0.0, |m| m.0),
+                    damage: dmg,
+                    weight: row.weight.max(0.0),
+                    radius: if row.hitrad >= 0.0 { row.hitrad } else { 1.0 },
+                    tumble: 0.0,
+                    reflect: row.dmgtype & m::DMG_REFLECT != 0,
+                    pierced: (row.dmgtype & m::DMG_SUPER != 0).then(Vec::new),
+                    wall_sound,
+                    hold: row.mintime,
+                    morph,
+                };
+                e.yaw = vel.x.atan2(vel.z);
+                e.pitch = Self::missile_pitch(vel, 0.0, 0.0);
+            }
             return;
         }
+        let at = fx.pos;
         let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
-        let side = Vec3::new(fwd.z, 0.0, -fwd.x);
-        match row.kind {
-            0 | 5 => {}
-            2 | 10 => {
-                // A projectile (type 10: a burst either side, at +-angle).
-                let angles: &[f32] = if row.kind == 10 && row.angle != 0.0 {
-                    &[1.0, -1.0]
-                } else {
-                    &[0.0]
+        let delay = row.delay.max(1.0 / 60.0);
+        let hits: Vec<(usize, Vec2)> = self
+            .entities
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.alive
+                    && matches!(
+                        e.kind,
+                        Kind::Enemy { .. }
+                            | Kind::Generator { .. }
+                            | Kind::Container { chest: false, .. }
+                            | Kind::Critter(_)
+                    )
+                    && !self.damg_cooldown.contains_key(&(pi, e.id))
+            })
+            .filter_map(|(i, e)| {
+                let (pt, r) = match &e.kind {
+                    Kind::Critter(_) => Self::aim_point(e, at)?,
+                    _ => (e.pos, 0.0),
                 };
-                let speed = row.speed_max.max(row.speed_min).max(10.0);
-                // Type 10 is PlayerStartMissile unaimed (speedArg -1): the
-                // class's missile, level and then falling; type 2 an effect
-                // with the row's own weight and radius (PlyrSfxDoDamageSub).
-                let mut desc = crate::missile::PLAYER_MISSILE_INFO[self.players[pi].class_id % 8];
-                if row.kind == 2 {
-                    desc.weight = row.weight;
-                    desc.collision_radius = row.hitrad.max(0.1);
-                    desc.angular_velocity = [0.0; 3];
-                }
-                for k in angles {
-                    let y = yaw + k * row.angle.to_radians();
-                    let dir = Vec3::new(y.sin(), 0.0, y.cos());
-                    let model = self.players[pi].proj_model;
-                    self.spawn(
-                        Kind::Projectile {
-                            owner: pi,
-                            vel: dir * speed,
-                            life: PROJECTILE_LIFE,
-                            damage: dmg,
-                            weight: desc.weight,
-                            radius: desc.collision_radius,
-                            tumble: desc.angular_velocity[0],
-                            reflect: false,
-                            pierced: None,
-                            // Type 10 goes through PlayerStartMissile; type 2's
-                            // comes from its plyr_sfx sndidx (not parsed).
-                            wall_sound: if row.kind == 10 { 5 } else { 0 },
-                        },
-                        model,
-                        pos + Vec3::Y * 2.5 + dir * 1.2,
-                        y,
-                    );
-                }
-            }
-            _ => {
-                let o = row.offset;
-                let at = pos + side * o[0] + Vec3::Y * o[1] + fwd * o[2];
-                let delay = row.delay.max(1.0 / 60.0);
-                let hits: Vec<(usize, Vec2)> = self
-                    .entities
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| {
-                        e.alive
-                            && matches!(
-                                e.kind,
-                                Kind::Enemy { .. }
-                                    | Kind::Generator { .. }
-                                    | Kind::Container { chest: false, .. }
-                                    | Kind::Critter(_)
-                            )
-                            && !self.damg_cooldown.contains_key(&(pi, e.id))
-                    })
-                    .filter_map(|(i, e)| {
-                        let (pt, r) = match &e.kind {
-                            Kind::Critter(_) => Self::aim_point(e, at)?,
-                            _ => (e.pos, 0.0),
-                        };
-                        let d = Vec2::new(pt.x - at.x, pt.z - at.z);
-                        let dist = d.length() - r;
-                        let n = d.normalize_or_zero();
-                        let in_arc = row.arc == 0.0 || n.dot(Vec2::new(fwd.x, fwd.z)) >= row.arc;
-                        (dist < row.radius && dist >= row.minrad && in_arc).then_some((i, n))
-                    })
-                    .collect();
-                for (i, push) in hits {
-                    let id = self.entities[i].id;
-                    self.damg_cooldown.insert((pi, id), delay);
-                    self.hit_entity(pi, i, dmg, push, false);
-                }
+                let d = Vec2::new(pt.x - at.x, pt.z - at.z);
+                let dist = d.length() - r;
+                let n = d.normalize_or_zero();
+                let in_arc = row.arc == 0.0 || n.dot(Vec2::new(fwd.x, fwd.z)) >= row.arc;
+                (dist < row.radius && dist >= row.minrad && in_arc).then_some((i, n))
+            })
+            .collect();
+        for (i, push) in hits {
+            let id = self.entities[i].id;
+            self.damg_cooldown.insert((pi, id), delay);
+            self.hit_entity(pi, i, dmg, push, false);
+        }
+    }
+
+    /// DoPlyrSfxSub: run plyr_sfx record `idx` and those chained after it:
+    /// start its effect at its offset (turned into the hero's frame unless
+    /// `riding`, which flag 1 sets) plus `offset`, play its sound, shake the
+    /// camera (flag 2). Returns the first record's effect.
+    fn do_plyr_sfx_sub(
+        &mut self,
+        pi: usize,
+        idx: i32,
+        offset: Option<Vec3>,
+        mut riding: bool,
+        partner: Option<usize>,
+        depth: usize,
+    ) -> Option<PlyrFx> {
+        let m = self.players[pi].model;
+        if idx < 0 || depth > 16 {
+            return None;
+        }
+        let rec = self.pdata[m].sfx.get(idx as usize)?.clone();
+        let res = self.psfx[m].get(idx as usize).cloned().unwrap_or_default();
+        let f = rec.flags;
+        let mut result = None;
+        // Hiding the hero (0x400), SetSkinFX (0x100) and the particle
+        // systems (0x0F000000, PsfxDoParticle) are not drawn.
+        if f & 0x0F00_0300 == 0 {
+            let l = if riding {
+                Vec3::from(rec.offset)
+            } else {
+                crate::missile::rotate_offset(rec.offset, self.players[pi].yaw)
+            };
+            let at = if f & 1 != 0 {
+                riding = true;
+                l
+            } else {
+                offset.map_or(l, |o| o + l)
+            };
+            result = self.do_plyr_sfx(pi, &rec, &res, at, riding, partner);
+        }
+        if f & 0x0F00_0000 == 0 {
+            if let Some(s) = res.sound {
+                self.sfx.push(s);
             }
         }
+        if f & 2 != 0 {
+            self.shake.start(0, 0, 90, 0.1, 100);
+        }
+        // Flag 0x20 (SafeRockSetup) is set by no shipped record.
+        self.do_plyr_sfx_sub(pi, rec.nextfxidx, offset, riding, partner, depth + 1);
+        result
+    }
+
+    /// DoPlyrSfx: the record's effect at `at`, lasting its maxlen (else its
+    /// animation): at the hero with its facing (flag 0x80), with the facing
+    /// (0x40), else riding the hero's model when `riding` (the grab
+    /// partner's with 0x2000), else in the world unturned.
+    fn do_plyr_sfx(
+        &mut self,
+        pi: usize,
+        rec: &gdl_formats::pdata::SfxRecord,
+        res: &PlyrSfx,
+        at: Vec3,
+        riding: bool,
+        partner: Option<usize>,
+    ) -> Option<PlyrFx> {
+        if !res.effect {
+            return None;
+        }
+        let f = rec.flags;
+        let owner = match partner {
+            Some(o) if f & 0x2000 != 0 && o < self.players.len() => o,
+            _ => pi,
+        };
+        let (p, o) = (&self.players[pi], &self.players[owner]);
+        let in_frame = |q: &Player| q.pos + crate::missile::rotate_offset(at.into(), q.yaw);
+        let (pos, yaw, follow) = if f & 0x80 != 0 {
+            (p.pos, p.yaw, None)
+        } else if f & 0x40 != 0 {
+            (if riding { in_frame(o) } else { at }, o.yaw, None)
+        } else if riding && f & 0x800 == 0 {
+            (in_frame(o), o.yaw, Some(owner))
+        } else {
+            (at, 0.0, None)
+        };
+        // StartFXSub fails with every effect slot in use.
+        let live = self
+            .entities
+            .iter()
+            .filter(|e| e.alive && matches!(e.kind, Kind::Effect { .. }))
+            .count();
+        if live >= 48 {
+            return None;
+        }
+        let life = self.fx_life(res.model, rec.maxlen);
+        let id = self.spawn(Kind::Effect { life }, res.model, pos, yaw);
+        if let Some(player) = follow {
+            self.fx_follow.push(FxFollow {
+                id,
+                player,
+                local: at,
+                yaw: 0.0,
+            });
+        }
+        Some(PlyrFx { id, pos })
+    }
+
+    /// StartFXTree's lifetime: `time`, else one play of the effect's
+    /// animation (30 frames when it has none).
+    fn fx_life(&self, model: Option<usize>, time: f32) -> f32 {
+        if time > 0.0 {
+            return time;
+        }
+        let seq = model.and_then(|m| self.models[m].skeleton.sequences.first());
+        let n = seq.map_or(0, |s| s.frame_count);
+        let rate = seq.map_or(0, |s| s.frame_rate);
+        let n = if n == 0 { 30 } else { n };
+        let rate = if rate > 0 { rate as f32 } else { 30.0 };
+        n as f32 * rate / 900.0
+    }
+
+    /// Effects riding a hero follow it.
+    fn update_fx_follow(&mut self) {
+        let (players, entities) = (&self.players, &mut self.entities);
+        self.fx_follow.retain(|f| {
+            let Some(p) = players.get(f.player) else {
+                return false;
+            };
+            let Some(e) = entities
+                .iter_mut()
+                .find(|e| e.id == f.id && e.alive && matches!(e.kind, Kind::Effect { .. }))
+            else {
+                return false;
+            };
+            e.pos = p.pos + crate::missile::rotate_offset(f.local.into(), p.yaw);
+            e.yaw = p.yaw + f.yaw;
+            true
+        });
     }
 
     /// Damage entity `t` on player `pi`'s behalf: sounds, experience (more for
@@ -4675,7 +5081,7 @@ impl Game {
         let mut barrier_touches = Vec::new();
         let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32)> = Vec::new();
         let mut fallers_started: Vec<(i32, Option<(usize, usize)>)> = Vec::new();
-        let mut wall_sounds: Vec<u8> = Vec::new();
+        let mut wall_sounds: Vec<WallSound> = Vec::new();
         let mut fallers_moved: Vec<((usize, usize), Vec3)> = Vec::new();
         // Which damage tiles are on screen (off-screen ones pause their cycle).
         let hazard_vis: HashSet<u64> = self
@@ -5317,10 +5723,19 @@ impl Game {
                     tumble,
                     reflect,
                     wall_sound,
+                    hold,
+                    morph,
                     ..
                 } => {
                     // ProcessEffects: move by the velocity, then fall.
                     *life -= dt;
+                    *hold -= dt;
+                    if let Some((t, m)) = *morph {
+                        if *life <= t {
+                            e.model = m;
+                            *morph = None;
+                        }
+                    }
                     let from = e.pos;
                     let mut to = from + *vel * dt;
                     vel.y -= *weight * dt;
@@ -5336,9 +5751,11 @@ impl Game {
                                 vel.y *= 0.4;
                             }
                             *life = if *life > 10.0 { 10.0 } else { *life - 1.0 };
+                        } else if *hold > 0.0 {
+                            to = at;
                         } else {
                             gone = true;
-                            wall_sounds.push(*wall_sound);
+                            wall_sounds.push(wall_sound.clone());
                         }
                     }
                     if gone {
@@ -5474,7 +5891,7 @@ impl Game {
         // fn_8009DB24: missiles bursting on walls.
         for snd in wall_sounds {
             match snd {
-                5 => {
+                WallSound::Sel(5) => {
                     let name = self
                         .wave
                         .and_then(|w| self.worlds.level_sound(w, true))
@@ -5484,8 +5901,9 @@ impl Game {
                         self.sfx.push(n.chars().take(15).collect());
                     }
                 }
-                6 => self.sfx_id(63),
-                7 => self.sfx_id(64),
+                WallSound::Sel(6) => self.sfx_id(63),
+                WallSound::Sel(7) => self.sfx_id(64),
+                WallSound::Sound(n) => self.sfx.push(n),
                 _ => {}
             }
         }
@@ -7092,6 +7510,191 @@ mod tests {
             let (alt, len) = found.unwrap_or_else(|| panic!("{req} did not resolve"));
             assert!(len > 0.1, "{alt} is empty");
             eprintln!("{req} -> {alt} {len:.2}s");
+        }
+    }
+
+    #[test]
+    fn every_hero_effect_record_resolves() {
+        let Some(fs) = data() else { return };
+        for class in [
+            "WAR", "VAL", "WIZ", "ARC", "DWF", "KNI", "SOR", "JES", "MIN", "JAC",
+        ] {
+            let g = Game::new(&fs, "levelA1", &[(class, "BLU")]).unwrap();
+            let missing: Vec<&str> = g.pdata[0]
+                .sfx
+                .iter()
+                .zip(&g.psfx[0])
+                .filter(|(r, s)| r.flags & 0x0F00_0100 == 0 && !r.fxdesc.is_empty() && !s.effect)
+                .map(|(r, _)| r.fxdesc.as_str())
+                .collect();
+            assert!(missing.is_empty(), "{class}: {missing:?}");
+            // NULLFX (WEAPONS) is found but has nothing to draw; the power
+            // B ring has a model.
+            let named = |n: &str| {
+                let i = g.pdata[0].sfx.iter().position(|r| r.fxdesc == n);
+                i.map(|i| &g.psfx[0][i])
+            };
+            assert!(named("NULLFX").is_some_and(|s| s.effect));
+            let b = g.pdata[0].rows.turbo_b as usize;
+            let fx = g.pdata[0].damage[b].fxidx as usize;
+            assert!(g.psfx[0][fx].model.is_some(), "{class} power B model");
+            let sounds: Vec<String> = g.psfx[0].iter().filter_map(|s| s.sound.clone()).collect();
+            for (req, found) in crate::audio::check_sounds(&fs, &sounds) {
+                assert!(found.is_some(), "{class}: {req} did not resolve");
+            }
+        }
+    }
+
+    #[test]
+    fn power_b_starts_its_effect_sound_and_shake() {
+        let Some(fs) = data() else { return };
+        let (mut g, _) = missile_game(&fs, "WIZ");
+        let row = g.pdata[0].damage[g.pdata[0].rows.turbo_b as usize].clone();
+        g.sfx.clear();
+        g.fire_damage_row(0, &row, -1.0, 0.0, None);
+        // WIZ_POWERB (flags 6: shake) chains to the wrist particles (sound
+        // field = node, not played).
+        assert_eq!(g.sfx, vec!["S_WIZTURBOB".to_string()]);
+        assert!(g.shake.shaking);
+        let fx: Vec<&Entity> = g
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Effect { .. }))
+            .collect();
+        assert_eq!(fx.len(), 1);
+        assert!(fx[0].model.is_some());
+        // It rides the wizard.
+        g.players[0].pos += Vec3::X * 3.0;
+        g.update_fx_follow();
+        let id = fx_id(&g);
+        let e = g.entities.iter().find(|e| e.id == id).unwrap();
+        assert!((e.pos - g.players[0].pos).length() < 1e-4);
+    }
+
+    fn fx_id(g: &Game) -> u64 {
+        g.entities
+            .iter()
+            .find(|e| matches!(e.kind, Kind::Effect { .. }))
+            .map(|e| e.id)
+            .unwrap()
+    }
+
+    #[test]
+    fn rows_without_an_effect_do_no_damage() {
+        let Some(fs) = data() else { return };
+        let (mut g, _) = missile_game(&fs, "WAR");
+        // WAR dmg10 (combo): fx -1, 10 damage; a grunt in reach is untouched.
+        let mut row = g.pdata[0].damage[10].clone();
+        assert_eq!(row.fxidx, -1);
+        row.radius = 50.0;
+        let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
+        let kind = g.new_enemy(class, 1, EnemyState::Idle);
+        let model = g.classes[class].model(1);
+        let p = g.players[0].pos;
+        g.spawn(kind, model, p + Vec3::X * 2.0, 0.0);
+        g.fire_damage_row(0, &row, -1.0, 0.0, None);
+        assert!(g.damg_cooldown.is_empty());
+        // The 360 (NULLFX, radius 10) does hit it.
+        let row = g.pdata[0].damage[g.pdata[0].rows.turbo_a_360 as usize].clone();
+        g.fire_damage_row(0, &row, 0.0, 1.0, None);
+        assert_eq!(g.damg_cooldown.len(), 1);
+    }
+
+    #[test]
+    fn turbo_c_wave_flies_at_the_row_speed() {
+        let Some(fs) = data() else { return };
+        let (mut g, _) = missile_game(&fs, "WAR");
+        let row = g.pdata[0].damage[g.pdata[0].rows.turbo_c2 as usize].clone();
+        assert_eq!(row.kind, 2);
+        let (p, yaw) = (g.players[0].pos, g.players[0].yaw);
+        g.fire_damage_row(0, &row, 8.0, 9.0, None);
+        let e = g
+            .entities
+            .iter()
+            .find(|e| matches!(e.kind, Kind::Projectile { .. }))
+            .unwrap();
+        let Kind::Projectile {
+            vel,
+            radius,
+            pierced,
+            wall_sound,
+            ..
+        } = &e.kind
+        else {
+            unreachable!()
+        };
+        // 30 along the facing, from (0, 1, 5) in the hero's frame; a super
+        // (pass-through) shot of radius hitrad 10 with no hit record.
+        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        assert!((*vel - fwd * 30.0).length() < 1e-3);
+        assert!((e.pos - (p + Vec3::Y + fwd * 5.0)).length() < 1e-3);
+        assert_eq!((*radius, pierced.is_some()), (10.0, true));
+        assert_eq!(*wall_sound, WallSound::None);
+        assert!(e.model.is_some(), "WAR_PWRC3A");
+        // Walls only stop it for mintime 6; after its animation it becomes
+        // WAR_PWRC3B for maxtime 6.
+        let Kind::Projectile { hold, morph, .. } = &e.kind else {
+            unreachable!()
+        };
+        assert_eq!(*hold, 6.0);
+        assert!(matches!(morph, Some((t, Some(_))) if *t == 6.0));
+    }
+
+    #[test]
+    fn victory_row_plays_the_victory_sound() {
+        let Some(fs) = data() else { return };
+        let (mut g, _) = missile_game(&fs, "WAR");
+        let row = g.pdata[0].damage[g.pdata[0].rows.victory as usize].clone();
+        g.sfx.clear();
+        g.fire_damage_row(0, &row, 9.0, 10.0, None);
+        assert_eq!(g.sfx, vec!["S_WARVICTORY".to_string()]);
+    }
+
+    #[test]
+    fn archer_turbo_fan_fires_every_delay_frames() {
+        let Some(fs) = data() else { return };
+        let (mut g, _) = missile_game(&fs, "ARC");
+        // dmg7: type 10, frames 16..26, every 2.25 frames, swept in from 90
+        // degrees left (0x200).
+        let row = g.pdata[0].damage[7].clone();
+        assert_eq!((row.kind, row.startframe, row.endframe), (10, 16, 26));
+        let yaw = g.players[0].yaw;
+        let mut dirs = Vec::new();
+        for f in 16..27 {
+            let before = missiles(&g).len();
+            g.fire_damage_row(0, &row, f as f32 - 1.0, f as f32, None);
+            for m in &missiles(&g)[before..] {
+                dirs.push(m.1.normalize());
+            }
+        }
+        // PlyrSfxWrapTime: frames 16, 19, 21, 23 and 25; the angle shrinks
+        // to the facing.
+        assert_eq!(dirs.len(), 5);
+        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        assert!(dirs[0].dot(fwd).abs() < 0.05, "first goes out sideways");
+        assert!(dirs.last().unwrap().dot(fwd) > 0.9, "last nearly ahead");
+    }
+
+    #[test]
+    fn turbo_moves_play_their_records() {
+        let Some(fs) = data() else { return };
+        for class in ["WAR", "VAL", "WIZ", "ARC", "DWF", "KNI", "SOR", "JES"] {
+            let mut g = Game::new(&fs, "levelA1", &[(class, "RED")]).unwrap();
+            let mut heard = Vec::new();
+            for f in 0..900 {
+                g.players[0].power = 100.0;
+                let inp = PlayerInput {
+                    turbo: true,
+                    attack: f % 60 < 5,
+                    attack_pressed: f % 60 == 0,
+                    slow: (f + 30) % 60 < 5,
+                    slow_pressed: f % 60 == 30,
+                    ..Default::default()
+                };
+                g.update(1.0 / 60.0, &[inp]);
+                heard.extend(g.sfx.drain(..).filter(|s| s.contains("TURBO")));
+            }
+            assert!(!heard.is_empty(), "{class}: no turbo sounds");
         }
     }
 }
