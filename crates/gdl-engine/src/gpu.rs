@@ -380,6 +380,20 @@ impl Gpu {
         clear: [f64; 3],
         draws: &[(&GpuMesh, &Instance)],
     ) {
+        self.render_viewport(target, depth, globals, clear, draws, None);
+    }
+
+    /// As [`Gpu::render`], drawing the scene only into `viewport` (x, y, w, h in
+    /// pixels); the rest of the target is just cleared.
+    pub fn render_viewport(
+        &self,
+        target: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        globals: &Globals,
+        clear: [f64; 3],
+        draws: &[(&GpuMesh, &Instance)],
+        viewport: Option<[f32; 4]>,
+    ) {
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(globals));
         for (mesh, inst) in draws {
@@ -432,6 +446,9 @@ impl Gpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            if let Some([x, y, w, h]) = viewport {
+                pass.set_viewport(x, y, w, h, 0.0, 1.0);
+            }
             pass.set_bind_group(0, &self.globals_bg, &[]);
             // 0 = opaque (alpha test), 1 = alpha blended, 2 = additive.
             for pass_kind in 0..3u8 {

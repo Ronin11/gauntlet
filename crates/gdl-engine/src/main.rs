@@ -290,18 +290,26 @@ fn snapshot_game(args: &Args) -> Result<()> {
         gpu.color_format,
         ui::UiAssets::load(&fs),
     );
-    let names: Vec<String> = players
+    let panels: Vec<hud::PanelInfo> = players
         .iter()
-        .map(|(c, _)| {
-            select::HEROES
+        .enumerate()
+        .map(|(slot, (c, col))| hud::PanelInfo {
+            slot,
+            name: ["SAM", "BOB", "ANN", "JO"][slot % 4].into(),
+            colour: select::COLOURS
                 .iter()
-                .find(|(k, _)| k == c)
-                .map_or(c.clone(), |(_, n)| n.to_string())
+                .position(|k| k == col)
+                .unwrap_or(slot % 4),
+            class: select::CLASSES.iter().position(|k| k == c).unwrap_or(0),
         })
         .collect();
     let draw_hud = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
-        hud::build(&mut canvas, &hud.ui, &g, &names);
+        hud::build(
+            &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
+            &g,
+            &panels,
+        );
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
     };
     // Menu screens for checking their layout headlessly.
@@ -321,7 +329,11 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
             Some("loading") => menu::draw_loading(&mut screen::Scr::new(&mut canvas, &hud.ui, 40)),
             Some("pause") => {
-                hud::build(&mut canvas, &hud.ui, &g, &names);
+                hud::build(
+                    &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
+                    &g,
+                    &panels,
+                );
                 menu::Pause::default().draw(&mut canvas, &style, t);
             }
             _ => {}

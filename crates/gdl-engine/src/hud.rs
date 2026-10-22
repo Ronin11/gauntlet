@@ -1,7 +1,8 @@
 //! 2D overlay drawn after the 3D scene: textured quads (the disc's menu art and
 //! fonts, see [`crate::ui`]), solid rectangles, and an 8x8 fallback font.
 
-use crate::game::{Game, PlayerState, PLAYER_COLORS};
+use crate::game::{Game, PlayerState};
+use crate::screen::Scr;
 use crate::ui::{Font, Tex, UiAssets};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -377,104 +378,191 @@ pub const PLAYER_RGB: [[f32; 3]; 4] = [
     [0.3, 0.9, 0.35],
 ];
 
-/// Build the in-game HUD for the current game state: a framed stone panel in each
-/// player's corner with name, health, gold, keys and potions.
-pub fn build(c: &mut Canvas, ui: &UiAssets, game: &Game, names: &[String]) {
-    let st = Style { ui };
-    let u = (c.height() / 720.0).min(c.width() / 1120.0).max(0.5);
-    let panel_w = 256.0 * u;
-    let panel_h = 128.0 * u;
-    let m = 8.0 * u;
-    for (i, p) in game.players.iter().enumerate() {
-        let rgb = PLAYER_RGB[i % 4];
-        let col = [rgb[0], rgb[1], rgb[2], 1.0];
-        // Corners: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right.
-        let x = if i % 2 == 0 {
-            m
-        } else {
-            c.width() - panel_w - m
+/// A joined player's place on the HUD.
+#[derive(Clone, Debug)]
+pub struct PanelInfo {
+    /// Column 0..3 (the player's slot).
+    pub slot: usize,
+    /// The name typed on the select screen.
+    pub name: String,
+    /// Costume colour, as class_id (0 yellow, 1 blue, 2 red, 3 green).
+    pub colour: usize,
+    /// Character class id (WAR 0 .. HYE 15, SUM 16).
+    pub class: usize,
+}
+
+/// player_pal: text colours per costume colour.
+const PLAYER_PAL: [u32; 4] = [0xFFFF80, 0x87CEEB, 0xFFC0E0, 0x80FF80];
+/// player_rgb / player_inactive_rgb: the portrait tint for a joined or empty slot.
+const PLAYER_TINT: [u32; 4] = [0x787800, 0x1E1E78, 0x780000, 0x006400];
+const INACTIVE_TINT: [u32; 4] = [0x5A5A1E, 0x1E1E69, 0x642828, 0x1E4B1E];
+/// potionicon_tab, indexed by potion_type[count - 1] = (count - 1) & 3.
+const POTION_ICONS: [&str; 5] = ["RED", "RED", "BLU", "YEL", "GRE"];
+
+/// MBBlitSetColor: blit colours are 0x80 = 1.0, so a tint is about rgb / 255.
+fn tint(rgb: u32) -> [f32; 4] {
+    let c = |v: u32| (((v >> 1) & 0x7F) + 1) as f32 / 128.0;
+    [c(rgb >> 16), c(rgb >> 8), c(rgb), 1.0]
+}
+
+/// The status panels along the bottom of the screen (create_player_blits,
+/// setup_player_display and write_health_and_items in player.c): one 128-pixel
+/// column per slot from y = 304, the empty slots dimmed.
+pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
+    use crate::ui::{FONT_8HI, FONT_INITIALS};
+    const FONT_SCORE: usize = 4;
+    s.bars(1.0);
+    for slot in 0..4 {
+        let x0 = 128.0 * slot as f32;
+        let xc = x0 + 64.0;
+        let joined = panels.iter().position(|p| p.slot == slot);
+        let Some(pi) = joined else {
+            // An empty slot: S3 strip, S4 in the inactive tint, S4_FRAME.
+            for (name, y, h, color) in [
+                ("S3", 304.0, 16.0, [1.0; 4]),
+                ("S4", 320.0, 64.0, tint(INACTIVE_TINT[slot])),
+                ("S4_FRAME", 320.0, 64.0, [1.0; 4]),
+            ] {
+                if let Some(t) = s.ui.get(name) {
+                    s.blit_tint(t, x0, y, 128.0, h, color);
+                }
+            }
+            continue;
         };
-        let y = if i < 2 { m } else { c.height() - panel_h - m };
-        let frame = [
-            0.75 + rgb[0] * 0.25,
-            0.75 + rgb[1] * 0.25,
-            0.75 + rgb[2] * 0.25,
-            1.0,
-        ];
-        st.panel(c, x, y, panel_w, panel_h, frame);
-        let (l, r) = (x + 22.0 * u, x + panel_w - 22.0 * u);
-
-        let name = names.get(i).map(String::as_str).unwrap_or("");
-        st.text(c, l, y + 14.0 * u, 28.0 * u, col, name);
-
+        let info = &panels[pi];
+        let Some(p) = game.players.get(pi) else {
+            continue;
+        };
+        let pal = PLAYER_PAL[info.colour % 4];
         let dead = matches!(p.state, PlayerState::Dead { .. });
-        let health = p.health.max(0.0) as u32;
-        let htxt = if dead {
-            "Dead".to_string()
-        } else {
-            health.to_string()
-        };
-        let hcol = if dead || health < 200 {
-            let pulse = 0.6 + 0.4 * (game.time * 8.0).sin().abs();
-            [1.0, 0.25 * pulse, 0.2 * pulse, 1.0]
-        } else {
-            [1.0, 1.0, 1.0, 1.0]
-        };
-        let hw = st.width(&htxt, 30.0 * u);
-        st.text(c, r - hw, y + 44.0 * u, 30.0 * u, hcol, &htxt);
-
-        // Health bar: the metal tube with the pink fill over it.
-        let (bx, by, bw, bh) = (l - 4.0 * u, y + 48.0 * u, r - l - 80.0 * u, 22.0 * u);
-        let frac = (p.health / 999.0).clamp(0.0, 1.0);
-        match ui.get("EMPTY_BAR") {
-            Some(t) => c.sprite(t, bx, by, bw, bh, [1.0; 4]),
-            None => c.rect(bx, by, bw, bh, [0.2, 0.2, 0.2, 1.0]),
-        }
-        let (fx, fy, fw, fh) = (bx + bw * 0.03, by + bh * 0.3, bw * 0.94, bh * 0.4);
-        c.rect(fx, fy, fw, fh, [0.1, 0.0, 0.02, 0.85]);
-        match ui.get("PINK_BAR") {
-            Some(t) => c.sprite(t, fx, fy, fw * frac, fh, [1.0, 0.45, 0.45, 1.0]),
-            None => c.rect(fx, fy, fw * frac, fh, [0.9, 0.15, 0.1, 1.0]),
-        }
-
-        // Gold on the left; potions and keys on the right.
-        let ry = y + 80.0 * u;
-        let icon = 26.0 * u;
-        let mut cx = l;
-        if let Some(t) = ui.get("COIN") {
-            c.sprite(t, cx, ry, icon, icon, [1.0; 4]);
-            cx += icon + 6.0 * u;
-        }
-        st.text(c, cx, ry, 26.0 * u, GOLD, &p.score.to_string());
-        let key = ui.get("KEY_ICON");
-        let potion = ui.get(&format!("POTION_ICON_{}", PLAYER_COLORS[i % 4]));
-        let mut rx = r;
-        for (tex, n) in [(potion, p.potions), (key, p.keys)] {
-            let Some(t) = tex else { continue };
-            if n == 0 {
-                continue;
+        // Display mode 1: the rune-stone strip and the class portrait.
+        let portrait = format!("S4_{}", crate::select::CLASSES[info.class.min(16)]);
+        for (name, y, h, color) in [
+            ("BK_RUNE_STONE_02", 304.0, 16.0, [1.0; 4]),
+            (
+                portrait.as_str(),
+                320.0,
+                64.0,
+                tint(PLAYER_TINT[info.colour % 4]),
+            ),
+            ("S4_FRAME", 320.0, 64.0, [1.0; 4]),
+        ] {
+            if let Some(t) = s.ui.get(name) {
+                s.blit_tint(t, x0, y, 128.0, h, color);
             }
-            if n > 1 {
-                let label = n.to_string();
-                rx -= st.width(&label, 24.0 * u);
-                st.text(c, rx, ry + 1.0 * u, 24.0 * u, [1.0; 4], &label);
+        }
+        if !dead {
+            power_meter(s, x0, 0.0);
+        }
+        for (name, x) in [("COIN", x0 + 6.0), ("HEART", x0 + 61.0)] {
+            if let Some(t) = s.ui.get(name) {
+                s.blit(t, x, 357.0, 20.0, 20.0, 0);
             }
-            rx -= icon + 2.0 * u;
-            c.sprite(t, rx, ry, icon, icon, [1.0; 4]);
-            rx -= 10.0 * u;
+        }
+        let gold = p.score.min(99999).to_string();
+        let w = s.text_width(FONT_SCORE, 1.0, &gold);
+        s.text(1.0, x0 + 60.0 - w, 359.0, FONT_SCORE, pal, 0, &gold);
+        let health = (p.health.max(0.0) as u32).min(9999).to_string();
+        let w = s.text_width(FONT_SCORE, 1.0, &health);
+        s.text(1.0, x0 + 116.0 - w, 359.0, FONT_SCORE, pal, 0, &health);
+        s.text(0.667, -xc, 339.0, FONT_INITIALS, pal, 0, &info.name);
+        s.text(
+            1.0,
+            -xc,
+            326.0,
+            FONT_8HI,
+            0xFFFFFF,
+            0,
+            &format!("LV {}", p.level),
+        );
+        if p.keys > 0 {
+            if let Some(t) = s.ui.get("KEY_ICON") {
+                s.blit(t, x0 + 8.0, 323.0, t.w as f32, t.h as f32, 0);
+            }
+            s.text(
+                0.8,
+                x0 + 26.0,
+                327.0,
+                FONT_SCORE,
+                pal,
+                0,
+                &p.keys.to_string(),
+            );
+        }
+        if p.potions > 0 {
+            let icon = POTION_ICONS[((p.potions - 1) & 3) as usize];
+            if let Some(t) = s.ui.get(&format!("POTION_ICON_{icon}")) {
+                s.blit(t, x0 + 102.0, 323.0, t.w as f32, t.h as f32, 0);
+            }
+            s.text(
+                0.8,
+                x0 + 92.0,
+                327.0,
+                FONT_SCORE,
+                pal,
+                0,
+                &p.potions.to_string(),
+            );
         }
     }
-    // Centre messages.
-    for (k, (msg, t)) in game.messages.iter().enumerate() {
-        let a = t.min(1.0);
-        st.centered(
-            c,
-            c.width() * 0.5,
-            c.height() * 0.28 + k as f32 * 46.0 * u,
-            38.0 * u,
-            [GOLD[0], GOLD[1], GOLD[2], a],
-            msg,
-        );
+    // Messages not yet driven by the game's message table: drawn as msgPost does
+    // without a world position, in the parchment box over slot 0.
+    let lines: Vec<&str> = game.messages.iter().map(|(m, _)| m.as_str()).collect();
+    if !lines.is_empty() {
+        message_box(s, 64.0, 250.0, &lines, 0x160C03);
+    }
+}
+
+/// draw_power_meter at power level `level` (0..100), not flashing.
+fn power_meter(s: &mut Scr, x0: f32, level: f32) {
+    let f = 0.01 * level;
+    let (zone1, frac) = if f < 0.4 {
+        (true, f / 0.4)
+    } else if f < 0.99 {
+        (false, (f - 0.4) / 0.6)
+    } else {
+        (false, 1.0)
+    };
+    let a = (127.0 * frac + 128.0) / 255.0;
+    let (fill, bar) = if zone1 {
+        ([a, a, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0])
+    } else {
+        ([a, 0.0, 0.0, 1.0], [1.0, 1.0, 0.0, 1.0])
+    };
+    let Some(t) = s.ui.get("TRBO_FULL_NEW") else {
+        return;
+    };
+    s.blit_tint(t, x0, 304.0, 128.0, 32.0, bar);
+    let w = (((128.0 * frac) as i32) >> 1).max(1) as f32;
+    s.blit_tint(t, x0 + 64.0 - w, 304.0, 2.0 * w, 32.0, fill);
+    if let Some(g) = s.ui.get("TRBO_GLINT") {
+        s.blit(g, x0, 304.0, 128.0, 16.0, 0);
+    }
+}
+
+/// msgPost / msgDraw: dark text centred in a 75%-opaque SCROLL_A box, the block
+/// centred on (cx, cy) and kept on screen.
+pub fn message_box(s: &mut Scr, cx: f32, cy: f32, lines: &[&str], rgb: u32) {
+    use crate::ui::FONT_8X8;
+    let fh = 9.0;
+    let gap = 8.0;
+    let h = lines.len() as f32 * (fh + gap) + 16.0;
+    let w = lines
+        .iter()
+        .map(|l| s.text_width(FONT_8X8, 1.0, l))
+        .fold(0.0, f32::max)
+        + 64.0;
+    let top = (cy - h / 2.0).clamp(2.0, 304.0 - h);
+    let left = (cx - w / 2.0).clamp(0.0, 511.0 - w);
+    let (cx, cy) = (left + w / 2.0, top + h / 2.0);
+    if let Some(t) = s.ui.get("SCROLL_A") {
+        s.blit(t, left, top, w, h, 0x40);
+    }
+    let n = lines.len() as f32;
+    let mut y = cy - (fh + 11.0 * (n - 1.0)) / 2.0;
+    for l in lines {
+        s.text(1.0, -cx, y, FONT_8X8, rgb, 0, l);
+        y += 11.0;
     }
 }
 

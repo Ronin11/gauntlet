@@ -5,12 +5,13 @@ use crate::audio::Audio;
 use crate::fs::GameFs;
 use crate::game::Game;
 use crate::gpu::Gpu;
+use crate::hud::PanelInfo;
 use crate::hud::{self, Hud, Style};
 use crate::input::{Input, PlayerInput, Source};
 use crate::menu::{self, Pause, PauseAction, Title};
 use crate::scene::{Scene, CLEAR};
 use crate::screen::Scr;
-use crate::select::{Select, HEROES};
+use crate::select::{Select, CLASSES, COLOURS};
 use crate::ui::UiAssets;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -34,7 +35,7 @@ pub struct Config {
 struct Playing {
     game: Game,
     scene: Scene,
-    players: Vec<(String, String)>,
+    panels: Vec<PanelInfo>,
     /// Seconds played, for fading out the loading art.
     intro: f32,
 }
@@ -48,7 +49,7 @@ enum Screen {
     /// The loading art is shown for one frame, then the level loads.
     Loading {
         level: String,
-        players: Vec<(String, String)>,
+        panels: Vec<PanelInfo>,
         carry: Option<Carry>,
         shown: bool,
     },
@@ -149,7 +150,7 @@ impl App {
             }
             let screen = Screen::Loading {
                 level: self.cfg.level.clone(),
-                players: self.cfg.players.clone(),
+                panels: panels_for(&self.cfg.players),
                 carry: None,
                 shown: false,
             };
@@ -171,20 +172,6 @@ impl App {
             window,
         })
     }
-}
-
-/// Display names of the chosen heroes, for the HUD.
-fn hero_names(players: &[(String, String)]) -> Vec<String> {
-    players
-        .iter()
-        .map(|(c, _)| {
-            HEROES
-                .iter()
-                .find(|(k, _)| k == c)
-                .map(|(_, n)| n.to_string())
-                .unwrap_or_else(|| c.clone())
-        })
-        .collect()
 }
 
 impl ApplicationHandler for App {
@@ -293,17 +280,17 @@ impl App {
         // A level load blocks, so it happens on the frame after the loading art showed.
         if let Screen::Loading {
             level,
-            players,
+            panels,
             carry,
             shown: true,
         } = &mut r.screen
         {
-            let (level, players, carry) = (level.clone(), players.clone(), carry.take());
-            match start_game(fs, &r.gpu, &level, players) {
+            let (level, panels, carry) = (level.clone(), panels.clone(), carry.take());
+            match start_game(fs, &r.gpu, &level, panels) {
                 Ok(mut p) => {
                     if let Some(carry) = carry {
                         for (a, b) in p.game.players.iter_mut().zip(carry) {
-                            a.health = b.0.max(300.0);
+                            a.health = b.0;
                             (a.score, a.keys, a.potions) = (b.1, b.2, b.3);
                         }
                     }
@@ -367,11 +354,12 @@ impl App {
                     }
                     if escape || sel.leave {
                         next = Some(Screen::Title(Title::default()));
-                    } else if let Some(players) = sel.update(&all) {
+                    } else if sel.update(&all).is_some() {
                         r.sources = sel.sources();
+                        let panels = sel.panels();
                         next = Some(Screen::Loading {
                             level: self.cfg.level.clone(),
-                            players,
+                            panels,
                             carry: None,
                             shown: false,
                         });
@@ -438,12 +426,29 @@ impl App {
                     r.audio.play(fs, &snd);
                 }
                 p.scene.sync(&r.gpu, &p.game);
-                let g = p
-                    .scene
-                    .globals(&p.game, r.config.width as f32 / r.config.height as f32);
-                r.gpu
-                    .render(&view, &r.depth, &g, CLEAR, &p.scene.draws(&p.game));
-                hud::build(&mut canvas, &r.hud.ui, &p.game, &hero_names(&p.players));
+                // The game draws a 4:3 picture; keep it, centred, in any window.
+                let (w, h) = (r.config.width as f32, r.config.height as f32);
+                let k = (w / 512.0).min(h / 384.0);
+                let vp = [
+                    (w - 512.0 * k) / 2.0,
+                    (h - 384.0 * k) / 2.0,
+                    512.0 * k,
+                    384.0 * k,
+                ];
+                let g = p.scene.globals(&p.game, 4.0 / 3.0);
+                r.gpu.render_viewport(
+                    &view,
+                    &r.depth,
+                    &g,
+                    CLEAR,
+                    &p.scene.draws(&p.game),
+                    Some(vp),
+                );
+                hud::build(
+                    &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+                    &p.game,
+                    &p.panels,
+                );
                 let fade = menu::loading_fade(p.intro);
                 if fade < 255 {
                     menu::transition(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), fade);
@@ -477,7 +482,7 @@ impl App {
                 if fs.exists(&format!("LEVELS/{next}/WORLDS.PS2")) {
                     r.screen = Screen::Loading {
                         level: next,
-                        players: play.players.clone(),
+                        panels: play.panels.clone(),
                         carry: Some(carry),
                         shown: false,
                     };
@@ -492,22 +497,41 @@ impl App {
     }
 }
 
-fn start_game(
-    fs: &GameFs,
-    gpu: &Gpu,
-    level: &str,
-    players: Vec<(String, String)>,
-) -> Result<Playing> {
-    let classes: Vec<(&str, &str)> = players
+/// HUD panels for players given on the command line: slots in order, no names.
+fn panels_for(players: &[(String, String)]) -> Vec<PanelInfo> {
+    players
         .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .enumerate()
+        .map(|(slot, (class, colour))| PanelInfo {
+            slot,
+            name: String::new(),
+            colour: COLOURS.iter().position(|c| c == colour).unwrap_or(slot % 4),
+            class: CLASSES.iter().position(|c| c == class).unwrap_or(0),
+        })
+        .collect()
+}
+
+fn start_game(fs: &GameFs, gpu: &Gpu, level: &str, panels: Vec<PanelInfo>) -> Result<Playing> {
+    // Sumner plays with the Wizard's model.
+    let classes: Vec<(&str, &str)> = panels
+        .iter()
+        .map(|p| {
+            (
+                if p.class >= 16 {
+                    "WIZ"
+                } else {
+                    CLASSES[p.class]
+                },
+                COLOURS[p.colour % 4],
+            )
+        })
         .collect();
     let game = Game::new(fs, level, &classes)?;
     let scene = Scene::new(gpu, &game)?;
     Ok(Playing {
         game,
         scene,
-        players,
+        panels,
         intro: 0.0,
     })
 }

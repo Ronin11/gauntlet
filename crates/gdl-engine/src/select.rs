@@ -284,6 +284,23 @@ impl Select {
         self.players.iter().flatten().map(|p| p.source).collect()
     }
 
+    /// Each joined player's HUD panel: column, name, colour and class.
+    pub fn panels(&self) -> Vec<crate::hud::PanelInfo> {
+        self.players
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, p)| {
+                let p = p.as_ref()?;
+                Some(crate::hud::PanelInfo {
+                    slot,
+                    name: p.name.clone(),
+                    colour: p.colour,
+                    class: p.character,
+                })
+            })
+            .collect()
+    }
+
     /// Player names in column order.
     pub fn names(&self) -> Vec<String> {
         self.players

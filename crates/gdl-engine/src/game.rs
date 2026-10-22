@@ -22,10 +22,11 @@ const TURBO_SPEED: f32 = 18.0;
 const STEP_HEIGHT: f32 = 1.2;
 const PLAYER_RADIUS: f32 = 1.0;
 const PLAYER_HEIGHT: f32 = 4.5;
-const PLAYER_MAX_HEALTH: f32 = 999.0;
-const PLAYER_START_HEALTH: f32 = 600.0;
-/// Health drains slowly over time, as in every Gauntlet.
-const HEALTH_DRAIN_PER_SEC: f32 = 1.0;
+/// player_max_health: 100 per level above 1 plus 500, at most 9999. A new
+/// character starts full at level 1.
+pub fn max_health(level: u32) -> f32 {
+    (100.0 * (level.max(1) - 1) as f32 + 500.0).min(9999.0)
+}
 const ATTACK_RANGE: f32 = 5.0;
 const ATTACK_ARC_COS: f32 = 0.25;
 const ENEMY_ACTIVATE_DIST: f32 = 60.0;
@@ -93,6 +94,8 @@ pub struct Player {
     pub animator: Animator,
     pub state: PlayerState,
     pub health: f32,
+    /// Experience level (1..99).
+    pub level: u32,
     pub keys: u32,
     pub potions: u32,
     pub score: u32,
@@ -104,7 +107,6 @@ pub struct Player {
     /// Class and colour codes ("WAR", "RED") for sounds.
     pub class: String,
     pub color: String,
-    low_health_warned: bool,
     walk_phase: u8,
 }
 
@@ -322,6 +324,10 @@ pub struct Game {
     pub cam_yaw: f32,
     pub cam_pitch: f32,
     pub time: f32,
+    /// 60 Hz ticks since the level started.
+    pub frame: u32,
+    /// Ticks until the next low-health heartbeat.
+    heartbeat: i32,
     pub rng: Rng,
     /// Set when a player reaches the exit.
     pub exit_to: Option<String>,
@@ -457,6 +463,8 @@ impl Game {
             cam_yaw: std::f32::consts::PI,
             cam_pitch: 60f32.to_radians(),
             time: 0.0,
+            frame: 0,
+            heartbeat: 0,
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             exit_to: None,
             messages: Vec::new(),
@@ -480,7 +488,8 @@ impl Game {
                 on_ground: false,
                 animator: Animator::new(game.player_seqs[i].ready),
                 state: PlayerState::Normal,
-                health: PLAYER_START_HEALTH,
+                health: max_health(1),
+                level: 1,
                 keys: 0,
                 potions: 0,
                 score: 0,
@@ -491,7 +500,6 @@ impl Game {
                     .find(|(k, _)| *k == classes[i].0)
                     .map(|(_, n)| n.to_string())
                     .unwrap_or_else(|| classes[i].0.to_string()),
-                low_health_warned: false,
                 class: classes[i].0.to_string(),
                 color: classes[i].1.to_string(),
                 walk_phase: 0,
@@ -1016,14 +1024,44 @@ impl Game {
         }
     }
 
+    /// do_weakening's heartbeat (S_WARN): for the living player with the least
+    /// health, while it is 200 or less, every 120 ticks above 100, 60 above 25 and
+    /// 30 below.
+    fn heartbeat(&mut self) {
+        let low = self
+            .players
+            .iter()
+            .filter(|p| !matches!(p.state, PlayerState::Dead { .. }) && p.health > 1.0)
+            .map(|p| p.health)
+            .min_by(|a, b| a.total_cmp(b));
+        match low {
+            Some(h) if h <= 200.0 => {
+                self.heartbeat -= 1;
+                if self.heartbeat <= 0 {
+                    self.sfx.push("S_WARN".into());
+                    self.heartbeat = if h >= 100.0 {
+                        120
+                    } else if h >= 25.0 {
+                        60
+                    } else {
+                        30
+                    };
+                }
+            }
+            _ => self.heartbeat = 0,
+        }
+    }
+
     pub fn update(&mut self, dt: f32, inputs: &[PlayerInput]) {
         self.time += dt;
         self.messages.retain_mut(|(_, t)| {
             *t -= dt;
             *t > 0.0
         });
+        self.frame += 1;
         self.update_players(dt, inputs);
         self.update_entities(dt);
+        self.heartbeat();
 
         // Camera follows the centroid of living players.
         let alive: Vec<Vec3> = self
@@ -1084,7 +1122,7 @@ impl Game {
                 if *timer <= 0.0 {
                     // Respawn next to the camera focus with fresh health (kid-friendly rules).
                     p.state = PlayerState::Normal;
-                    p.health = PLAYER_START_HEALTH;
+                    p.health = max_health(p.level);
                     p.pos = self.cam_focus + Vec3::Y * 2.0;
                     p.vy = 0.0;
                     p.animator.restart(seqs.ready);
@@ -1093,19 +1131,6 @@ impl Game {
                 continue;
             }
 
-            p.health -= HEALTH_DRAIN_PER_SEC * dt;
-            // The announcer's most famous line.
-            if p.health < 200.0 && !p.low_health_warned {
-                p.low_health_warned = true;
-                self.messages
-                    .push((format!("{} NEEDS FOOD, BADLY!", p.name), 3.0));
-                self.sfx.push(format!(
-                    "VOICE:S_{}{}1+S_NEEDSFOOD+S_BADLY|VOICE:S_NEEDSFOOD+S_BADLY",
-                    p.color, p.class
-                ));
-            } else if p.health > 300.0 {
-                p.low_health_warned = false;
-            }
             if inp.magic_pressed && p.potions > 0 {
                 p.potions -= 1;
                 self.sfx.push("S_POTION1".into());
@@ -1901,7 +1926,22 @@ impl Game {
             if matches!(p.state, PlayerState::Dead { .. }) {
                 continue;
             }
+            // damage_player: the announcer speaks as health crosses 150 and 50
+            // (there is no passive drain on GameCube).
+            let old = (p.health + 0.5) as i32;
             p.health -= dmg;
+            let new = (p.health + 0.5) as i32;
+            let name = format!("VOICE:S_{}{}1", p.color, p.class);
+            if old > 150 && new <= 150 {
+                self.sfx.push(format!("{name}+S_BADLY|VOICE:S_BADLY"));
+            } else if old > 50 && new <= 50 {
+                let line = if self.frame % 2 == 0 {
+                    "S_LIFEFORCE"
+                } else {
+                    "S_ABOUT"
+                };
+                self.sfx.push(format!("{name}+{line}|VOICE:{line}"));
+            }
             if p.hurt_flash < 0.3 {
                 let n = 1 + (self.time * 13.0) as u32 % 4;
                 self.sfx.push(format!("S_{}PAIN{n}|S_PLYRDMG", p.class));
@@ -1918,7 +1958,12 @@ impl Game {
                 PickupKind::Other(_) => "S_PICKUPSPECIAL".into(),
             });
             match kind {
-                PickupKind::Food(hp) => p.health = (p.health + hp).min(PLAYER_MAX_HEALTH),
+                // heal_player: food never takes health past the maximum.
+                PickupKind::Food(hp) => {
+                    if !(hp > 0.0 && p.health >= max_health(p.level)) {
+                        p.health = (p.health + hp).min(max_health(p.level));
+                    }
+                }
                 PickupKind::Key => p.keys += 1,
                 PickupKind::Gold(v) => p.score += v,
                 PickupKind::Potion => p.potions += 1,
