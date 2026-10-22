@@ -28,8 +28,10 @@ const HEALTH_DRAIN_PER_SEC: f32 = 1.0;
 const ATTACK_RANGE: f32 = 5.0;
 const ATTACK_ARC_COS: f32 = 0.25;
 const ENEMY_ACTIVATE_DIST: f32 = 60.0;
-const GENERATOR_ACTIVATE_DIST: f32 = 55.0;
-const MAX_ENEMIES: usize = 120;
+const GENERATOR_ACTIVATE_DIST: f32 = 40.0;
+const MAX_ENEMIES: usize = 48;
+/// Players are kept within this distance of the group's centre (stay on screen).
+const PARTY_RADIUS: f32 = 13.0;
 
 /// Small deterministic RNG (xorshift) so simulations are reproducible.
 #[derive(Clone)]
@@ -187,8 +189,17 @@ pub enum Kind {
     Prop,
 }
 
+/// Solid collision shape of an entity, from its item info.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Shape {
+    Cylinder { radius: f32 },
+    /// Half extents along the entity's local x and z axes.
+    Box { half: Vec2 },
+}
+
 pub struct Entity {
     pub id: u64,
+    pub solid: Option<Shape>,
     pub kind: Kind,
     pub model: Option<usize>,
     pub pos: Vec3,
@@ -321,6 +332,13 @@ fn build_collision(level: &Level) -> Vec<Tri> {
         );
     }
     tris
+}
+
+fn item_shape(info: &gdl_formats::worlds::ItemInfo) -> Shape {
+    match info.coll_type {
+        3 => Shape::Box { half: Vec2::new(info.x_dim.max(0.5), info.z_dim.max(0.5)) },
+        _ => Shape::Cylinder { radius: info.radius.clamp(0.4, 6.0) },
+    }
 }
 
 /// Next level name: `levelA1` -> `levelA2`.
@@ -470,6 +488,7 @@ impl Game {
         animator.force_loop = !matches!(kind, Kind::Enemy { .. });
         self.entities.push(Entity {
             id,
+            solid: None,
             kind,
             model,
             pos,
@@ -479,6 +498,64 @@ impl Game {
             alive: true,
         });
         id
+    }
+
+    fn set_solid(&mut self, id: u64, shape: Shape) {
+        if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+            e.solid = Some(shape);
+        }
+    }
+
+    /// Push a circle of `radius` at `pos` out of every solid entity.
+    fn resolve_solids(entities: &[Entity], mut pos: Vec3, radius: f32, skip: u64) -> Vec3 {
+        for e in entities {
+            let Some(shape) = e.solid else { continue };
+            if !e.alive || e.id == skip || (e.pos.y - pos.y).abs() > 4.0 {
+                continue;
+            }
+            let d = Vec2::new(pos.x - e.pos.x, pos.z - e.pos.z);
+            match shape {
+                Shape::Cylinder { radius: r } => {
+                    let len = d.length();
+                    let min = r + radius;
+                    if len < min {
+                        let n = if len > 1e-4 { d / len } else { Vec2::X };
+                        pos.x = e.pos.x + n.x * min;
+                        pos.z = e.pos.z + n.y * min;
+                    }
+                }
+                Shape::Box { half } => {
+                    // Work in the box's local frame.
+                    let (s, c) = e.yaw.sin_cos();
+                    let local = Vec2::new(d.x * c - d.y * s, d.x * s + d.y * c);
+                    let clamped = local.clamp(-half, half);
+                    let diff = local - clamped;
+                    let len = diff.length();
+                    let push_local = if len > 1e-4 {
+                        if len >= radius {
+                            continue;
+                        }
+                        diff / len * (radius - len)
+                    } else {
+                        // Centre inside the box: push out along the shallowest axis.
+                        let px = half.x + radius - local.x.abs();
+                        let pz = half.y + radius - local.y.abs();
+                        if px < pz {
+                            Vec2::new(px * local.x.signum(), 0.0)
+                        } else {
+                            Vec2::new(0.0, pz * local.y.signum())
+                        }
+                    };
+                    let push = Vec2::new(
+                        push_local.x * c + push_local.y * s,
+                        -push_local.x * s + push_local.y * c,
+                    );
+                    pos.x += push.x;
+                    pos.z += push.y;
+                }
+            }
+        }
+        pos
     }
 
     fn item_model(
@@ -566,7 +643,10 @@ impl Game {
                 }
             }
             let pos = Vec3::from(inst.pos);
-            let yaw = inst.rot[1];
+            // Placement rotations use the game's pitch/yaw/roll convention; items stand
+            // upright, so reduce to the yaw that the rotation turns +z towards.
+            let fwd = crate::character::ryp_matrix(inst.rot).transform_vector3(Vec3::Z);
+            let yaw = fwd.x.atan2(fwd.z);
             let p16 = |k: usize| i16::from_le_bytes([inst.params[k], inst.params[k + 1]]);
 
             match info.item_type {
@@ -593,12 +673,12 @@ impl Game {
                 ItemType::Generator => {
                     let strength = p16(0).clamp(0, 3) as usize;
                     let max = p16(4).clamp(1, 12) as usize;
-                    let interval = (p16(6).max(1) as f32) * 0.25;
+                    let interval = (p16(6).max(1) as f32) * 0.5;
                     if let Some(c) = self.monster_class(fs, &mut cache, &info.name) {
                         let model = self.classes[c].gen_model(strength);
                         let hp = 20.0 * strength.max(1) as f32;
                         let timer = self.rng.range(0.0, interval);
-                        self.spawn(
+                        let id = self.spawn(
                             Kind::Generator {
                                 class: c,
                                 strength: strength.max(1),
@@ -612,6 +692,7 @@ impl Game {
                             pos,
                             yaw,
                         );
+                        self.set_solid(id, Shape::Cylinder { radius: info.radius.max(1.0) });
                     }
                 }
                 ItemType::Powerup => {
@@ -649,7 +730,7 @@ impl Game {
                         .then(|| i32::from_le_bytes(inst.params[0..4].try_into().unwrap()))
                         .filter(|&i| i >= 0)
                         .map(|i| i as usize);
-                    self.spawn(
+                    let id = self.spawn(
                         Kind::Container {
                             hp: info.hit_points.max(1) as f32 * 2.0,
                             drop,
@@ -658,12 +739,13 @@ impl Game {
                         pos,
                         yaw,
                     );
+                    self.set_solid(id, item_shape(&info));
                 }
                 ItemType::Door => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     let coll = (inst.coll_tri_count > 0 && inst.coll_tri_index >= 0)
                         .then(|| (inst.coll_tri_index as usize, inst.coll_tri_count as usize));
-                    self.spawn(
+                    let id = self.spawn(
                         Kind::Door {
                             radius: info.radius.max(2.0) + 1.5,
                             coll,
@@ -672,6 +754,7 @@ impl Game {
                         pos,
                         yaw,
                     );
+                    self.set_solid(id, item_shape(&info));
                 }
                 ItemType::Exit => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
@@ -850,6 +933,7 @@ impl Game {
             p.pos = self
                 .collision
                 .resolve_walls(p.pos, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT);
+            p.pos = Self::resolve_solids(&self.entities, p.pos, PLAYER_RADIUS, 0);
             p.on_ground = Self::snap_to_ground(&self.collision, &mut p.pos, &mut p.vy, dt);
             if p.pos.y < self.level.worlds.min_bounds[1] - 50.0 {
                 p.pos = self.cam_focus + Vec3::Y * 2.0;
@@ -877,6 +961,38 @@ impl Game {
                 }
             }
             p.animator.update(&model.skeleton, dt);
+        }
+        // Players don't overlap each other.
+        for a in 0..self.players.len() {
+            for b in (a + 1)..self.players.len() {
+                let d = Vec2::new(
+                    self.players[b].pos.x - self.players[a].pos.x,
+                    self.players[b].pos.z - self.players[a].pos.z,
+                );
+                let len = d.length();
+                let min = PLAYER_RADIUS * 2.0;
+                if len < min {
+                    let n = if len > 1e-4 { d / len } else { Vec2::new(1.0, 0.0) };
+                    let push = n * (min - len) * 0.5;
+                    self.players[a].pos -= Vec3::new(push.x, 0.0, push.y);
+                    self.players[b].pos += Vec3::new(push.x, 0.0, push.y);
+                }
+            }
+        }
+        // Keep the party together: nobody may wander too far from the group's centre.
+        let alive: Vec<usize> =
+            (0..self.players.len()).filter(|&i| !matches!(self.players[i].state, PlayerState::Dead { .. })).collect();
+        if alive.len() > 1 {
+            let c = alive.iter().map(|&i| self.players[i].pos).sum::<Vec3>() / alive.len() as f32;
+            for &i in &alive {
+                let p = &mut self.players[i];
+                let d = Vec2::new(p.pos.x - c.x, p.pos.z - c.z);
+                if d.length() > PARTY_RADIUS {
+                    let lim = d.normalize() * PARTY_RADIUS;
+                    p.pos.x = c.x + lim.x;
+                    p.pos.z = c.z + lim.y;
+                }
+            }
         }
         for (pi, pos, yaw, dmg) in attacks {
             self.player_attack(pi, pos, yaw, dmg);
@@ -1171,6 +1287,41 @@ impl Game {
             }
         }
 
+        // Monsters can't walk through doors, barrels and generators either.
+        let moved: Vec<(usize, Vec3)> = (0..self.entities.len())
+            .filter(|&i| self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. }))
+            .map(|i| (i, Self::resolve_solids(&self.entities, self.entities[i].pos, 0.9, self.entities[i].id)))
+            .collect();
+        for (i, p) in moved {
+            self.entities[i].pos = p;
+        }
+
+        // Keep monsters from stacking on top of each other (and on players).
+        let enemy_idx: Vec<usize> = (0..self.entities.len())
+            .filter(|&i| self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. }))
+            .collect();
+        for a in 0..enemy_idx.len() {
+            for b in (a + 1)..enemy_idx.len() {
+                let (ia, ib) = (enemy_idx[a], enemy_idx[b]);
+                let d = Vec2::new(self.entities[ib].pos.x - self.entities[ia].pos.x, self.entities[ib].pos.z - self.entities[ia].pos.z);
+                let len = d.length();
+                if len < 1.6 && len > 1e-4 {
+                    let push = d / len * (1.6 - len) * 0.5;
+                    self.entities[ia].pos -= Vec3::new(push.x, 0.0, push.y);
+                    self.entities[ib].pos += Vec3::new(push.x, 0.0, push.y);
+                }
+            }
+            for (pp, alive) in &player_pos {
+                let e = &mut self.entities[enemy_idx[a]];
+                let d = Vec2::new(e.pos.x - pp.x, e.pos.z - pp.z);
+                let len = d.length();
+                if *alive && len < 1.8 && len > 1e-4 {
+                    let push = d / len * (1.8 - len);
+                    e.pos += Vec3::new(push.x, 0.0, push.y);
+                }
+            }
+        }
+
         for pi in key_used {
             self.players[pi].keys -= 1;
             self.messages.push(("Door unlocked".into(), 2.0));
@@ -1243,15 +1394,53 @@ impl Game {
 
     /// Camera eye and target in game coordinates.
     pub fn camera(&self) -> (Vec3, Vec3) {
-        let spread = self
-            .players
-            .iter()
-            .map(|p| (p.pos - self.cam_focus).length())
-            .fold(0.0f32, f32::max);
-        let dist = 34.0 + spread * 0.8;
-        let pitch = 55f32.to_radians();
+        let spread = self.players.iter().map(|p| (p.pos - self.cam_focus).length()).fold(0.0f32, f32::max);
+        let dist = 36.0 + spread * 0.8;
+        let pitch = 60f32.to_radians();
         let at = self.cam_focus + Vec3::Y * 2.0;
-        let eye = at + Vec3::new(0.0, pitch.sin() * dist, -pitch.cos() * dist);
+        let mut eye = at + Vec3::new(0.0, pitch.sin() * dist, -pitch.cos() * dist);
+        // Pull the camera in front of any wall that would hide the players.
+        if let Some(f) = self.collision.raycast(at + Vec3::Y * 1.5, eye) {
+            let f = (f - 0.04).max(0.25);
+            eye = at + (eye - at) * f;
+        }
         (eye, at)
+    }
+}
+
+impl Game {
+    /// Simple bot: walk towards the nearest enemy, generator or pickup and attack when close.
+    /// Used for the attract/demo mode and for headless testing.
+    pub fn bot_input(&self, pi: usize) -> PlayerInput {
+        let Some(p) = self.players.get(pi) else { return PlayerInput::default() };
+        let target = self
+            .entities
+            .iter()
+            .filter(|e| match &e.kind {
+                Kind::Enemy { state, .. } => !matches!(state, EnemyState::Dying { .. }),
+                Kind::Generator { .. } | Kind::Pickup { .. } => true,
+                _ => false,
+            })
+            .filter(|e| (e.pos.y - p.pos.y).abs() < 4.0)
+            .min_by(|a, b| (a.pos - p.pos).length().total_cmp(&(b.pos - p.pos).length()));
+        let Some(t) = target else { return PlayerInput::default() };
+        let to = t.pos - p.pos;
+        let d = Vec2::new(to.x, to.z);
+        let fighting = !matches!(t.kind, Kind::Pickup { .. });
+        let close = d.length() < if fighting { 3.5 } else { 0.5 };
+        PlayerInput {
+            stick: if close && fighting { d.normalize_or_zero() * 0.06 } else { d.normalize_or_zero() },
+            attack: close && fighting,
+            attack_pressed: close && fighting,
+            ..Default::default()
+        }
+    }
+
+    /// Totals for test output.
+    pub fn stats(&self) -> String {
+        let enemies = self.entities.iter().filter(|e| matches!(e.kind, Kind::Enemy { .. })).count();
+        let gens = self.entities.iter().filter(|e| matches!(e.kind, Kind::Generator { .. })).count();
+        let pick = self.entities.iter().filter(|e| matches!(e.kind, Kind::Pickup { .. })).count();
+        format!("enemies {enemies} generators {gens} pickups {pick}")
     }
 }

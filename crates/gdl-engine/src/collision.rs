@@ -208,3 +208,53 @@ impl Collision {
         pos
     }
 }
+
+impl Collision {
+    /// First hit of the segment `from -> to` against enabled triangles, as a fraction 0..1.
+    pub fn raycast(&self, from: Vec3, to: Vec3) -> Option<f32> {
+        let dir = to - from;
+        let len = dir.length();
+        if len < 1e-4 {
+            return None;
+        }
+        // Gather candidate triangles from cells along the segment.
+        let steps = (len / (self.cell * 0.5)).ceil() as usize + 1;
+        let mut cands: Vec<u32> = Vec::new();
+        for s in 0..=steps {
+            let p = from + dir * (s as f32 / steps as f32);
+            for i in self.cells_around(Vec2::new(p.x, p.z), 0.0) {
+                if !cands.contains(&i) {
+                    cands.push(i);
+                }
+            }
+        }
+        let mut best: Option<f32> = None;
+        for i in cands {
+            let t = &self.tris[i as usize];
+            // Moller-Trumbore, double-sided.
+            let e1 = t.v[1] - t.v[0];
+            let e2 = t.v[2] - t.v[0];
+            let p = dir.cross(e2);
+            let det = e1.dot(p);
+            if det.abs() < 1e-7 {
+                continue;
+            }
+            let inv = 1.0 / det;
+            let s = from - t.v[0];
+            let u = s.dot(p) * inv;
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            let q = s.cross(e1);
+            let v = dir.dot(q) * inv;
+            if v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            let tt = e2.dot(q) * inv;
+            if (0.0..=1.0).contains(&tt) && best.is_none_or(|b| tt < b) {
+                best = Some(tt);
+            }
+        }
+        best
+    }
+}

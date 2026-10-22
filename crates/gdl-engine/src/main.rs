@@ -29,6 +29,7 @@ struct Args {
     simulate: u32,
     hold: Vec2,
     attack_at: Option<u32>,
+    bot: bool,
 }
 
 fn parse_vec3(s: &str) -> Result<Vec3> {
@@ -59,6 +60,7 @@ Testing:
   --simulate <frames>   Simulate N 60 Hz frames before the snapshot
   --hold <x,y>          Stick input held during simulation
   --attack-at <frame>   Press attack on that frame
+  --bot                 Let a simple bot play every player during simulation
   --char CLASS/COLOR    Snapshot a single character (or monster/NAME)
   --seq NAME --frame F  Animation sequence and frame for --char
   --eye x,y,z --at x,y,z --size WxH   Snapshot camera";
@@ -78,6 +80,7 @@ fn parse_args() -> Result<Args> {
         simulate: 0,
         hold: Vec2::ZERO,
         attack_at: None,
+        bot: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -101,6 +104,7 @@ fn parse_args() -> Result<Args> {
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
             "--attack-at" => a.attack_at = Some(val()?.parse()?),
+            "--bot" => a.bot = true,
             "--hold" => {
                 let v = val()?;
                 let (x, y) = v.split_once(',').context("--hold x,y")?;
@@ -205,14 +209,25 @@ fn snapshot_game(args: &Args) -> Result<()> {
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
     let mut g = game::Game::new(&fs, &args.level, &classes)?;
+    if std::env::var("GDL_DEBUG_DOORS").is_ok() {
+        for e in &g.entities {
+            if let game::Kind::Door { .. } = e.kind {
+                println!("door {} pos {:?} yaw {:.2} solid {:?} model {:?}", e.id, e.pos, e.yaw, e.solid, e.model);
+            }
+        }
+    }
     for f in 0..args.simulate {
         let inp = input::PlayerInput {
             stick: args.hold,
             attack_pressed: args.attack_at == Some(f),
             ..Default::default()
         };
-        let inputs = vec![inp; g.players.len()];
+        let inputs: Vec<_> = (0..g.players.len()).map(|i| if args.bot { g.bot_input(i) } else { inp }).collect();
         g.update(1.0 / 60.0, &inputs);
+        if f % 600 == 0 {
+            let p = &g.players[0];
+            println!("t={:4}s hp {:4.0} score {:5} keys {} | {}", f / 60, p.health, p.score, p.keys, g.stats());
+        }
     }
     for (i, p) in g.players.iter().enumerate() {
         println!(
