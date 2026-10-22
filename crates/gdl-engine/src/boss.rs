@@ -1289,9 +1289,14 @@ fn point_view_dist(eye: Vec3, fwd: Vec3, p: Vec3, r: f32) -> f32 {
     let (x, y, z) = (d.dot(right), d.dot(up), d.dot(fwd));
     let hv = 22.5f32.to_radians();
     let hh = (hv.tan() * 4.0 / 3.0).atan();
+    // [CHOICE] The status panels cover the bottom 80 of the 384 lines, so the
+    // frame's bottom edge is taken at line 304 (our view is 45 degrees; the
+    // game's own frustum is not known).
+    let hb = (hv.tan() * (2.0f32 * 304.0 / 384.0 - 1.0)).atan();
     let side = |a: f32, h: f32| z * h.sin() - a.abs() * h.cos();
     let near = z - 1.0;
-    near.min(side(x, hh)).min(side(y, hv)) - r
+    let vert = if y >= 0.0 { side(y, hv) } else { side(y, hb) };
+    near.min(side(x, hh)).min(vert) - r
 }
 
 /// CaptionTextSub's typewriter: the text revealed after `budget` (ticks / 2).
