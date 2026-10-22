@@ -343,7 +343,9 @@ fn snapshot_game(args: &Args) -> Result<()> {
             ..Default::default()
         };
         // GDL_FUZZ=seed: every hero mashes random buttons and sticks.
-        let fuzz = std::env::var("GDL_FUZZ").ok().and_then(|v| v.parse::<u64>().ok());
+        let fuzz = std::env::var("GDL_FUZZ")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
         let inputs: Vec<_> = (0..g.players.len())
             .map(|i| match fuzz {
                 Some(seed) => fuzz_input(seed, f, i),

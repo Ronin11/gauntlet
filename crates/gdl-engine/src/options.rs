@@ -1721,6 +1721,48 @@ fn draw_fire_scroll(s: &mut Scr, f: &FireScroll) {
 
 #[cfg(test)]
 mod tests {
+    /// Random presses through every menu (title, game, tower): never a panic.
+    #[test]
+    fn fuzzed_menus_never_crash() {
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..300 {
+            let mut o = match round % 3 {
+                0 => Options::title(0),
+                1 => Options::game(1),
+                _ => Options::tower(2),
+            };
+            let mut prefs = Prefs::default();
+            for _ in 0..600 {
+                let r = next();
+                let b = |k: u32| r >> k & 7 == 0;
+                let stick = match (r >> 40) % 5 {
+                    1 => glam::Vec2::new(0.0, 1.0),
+                    2 => glam::Vec2::new(0.0, -1.0),
+                    3 => glam::Vec2::new(1.0, 0.0),
+                    4 => glam::Vec2::new(-1.0, 0.0),
+                    _ => glam::Vec2::ZERO,
+                };
+                let inp = PlayerInput {
+                    stick,
+                    attack_pressed: b(0),
+                    b_pressed: b(4),
+                    start_pressed: b(8) && b(12),
+                    ..Default::default()
+                };
+                o.update(&inp, &mut prefs);
+                if !o.is_open() && !o.is_drawing() {
+                    break;
+                }
+            }
+        }
+    }
+
     use super::*;
     use glam::Vec2;
 
