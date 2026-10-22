@@ -25,6 +25,8 @@ pub struct Batch {
     pub lightmap: Option<usize>,
     pub blend: bool,
     pub prelit: bool,
+    /// Additive ("fb_add") blending: glows, fire, light shafts.
+    pub additive: bool,
     /// Rigid part this batch belongs to (index into an instance's part transforms).
     pub part: u16,
 }
@@ -46,7 +48,12 @@ pub struct MeshBuilder<'a> {
     /// bitmap index -> texture slot
     tex_slots: HashMap<u16, Option<usize>>,
     /// (texture, lightmap, blend, prelit) -> (vertices, indices) accumulated per batch
-    groups: Vec<((Option<usize>, Option<usize>, bool, bool, u16), Vec<u32>)>,
+    groups: Vec<(
+        (Option<usize>, Option<usize>, bool, bool, u16, bool),
+        Vec<u32>,
+    )>,
+    /// Objects added while this is set are drawn with additive blending.
+    pub additive: bool,
     pub data: MeshData,
 }
 
@@ -57,6 +64,7 @@ impl<'a> MeshBuilder<'a> {
             textures_file,
             tex_slots: HashMap::new(),
             groups: Vec::new(),
+            additive: false,
             data: MeshData {
                 bounds_min: Vec3::splat(f32::MAX),
                 bounds_max: Vec3::splat(f32::MIN),
@@ -124,7 +132,14 @@ impl<'a> MeshBuilder<'a> {
             let blend = obj_alpha
                 && self.bitmap_has_alpha(sub.tex_index)
                 && obj.flags & object_flags::ALPHA != 0;
-            let key = (tex, lm, blend, prelit && lm.is_none(), part);
+            let key = (
+                tex,
+                lm,
+                blend && !self.additive,
+                prelit && lm.is_none(),
+                part,
+                self.additive,
+            );
             let base = self.data.vertices.len() as u32;
             for i in 0..mesh.positions.len() {
                 let p = xf.transform_point3(Vec3::from(mesh.positions[i]));
@@ -150,7 +165,9 @@ impl<'a> MeshBuilder<'a> {
     }
 
     pub fn finish(mut self) -> MeshData {
-        for ((texture, lightmap, blend, prelit, part), idx) in std::mem::take(&mut self.groups) {
+        for ((texture, lightmap, blend, prelit, part, additive), idx) in
+            std::mem::take(&mut self.groups)
+        {
             let start = self.data.indices.len() as u32;
             self.data.indices.extend(idx);
             self.data.batches.push(Batch {
@@ -160,6 +177,7 @@ impl<'a> MeshBuilder<'a> {
                 lightmap,
                 blend,
                 prelit,
+                additive,
                 part,
             });
         }

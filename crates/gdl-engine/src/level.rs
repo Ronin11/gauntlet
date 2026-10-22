@@ -39,6 +39,7 @@ impl Level {
         let mut placed = 0;
         for (wo, pos) in self.worlds.world_objects.iter().zip(&self.world_pos) {
             if let Some(obj) = self.objects.object_by_name(&wo.name) {
+                b.additive = wo.mb_flags & (1 << 23) != 0;
                 b.add_object(obj, Mat4::from_translation(Vec3::from(*pos)));
                 placed += 1;
             }

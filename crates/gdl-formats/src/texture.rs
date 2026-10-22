@@ -39,6 +39,24 @@ pub struct Image {
 }
 
 impl Image {
+    /// White radial gradient with soft alpha falloff.
+    pub fn glow(width: u32, height: u32) -> Image {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let dx = (x as f32 + 0.5) / width as f32 * 2.0 - 1.0;
+                let dy = (y as f32 + 0.5) / height as f32 * 2.0 - 1.0;
+                let a = (1.0 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+                rgba.extend_from_slice(&[255, 240, 200, (a * a * 255.0) as u8]);
+            }
+        }
+        Image {
+            width,
+            height,
+            rgba,
+        }
+    }
+
     pub fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Image {
         Image {
             width,
@@ -128,8 +146,10 @@ pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
     if w == 0 || h == 0 || w > 1024 || h > 1024 {
         bail!("bad texture size {w}x{h}");
     }
-    if b.flags & bitmap_flags::EXTERNAL != 0 {
-        return Ok(Image::solid(w, h, [255, 255, 255, 255]));
+    if b.flags & bitmap_flags::EXTERNAL != 0 || b.frame_count > 0 {
+        // Animated/external textures (flames, glows) get their frames from texture
+        // animations elsewhere; stand in with a soft radial glow.
+        return Ok(Image::glow(w, h));
     }
     let (bpp, pal_count) = layout(b.format)?;
     let start = b.tex_pointer as usize;

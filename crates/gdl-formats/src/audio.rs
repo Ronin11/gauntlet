@@ -104,7 +104,14 @@ impl Ads {
             headers.push(DspHeader::parse(&b[0x28 + c * 0x60..])?);
         }
         let data_offset = 0x28 + channels * 0x60;
-        Ok(Ads { sample_rate, channels, interleave: be32(b, 0x14) as usize, headers, data_offset, data_size })
+        Ok(Ads {
+            sample_rate,
+            channels,
+            interleave: be32(b, 0x14) as usize,
+            headers,
+            data_offset,
+            data_size,
+        })
     }
 
     /// Decode the whole stream to interleaved i16 PCM using the header's interleave
@@ -119,7 +126,11 @@ impl Ads {
         let ch = self.channels;
         let mut chans: Vec<Vec<i16>> = vec![Vec::new(); ch];
         let mut st = vec![DspChannel::default(); ch];
-        let block = if ch == 1 { data.len() } else { interleave.max(8) };
+        let block = if ch == 1 {
+            data.len()
+        } else {
+            interleave.max(8)
+        };
         let mut off = 0;
         'outer: while off < data.len() {
             for c in 0..ch {
@@ -134,7 +145,12 @@ impl Ads {
             }
             off += block * ch;
         }
-        let n = chans.iter().map(Vec::len).min().unwrap_or(0).min(self.headers[0].num_samples as usize);
+        let n = chans
+            .iter()
+            .map(Vec::len)
+            .min()
+            .unwrap_or(0)
+            .min(self.headers[0].num_samples as usize);
         let mut out = Vec::with_capacity(n * ch);
         for i in 0..n {
             for c in &chans {

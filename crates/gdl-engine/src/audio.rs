@@ -49,31 +49,42 @@ pub struct Audio {
 impl Audio {
     pub fn new(muted: bool) -> Self {
         if muted {
-            return Audio { tx: None, current: String::new() };
+            return Audio {
+                tx: None,
+                current: String::new(),
+            };
         }
         let (tx, rx) = mpsc::channel::<Cmd>();
-        let spawned = std::thread::Builder::new().name("audio".into()).spawn(move || {
-            let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
-                log::warn!("no audio output device");
-                return;
-            };
-            // Keep the current sink alive; replacing it stops the previous track.
-            let mut _sink: Option<rodio::Sink> = None;
-            while let Ok(cmd) = rx.recv() {
-                match cmd {
-                    Cmd::Play(pcm, ch, rate) => {
-                        use rodio::Source;
-                        if let Ok(s) = rodio::Sink::try_new(&handle) {
-                            s.set_volume(0.6);
-                            s.append(rodio::buffer::SamplesBuffer::new(ch, rate, pcm).repeat_infinite());
-                            _sink = Some(s);
+        let spawned = std::thread::Builder::new()
+            .name("audio".into())
+            .spawn(move || {
+                let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+                    log::warn!("no audio output device");
+                    return;
+                };
+                // Keep the current sink alive; replacing it stops the previous track.
+                let mut _sink: Option<rodio::Sink> = None;
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        Cmd::Play(pcm, ch, rate) => {
+                            use rodio::Source;
+                            if let Ok(s) = rodio::Sink::try_new(&handle) {
+                                s.set_volume(0.6);
+                                s.append(
+                                    rodio::buffer::SamplesBuffer::new(ch, rate, pcm)
+                                        .repeat_infinite(),
+                                );
+                                _sink = Some(s);
+                            }
                         }
+                        Cmd::Stop => _sink = None,
                     }
-                    Cmd::Stop => _sink = None,
                 }
-            }
-        });
-        Audio { tx: spawned.ok().map(|_| tx), current: String::new() }
+            });
+        Audio {
+            tx: spawned.ok().map(|_| tx),
+            current: String::new(),
+        }
     }
 
     /// Start the music for `level` (no-op if it is already playing).
@@ -94,7 +105,12 @@ impl Audio {
             std::thread::spawn(move || match Ads::parse(&bytes) {
                 Ok(ads) => {
                     let pcm = ads.decode_all(&bytes);
-                    log::info!("music: {name} ({} Hz, {} ch, {:.0} s)", ads.sample_rate, ads.channels, pcm.len() as f32 / ads.channels as f32 / ads.sample_rate as f32);
+                    log::info!(
+                        "music: {name} ({} Hz, {} ch, {:.0} s)",
+                        ads.sample_rate,
+                        ads.channels,
+                        pcm.len() as f32 / ads.channels as f32 / ads.sample_rate as f32
+                    );
                     let _ = tx.send(Cmd::Play(pcm, ads.channels as u16, ads.sample_rate));
                 }
                 Err(e) => log::warn!("music {name}: {e:#}"),

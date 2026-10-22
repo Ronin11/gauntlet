@@ -70,10 +70,40 @@ fn name_matches(object: &str, full: &str) -> bool {
 impl Model {
     /// Load a player class (`WAR`, `VAL`, ...) in a colour variant (`RED`, `BLU`, ...).
     pub fn load_player(fs: &GameFs, class: &str, color: &str) -> Result<Self> {
-        let anim = Anim::parse(&fs.read(&format!("PLAYERS/{class}/ANIM/ANIM.PS2"))?)?;
         let dir = format!("PLAYERS/{class}/{color}");
         let objects = Objects::parse(&fs.read(&format!("{dir}/objects.ngc"))?)?;
         let textures = fs.read(&format!("{dir}/textures.ngc"))?;
+        let prefix = format!("{class}_{color}");
+        let anim = match fs.read(&format!("PLAYERS/{class}/ANIM/ANIM.PS2")) {
+            Ok(d) => Anim::parse(&d)?,
+            Err(_) => {
+                // Secret heroes reuse a base class's animations: pick the skeleton
+                // whose node names match the most of this model's parts.
+                let mut best: Option<(usize, Anim)> = None;
+                for base in ["WAR", "VAL", "WIZ", "ARC", "DWF", "KNI", "SOR", "JES"] {
+                    let Ok(d) = fs.read(&format!("PLAYERS/{base}/ANIM/ANIM.PS2")) else {
+                        continue;
+                    };
+                    let Ok(a) = Anim::parse(&d) else { continue };
+                    let Some(t) = a.atrees.first() else { continue };
+                    let score = t
+                        .nodes
+                        .iter()
+                        .filter(|n| {
+                            let full = format!("{prefix}{}", n.name);
+                            objects
+                                .object_defs
+                                .iter()
+                                .any(|d| name_matches(&d.name, &full))
+                        })
+                        .count();
+                    if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                        best = Some((score, a));
+                    }
+                }
+                best.context("no base animation set for hero")?.1
+            }
+        };
         let skeleton = anim
             .atrees
             .into_iter()
@@ -139,7 +169,10 @@ impl Model {
                 .find(|(_, d)| name_matches(&d.name, &full))
             {
                 if let Some(obj) = objects.objects.get(defs[oi].obj_index.max(0) as usize) {
+                    // Glow/fire nodes use additive "fb_add" blending.
+                    b.additive = node.mb_flags & (1 << 23) != 0;
                     b.add_part(obj, Mat4::IDENTITY, next_part);
+                    b.additive = false;
                     node_part[ni] = Some(next_part);
                     next_part += 1;
                 }

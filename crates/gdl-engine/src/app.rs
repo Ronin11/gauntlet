@@ -7,6 +7,7 @@ use crate::gpu::Gpu;
 use crate::hud::{self, Hud};
 use crate::input::{Input, Source};
 use crate::scene::{Scene, CLEAR};
+use crate::select::Select;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,8 +22,15 @@ const TICK: f32 = 1.0 / 60.0;
 pub struct Config {
     pub fs: GameFs,
     pub level: String,
+    /// Players chosen on the command line; empty shows the join screen.
     pub players: Vec<(String, String)>,
     pub mute: bool,
+}
+
+struct Playing {
+    game: Game,
+    scene: Scene,
+    players: Vec<(String, String)>,
 }
 
 struct Running {
@@ -31,8 +39,8 @@ struct Running {
     config: wgpu::SurfaceConfiguration,
     gpu: Gpu,
     depth: wgpu::TextureView,
-    game: Game,
-    scene: Scene,
+    play: Option<Playing>,
+    select: Option<Select>,
     hud: Hud,
     audio: Audio,
     input: Input,
@@ -43,6 +51,7 @@ struct Running {
 
 struct App {
     cfg: Config,
+    started: Instant,
     run: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -81,32 +90,35 @@ impl App {
         let gpu = Gpu::new(device, queue, config.format);
         let depth = gpu.depth_view(config.width, config.height);
 
-        let classes: Vec<(&str, &str)> = self
-            .cfg
-            .players
-            .iter()
-            .map(|(a, b)| (a.as_str(), b.as_str()))
-            .collect();
-        let game = Game::new(&self.cfg.fs, &self.cfg.level, &classes)?;
-        let scene = Scene::new(&gpu, &game)?;
         let hud = Hud::new(&gpu.device, config.format);
         let mut audio = Audio::new(self.cfg.mute);
         audio.play_level_music(&self.cfg.fs, &self.cfg.level);
         let input = Input::new();
-        let mut sources: Vec<Source> = input.pads().into_iter().map(Source::Pad).collect();
-        sources.truncate(game.players.len());
-        // The keyboard drives the first player without a gamepad.
-        if sources.len() < game.players.len() {
-            sources.push(Source::Keyboard);
-        }
+        let (play, select, sources) = if self.cfg.players.is_empty() {
+            (None, Some(Select::default()), Vec::new())
+        } else {
+            let play = start_game(
+                &self.cfg.fs,
+                &gpu,
+                &self.cfg.level,
+                self.cfg.players.clone(),
+            )?;
+            let mut sources: Vec<Source> = input.pads().into_iter().map(Source::Pad).collect();
+            sources.truncate(play.game.players.len());
+            // The keyboard drives the first player without a gamepad.
+            if sources.len() < play.game.players.len() {
+                sources.push(Source::Keyboard);
+            }
+            (Some(play), None, sources)
+        };
         Ok(Running {
             window,
             surface,
             config,
             gpu,
             depth,
-            game,
-            scene,
+            play,
+            select,
             hud,
             audio,
             input,
@@ -174,14 +186,6 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                while r.acc >= TICK {
-                    let inputs: Vec<_> = r.sources.iter().map(|s| r.input.read(*s)).collect();
-                    r.game.update(TICK, &inputs);
-                    r.input.end_frame();
-                    r.acc -= TICK;
-                }
-
-                r.scene.sync(&r.gpu, &r.game);
                 let frame = match r.surface.get_current_texture() {
                     Ok(f) => f,
                     Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -194,47 +198,83 @@ impl ApplicationHandler for App {
                     }
                 };
                 let view = frame.texture.create_view(&Default::default());
-                let g = r
-                    .scene
-                    .globals(&r.game, r.config.width as f32 / r.config.height as f32);
-                r.gpu
-                    .render(&view, &r.depth, &g, CLEAR, &r.scene.draws(&r.game));
                 let mut canvas = hud::Canvas::new(r.config.width, r.config.height);
-                let classes: Vec<String> =
-                    self.cfg.players.iter().map(|(c, _)| c.clone()).collect();
-                hud::build(&mut canvas, &r.game, &classes);
+
+                if let Some(sel) = &mut r.select {
+                    let mut chosen = None;
+                    while r.acc >= TICK {
+                        if chosen.is_none() {
+                            chosen = sel.update(&r.input, TICK);
+                        }
+                        r.input.end_frame();
+                        r.acc -= TICK;
+                    }
+                    r.gpu.render(
+                        &view,
+                        &r.depth,
+                        &crate::gpu::globals(glam::Mat4::IDENTITY, glam::Vec3::ZERO, [0.0; 3], 0.0),
+                        CLEAR,
+                        &[],
+                    );
+                    sel.draw(
+                        &mut canvas,
+                        r.last.duration_since(self.started).as_secs_f32(),
+                    );
+                    r.hud.draw(&r.gpu.device, &r.gpu.queue, &view, &canvas);
+                    frame.present();
+                    if let Some(players) = chosen {
+                        let sources = sel.sources();
+                        match start_game(&self.cfg.fs, &r.gpu, &self.cfg.level, players) {
+                            Ok(p) => {
+                                r.sources = sources;
+                                r.play = Some(p);
+                                r.select = None;
+                            }
+                            Err(e) => {
+                                self.error = Some(e);
+                                el.exit();
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                let Some(p) = &mut r.play else { return };
+                while r.acc >= TICK {
+                    let inputs: Vec<_> = r.sources.iter().map(|s| r.input.read(*s)).collect();
+                    p.game.update(TICK, &inputs);
+                    r.input.end_frame();
+                    r.acc -= TICK;
+                }
+
+                p.scene.sync(&r.gpu, &p.game);
+                let g = p
+                    .scene
+                    .globals(&p.game, r.config.width as f32 / r.config.height as f32);
+                r.gpu
+                    .render(&view, &r.depth, &g, CLEAR, &p.scene.draws(&p.game));
+                let classes: Vec<String> = p.players.iter().map(|(c, _)| c.clone()).collect();
+                hud::build(&mut canvas, &p.game, &classes);
                 r.hud.draw(&r.gpu.device, &r.gpu.queue, &view, &canvas);
                 frame.present();
 
                 // Reaching an exit loads the next level, keeping each player's progress.
-                if let Some(next) = r.game.exit_to.take() {
-                    let classes: Vec<(&str, &str)> = self
-                        .cfg
-                        .players
-                        .iter()
-                        .map(|(a, b)| (a.as_str(), b.as_str()))
-                        .collect();
-                    match Game::new(&self.cfg.fs, &next, &classes) {
-                        Ok(mut g) => {
-                            for (np, op) in g.players.iter_mut().zip(&r.game.players) {
-                                np.health = op.health.max(300.0);
-                                np.score = op.score;
-                                np.keys = op.keys;
-                                np.potions = op.potions;
+                if let Some(next) = p.game.exit_to.take() {
+                    match start_game(&self.cfg.fs, &r.gpu, &next, p.players.clone()) {
+                        Ok(mut np) => {
+                            for (a, b) in np.game.players.iter_mut().zip(&p.game.players) {
+                                a.health = b.health.max(300.0);
+                                a.score = b.score;
+                                a.keys = b.keys;
+                                a.potions = b.potions;
                             }
-                            match Scene::new(&r.gpu, &g) {
-                                Ok(sc) => {
-                                    log::info!("entering {next}");
-                                    r.audio.play_level_music(&self.cfg.fs, &next);
-                                    r.game = g;
-                                    r.scene = sc;
-                                }
-                                Err(e) => log::error!("loading {next}: {e:#}"),
-                            }
+                            log::info!("entering {next}");
+                            r.audio.play_level_music(&self.cfg.fs, &next);
+                            *p = np;
                         }
                         Err(e) => {
                             log::error!("loading {next}: {e:#}");
-                            r.game.messages.push((format!("{next} not available"), 3.0));
+                            p.game.messages.push((format!("{next} not available"), 3.0));
                         }
                     }
                 }
@@ -250,11 +290,31 @@ impl ApplicationHandler for App {
     }
 }
 
+fn start_game(
+    fs: &GameFs,
+    gpu: &Gpu,
+    level: &str,
+    players: Vec<(String, String)>,
+) -> Result<Playing> {
+    let classes: Vec<(&str, &str)> = players
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let game = Game::new(fs, level, &classes)?;
+    let scene = Scene::new(gpu, &game)?;
+    Ok(Playing {
+        game,
+        scene,
+        players,
+    })
+}
+
 pub fn run(cfg: Config) -> Result<()> {
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         cfg,
+        started: Instant::now(),
         run: None,
         error: None,
     };

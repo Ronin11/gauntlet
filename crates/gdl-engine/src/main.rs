@@ -10,6 +10,7 @@ mod input;
 mod level;
 mod mesh;
 mod scene;
+mod select;
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec2, Vec3};
@@ -72,7 +73,7 @@ fn parse_args() -> Result<Args> {
     let mut a = Args {
         data: None,
         level: "levelA1".into(),
-        players: vec![("WAR".into(), "RED".into())],
+        players: Vec::new(),
         snapshot: None,
         eye: None,
         at: None,
@@ -208,8 +209,12 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
 /// Run the game headless for a number of frames, then render.
 fn snapshot_game(args: &Args) -> Result<()> {
     let fs = open_fs(args)?;
-    let classes: Vec<(&str, &str)> = args
-        .players
+    let players = if args.players.is_empty() {
+        vec![("WAR".to_string(), "RED".to_string())]
+    } else {
+        args.players.clone()
+    };
+    let classes: Vec<(&str, &str)> = players
         .iter()
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
@@ -217,7 +222,10 @@ fn snapshot_game(args: &Args) -> Result<()> {
     if std::env::var("GDL_DEBUG_DOORS").is_ok() {
         for e in &g.entities {
             if let game::Kind::Door { .. } = e.kind {
-                println!("door {} pos {:?} yaw {:.2} solid {:?} model {:?}", e.id, e.pos, e.yaw, e.solid, e.model);
+                println!(
+                    "door {} pos {:?} yaw {:.2} solid {:?} model {:?}",
+                    e.id, e.pos, e.yaw, e.solid, e.model
+                );
             }
         }
     }
@@ -227,11 +235,20 @@ fn snapshot_game(args: &Args) -> Result<()> {
             attack_pressed: args.attack_at == Some(f),
             ..Default::default()
         };
-        let inputs: Vec<_> = (0..g.players.len()).map(|i| if args.bot { g.bot_input(i) } else { inp }).collect();
+        let inputs: Vec<_> = (0..g.players.len())
+            .map(|i| if args.bot { g.bot_input(i) } else { inp })
+            .collect();
         g.update(1.0 / 60.0, &inputs);
         if f % 600 == 0 {
             let p = &g.players[0];
-            println!("t={:4}s hp {:4.0} score {:5} keys {} | {}", f / 60, p.health, p.score, p.keys, g.stats());
+            println!(
+                "t={:4}s hp {:4.0} score {:5} keys {} | {}",
+                f / 60,
+                p.health,
+                p.score,
+                p.keys,
+                g.stats()
+            );
         }
     }
     for (i, p) in g.players.iter().enumerate() {
@@ -256,7 +273,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         globals = gpu::globals(proj * view, m.transform_point3(eye), [0.0; 3], 0.0);
     }
     let hud = hud::Hud::new(&gpu.device, gpu.color_format);
-    let classes: Vec<String> = args.players.iter().map(|(c, _)| c.clone()).collect();
+    let classes: Vec<String> = players.iter().map(|(c, _)| c.clone()).collect();
     let draw_hud = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
         hud::build(&mut canvas, &g, &classes);

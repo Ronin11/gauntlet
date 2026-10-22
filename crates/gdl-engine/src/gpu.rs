@@ -33,6 +33,7 @@ pub struct Gpu {
     pub color_format: wgpu::TextureFormat,
     opaque: wgpu::RenderPipeline,
     blend: wgpu::RenderPipeline,
+    additive: wgpu::RenderPipeline,
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
@@ -42,6 +43,7 @@ pub struct Gpu {
 }
 
 struct GpuBatch {
+    additive: bool,
     part: u16,
     start: u32,
     count: u32,
@@ -129,7 +131,15 @@ impl Gpu {
         });
 
         let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x2];
-        let make = |fs: &str, blend: bool| {
+        let additive_state = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        };
+        let make = |fs: &str, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
                 layout: Some(&layout),
@@ -148,7 +158,7 @@ impl Gpu {
                     entry_point: Some(fs),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: color_format,
-                        blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                        blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: Default::default(),
@@ -160,7 +170,7 @@ impl Gpu {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: !blend,
+                    depth_write_enabled: blend.is_none(),
                     depth_compare: wgpu::CompareFunction::LessEqual,
                     stencil: Default::default(),
                     bias: Default::default(),
@@ -170,8 +180,9 @@ impl Gpu {
                 cache: None,
             })
         };
-        let opaque = make("fs_opaque", false);
-        let blend = make("fs_blend", true);
+        let opaque = make("fs_opaque", None);
+        let blend = make("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING));
+        let additive = make("fs_blend", Some(additive_state));
 
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -204,6 +215,7 @@ impl Gpu {
             color_format,
             opaque,
             blend,
+            additive,
             globals_buf,
             globals_bg,
             material_layout,
@@ -259,6 +271,7 @@ impl Gpu {
                 }
             };
             batches.push(GpuBatch {
+                additive: b.additive,
                 part: b.part,
                 start: b.start,
                 count: b.count,
@@ -273,7 +286,7 @@ impl Gpu {
             });
         }
         // Opaque first, then blended, so transparent surfaces draw over the world.
-        batches.sort_by_key(|b| b.blend);
+        batches.sort_by_key(|b| (b.blend, b.additive));
 
         let verts = if mesh.vertices.is_empty() {
             vec![Vertex::zeroed()]
@@ -420,11 +433,12 @@ impl Gpu {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            for pass_blend in [false, true] {
-                pass.set_pipeline(if pass_blend {
-                    &self.blend
-                } else {
-                    &self.opaque
+            // 0 = opaque (alpha test), 1 = alpha blended, 2 = additive.
+            for pass_kind in 0..3u8 {
+                pass.set_pipeline(match pass_kind {
+                    0 => &self.opaque,
+                    1 => &self.blend,
+                    _ => &self.additive,
                 });
                 for (mesh, inst) in draws {
                     if !inst.visible {
@@ -433,7 +447,8 @@ impl Gpu {
                     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
                     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     for (b, (_, bg)) in mesh.batches.iter().zip(&inst.bufs) {
-                        if b.blend != pass_blend
+                        let kind = if b.additive { 2 } else { b.blend as u8 };
+                        if kind != pass_kind
                             || b.count == 0
                             || inst.hidden.get(b.part as usize).copied().unwrap_or(false)
                         {

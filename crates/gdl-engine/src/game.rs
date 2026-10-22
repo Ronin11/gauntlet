@@ -192,9 +192,13 @@ pub enum Kind {
 /// Solid collision shape of an entity, from its item info.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Shape {
-    Cylinder { radius: f32 },
+    Cylinder {
+        radius: f32,
+    },
     /// Half extents along the entity's local x and z axes.
-    Box { half: Vec2 },
+    Box {
+        half: Vec2,
+    },
 }
 
 pub struct Entity {
@@ -336,8 +340,12 @@ fn build_collision(level: &Level) -> Vec<Tri> {
 
 fn item_shape(info: &gdl_formats::worlds::ItemInfo) -> Shape {
     match info.coll_type {
-        3 => Shape::Box { half: Vec2::new(info.x_dim.max(0.5), info.z_dim.max(0.5)) },
-        _ => Shape::Cylinder { radius: info.radius.clamp(0.4, 6.0) },
+        3 => Shape::Box {
+            half: Vec2::new(info.x_dim.max(0.5), info.z_dim.max(0.5)),
+        },
+        _ => Shape::Cylinder {
+            radius: info.radius.clamp(0.4, 6.0),
+        },
     }
 }
 
@@ -692,7 +700,12 @@ impl Game {
                             pos,
                             yaw,
                         );
-                        self.set_solid(id, Shape::Cylinder { radius: info.radius.max(1.0) });
+                        self.set_solid(
+                            id,
+                            Shape::Cylinder {
+                                radius: info.radius.max(1.0),
+                            },
+                        );
                     }
                 }
                 ItemType::Powerup => {
@@ -972,7 +985,11 @@ impl Game {
                 let len = d.length();
                 let min = PLAYER_RADIUS * 2.0;
                 if len < min {
-                    let n = if len > 1e-4 { d / len } else { Vec2::new(1.0, 0.0) };
+                    let n = if len > 1e-4 {
+                        d / len
+                    } else {
+                        Vec2::new(1.0, 0.0)
+                    };
                     let push = n * (min - len) * 0.5;
                     self.players[a].pos -= Vec3::new(push.x, 0.0, push.y);
                     self.players[b].pos += Vec3::new(push.x, 0.0, push.y);
@@ -980,8 +997,9 @@ impl Game {
             }
         }
         // Keep the party together: nobody may wander too far from the group's centre.
-        let alive: Vec<usize> =
-            (0..self.players.len()).filter(|&i| !matches!(self.players[i].state, PlayerState::Dead { .. })).collect();
+        let alive: Vec<usize> = (0..self.players.len())
+            .filter(|&i| !matches!(self.players[i].state, PlayerState::Dead { .. }))
+            .collect();
         if alive.len() > 1 {
             let c = alive.iter().map(|&i| self.players[i].pos).sum::<Vec3>() / alive.len() as f32;
             for &i in &alive {
@@ -1289,8 +1307,20 @@ impl Game {
 
         // Monsters can't walk through doors, barrels and generators either.
         let moved: Vec<(usize, Vec3)> = (0..self.entities.len())
-            .filter(|&i| self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. }))
-            .map(|i| (i, Self::resolve_solids(&self.entities, self.entities[i].pos, 0.9, self.entities[i].id)))
+            .filter(|&i| {
+                self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. })
+            })
+            .map(|i| {
+                (
+                    i,
+                    Self::resolve_solids(
+                        &self.entities,
+                        self.entities[i].pos,
+                        0.9,
+                        self.entities[i].id,
+                    ),
+                )
+            })
             .collect();
         for (i, p) in moved {
             self.entities[i].pos = p;
@@ -1298,12 +1328,17 @@ impl Game {
 
         // Keep monsters from stacking on top of each other (and on players).
         let enemy_idx: Vec<usize> = (0..self.entities.len())
-            .filter(|&i| self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. }))
+            .filter(|&i| {
+                self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. })
+            })
             .collect();
         for a in 0..enemy_idx.len() {
             for b in (a + 1)..enemy_idx.len() {
                 let (ia, ib) = (enemy_idx[a], enemy_idx[b]);
-                let d = Vec2::new(self.entities[ib].pos.x - self.entities[ia].pos.x, self.entities[ib].pos.z - self.entities[ia].pos.z);
+                let d = Vec2::new(
+                    self.entities[ib].pos.x - self.entities[ia].pos.x,
+                    self.entities[ib].pos.z - self.entities[ia].pos.z,
+                );
                 let len = d.length();
                 if len < 1.6 && len > 1e-4 {
                     let push = d / len * (1.6 - len) * 0.5;
@@ -1394,7 +1429,11 @@ impl Game {
 
     /// Camera eye and target in game coordinates.
     pub fn camera(&self) -> (Vec3, Vec3) {
-        let spread = self.players.iter().map(|p| (p.pos - self.cam_focus).length()).fold(0.0f32, f32::max);
+        let spread = self
+            .players
+            .iter()
+            .map(|p| (p.pos - self.cam_focus).length())
+            .fold(0.0f32, f32::max);
         let dist = 36.0 + spread * 0.8;
         let pitch = 60f32.to_radians();
         let at = self.cam_focus + Vec3::Y * 2.0;
@@ -1412,7 +1451,9 @@ impl Game {
     /// Simple bot: walk towards the nearest enemy, generator or pickup and attack when close.
     /// Used for the attract/demo mode and for headless testing.
     pub fn bot_input(&self, pi: usize) -> PlayerInput {
-        let Some(p) = self.players.get(pi) else { return PlayerInput::default() };
+        let Some(p) = self.players.get(pi) else {
+            return PlayerInput::default();
+        };
         let target = self
             .entities
             .iter()
@@ -1422,14 +1463,24 @@ impl Game {
                 _ => false,
             })
             .filter(|e| (e.pos.y - p.pos.y).abs() < 4.0)
-            .min_by(|a, b| (a.pos - p.pos).length().total_cmp(&(b.pos - p.pos).length()));
-        let Some(t) = target else { return PlayerInput::default() };
+            .min_by(|a, b| {
+                (a.pos - p.pos)
+                    .length()
+                    .total_cmp(&(b.pos - p.pos).length())
+            });
+        let Some(t) = target else {
+            return PlayerInput::default();
+        };
         let to = t.pos - p.pos;
         let d = Vec2::new(to.x, to.z);
         let fighting = !matches!(t.kind, Kind::Pickup { .. });
         let close = d.length() < if fighting { 3.5 } else { 0.5 };
         PlayerInput {
-            stick: if close && fighting { d.normalize_or_zero() * 0.06 } else { d.normalize_or_zero() },
+            stick: if close && fighting {
+                d.normalize_or_zero() * 0.06
+            } else {
+                d.normalize_or_zero()
+            },
             attack: close && fighting,
             attack_pressed: close && fighting,
             ..Default::default()
@@ -1438,9 +1489,21 @@ impl Game {
 
     /// Totals for test output.
     pub fn stats(&self) -> String {
-        let enemies = self.entities.iter().filter(|e| matches!(e.kind, Kind::Enemy { .. })).count();
-        let gens = self.entities.iter().filter(|e| matches!(e.kind, Kind::Generator { .. })).count();
-        let pick = self.entities.iter().filter(|e| matches!(e.kind, Kind::Pickup { .. })).count();
+        let enemies = self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Enemy { .. }))
+            .count();
+        let gens = self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Generator { .. }))
+            .count();
+        let pick = self
+            .entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Pickup { .. }))
+            .count();
         format!("enemies {enemies} generators {gens} pickups {pick}")
     }
 }
