@@ -22,6 +22,7 @@ pub mod mapscreen;
 pub mod menu;
 pub mod mesh;
 pub mod messages;
+pub mod missile;
 pub mod movie;
 pub mod options;
 pub mod optmenu;

@@ -243,6 +243,20 @@ pub struct Ring {
 
 /// A monster's missile to launch.
 #[derive(Clone, Copy, Debug)]
+/// A missile launch this tick (pmotion.c's missile block).
+struct Throw {
+    pi: usize,
+    pos: Vec3,
+    /// The player's facing, and the unit direction to its target (else along
+    /// the attack yaw).
+    yaw: f32,
+    aim: Vec3,
+    target: bool,
+    bits: u32,
+    /// Seconds since the throw began (sMusicFadeBase - combo_fade).
+    since_swing: f32,
+}
+
 struct Shot {
     from: Vec3,
     to: Vec3,
@@ -372,6 +386,8 @@ pub struct Player {
     hit_flags: u32,
     /// When a damage tile may hurt this hero again (fxhittime).
     fxhittime: f32,
+    /// combo_fade: when the last swing or throw began.
+    combo_fade: f32,
     /// floor_fx_time: when a hurting floor or wall may hurt again.
     floor_fx_time: f32,
     hit_force: Vec3,
@@ -746,11 +762,21 @@ pub enum Kind {
         wave: Option<u32>,
         used: bool,
     },
+    /// A hero's missile (StartMissile): it falls at `weight` and tumbles at
+    /// `tumble` (rad/s; 0 points it along its flight), bursts on walls and
+    /// floors, or rebounds off them with DMG_REFLECT.
     Projectile {
         owner: usize,
         vel: Vec3,
         life: f32,
         damage: f32,
+        weight: f32,
+        /// colrad: hits within it, walls within half of it.
+        radius: f32,
+        tumble: f32,
+        reflect: bool,
+        /// A super shot passes through what it hits, each once.
+        pierced: Option<Vec<u64>>,
     },
     /// A monster's arrow, bomb or fireball.
     EnemyShot {
@@ -813,6 +839,9 @@ pub struct Entity {
     pub yaw: f32,
     pub animator: Animator,
     pub spin: f32,
+    /// Tumble about the model's x axis, and its size.
+    pub pitch: f32,
+    pub scale: f32,
     pub alive: bool,
     /// 1 = fully shown, 0 = invisible (the tower's fade-ins).
     pub fade: f32,
@@ -1601,6 +1630,7 @@ impl Game {
                 hit_damage: 0.0,
                 hit_flags: 0,
                 fxhittime: 0.0,
+                combo_fade: 0.0,
                 floor_fx_time: 0.0,
                 hit_force: Vec3::ZERO,
                 knock_vel: Vec3::ZERO,
@@ -1953,6 +1983,8 @@ impl Game {
             yaw,
             animator,
             spin: 0.0,
+            pitch: 0.0,
+            scale: 1.0,
             alive: true,
             fade: 1.0,
         });
@@ -2751,7 +2783,7 @@ impl Game {
         // Swings landing (player, damage multiplier, knockdown), throws (x size),
         // potion blasts, breath and hammer power-ups, damage rows firing.
         let mut swings: Vec<(usize, f32, bool)> = Vec::new();
-        let mut throws: Vec<(usize, Vec3, f32, f32)> = Vec::new();
+        let mut throws: Vec<Throw> = Vec::new();
         let mut rings: Vec<(usize, Vec3, u8)> = Vec::new();
         let mut breaths: Vec<usize> = Vec::new();
         let mut hammers: Vec<usize> = Vec::new();
@@ -3030,13 +3062,15 @@ impl Game {
                     let d = Vec2::new(t.x - p.pos.x, t.z - p.pos.z);
                     let surf = d.length() - r;
                     (surf < TARGET_RANGE && (d.length() < 0.5 || d.normalize().dot(hdir) >= cone))
-                        .then_some((surf, d, *short))
+                        .then_some((surf, d, *short, t.y - p.pos.y))
                 })
                 .min_by(|a, b| a.0.total_cmp(&b.0));
             let (tdist, attack_yaw, short) = match found {
-                Some((dist, d, short)) => (dist, d.x.atan2(d.y), short),
+                Some((dist, d, short, _)) => (dist, d.x.atan2(d.y), short),
                 None => (TARGET_RANGE, p.yaw, false),
             };
+            // PlayerGetTarget's attackDir climbs to the target.
+            let aim_rise = found.map(|(_, d, _, dy)| dy.atan2(d.length()));
             // Strafing and blocking keep the stick's direction.
             let attack_yaw =
                 if p.act.hud & 0xC000 != 0 || levels & (bits::STRAFE | bits::DEFEND) != 0 {
@@ -3080,14 +3114,24 @@ impl Game {
                 };
                 swings.push((i, mult, knock));
             }
-            if bits_now & act::THROW != 0 {
-                throws.push((i, p.pos, attack_yaw, 1.0));
+            if bits_now & act::SWING != 0 {
+                p.combo_fade = self.time;
             }
-            if bits_now & act::PWRA_THROW != 0 {
-                throws.push((i, p.pos, attack_yaw, 2.0));
-            }
-            if bits_now & (act::SUPER_SHOT | act::FIREL | act::FIRER) != 0 {
-                throws.push((i, p.pos, attack_yaw, 1.0));
+            if bits_now & 0xFF00 != 0 {
+                let rise = aim_rise.unwrap_or(0.0);
+                throws.push(Throw {
+                    pi: i,
+                    pos: p.pos,
+                    yaw: p.yaw,
+                    aim: Vec3::new(
+                        attack_yaw.sin() * rise.cos(),
+                        rise.sin(),
+                        attack_yaw.cos() * rise.cos(),
+                    ),
+                    target: aim_rise.is_some(),
+                    bits: bits_now,
+                    since_swing: self.time - p.combo_fade,
+                });
             }
             if bits_now & act::USE_MAGIC != 0 && p.potions > 0 {
                 p.potions -= 1;
@@ -3322,48 +3366,8 @@ impl Game {
                 hit: Vec::new(),
             });
         }
-        for (pi, pos, yaw, size) in throws {
-            use crate::powerups as pu;
-            self.sfx.push(format!("S_{}THROW", self.players[pi].class));
-            let p = &self.players[pi];
-            let (speed, mut damage, model, w) = (
-                p.derived.missile_speed,
-                p.derived.missile_damage,
-                p.proj_model,
-                p.fx.weapon,
-            );
-            if w & pu::W_ELEMENT != 0 {
-                damage *= ELEMENT_BONUS;
-            }
-            // A super shot doubles the damage, one use a throw; the power-A
-            // throw is a double-size missile.
-            if self.players[pi].powerups.use_one(pu::WEAPON, pu::W_SUPER) {
-                damage *= 2.0;
-            }
-            damage *= size;
-            // 3-way and 5-way shots fan out 15 degrees apart.
-            let spread: &[f32] = if w & pu::W_5WAY != 0 {
-                &[0.0, 15.0, -15.0, 30.0, -30.0]
-            } else if w & pu::W_3WAY != 0 {
-                &[0.0, 15.0, -15.0]
-            } else {
-                &[0.0]
-            };
-            for a in spread {
-                let y = yaw + a.to_radians();
-                let dir = Vec3::new(y.sin(), 0.0, y.cos());
-                self.spawn(
-                    Kind::Projectile {
-                        owner: pi,
-                        vel: dir * speed,
-                        life: PROJECTILE_LIFE,
-                        damage,
-                    },
-                    model,
-                    pos + Vec3::Y * 2.5 + dir * 1.2,
-                    y,
-                );
-            }
+        for t in throws {
+            self.player_start_missile(t);
         }
         for (pos, n) in key_drops {
             let model = self.pickup_model(&PickupKind::Key(1));
@@ -3376,6 +3380,136 @@ impl Game {
                 pos + Vec3::Y * 0.5,
                 0.0,
             );
+        }
+    }
+
+    /// pmotion.c's missile block and PlayerStartMissile: the throw's charge,
+    /// scale and launch offset, the aimed arc, the launch sweep (a wall in the
+    /// way bursts it, a barrel or generator there takes the hit), then a
+    /// missile per shot of the fan (StartMissile).
+    fn player_start_missile(&mut self, t: Throw) {
+        use crate::missile as m;
+        use crate::paction::act;
+        use crate::powerups as pu;
+        let pi = t.pi;
+        self.sfx.push(format!("S_{}THROW", self.players[pi].class));
+        let p = &self.players[pi];
+        let ct = p.class_id % 8;
+        let (speed, mut damage, model, w) = (
+            p.derived.missile_speed,
+            p.derived.missile_damage,
+            p.proj_model,
+            p.fx.weapon,
+        );
+        let mut flags = w & (pu::W_ELEMENT | pu::W_3WAY | pu::W_5WAY | pu::W_REFLECT);
+        let pdata = self.pdata.get(p.model);
+        // FIREL/R and the power-A throw have a fixed charge; the power-A
+        // missile is big, double size and from the turbo-A hand.
+        let (charge, scale, offset) = if t.bits & (act::FIREL | act::FIRER) != 0 {
+            (0.06, 1.0, None)
+        } else if t.bits & act::PWRA_THROW != 0 {
+            flags |= m::DMG_TURBO | DmgType::KNOCKBACK;
+            (0.06, 2.0, pdata.map(|d| d.turboa_offset))
+        } else if t.bits & act::SUPER_SHOT != 0 {
+            (0.0, 1.0, None)
+        } else {
+            let offset = pdata.map(|d| d.weapon_offset);
+            (m::throw_charge(t.since_swing), 1.0, offset)
+        };
+        if w & pu::W_ELEMENT != 0 {
+            damage *= ELEMENT_BONUS;
+        }
+        // A super shot doubles the damage, one use a throw.
+        if self.players[pi].powerups.use_one(pu::WEAPON, pu::W_SUPER) {
+            damage *= 2.0;
+            flags |= m::DMG_SUPER;
+        }
+        damage *= scale;
+        let level = self.players[pi].level;
+        let desc = m::MissileInfo::for_shot(ct, flags);
+        let from = Vec3::new(t.yaw.sin(), 0.0, t.yaw.cos());
+        let mut dir = t.aim;
+        let reach = m::modify_dpos(from, &mut dir, 0.0, ct, flags, t.target, charge);
+        let hand = t.pos
+            + Vec3::Y * (PLAYER_HEIGHT * 0.5)
+            + offset.map_or(Vec3::ZERO, |o| m::rotate_offset(o, t.yaw));
+        let pt0 = hand + dir * m::SWEEP_BACK;
+        let mut pt1 = hand + dir * m::SWEEP_AHEAD;
+        let r = desc.collision_radius;
+        let push = Vec2::new(dir.x, dir.z).normalize_or_zero();
+        // Only a wall faced from the sweep's start counts (not one at the back).
+        let wall = self
+            .collision
+            .sweep(pt0, pt1, r)
+            .is_some_and(|(_, n)| n.dot(pt1 - pt0) < 0.0);
+        if flags & m::DMG_SUPER == 0 && wall {
+            if flags & m::DMG_REFLECT == 0 {
+                return;
+            }
+            pt1 = pt0;
+        }
+        // fn_8005ED44: a barrel or generator in the sweep is hit at once.
+        let item = (0..self.entities.len()).find(|&i| {
+            let e = &self.entities[i];
+            if !e.alive
+                || !matches!(
+                    e.kind,
+                    Kind::Generator { .. } | Kind::Container { chest: false, .. }
+                )
+            {
+                return false;
+            }
+            let Some(reach) = Self::target_radius(e) else {
+                return false;
+            };
+            let (a, b) = (Vec2::new(pt0.x, pt0.z), Vec2::new(pt1.x, pt1.z));
+            let q = Vec2::new(e.pos.x, e.pos.z);
+            let ab = b - a;
+            let k = ((q - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            (a + ab * k).distance(q) < reach + r && (e.pos.y + 2.0 - hand.y).abs() < 3.5
+        });
+        if let Some(i) = item {
+            self.hit_from = Some(pt1);
+            self.hit_entity(pi, i, damage, push, false);
+            self.hit_from = None;
+            if flags & m::DMG_SUPER == 0 {
+                return;
+            }
+        }
+        let vel = m::launch_velocity(dir, speed, reach, desc.weight, flags);
+        let size = m::model_scale(scale, level, flags);
+        for i in 0..m::shot_count(flags) {
+            let v = m::spread(vel, i);
+            let id = self.spawn(
+                Kind::Projectile {
+                    owner: pi,
+                    vel: v,
+                    life: m::lifetime(flags),
+                    damage,
+                    weight: desc.weight,
+                    radius: desc.radius(flags),
+                    tumble: desc.angular_velocity[0],
+                    reflect: flags & m::DMG_REFLECT != 0,
+                    pierced: (flags & m::DMG_SUPER != 0).then(Vec::new),
+                },
+                model,
+                pt1,
+                v.x.atan2(v.z),
+            );
+            if let Some(e) = self.entities.last_mut().filter(|e| e.id == id) {
+                e.scale = size;
+                e.pitch = Self::missile_pitch(v, desc.angular_velocity[0], 0.0);
+            }
+        }
+    }
+
+    /// A missile's pitch: a tumbler turns by its pyrvel, anything else points
+    /// along its flight (CreateDirMatrix).
+    fn missile_pitch(vel: Vec3, tumble: f32, pitch: f32) -> f32 {
+        if tumble != 0.0 {
+            pitch
+        } else {
+            -vel.y.atan2(vel.x.hypot(vel.z))
         }
     }
 
@@ -3756,6 +3890,15 @@ impl Game {
                     &[0.0]
                 };
                 let speed = row.speed_max.max(row.speed_min).max(10.0);
+                // Type 10 is PlayerStartMissile unaimed (speedArg -1): the
+                // class's missile, level and then falling; type 2 an effect
+                // with the row's own weight and radius (PlyrSfxDoDamageSub).
+                let mut desc = crate::missile::PLAYER_MISSILE_INFO[self.players[pi].class_id % 8];
+                if row.kind == 2 {
+                    desc.weight = row.weight;
+                    desc.collision_radius = row.hitrad.max(0.1);
+                    desc.angular_velocity = [0.0; 3];
+                }
                 for k in angles {
                     let y = yaw + k * row.angle.to_radians();
                     let dir = Vec3::new(y.sin(), 0.0, y.cos());
@@ -3766,6 +3909,11 @@ impl Game {
                             vel: dir * speed,
                             life: PROJECTILE_LIFE,
                             damage: dmg,
+                            weight: desc.weight,
+                            radius: desc.collision_radius,
+                            tumble: desc.angular_velocity[0],
+                            reflect: false,
+                            pierced: None,
                         },
                         model,
                         pos + Vec3::Y * 2.5 + dir * 1.2,
@@ -4416,7 +4564,7 @@ impl Game {
         let mut chest_used: Vec<usize> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut chests_opened: Vec<(Vec3, Option<usize>)> = Vec::new();
-        let mut proj_hits: Vec<(usize, usize, f32, Vec2)> = Vec::new();
+        let mut proj_hits: Vec<(usize, usize, f32, Vec2, f32)> = Vec::new();
 
         for ei in 0..self.entities.len() {
             if !self.entities[ei].alive {
@@ -4988,20 +5136,45 @@ impl Game {
                     vel,
                     life,
                     damage: dmg,
+                    weight,
+                    radius,
+                    tumble,
+                    reflect,
+                    ..
                 } => {
+                    // ProcessEffects: move by the velocity, then fall.
                     *life -= dt;
                     let from = e.pos;
-                    let to = from + *vel * dt;
-                    if *life <= 0.0 || self.collision.raycast(from, to).is_some() {
+                    let mut to = from + *vel * dt;
+                    vel.y -= *weight * dt;
+                    let mut gone = *life <= 0.0;
+                    // A wall or floor (within half the radius) bursts it, or
+                    // turns it back with DMG_REFLECT (rising at 0.4), its time
+                    // cut to 10 s or by 1 s.
+                    if let Some((at, n)) = self.collision.sweep(from, to, 0.5 * *radius) {
+                        if *reflect {
+                            to = at;
+                            *vel -= 2.0 * vel.dot(n) * n;
+                            if vel.y > 0.0 {
+                                vel.y *= 0.4;
+                            }
+                            *life = if *life > 10.0 { 10.0 } else { *life - 1.0 };
+                        } else {
+                            gone = true;
+                        }
+                    }
+                    if gone {
                         e.alive = false;
                     } else {
                         e.pos = to;
-                        e.spin += dt * 20.0;
+                        e.yaw = vel.x.atan2(vel.z);
+                        e.pitch = Self::missile_pitch(*vel, *tumble, e.pitch + *tumble * dt);
                         proj_hits.push((
                             ei,
                             *owner,
                             *dmg,
                             Vec2::new(vel.x, vel.z).normalize_or_zero(),
+                            *radius,
                         ));
                     }
                 }
@@ -5064,11 +5237,20 @@ impl Game {
             self.post(21, Some(pi), &[]);
         }
 
-        // Projectiles hit the first damageable thing they touch.
-        for (pidx, owner, dmg, dir) in proj_hits {
+        // Projectiles hit the first damageable thing they touch; a monster
+        // within the missile's radius of its cylinder (MissileCollideEnemy). A
+        // super shot goes on through, hitting each thing once.
+        for (pidx, owner, dmg, dir, mr) in proj_hits {
             let ppos = self.entities[pidx].pos;
+            let pierced = match &self.entities[pidx].kind {
+                Kind::Projectile { pierced, .. } => pierced.clone(),
+                _ => None,
+            };
             let target = (0..self.entities.len()).find(|&t| {
                 let e = &self.entities[t];
+                if pierced.as_ref().is_some_and(|p| p.contains(&e.id)) {
+                    return false;
+                }
                 if let Kind::Critter(c) = &e.kind {
                     if !e.alive || !c.hittable() {
                         return false;
@@ -5078,15 +5260,21 @@ impl Game {
                     let cp = c.coll_pos(0, e.pos, e.yaw);
                     return surf < 0.4 && (node.is_some() || (ppos.y - cp.y).abs() < t0.hht + 2.0);
                 }
+                let flat = Vec2::new(e.pos.x - ppos.x, e.pos.z - ppos.z).length();
+                if let Kind::Enemy { state, etype, .. } = &e.kind {
+                    let ty = &crate::enemies::TYPES[(*etype).min(33)];
+                    let hht = ty.height * 0.5;
+                    return e.alive
+                        && !matches!(state, EnemyState::Dying { .. })
+                        && flat < mr + ty.radius
+                        && (e.pos.y + hht - ppos.y).abs() < mr + hht;
+                }
                 let r = match &e.kind {
-                    Kind::Enemy { state, .. } if !matches!(state, EnemyState::Dying { .. }) => 1.4,
                     Kind::Generator { .. } => 2.2,
                     Kind::Container { chest: false, .. } => 1.6,
                     _ => return false,
                 };
-                e.alive
-                    && Vec2::new(e.pos.x - ppos.x, e.pos.z - ppos.z).length() < r
-                    && (e.pos.y + 2.0 - ppos.y).abs() < 3.5
+                e.alive && flat < r && (e.pos.y + 2.0 - ppos.y).abs() < 3.5
             });
             if let Some(t) = target {
                 if owner < self.players.len() {
@@ -5094,7 +5282,13 @@ impl Game {
                     self.hit_entity(owner, t, dmg, dir, false);
                     self.hit_from = None;
                 }
-                self.entities[pidx].alive = false;
+                let id = self.entities[t].id;
+                match &mut self.entities[pidx].kind {
+                    Kind::Projectile {
+                        pierced: Some(p), ..
+                    } => p.push(id),
+                    _ => self.entities[pidx].alive = false,
+                }
             } else if self.friendly_fire > 0 {
                 // The Multiplayer option: a hero's shot stuns (1) or hurts (2)
                 // another hero it hits (combat.c:1129).
@@ -6293,6 +6487,160 @@ mod tests {
         assert_eq!(seen.get("XBOWICON"), Some(&(5, 0x100000, 5.0, -1.0)));
         assert_eq!(seen.get("MULTIICON"), Some(&(5, 0x80000, 0.0, 45.0)));
         assert_eq!(seen.get("INVULICON"), Some(&(6, 0x10000, 0.0, 30.0)));
+    }
+
+    /// A settled hero on levelA1 with nothing else about, and a throw of it.
+    fn missile_game(fs: &GameFs, class: &str) -> (Game, Throw) {
+        let mut g = Game::new(fs, "levelA1", &[(class, "RED")]).unwrap();
+        g.entities.clear();
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = &g.players[0];
+        let t = Throw {
+            pi: 0,
+            pos: p.pos,
+            yaw: p.yaw,
+            aim: Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()),
+            target: false,
+            bits: crate::paction::act::THROW,
+            since_swing: 1.0,
+        };
+        (g, t)
+    }
+
+    fn missiles(g: &Game) -> Vec<(Vec3, Vec3, f32)> {
+        g.entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::Projectile { vel, .. } if e.alive => Some((e.pos, *vel, e.scale)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn thrown_axe_leaves_the_hand_and_arcs_to_the_floor() {
+        let Some(fs) = data() else { return };
+        let (mut g, t) = missile_game(&fs, "WAR");
+        let p = g.players[0].pos;
+        // On an open, flat floor.
+        let (lo, hi) = (p - Vec3::splat(500.0), p + Vec3::splat(500.0));
+        let tri = |v: [Vec3; 3]| crate::collision::Tri {
+            v,
+            n: Vec3::Y,
+            owner: -1,
+        };
+        g.collision = crate::collision::Collision::new(vec![
+            tri([
+                Vec3::new(lo.x, p.y, lo.z),
+                Vec3::new(hi.x, p.y, lo.z),
+                Vec3::new(hi.x, p.y, hi.z),
+            ]),
+            tri([
+                Vec3::new(lo.x, p.y, lo.z),
+                Vec3::new(hi.x, p.y, hi.z),
+                Vec3::new(lo.x, p.y, hi.z),
+            ]),
+        ]);
+        let yaw = t.yaw;
+        g.player_start_missile(t);
+        let m = missiles(&g);
+        assert_eq!(m.len(), 1);
+        // effectpos + the PDATA weapon_offset (-0.5, 0.5, 1.5), then 2 along
+        // the aim.
+        let want = p
+            + Vec3::Y * 2.5
+            + crate::missile::rotate_offset([-0.5, 0.5, 1.5], yaw)
+            + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 2.0;
+        assert!((m[0].0 - want).length() < 1e-3, "{:?} vs {want:?}", m[0].0);
+        // Lobbed: rising, at the clamped missile speed across.
+        let speed = g.players[0].derived.missile_speed.clamp(1.0, 100.0);
+        assert!(m[0].1.y > 0.0);
+        assert!((Vec2::new(m[0].1.x, m[0].1.z).length() - speed).abs() < 1e-3);
+        let start = m[0].0;
+        let (mut top, mut last) = (start.y, start);
+        for _ in 0..180 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            match missiles(&g).first() {
+                Some(&(pos, v, _)) => {
+                    top = top.max(pos.y);
+                    last = pos;
+                }
+                None => break,
+            }
+        }
+        assert!(missiles(&g).is_empty(), "bursts before its 3 s are up");
+        assert!(top > start.y + 0.5, "peaks at {top}");
+        // Comes down 0.5 under the hand 35 out (speedArg), then on down to the
+        // floor 3 below it: 4.14 t - 6 t^2 = -2.9 at t = 1.12 s, 49 out.
+        let out = Vec2::new(last.x - start.x, last.z - start.z).length();
+        assert!(
+            (45.0..55.0).contains(&out) && last.y < p.y + 0.5,
+            "{out} out at {last:?} from {start:?}"
+        );
+    }
+
+    #[test]
+    fn five_way_fans_by_the_spread_table() {
+        let Some(fs) = data() else { return };
+        let (mut g, t) = missile_game(&fs, "ARC");
+        g.players[0]
+            .powerups
+            .add(crate::powerups::WEAPON, crate::powerups::W_5WAY, 0.0, 45.0);
+        g.players[0].powerups.slots[0].state = crate::powerups::ON;
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        let yaw = g.players[0].yaw;
+        g.player_start_missile(Throw { yaw, ..t });
+        let mut turns: Vec<i32> = missiles(&g)
+            .iter()
+            .map(|(_, v, _)| wrap_angle(v.x.atan2(v.z) - yaw).to_degrees().round() as i32)
+            .collect();
+        turns.sort();
+        assert_eq!(turns, [-30, -15, 0, 15, 30]);
+        // A fanned throw lasts 2 s, not 3.
+        assert!(g.entities.iter().all(|e| match e.kind {
+            Kind::Projectile { life, .. } => life == 2.0,
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn power_a_throw_is_big_and_rebound_shots_bounce() {
+        let Some(fs) = data() else { return };
+        let (mut g, t) = missile_game(&fs, "WAR");
+        g.player_start_missile(Throw {
+            bits: crate::paction::act::PWRA_THROW,
+            ..t
+        });
+        let e = g
+            .entities
+            .iter()
+            .find(|e| matches!(e.kind, Kind::Projectile { .. }));
+        let e = e.unwrap();
+        assert_eq!(e.scale, 2.0);
+        assert!(matches!(e.kind, Kind::Projectile { radius, .. } if (radius - 1.8).abs() < 1e-5));
+        g.entities.clear();
+        g.players[0].powerups.add(
+            crate::powerups::WEAPON,
+            crate::powerups::W_REFLECT,
+            0.0,
+            45.0,
+        );
+        g.players[0].powerups.slots[0].state = crate::powerups::ON;
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        let yaw = g.players[0].yaw;
+        g.player_start_missile(Throw { yaw, ..t });
+        let mut bounced = false;
+        for _ in 0..120 {
+            let before = missiles(&g);
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            let after = missiles(&g);
+            if let (Some(b), Some(a)) = (before.first(), after.first()) {
+                bounced |= b.1.y < 0.0 && a.1.y > 0.0;
+            }
+        }
+        assert!(bounced, "a rebound shot comes back up off the floor");
     }
 
     #[test]
