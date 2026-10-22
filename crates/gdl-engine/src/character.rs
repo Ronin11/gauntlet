@@ -380,7 +380,11 @@ impl Animator {
         // InitAnim / CalcAnimInfo: a frame lasts rate/30 x animscale x 1/30 s, so
         // `rate` is an inverse speed (30 plays 30 frames a second, 60 plays 15);
         // `speed` is 1/animscale. A sequence is done half a frame past its last.
-        let rate = if s.frame_rate > 0 { s.frame_rate as f32 } else { 30.0 };
+        let rate = if s.frame_rate > 0 {
+            s.frame_rate as f32
+        } else {
+            30.0
+        };
         self.frame += dt * 900.0 / rate * self.speed;
         let end = (frames - 0.5).max(0.5);
         if self.frame >= end {

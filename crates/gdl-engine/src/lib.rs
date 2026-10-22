@@ -22,6 +22,7 @@ pub mod messages;
 pub mod movie;
 pub mod options;
 pub mod optmenu;
+pub mod paction;
 pub mod powerups;
 pub mod progress;
 pub mod scene;
