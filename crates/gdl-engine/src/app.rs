@@ -294,6 +294,19 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
             }
+            // Android delivers a gamepad's stick as joystick motion, which winit
+            // passes on as a touch whose position is the raw AXIS_X / AXIS_Y.
+            WindowEvent::Touch(t)
+                if t.phase == winit::event::TouchPhase::Moved
+                    && t.location.x.abs() <= 1.0
+                    && t.location.y.abs() <= 1.0 =>
+            {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                t.device_id.hash(&mut h);
+                r.input
+                    .device_axes(h.finish(), t.location.x as f32, -t.location.y as f32);
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(e) = self.frame(el) {
                     self.error = Some(e);

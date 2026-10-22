@@ -69,6 +69,8 @@ pub struct Input {
     #[cfg(not(target_os = "android"))]
     pad_pressed: Vec<(PadId, Button)>,
     dev_held: HashMap<u64, HashSet<u32>>,
+    /// Left-stick axes of key-reporting controllers (Android joystick motion).
+    dev_stick: HashMap<u64, Vec2>,
     dev_pressed: Vec<(u64, u32)>,
 }
 
@@ -101,6 +103,7 @@ impl Input {
             #[cfg(not(target_os = "android"))]
             pad_pressed: Vec::new(),
             dev_held: HashMap::new(),
+            dev_stick: HashMap::new(),
             dev_pressed: Vec::new(),
         }
     }
@@ -113,6 +116,12 @@ impl Input {
         } else {
             self.keys.remove(&code);
         }
+    }
+
+    /// A key-reporting controller's left stick (x right, y up, -1..1).
+    pub fn device_axes(&mut self, dev: u64, x: f32, y: f32) {
+        self.dev_held.entry(dev).or_default();
+        self.dev_stick.insert(dev, Vec2::new(x, y));
     }
 
     /// A raw button event from a key-reporting controller.
@@ -239,8 +248,31 @@ impl Input {
                 if h(DPAD_LEFT) {
                     v.x -= 1.0;
                 }
+                let dpad = v.normalize_or_zero();
+                // A pad whose stick reports walks with it, and its d-pad runs the
+                // mini-inventory; one without walks with the d-pad.
+                let (stick, dpad, inv) = match self.dev_stick.get(&dev) {
+                    Some(&a) => {
+                        let mag = a.length();
+                        let a = if mag < 0.2 {
+                            Vec2::ZERO
+                        } else {
+                            a / mag * ((mag - 0.2) / 0.8).min(1.0)
+                        };
+                        let inv = crate::powerups::DPad {
+                            up: p(DPAD_UP),
+                            down: p(DPAD_DOWN),
+                            left: p(DPAD_LEFT),
+                            right: p(DPAD_RIGHT),
+                        };
+                        ((a + dpad).clamp_length_max(1.0), dpad, inv)
+                    }
+                    None => (dpad, Vec2::ZERO, Default::default()),
+                };
                 PlayerInput {
-                    stick: v.normalize_or_zero(),
+                    stick,
+                    dpad,
+                    inv,
                     attack: h(BUTTON_A) || h(DPAD_CENTER),
                     attack_pressed: p(BUTTON_A) || p(DPAD_CENTER),
                     magic_pressed: p(BUTTON_X),
@@ -248,9 +280,6 @@ impl Input {
                     b_pressed: p(BUTTON_B),
                     slow_pressed: p(BUTTON_Y),
                     start_pressed: p(BUTTON_START),
-                    // Key-event pads walk with the d-pad until their sticks are
-                    // read; no mini-inventory for them yet.
-                    ..Default::default()
                 }
             }
             #[cfg(not(target_os = "android"))]
