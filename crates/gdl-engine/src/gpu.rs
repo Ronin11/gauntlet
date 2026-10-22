@@ -162,6 +162,8 @@ pub struct Instance {
     pub visible: bool,
     /// Per-part texmod effects (empty: none).
     pub part_fx: Vec<PartFx>,
+    /// `MBTreeSetAltTex` over the whole model: one texture for every batch.
+    pub alt_tex: Option<std::sync::Arc<wgpu::BindGroup>>,
 }
 
 impl Gpu {
@@ -483,7 +485,35 @@ impl Gpu {
             tint: Vec4::ONE,
             visible: true,
             part_fx: Vec::new(),
+            alt_tex: None,
         }
+    }
+
+    /// A material showing `img` (for [`Instance::alt_tex`]).
+    pub fn texture_material(&self, img: &Image) -> std::sync::Arc<wgpu::BindGroup> {
+        let view = self.upload_texture(img);
+        std::sync::Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.material_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.white),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
+                },
+            ],
+        }))
     }
 
     pub fn depth_view(&self, width: u32, height: u32) -> wgpu::TextureView {
@@ -643,7 +673,8 @@ impl Gpu {
                         {
                             continue;
                         }
-                        pass.set_bind_group(1, &mesh.materials[material], &[]);
+                        let mat = inst.alt_tex.as_deref().unwrap_or(&mesh.materials[material]);
+                        pass.set_bind_group(1, mat, &[]);
                         pass.set_bind_group(2, bg, &[]);
                         pass.draw_indexed(b.start..b.start + b.count, 0, 0..1);
                     }

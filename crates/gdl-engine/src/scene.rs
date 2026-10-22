@@ -26,6 +26,8 @@ pub struct Scene {
     entities: HashMap<u64, Instance>,
     /// How many world objects were hidden when the world mesh was built.
     hidden_count: usize,
+    /// The boss's SEETHROUGH material, made on first use.
+    seethrough: Option<std::sync::Arc<wgpu::BindGroup>>,
 }
 
 /// Instance key bit for a critter's GMETER bar.
@@ -86,6 +88,7 @@ impl Scene {
             players,
             entities: HashMap::new(),
             hidden_count: game.hidden.len(),
+            seethrough: None,
         })
     }
 
@@ -194,8 +197,27 @@ impl Scene {
                 (inst.parts, inst.hidden) =
                     model.evaluate_nodes(r.anim.seq, r.anim.frame, &world, &hidden, &c.swapped);
                 inst.part_fx = model.texmod_fx(r.anim.seq, r.anim.frame);
+                // CritterAnimate: while paused the boss shows its boss_texture
+                // (the Dragon's SEETHROUGH), blinking off in the last 180 ticks.
+                let see = game.boss.as_ref().and_then(|b| b.seethrough.as_ref());
+                inst.alt_tex = None;
+                if let (true, Some(img)) = (r.freeze > 0.0, see) {
+                    let blink = r.freeze < 180.0 && (r.freeze as i32) & 8 != 0;
+                    if !blink {
+                        let mat = self
+                            .seethrough
+                            .get_or_insert_with(|| gpu.texture_material(img))
+                            .clone();
+                        if let Some(inst) = self.entities.get_mut(&e.id) {
+                            inst.alt_tex = Some(mat);
+                        }
+                    }
+                }
+                let inst = self.entities.get_mut(&e.id).unwrap();
                 let flash = c.parts.iter().map(|p| p.flash).fold(0.0f32, f32::max);
-                inst.tint = if r.freeze > 0.0 {
+                inst.tint = if r.freeze > 0.0 && see.is_some() {
+                    Vec4::new(1.0, 1.0, 1.0, c.alpha)
+                } else if r.freeze > 0.0 {
                     // Frozen (pausecnt): blinking blue-white.
                     Vec4::new(0.7, 0.8, 1.6, c.alpha)
                 } else if flash > 0.0 {

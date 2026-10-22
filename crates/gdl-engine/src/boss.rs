@@ -132,6 +132,9 @@ pub struct Boss {
     /// Coin models (bronze, silver, gold) and Skorne's boss power-ups.
     pub coin_models: [Option<usize>; 3],
     pub key_model: Option<usize>,
+    /// The Dragon's SEETHROUGH texture (ITEMS, sItemFile1), shown while the
+    /// legend weapon holds him (pausecnt).
+    pub seethrough: Option<gdl_formats::Image>,
     /// BOSSKEY2, and the BOSSKEY effect waiting to change into it.
     pub key2_model: Option<usize>,
     pub key_effect: Option<u64>,
@@ -443,6 +446,22 @@ impl Game {
             }
             if let Some(b) = self.boss.as_mut() {
                 b.meters = meters;
+            }
+        }
+        if level.boss == 34 {
+            let dir = format!("ITEMS/{}", self.level.name);
+            let img = (|| {
+                let objs = gdl_formats::objects::Objects::parse(
+                    &fs.read(&format!("{dir}/objects.ngc")).ok()?,
+                )
+                .ok()?;
+                let tex = fs.read(&format!("{dir}/textures.ngc")).ok()?;
+                let def = objs.bitmap_defs.iter().find(|d| d.name == "SEETHROUGH")?;
+                let bm = objs.bitmaps.get(def.tex_index as usize)?;
+                gdl_formats::texture::decode_ngc(bm, &tex).ok()
+            })();
+            if let Some(b) = self.boss.as_mut() {
+                b.seethrough = img;
             }
         }
         // The spewed coins, the boss key and the wizard's models.

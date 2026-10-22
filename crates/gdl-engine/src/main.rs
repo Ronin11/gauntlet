@@ -291,6 +291,11 @@ fn snapshot_game(args: &Args) -> Result<()> {
         let s = gdl_engine::tower::Sumner::new(&fs, &mut g, entry);
         g.sumner = Some(Box::new(s));
     }
+    // GDL_LEGEND=1: the party holds this realm's Item of Legend.
+    if std::env::var_os("GDL_LEGEND").is_some() {
+        let realm = g.wave.map_or(0, |w| w >> 8);
+        g.set_legend_held(1 << realm);
+    }
     // GDL_INV=1: player 0 holds a 3-way shot and levitation, the inventory
     // open on levitation and switched on.
     if std::env::var_os("GDL_INV").is_some() {
