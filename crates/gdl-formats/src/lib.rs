@@ -8,6 +8,7 @@ pub mod audio;
 pub mod bin;
 pub mod mesh;
 pub mod objects;
+pub mod sequence;
 pub mod texture;
 pub mod worlds;
 
