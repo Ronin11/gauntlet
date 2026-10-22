@@ -773,6 +773,9 @@ pub enum Kind {
         reflect: bool,
         /// A super shot passes through what it hits, each once.
         pierced: Option<Vec<u64>>,
+        /// fn_8009DB24 selector played when it bursts on a wall: 5 the
+        /// level's hit sound, 6/7 the 3/5-way burst (first shot only).
+        wall_sound: u8,
     },
     /// A monster's arrow, bomb or fireball.
     EnemyShot {
@@ -3544,6 +3547,13 @@ impl Game {
                     tumble: desc.angular_velocity[0],
                     reflect: flags & m::DMG_REFLECT != 0,
                     pierced: (flags & m::DMG_SUPER != 0).then(Vec::new),
+                    // StartMissile: the fan's first shot has its own sound.
+                    wall_sound: match (flags & 0x480000 != 0, i) {
+                        (false, _) => 5,
+                        (true, 0) if flags & 0x400000 != 0 => 7,
+                        (true, 0) => 6,
+                        _ => 0,
+                    },
                 },
                 model,
                 pt1,
@@ -3967,6 +3977,9 @@ impl Game {
                             tumble: desc.angular_velocity[0],
                             reflect: false,
                             pierced: None,
+                            // Type 10 goes through PlayerStartMissile; type 2's
+                            // comes from its plyr_sfx sndidx (not parsed).
+                            wall_sound: if row.kind == 10 { 5 } else { 0 },
                         },
                         model,
                         pos + Vec3::Y * 2.5 + dir * 1.2,
@@ -4555,6 +4568,7 @@ impl Game {
         let mut barrier_touches = Vec::new();
         let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32)> = Vec::new();
         let mut fallers_started: Vec<(i32, Option<(usize, usize)>)> = Vec::new();
+        let mut wall_sounds: Vec<u8> = Vec::new();
         let mut fallers_moved: Vec<((usize, usize), Vec3)> = Vec::new();
         // Which damage tiles are on screen (off-screen ones pause their cycle).
         let hazard_vis: HashSet<u64> = self
@@ -5195,6 +5209,7 @@ impl Game {
                     radius,
                     tumble,
                     reflect,
+                    wall_sound,
                     ..
                 } => {
                     // ProcessEffects: move by the velocity, then fall.
@@ -5216,6 +5231,7 @@ impl Game {
                             *life = if *life > 10.0 { 10.0 } else { *life - 1.0 };
                         } else {
                             gone = true;
+                            wall_sounds.push(*wall_sound);
                         }
                     }
                     if gone {
@@ -5346,6 +5362,24 @@ impl Game {
                 for v in &mut self.collision.tris[t].v {
                     *v += d;
                 }
+            }
+        }
+        // fn_8009DB24: missiles bursting on walls.
+        for snd in wall_sounds {
+            match snd {
+                5 => {
+                    let name = self
+                        .wave
+                        .and_then(|w| self.worlds.level_sound(w, true))
+                        .map(str::to_string);
+                    if let Some(n) = name {
+                        // The sound table's names are 15 characters at most.
+                        self.sfx.push(n.chars().take(15).collect());
+                    }
+                }
+                6 => self.sfx_id(63),
+                7 => self.sfx_id(64),
+                _ => {}
             }
         }
         // fn_8009D8CC (sinking) / fn_8009D91C (falling): the realm's sound.
@@ -6677,6 +6711,20 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn missiles_bursting_on_the_world_play_the_level_hit_sound() {
+        let Some(fs) = data() else { return };
+        let (mut g, t) = missile_game(&fs, "WAR");
+        g.player_start_missile(t);
+        g.sfx.clear();
+        let mut heard = false;
+        for _ in 0..240 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            heard |= g.sfx.drain(..).any(|s| s == "S_WEAPONHITSTON");
+        }
+        assert!(missiles(&g).is_empty() && heard);
     }
 
     #[test]

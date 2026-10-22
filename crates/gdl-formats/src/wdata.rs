@@ -163,6 +163,16 @@ impl MapDef {
     }
 }
 
+/// One SNDS record (sound_data, 24 bytes).
+#[derive(Clone, Debug, Default)]
+pub struct SoundRef {
+    pub name: String,
+    /// Sound id (bank << 16 | index), -1 none.
+    pub idx: i32,
+    pub vol: i16,
+    pub pri: i16,
+}
+
 /// One AUDS record (audio_data, 60 bytes): the level's sound bank and music.
 #[derive(Clone, Debug, Default)]
 pub struct AudioDef {
@@ -172,6 +182,10 @@ pub struct AudioDef {
     /// Music areas (streams `<stream>a`, `<stream>b`, ...).
     pub areas: i16,
     pub channels: i16,
+    /// SNDS indices: the sound on entering the next stage, and on a wall
+    /// hit or exploding wall (AudioExplodeWall, wall sound 5).
+    pub entersnd: i16,
+    pub hitsnd: i16,
     /// Sequential parts per area (`<name>_1`, `<name>_2`, ...).
     pub parts: [i16; 8],
 }
@@ -203,6 +217,8 @@ pub struct Realm {
     pub letter: char,
     pub levels: Vec<LevelDef>,
     pub audio: Vec<AudioDef>,
+    /// SNDS (sound_data): the realm's event sounds by name.
+    pub sounds: Vec<SoundRef>,
     /// MAPS records, indexed by [`LevelDef::map_index`].
     pub maps: Vec<MapDef>,
     /// ENMY: (monster type, subtype) records the levels' enemy_types index.
@@ -378,7 +394,24 @@ impl Realm {
                     stream: cstr(&d[o + 0x18..o + 0x28]),
                     areas: i16_at(o + 0x28),
                     channels: i16_at(o + 0x2A),
+                    entersnd: i16_at(o + 0x10),
+                    hitsnd: i16_at(o + 0x12),
                     parts,
+                });
+            }
+        }
+        let mut sounds = Vec::new();
+        if let Some(&(_, so, n)) = dir.iter().find(|(t, _, _)| t == "SNDS") {
+            for k in 0..n {
+                let o = so + k * 24;
+                if o + 24 > d.len() {
+                    break;
+                }
+                sounds.push(SoundRef {
+                    name: cstr(&d[o..o + 16]),
+                    idx: i32_at(o + 0x10),
+                    vol: i16_at(o + 0x14),
+                    pri: i16_at(o + 0x16),
                 });
             }
         }
@@ -470,6 +503,7 @@ impl Realm {
             letter,
             levels,
             audio,
+            sounds,
             maps,
             enemies,
             enemy_variants,
@@ -556,6 +590,19 @@ impl Worlds {
                 let n = a.areas.max(1) as usize;
                 (a.streams(area.min(n - 1)), n)
             })
+    }
+
+    /// The name of a wave's level sound (`hitsnd` or `entersnd` of its AUDS
+    /// record) from the realm's SNDS table.
+    pub fn level_sound(&self, wave: u32, hit: bool) -> Option<&str> {
+        let realm = self.realm(wave >> 8)?;
+        let level = realm.levels.get((wave & 0xFF) as usize)?;
+        let a = realm.audio.get(level.audio_index.max(0) as usize)?;
+        let i = if hit { a.hitsnd } else { a.entersnd };
+        realm
+            .sounds
+            .get(usize::try_from(i).ok()?)
+            .map(|s| s.name.as_str())
     }
 
     /// The map-screen record of a wave's level (level_data.mapdata), if it has one.
