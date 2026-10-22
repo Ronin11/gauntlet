@@ -6,6 +6,7 @@ pub mod attract;
 pub mod audio;
 pub mod character;
 pub mod collision;
+pub mod cursor;
 pub mod fs;
 pub mod game;
 pub mod gpu;

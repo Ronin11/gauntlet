@@ -190,6 +190,31 @@ impl OptMenu {
         Event::None
     }
 
+    /// The 3D arrow's place for menus with an icon (the title menu): left of the
+    /// item block, on the selected line, pitched pi on odd items.
+    pub fn cursor(&self, s: &Scr) -> (f32, f32, f32) {
+        let mut x = self.x;
+        if x < 0.0 {
+            let w = self
+                .items
+                .iter()
+                .map(|it| s.text_width(FONT_32, self.scale, &it.text))
+                .fold(0.0, f32::max);
+            x = -(x + w / 2.0);
+        }
+        let lh = self.line_height();
+        let angle = if self.sel & 1 != 0 {
+            std::f32::consts::PI
+        } else {
+            0.0
+        };
+        (
+            x - 16.0,
+            self.y + self.sel as f32 * lh + (lh / 2.0).floor(),
+            angle,
+        )
+    }
+
     /// show_optmenu: unselected items in rgb_off; the selected one twice, a pulsing
     /// glow pass in rgb_hi then solid rgb_on. `fade` (0..255) fades everything.
     pub fn draw(&self, s: &mut Scr, fade: i32) {

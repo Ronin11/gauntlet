@@ -99,6 +99,8 @@ struct Running {
     checkpoint: Option<Carry>,
     /// The current movie frame's texture.
     movie_tex: Option<crate::ui::Tex>,
+    /// The menus' 3D arrow.
+    cursor: Option<crate::cursor::Cursor>,
     hud: Hud,
     audio: Audio,
     input: Input,
@@ -159,6 +161,9 @@ impl App {
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
         let gpu = Gpu::new(device, queue, config.format);
+        let cursor = crate::cursor::Cursor::load(&self.cfg.fs, &gpu)
+            .map_err(|e| log::warn!("menu arrow: {e:#}"))
+            .ok();
         let depth = gpu.depth_view(config.width, config.height);
 
         let hud = Hud::new(
@@ -201,6 +206,7 @@ impl App {
             carry: None,
             checkpoint: None,
             movie_tex: None,
+            cursor,
             hud,
             audio,
             input,
@@ -699,6 +705,27 @@ impl App {
             );
         }
         r.hud.draw(&r.gpu.device, &r.gpu.queue, &view, &canvas);
+        // The menus' 3D arrow goes over the 2D overlay.
+        let arrow = {
+            let mut scratch = hud::Canvas::new(r.config.width, r.config.height);
+            let s = Scr::new(&mut scratch, &r.hud.ui, ticks);
+            match &r.screen {
+                Screen::Title(t) => t.cursor(&s),
+                Screen::Playing { pause: Some(m), .. } => m.cursor(&s),
+                _ => None,
+            }
+        };
+        if let (Some(at), Some(c)) = (arrow, r.cursor.as_mut()) {
+            let (w, h) = (r.config.width as f32, r.config.height as f32);
+            let k = (w / 512.0).min(h / 384.0);
+            let vp = [
+                (w - 512.0 * k) / 2.0,
+                (h - 384.0 * k) / 2.0,
+                512.0 * k,
+                384.0 * k,
+            ];
+            c.draw(&r.gpu, &view, &r.depth, vp, at);
+        }
         frame.present();
 
         // A finished level: tower portals lead to their level (after its intro

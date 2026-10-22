@@ -519,9 +519,37 @@ struct Menu {
     burn: bool,
     y: f32,
     b: (f32, f32, f32, f32),
+    /// The arrow's glide (icon_y, icon_t): the line it is leaving, and ticks into
+    /// the 15-tick move (0 when resting).
+    icon_y: f32,
+    icon_t: i32,
 }
 
+/// OPTMENU_ICON_TIME: ticks for the arrow to glide to a new item.
+const ICON_TIME: i32 = 15;
+
 impl Menu {
+    /// Where the arrow's line is: half a line below the selected item's top.
+    fn icon_target(&self) -> f32 {
+        (line_height(self.def.scale) / 2) as f32
+            + self.draw_y(self.sel.min(self.items.len().saturating_sub(1)))
+    }
+
+    /// One tick of the glide.
+    fn glide(&mut self) {
+        let ty = self.icon_target();
+        if self.icon_t == 0 {
+            if ty != self.icon_y {
+                self.icon_t = 1;
+            }
+        } else if self.icon_t < ICON_TIME {
+            self.icon_t += 1;
+        } else {
+            self.icon_y = ty;
+            self.icon_t = 0;
+        }
+    }
+
     fn new(id: MenuId) -> Menu {
         let def = menu_def(id);
         let items = def
@@ -555,6 +583,8 @@ impl Menu {
             burn: def.burn,
             y: y as f32,
             b: (bx as f32, by as f32, bw as f32, bh as f32),
+            icon_y: 0.0,
+            icon_t: 0,
         };
         m.restart();
         m
@@ -722,6 +752,49 @@ impl Options {
         self.open || self.scroll.is_some() || self.popped.as_ref().is_some_and(Menu::fading)
     }
 
+    /// The 3D arrow's place (show_optmenu's icon glide): virtual screen x and y,
+    /// and its pitch, which turns half a circle per move and rests at pi on odd
+    /// items. None while no menu is shown.
+    pub fn cursor(&self, s: &Scr) -> Option<(f32, f32, f32)> {
+        if !self.open || self.finishing {
+            return None;
+        }
+        let m = self.stack.last()?;
+        if m.finish != 0 || m.items.is_empty() {
+            return None;
+        }
+        let base = if m.sel & 1 != 0 {
+            std::f32::consts::PI
+        } else {
+            0.0
+        };
+        let target = m.icon_target();
+        let (y, angle) = if m.icon_t == 0 {
+            (m.icon_y, base)
+        } else {
+            let k = m.icon_t as f32 / ICON_TIME as f32;
+            (
+                m.icon_y + (target - m.icon_y) * k,
+                base + std::f32::consts::PI * k,
+            )
+        };
+        let mut x = m.def.x as f32;
+        if x < 0.0 {
+            let w = m
+                .items
+                .iter()
+                .map(|it| s.text_width(crate::ui::FONT_32, m.def.scale, &it.text))
+                .fold(0.0, f32::max);
+            x = -(x + w / 2.0);
+        }
+        let dx = if m.id() == MenuId::ControlStyle {
+            -48.0
+        } else {
+            -16.0
+        };
+        Some((x + dx, y, angle))
+    }
+
     /// The top menu, if any.
     pub fn current(&self) -> Option<MenuId> {
         self.stack.last().map(Menu::id)
@@ -777,7 +850,11 @@ impl Options {
             self.fresh = false;
             let root = &mut self.stack[0];
             root.sel = prefs.menu_sel[root.id() as usize];
+            root.icon_y = root.icon_target();
             self.set_quit_level_enabled(self.quit_level_enabled);
+        }
+        if let Some(m) = self.stack.last_mut() {
+            m.glide();
         }
         // ServeFireScroll: while it runs, menu input is cleared.
         let mut input = *input;
@@ -1147,6 +1224,7 @@ impl Options {
         self.popped = None;
         let mut m = Menu::new(id);
         m.sel = prefs.menu_sel[id as usize].min(m.items.len() - 1);
+        m.icon_y = m.icon_target();
         self.stack.push(m);
         self.refresh(prefs);
     }

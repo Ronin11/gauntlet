@@ -383,6 +383,19 @@ impl Gpu {
         self.render_viewport(target, depth, globals, clear, draws, None);
     }
 
+    /// Draw over what is already in `target` (keeping its colour, clearing depth),
+    /// within `viewport`: 3D pieces of the 2D overlay such as the menu arrow.
+    pub fn render_over(
+        &self,
+        target: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        globals: &Globals,
+        draws: &[(&GpuMesh, &Instance)],
+        viewport: [f32; 4],
+    ) {
+        self.render_pass(target, depth, globals, None, draws, Some(viewport));
+    }
+
     /// As [`Gpu::render`], drawing the scene only into `viewport` (x, y, w, h in
     /// pixels); the rest of the target is just cleared.
     pub fn render_viewport(
@@ -391,6 +404,18 @@ impl Gpu {
         depth: &wgpu::TextureView,
         globals: &Globals,
         clear: [f64; 3],
+        draws: &[(&GpuMesh, &Instance)],
+        viewport: Option<[f32; 4]>,
+    ) {
+        self.render_pass(target, depth, globals, Some(clear), draws, viewport);
+    }
+
+    fn render_pass(
+        &self,
+        target: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        globals: &Globals,
+        clear: Option<[f64; 3]>,
         draws: &[(&GpuMesh, &Instance)],
         viewport: Option<[f32; 4]>,
     ) {
@@ -426,12 +451,15 @@ impl Gpu {
                     view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear[0],
-                            g: clear[1],
-                            b: clear[2],
-                            a: 1.0,
-                        }),
+                        load: match clear {
+                            Some(c) => wgpu::LoadOp::Clear(wgpu::Color {
+                                r: c[0],
+                                g: c[1],
+                                b: c[2],
+                                a: 1.0,
+                            }),
+                            None => wgpu::LoadOp::Load,
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],

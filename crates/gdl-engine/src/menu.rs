@@ -56,6 +56,15 @@ impl Default for Title {
 }
 
 impl Title {
+    /// Where the menus' 3D arrow goes, if a menu with one is showing.
+    pub fn cursor(&self, s: &Scr) -> Option<(f32, f32, f32)> {
+        match &self.options {
+            Some(o) => o.cursor(s),
+            None if self.open && self.starting.is_none() => Some(self.menu.cursor(s)),
+            None => None,
+        }
+    }
+
     /// The screen after its fade-in, for snapshots; `menu` opens the title menu.
     pub fn demo(menu: bool) -> Title {
         Title {
