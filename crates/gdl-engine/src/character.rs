@@ -58,6 +58,9 @@ pub struct Model {
     attachments: Vec<(u16, usize)>,
     /// runs[seq] = mesh-swap runs active during that sequence.
     runs: Vec<Vec<FrameRun>>,
+    /// Replacement parts shown instead of a node's own (a critter's broken
+    /// armour plate `<prefix>D<node>`): (part, node).
+    alt_parts: Vec<(u16, usize)>,
     pub part_count: usize,
 }
 
@@ -115,6 +118,7 @@ impl Model {
             skeleton,
             &format!("{class}_{color}"),
             Some("WEAP_"),
+            &[],
         ))
     }
 
@@ -142,7 +146,36 @@ impl Model {
         .with_context(|| format!("animation tree {tree:?} not found"))?
         .clone();
         let prefix = skeleton.prefix.clone();
-        Ok(Self::build(objects, textures, skeleton, &prefix, None))
+        Ok(Self::build(objects, textures, skeleton, &prefix, None, &[]))
+    }
+
+    /// [`Model::from_anim`] plus replacement objects for some nodes, by name
+    /// (shown with [`Model::evaluate_nodes`]'s `swapped`).
+    pub fn from_anim_alts(
+        objects: &Objects,
+        textures: &[u8],
+        anim: &Anim,
+        tree: &str,
+        alts: &[(String, String)],
+    ) -> Result<Self> {
+        let skeleton = anim
+            .atrees
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(tree))
+            .with_context(|| format!("animation tree {tree} not found"))?
+            .clone();
+        let prefix = skeleton.prefix.clone();
+        let alts: Vec<(usize, &str)> = alts
+            .iter()
+            .filter_map(|(node, obj)| {
+                let ni = skeleton
+                    .nodes
+                    .iter()
+                    .position(|n| n.name.eq_ignore_ascii_case(node))?;
+                Some((ni, obj.as_str()))
+            })
+            .collect();
+        Ok(Self::build(objects, textures, skeleton, &prefix, None, &alts))
     }
 
     fn build(
@@ -151,6 +184,7 @@ impl Model {
         skeleton: ATree,
         prefix: &str,
         weapon: Option<&str>,
+        alts: &[(usize, &str)],
     ) -> Self {
         let mut b = MeshBuilder::new(objects, textures);
         let mut next_part: u16 = 0;
@@ -189,6 +223,17 @@ impl Model {
                 if let Some(obj) = objects.objects.get(d.obj_index.max(0) as usize) {
                     b.add_part(obj, Mat4::IDENTITY, next_part);
                     attachments.push((next_part, wrist));
+                    next_part += 1;
+                }
+            }
+        }
+
+        let mut alt_parts = Vec::new();
+        for &(ni, name) in alts {
+            if let Some(d) = defs.iter().find(|d| name_matches(&d.name, name)) {
+                if let Some(obj) = objects.objects.get(d.obj_index.max(0) as usize) {
+                    b.add_part(obj, Mat4::IDENTITY, next_part);
+                    alt_parts.push((next_part, ni));
                     next_part += 1;
                 }
             }
@@ -243,6 +288,7 @@ impl Model {
             node_part,
             attachments,
             runs,
+            alt_parts,
             part_count: next_part as usize,
         }
     }
@@ -270,6 +316,7 @@ impl Model {
             node_part: Vec::new(),
             attachments: Vec::new(),
             runs: Vec::new(),
+            alt_parts: Vec::new(),
             part_count: 1,
         })
     }
@@ -282,6 +329,66 @@ impl Model {
     pub fn evaluate(&self, seq: usize, frame: f32) -> (Vec<Mat4>, Vec<bool>) {
         let poses = self.skeleton.sample(seq, frame);
         let world = self.node_transforms(&poses);
+        self.evaluate_nodes(seq, frame, &world, &[], &[])
+    }
+
+    /// Index of the node called `name`.
+    pub fn node_index(&self, name: &str) -> Option<usize> {
+        self.skeleton
+            .nodes
+            .iter()
+            .position(|n| n.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether node `n` is `root` or below it.
+    pub fn in_subtree(&self, n: usize, root: usize) -> bool {
+        let mut i = n as i32;
+        while i >= 0 {
+            if i as usize == root {
+                return true;
+            }
+            let p = self.skeleton.nodes[i as usize].parent;
+            if p >= i {
+                return false;
+            }
+            i = p;
+        }
+        false
+    }
+
+    /// Model-space node matrices for a layered pose: the first layer's
+    /// sequence drives the whole tree, and each later layer `(Some(root), seq,
+    /// frame)` replaces the poses of `root`'s subtree (a critter's child parts,
+    /// such as the Chimera's heads, animate their own branch of the shared tree).
+    pub fn pose_layers(&self, layers: &[(Option<usize>, usize, f32)]) -> Vec<Mat4> {
+        let Some(&(_, seq, frame)) = layers.first() else {
+            return self.node_transforms(&[]);
+        };
+        let mut poses = self.skeleton.sample(seq, frame);
+        for &(root, seq, frame) in &layers[1..] {
+            let Some(root) = root else { continue };
+            let sub = self.skeleton.sample(seq, frame);
+            for (i, p) in poses.iter_mut().enumerate() {
+                if self.in_subtree(i, root) {
+                    if let Some(s) = sub.get(i) {
+                        *p = *s;
+                    }
+                }
+            }
+        }
+        self.node_transforms(&poses)
+    }
+
+    /// Part transforms and visibility from node matrices ([`Model::pose_layers`]):
+    /// `hidden_nodes` hides a node's parts, `swapped` shows its replacement part.
+    pub fn evaluate_nodes(
+        &self,
+        seq: usize,
+        frame: f32,
+        world: &[Mat4],
+        hidden_nodes: &[bool],
+        swapped: &[bool],
+    ) -> (Vec<Mat4>, Vec<bool>) {
         let mut parts = vec![Mat4::IDENTITY; self.part_count];
         let mut hidden = vec![false; self.part_count];
         for (ni, p) in self.node_part.iter().enumerate() {
@@ -307,6 +414,20 @@ impl Model {
                 let p = r.parts[idx] as usize;
                 hidden[p] = false;
                 parts[p] = world[r.node];
+            }
+        }
+        for &(p, node) in &self.alt_parts {
+            parts[p as usize] = world[node];
+            hidden[p as usize] = !swapped.get(node).copied().unwrap_or(false);
+        }
+        for (ni, p) in self.node_part.iter().enumerate() {
+            if let Some(p) = p {
+                if hidden_nodes.get(ni).copied().unwrap_or(false)
+                    || (swapped.get(ni).copied().unwrap_or(false)
+                        && self.alt_parts.iter().any(|&(_, n)| n == ni))
+                {
+                    hidden[*p as usize] = true;
+                }
             }
         }
         (parts, hidden)

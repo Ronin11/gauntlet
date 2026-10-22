@@ -20,6 +20,8 @@ pub struct Progress {
     pub garg_items: [i32; 3],
     /// The last realm other than the tower that was played (lbl_803448C8).
     pub last_realm: Option<u32>,
+    /// Legend weapons carried (rune_near): bit = the item's value.
+    pub legend: u16,
 }
 
 impl Progress {

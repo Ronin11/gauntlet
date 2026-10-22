@@ -423,12 +423,21 @@ fn snapshot_game(args: &Args) -> Result<()> {
             class: select::CLASSES.iter().position(|k| k == c).unwrap_or(0),
         })
         .collect();
+    let boss_bank = g.boss_model_dir().map(|d| {
+        let imgs = hud::boss_meter_images(&fs, &d);
+        hud.load_images(&gpu.device, &gpu.queue, &imgs)
+    });
     let draw_hud = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
         hud::build(
             &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
             &g,
             &panels,
+        );
+        hud::build_boss(
+            &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
+            &g,
+            boss_bank.as_ref(),
         );
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
     };

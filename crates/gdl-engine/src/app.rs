@@ -43,6 +43,8 @@ struct Playing {
     panels: Vec<PanelInfo>,
     /// Seconds played, for fading out the loading art.
     intro: f32,
+    /// The boss's health-meter textures (boss levels).
+    boss_bank: Option<crate::hud::TexBank>,
 }
 
 /// Health, score, keys and potions carried from one level to the next.
@@ -363,6 +365,12 @@ impl App {
                     p.game.crystals = r.progress.crystals;
                     p.game.garg_items = r.progress.garg_items;
                     p.game.shards = r.progress.shards;
+                    // The party's legend weapons; a boss fight may use one.
+                    p.game.set_legend_held(r.progress.legend);
+                    if let Some(dir) = p.game.boss_model_dir() {
+                        let imgs = hud::boss_meter_images(fs, &dir);
+                        p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
+                    }
                     match p.game.wave {
                         Some(TOWER_WAVE) => {
                             let progress = r.progress.clone();
@@ -822,6 +830,11 @@ impl App {
                     &p.game,
                     &p.panels,
                 );
+                hud::build_boss(
+                    &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+                    &p.game,
+                    p.boss_bank.as_ref(),
+                );
                 let fade = menu::loading_fade(p.intro);
                 if fade < 255 {
                     menu::transition(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), fade);
@@ -889,6 +902,7 @@ impl App {
             r.progress.crystals = play.game.crystals;
             r.progress.garg_items = play.game.garg_items;
             r.progress.shards = play.game.shards;
+            r.progress.legend = play.game.legend_held;
             let mut carry: Carry = Default::default();
             for (p, info) in play.game.players.iter().zip(&play.panels) {
                 carry[info.slot % 4] = Some(p.carried());
@@ -923,6 +937,12 @@ impl App {
                 r.progress.crystals = play.game.crystals;
                 r.progress.garg_items = play.game.garg_items;
                 r.progress.shards = play.game.shards;
+                r.progress.legend = play.game.legend_held;
+                // BossDeath: PlayerGiveRune, the boss's shard (a "rune" in the code).
+                r.progress.runes |= play.game.boss_runes;
+                if let Some(bank) = play.boss_bank.take() {
+                    r.hud.free_bank(bank);
+                }
                 let checkpoint = r.checkpoint.clone().unwrap_or_default();
                 // Players who died in the level get back what they had at its start.
                 let mut carry: Carry = Default::default();
@@ -1101,6 +1121,7 @@ fn start_game(
         scene,
         panels,
         intro: 0.0,
+        boss_bank: None,
     })
 }
 

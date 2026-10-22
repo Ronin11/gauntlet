@@ -108,7 +108,12 @@ impl Scene {
         let mut live = std::collections::HashSet::new();
         for e in &game.entities {
             let Some(m) = e.model else { continue };
-            if (e.pos - focus).length() > DRAW_DIST {
+            let far = if matches!(e.kind, Kind::Critter(_)) {
+                DRAW_DIST * 2.0
+            } else {
+                DRAW_DIST
+            };
+            if (e.pos - focus).length() > far {
                 continue;
             }
             live.insert(e.id);
@@ -119,7 +124,36 @@ impl Scene {
                 .or_insert_with(|| gpu.new_instance(mesh));
             let yaw = e.yaw + e.spin;
             inst.transform = mirror() * Mat4::from_translation(e.pos) * Mat4::from_rotation_y(yaw);
-            (inst.parts, inst.hidden) = game.models[m].evaluate(e.animator.seq, e.animator.frame);
+            let model = &game.models[m];
+            if let Kind::Critter(c) = &e.kind {
+                // The root's sequence with each child's branch on top; broken
+                // plates swapped, dead heads hidden.
+                let world = model.pose_layers(&c.layers());
+                let hidden = c.hidden_nodes(model);
+                let r = &c.parts[0];
+                (inst.parts, inst.hidden) =
+                    model.evaluate_nodes(r.anim.seq, r.anim.frame, &world, &hidden, &c.swapped);
+                let flash = c.parts.iter().map(|p| p.flash).fold(0.0f32, f32::max);
+                inst.tint = if r.freeze > 0.0 {
+                    // Frozen (pausecnt): blinking blue-white.
+                    Vec4::new(0.7, 0.8, 1.6, c.alpha)
+                } else if flash > 0.0 {
+                    Vec4::new(2.0, 2.0, 2.0, c.alpha)
+                } else {
+                    Vec4::new(1.0, 1.0, 1.0, c.alpha)
+                };
+                continue;
+            }
+            (inst.parts, inst.hidden) = model.evaluate(e.animator.seq, e.animator.frame);
+            if let Some(w) = game
+                .boss
+                .as_ref()
+                .and_then(|b| b.wizard.as_ref())
+                .filter(|w| w.entity == Some(e.id))
+            {
+                inst.tint = Vec4::new(1.0, 1.0, 1.0, 1.0 - w.alpha as f32 / 255.0);
+                continue;
+            }
             inst.tint = match e.kind {
                 Kind::Enemy {
                     state: EnemyState::Hurt { .. },
