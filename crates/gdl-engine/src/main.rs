@@ -346,14 +346,19 @@ fn snapshot_game(args: &Args) -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
+    let cursor = std::cell::RefCell::new(gdl_engine::cursor::Cursor::load(&fs, &gpu).ok());
     let draw_screen = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
+        let mut arrow = None;
         match args.screen.as_deref() {
             Some("title") => {
                 menu::Title::demo(false).draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
             }
             Some("titlemenu") => {
-                menu::Title::demo(true).draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
+                let t = menu::Title::demo(true);
+                let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
+                t.draw(&mut s);
+                arrow = t.cursor(&s);
             }
             Some("select") => {
                 select::Select::demo().draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100))
@@ -382,6 +387,16 @@ fn snapshot_game(args: &Args) -> Result<()> {
             _ => {}
         }
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
+        if let (Some(at), Some(c)) = (arrow, cursor.borrow_mut().as_mut()) {
+            let k = (w as f32 / 512.0).min(h as f32 / 384.0);
+            let vp = [
+                (w as f32 - 512.0 * k) / 2.0,
+                (h as f32 - 384.0 * k) / 2.0,
+                512.0 * k,
+                384.0 * k,
+            ];
+            c.draw(&gpu, view, &gpu.depth_view(w, h), vp, at);
+        }
     };
     let img = match args.screen.as_deref() {
         Some(name) if name.starts_with("gamemenu") || name.starts_with("towermenu") => gpu
