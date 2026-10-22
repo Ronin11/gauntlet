@@ -9,6 +9,7 @@ pub mod bin;
 pub mod mesh;
 pub mod movie;
 pub mod objects;
+pub mod sequence;
 pub mod texture;
 pub mod worlds;
 
