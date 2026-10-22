@@ -16,6 +16,8 @@ pub struct Progress {
     pub shards: u16,
     /// Crystals found per colour, -1 once a colour is done.
     pub crystals: [i32; 9],
+    /// Gargoyle items (fangs, feathers, claws), -1 once their gate is open.
+    pub garg_items: [i32; 3],
     /// The last realm other than the tower that was played (lbl_803448C8).
     pub last_realm: Option<u32>,
 }

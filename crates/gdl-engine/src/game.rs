@@ -404,6 +404,12 @@ pub enum PickupKind {
     Crystal(usize),
     /// A scroll: the line of the level's SCROLLS message it shows.
     Scroll(usize),
+    /// A runestone: the party's shard bit (0..12).
+    Shard(u32),
+    /// A legend weapon (1..11).
+    Legend(u32),
+    /// A gargoyle's golden item: 0 fangs, 1 feathers, 2 claws.
+    Gargoyle(usize),
     /// A power-up: type, flags, amount (uses or bonus) and seconds (negative
     /// when counted in uses) before the class's powerup_time.
     Powerup {
@@ -437,6 +443,13 @@ fn pickup_kind(info: &gdl_formats::worlds::ItemInfo, params: &[u8]) -> PickupKin
             Some(c) => PickupKind::Crystal(c),
             None => PickupKind::Other(0),
         },
+        "runestone" => PickupKind::Shard(info.value.clamp(0, 12) as u32),
+        "legend_item" => PickupKind::Legend(info.value.max(0) as u32),
+        "gargoyle_item" => PickupKind::Gargoyle(match info.name.to_ascii_uppercase().as_str() {
+            n if n.starts_with("GARGSERP") => 0,
+            n if n.starts_with("GARGEAGL") => 1,
+            _ => 2,
+        }),
         "weapon" | "armor" | "speed" | "magic" | "special" => PickupKind::Powerup {
             kind: info.subtype as u8,
             flags: info.properties,
@@ -455,6 +468,7 @@ fn pickup_message(kind: &PickupKind) -> Option<usize> {
         PickupKind::Food(v) if v >= 100.0 => 15,
         PickupKind::Food(v) if v >= 50.0 => 16,
         PickupKind::Gold(v) if v >= 25 => 17,
+        PickupKind::Legend(v) => 113 + v as usize,
         PickupKind::Key(_) => 8,
         PickupKind::Potion(_) => 7,
         PickupKind::Powerup { kind, flags: f, .. } => match kind {
@@ -523,6 +537,11 @@ fn refused_message(kind: &PickupKind) -> Option<usize> {
     }
 }
 
+/// Whether a runestone is already the party's (msg 90).
+fn shard_owned(shards: u16, kind: &PickupKind) -> bool {
+    matches!(*kind, PickupKind::Shard(b) if shards & (1 << b) != 0)
+}
+
 /// Whether a player can take a pickup now: food isn't taken at full health,
 /// and keys and potions stop at 9 (the item stays on the floor).
 fn can_take(p: &Player, kind: &PickupKind) -> bool {
@@ -550,6 +569,8 @@ pub const CRYSTAL_COLOURS: [&str; 9] = [
     "", "ORANGE", "RED", "PURPLE", "BLUE", "GREEN", "YELLOW", "WHITE", "BLACK",
 ];
 pub const CRYSTALS_NEEDED: [i32; 9] = [0, 15, 100, 125, 150, 175, 200, 225, 250];
+/// Gargoyle items the tower's snake, eagle and lion gates need.
+pub const GARG_NEEDED: [i32; 3] = [12, 20, 28];
 
 /// towerAllPlayersMetBossReq: enough of a colour found, or that colour done (-1).
 pub fn crystals_met(crystals: &[i32; 9], c: usize) -> bool {
@@ -620,8 +641,10 @@ pub enum Kind {
         pressed: bool,
         /// Struck by an attack this frame.
         hit: bool,
-        /// A tower crystal barrier: the crystal colour it needs.
+        /// A tower barrier: the crystal colour (1-8) or gargoyle gate (101-103).
         gate: Option<usize>,
+        /// The trigger's id (instance params byte 6).
+        id: u8,
     },
     Prop,
 }
@@ -711,6 +734,12 @@ pub struct Game {
     shield_cooldown: HashMap<(usize, u64), f32>,
     /// Item models loaded for the level, by item name.
     item_models: HashMap<String, Option<usize>>,
+    /// The party's shards (runestones, 13 bits) and gargoyle items (fangs,
+    /// feathers, claws; -1 once their gate has opened).
+    pub shards: u16,
+    pub garg_items: [i32; 3],
+    /// Ticks the rune-stone icons stay up after one is found (welcome_timer).
+    pub welcome: i32,
     /// Crystals found per colour; -1 once a colour has opened its barrier.
     pub crystals: [i32; 9],
     /// The crystal count to show on the HUD (colour, seconds left).
@@ -845,6 +874,7 @@ impl Game {
     /// orange crystals are gone once orange is done.
     pub fn enter_tower(&mut self) {
         let crystals = self.crystals;
+        let garg = self.garg_items;
         let mut open = Vec::new();
         for e in &mut self.entities {
             match &e.kind {
@@ -852,7 +882,11 @@ impl Game {
                     gate: Some(c),
                     mover: Some(m),
                     ..
-                } if crystals[*c] < 0 => open.push(*m),
+                } if (*c < 9 && crystals[*c] < 0)
+                    || ((101..=103).contains(c) && garg[*c - 101] < 0) =>
+                {
+                    open.push(*m)
+                }
                 Kind::Pickup {
                     kind: PickupKind::Crystal(1),
                     ..
@@ -861,7 +895,26 @@ impl Game {
             }
         }
         self.entities.retain(|e| e.alive);
-        for m in open {
+        // The lion gate also brings the lift and elevator down to the Battle
+        // realm's floor; the 13th shard opens the lift to the Citadel.
+        let extra: Vec<usize> = self
+            .entities
+            .iter()
+            .filter_map(|e| match e.kind {
+                Kind::Trigger {
+                    id: 104 | 199,
+                    mover: Some(m),
+                    ..
+                } if garg[2] < 0 => Some(m),
+                Kind::Trigger {
+                    id: 255,
+                    mover: Some(m),
+                    ..
+                } if self.shards & 0x1000 != 0 => Some(m),
+                _ => None,
+            })
+            .collect();
+        for m in open.into_iter().chain(extra) {
             if let Some(m) = self.movers.get_mut(m) {
                 m.active = true;
             }
@@ -976,6 +1029,9 @@ impl Game {
             rings: Vec::new(),
             shield_cooldown: HashMap::new(),
             item_models: HashMap::new(),
+            shards: 0,
+            garg_items: [0; 3],
+            welcome: 300,
             crystals: [0; 9],
             crystal_shown: None,
             hidden: HashSet::new(),
@@ -1499,11 +1555,12 @@ impl Game {
                             shoot: info.subtype_name() == "shoot_trigger",
                             pressed: false,
                             hit: false,
-                            // Tower crystal barriers: flag 0x40, id = colour.
+                            // Tower barriers (flag 0x40): ids 1-8 need that colour's
+                            // crystals, 101-103 the gargoyle items.
                             gate: (p16(2) & 0x40 != 0
-                                && inst.params[6] < 100
-                                && inst.params[6] > 0)
-                                .then_some(inst.params[6] as usize),
+                                && matches!(inst.params[6], 1..=8 | 101..=103))
+                            .then_some(inst.params[6] as usize),
+                            id: inst.params[6],
                         },
                         model,
                         pos,
@@ -1648,6 +1705,7 @@ impl Game {
             }
         }
         self.msgs.tick();
+        self.welcome = (self.welcome - 1).max(0);
         let voices: Vec<String> = self.msgs.voice.drain(..).collect();
         self.sfx.extend(voices);
         self.frame += 1;
@@ -2788,6 +2846,10 @@ impl Game {
                     e.spin += dt * 2.0;
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                         if *alive && (*pp - e.pos).length() < *radius + 0.5 {
+                            if shard_owned(self.shards, kind) {
+                                posts.push((90, pi));
+                                continue;
+                            }
                             if can_take(&self.players[pi], kind) {
                                 pickups.push((pi, *kind));
                                 e.alive = false;
@@ -2856,10 +2918,14 @@ impl Game {
                     pressed,
                     hit,
                     gate,
+                    ..
                 } => {
                     *idle -= dt;
                     // A crystal barrier only works once enough crystals are found.
-                    let locked = gate.is_some_and(|c| !crystals_met(&self.crystals, c));
+                    let locked = gate.is_some_and(|c| match c {
+                        101..=103 => self.garg_items[c - 101] >= 0,
+                        c => !crystals_met(&self.crystals, c),
+                    });
                     // Walking into a lever or onto a pad sets it off; wall levers sit in
                     // the wall, so allow for the player's own radius.
                     let touched = !locked
@@ -3085,7 +3151,11 @@ impl Game {
                 PickupKind::Gold(_) => "S_PICKUPCRYST".into(),
                 PickupKind::Potion(_) => "S_PICKUPMAGIC".into(),
                 PickupKind::Crystal(_) => "S_PICKUPCRYST".into(),
-                PickupKind::Scroll(_) | PickupKind::Powerup { .. } => "S_PICKUPSPECIAL".into(),
+                PickupKind::Scroll(_)
+                | PickupKind::Powerup { .. }
+                | PickupKind::Legend(_)
+                | PickupKind::Gargoyle(_) => "S_PICKUPSPECIAL".into(),
+                PickupKind::Shard(_) => "S_PICKUPRUNE|S_PICKUPSPECIAL".into(),
                 PickupKind::Other(_) => "S_PICKUPSPECIAL".into(),
             });
             match kind {
@@ -3140,6 +3210,21 @@ impl Game {
                     } else {
                         let t = seconds * crate::stats::powerup_time(p.class_id);
                         p.powerups.add(kind, flags, amount, t);
+                    }
+                }
+                // PlayerGiveShard: every player gets the runestone.
+                PickupKind::Shard(bit) => {
+                    self.shards |= 1 << bit;
+                    self.welcome = 300;
+                }
+                PickupKind::Legend(_) => {}
+                // towerAdvanceLevelRecord.
+                PickupKind::Gargoyle(i) => {
+                    if self.garg_items[i] >= 0 {
+                        self.garg_items[i] = (self.garg_items[i] + 1).min(GARG_NEEDED[i]);
+                        if self.garg_items[i] == GARG_NEEDED[i] {
+                            self.garg_items[i] = -1;
+                        }
                     }
                 }
                 PickupKind::Other(_) => {}
@@ -3545,7 +3630,15 @@ mod tests {
         let barriers = g
             .entities
             .iter()
-            .filter(|e| matches!(e.kind, Kind::Trigger { gate: Some(_), .. }))
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    Kind::Trigger {
+                        gate: Some(1..=8),
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(barriers, 8, "one crystal barrier per crystal realm");
     }

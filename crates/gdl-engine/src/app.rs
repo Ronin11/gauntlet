@@ -349,6 +349,8 @@ impl App {
                     }
                     r.checkpoint = r.carry.clone();
                     p.game.crystals = r.progress.crystals;
+                    p.game.garg_items = r.progress.garg_items;
+                    p.game.shards = r.progress.shards;
                     match p.game.wave {
                         Some(TOWER_WAVE) => {
                             let progress = r.progress.clone();
@@ -757,6 +759,8 @@ impl App {
             if let Some(end) = play.game.level_end.take() {
                 // Crystals are kept whether or not the level was finished.
                 r.progress.crystals = play.game.crystals;
+                r.progress.garg_items = play.game.garg_items;
+                r.progress.shards = play.game.shards;
                 let checkpoint = r.checkpoint.clone().unwrap_or_default();
                 // Players who died in the level get back what they had at its start.
                 let mut carry: Carry = Default::default();

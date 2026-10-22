@@ -549,7 +549,17 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
             }
         }
         if !dead {
-            power_meter(s, x0, 0.0);
+            power_meter(s, x0, p.power);
+        }
+        // The party's runestones along the strip (rune_blit).
+        for j in 0..12u32 {
+            if game.shards & (1 << j) != 0 {
+                let c = ["BLU", "RED", "YEL", "GRE"][(j / 3) as usize];
+                if let Some(t) = s.ui.get(&format!("SM_RUNE_{c}_{:02}", j % 3 + 1)) {
+                    let x = x0 + (8 * j + j / 3 + 15) as f32;
+                    s.blit(t, x, 306.0, 8.0, 8.0, 0);
+                }
+            }
         }
         for (name, x) in [("COIN", x0 + 6.0), ("HEART", x0 + 61.0)] {
             if let Some(t) = s.ui.get(name) {
