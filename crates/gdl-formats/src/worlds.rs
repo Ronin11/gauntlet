@@ -415,6 +415,38 @@ impl Worlds {
     }
 
     /// Absolute position of every world object, resolving the child/next hierarchy.
+    /// WorldObjGetAllFlags: each object's flags OR'd with its ancestors'.
+    pub fn all_flags(&self) -> Vec<u32> {
+        let n = self.world_objects.len();
+        let mut out: Vec<Option<u32>> = vec![None; n];
+        let mut is_child = vec![false; n];
+        for o in &self.world_objects {
+            let mut c = o.child_index;
+            while c >= 0 && (c as usize) < n && !is_child[c as usize] {
+                is_child[c as usize] = true;
+                c = self.world_objects[c as usize].next_index;
+            }
+        }
+        fn walk(w: &Worlds, first: i16, base: u32, out: &mut [Option<u32>]) {
+            let mut i = first;
+            while i >= 0 && (i as usize) < out.len() && out[i as usize].is_none() {
+                let o = &w.world_objects[i as usize];
+                let f = base | o.flags;
+                out[i as usize] = Some(f);
+                walk(w, o.child_index, f, out);
+                i = o.next_index;
+            }
+        }
+        for i in 0..n {
+            if !is_child[i] && out[i].is_none() {
+                let f = self.world_objects[i].flags;
+                out[i] = Some(f);
+                walk(self, self.world_objects[i].child_index, f, &mut out);
+            }
+        }
+        out.into_iter().map(|f| f.unwrap_or(0)).collect()
+    }
+
     pub fn world_positions(&self) -> Vec<[f32; 3]> {
         let n = self.world_objects.len();
         let mut out: Vec<Option<[f32; 3]>> = vec![None; n];
@@ -444,5 +476,26 @@ impl Worlds {
             }
         }
         out.into_iter().map(|p| p.unwrap_or([0.0; 3])).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floors_inherit_hazard_flags() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../game-data/files/Gauntlet/LEVELS/levelH1/WORLDS.PS2");
+        let Ok(data) = std::fs::read(p) else { return };
+        let w = Worlds::parse(&data).unwrap();
+        let f = w.all_flags();
+        let burning = w
+            .world_objects
+            .iter()
+            .zip(&f)
+            .filter(|(o, f)| o.name.starts_with("H1FLOORB") && *f & 0xF0000 == 0x10000)
+            .count();
+        assert_eq!(burning, 13);
     }
 }

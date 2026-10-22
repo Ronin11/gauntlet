@@ -372,6 +372,8 @@ pub struct Player {
     hit_flags: u32,
     /// When a damage tile may hurt this hero again (fxhittime).
     fxhittime: f32,
+    /// floor_fx_time: when a hurting floor or wall may hurt again.
+    floor_fx_time: f32,
     hit_force: Vec3,
     knock_vel: Vec3,
     /// Two-player combos: the linked partner, the one about to be linked, the
@@ -853,6 +855,8 @@ impl MonsterClass {
 pub struct Game {
     pub level: Level,
     pub collision: Collision,
+    /// WorldObjGetAllFlags per world object (PlayerMotion_FloorFX).
+    obj_flags: Vec<u32>,
     pub models: Vec<Model>,
     pub player_seqs: Vec<PlayerSeqs>,
     monster_seqs: HashMap<usize, MonsterSeqs>,
@@ -1414,6 +1418,7 @@ impl Game {
         let collision = Collision::new(build_collision(&level));
 
         let mut game = Game {
+            obj_flags: level.worlds.all_flags(),
             level,
             collision,
             models: Vec::new(),
@@ -1596,6 +1601,7 @@ impl Game {
                 hit_damage: 0.0,
                 hit_flags: 0,
                 fxhittime: 0.0,
+                floor_fx_time: 0.0,
                 hit_force: Vec3::ZERO,
                 knock_vel: Vec3::ZERO,
                 grab_partner: None,
@@ -2550,6 +2556,43 @@ impl Game {
             .map(|l| (l.rot[1], l.rot[0]))
     }
 
+    /// PlayerMotion_FloorFX: a world object flagged 0xF0000 (lava, fire, spikes)
+    /// hurts the hero standing on or touching it, at most once a second. Objects
+    /// flagged 0x2000000 only while they move; nothing in a reaction state.
+    fn floor_fx(&mut self, pi: usize, owner: i32, dv: Vec3) {
+        let Some(&flags) = usize::try_from(owner)
+            .ok()
+            .and_then(|o| self.obj_flags.get(o))
+        else {
+            return;
+        };
+        if flags & 0xF0000 == 0 {
+            return;
+        }
+        if flags & 0x2000000 != 0
+            && !self
+                .movers
+                .iter()
+                .any(|m| m.moving && m.objects.contains(&(owner as usize)))
+        {
+            return;
+        }
+        let p = &self.players[pi];
+        if p.act.motion >= 31 || self.time < p.floor_fx_time {
+            return;
+        }
+        let dv = Vec3::new(dv.x, 0.0, dv.z).normalize_or_zero();
+        let (dmg, knock) = match (flags >> 16) & 0xF {
+            2 => (10.0, DmgType::KNOCKBACK),
+            3..=5 => (15.0, DmgType::KNOCKDOWN),
+            _ => (5.0, 0),
+        };
+        self.players[pi].floor_fx_time = self.time + 1.0;
+        self.damage_from = (knock != 0).then_some(self.players[pi].pos - dv);
+        self.damage_player(pi, dmg, knock);
+        self.damage_from = None;
+    }
+
     fn snap_to_ground(collision: &Collision, pos: &mut Vec3, vy: &mut f32, dt: f32) -> bool {
         *vy -= GRAVITY * dt;
         pos.y += *vy * dt;
@@ -2715,6 +2758,7 @@ impl Game {
         let mut damg: Vec<(usize, gdl_formats::pdata::DamageRow)> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
+        let mut floor_fx: Vec<(usize, i32, Vec3)> = Vec::new();
         let in_tower = self.wave == Some(gdl_formats::wdata::TOWER_WAVE);
         let pu_rate = if self.boss.as_ref().is_some_and(|b| b.active && !b.dead) {
             3.0
@@ -3159,11 +3203,23 @@ impl Game {
             if !grabbed {
                 p.pos += p.knock_vel * dt;
                 p.knock_vel *= 0.667f32.powf(dt * 30.0);
-                p.pos =
-                    self.collision
-                        .resolve_walls(p.pos, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT);
-                p.pos = Self::resolve_solids(&self.entities, p.pos, PLAYER_RADIUS, 0);
+                let (pos, wall) = self.collision.resolve_walls_hit(
+                    p.pos,
+                    PLAYER_RADIUS,
+                    PLAYER_HEIGHT,
+                    STEP_HEIGHT,
+                );
+                p.pos = Self::resolve_solids(&self.entities, pos, PLAYER_RADIUS, 0);
                 p.on_ground = Self::snap_to_ground(&self.collision, &mut p.pos, &mut p.vy, dt);
+                // PlayerMotion_FloorFX: the wall touched, then the floor stood on.
+                if let Some((owner, at)) = wall {
+                    floor_fx.push((i, owner, p.pos - at));
+                }
+                if p.on_ground {
+                    if let Some((_, owner)) = self.collision.ground_hit(p.pos, p.pos.y + 0.1) {
+                        floor_fx.push((i, owner, Vec3::ZERO));
+                    }
+                }
             }
             if p.pos.y < self.level.worlds.min_bounds[1] - 50.0 {
                 p.pos = self.cam_focus + Vec3::Y * 2.0;
@@ -3177,6 +3233,9 @@ impl Game {
                 p.animator.seq = p.act.anim.seq;
                 p.animator.frame = p.act.anim.frame;
             }
+        }
+        for (pi, owner, dv) in floor_fx {
+            self.floor_fx(pi, owner, dv);
         }
         self.update_combos();
         // Players don't overlap each other.
@@ -5918,6 +5977,45 @@ mod tests {
             .collect();
         println!("{} ambient sounds, missing {missing:?}", names.len());
         assert!(missing.len() * 4 < names.len(), "{missing:?}");
+    }
+
+    #[test]
+    fn hurting_floors_burn_once_a_second() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelH1", &[("WAR", "RED")]).unwrap();
+        let tri = g
+            .collision
+            .tris
+            .iter()
+            .find(|t| {
+                t.n.y > 0.9
+                    && t.owner >= 0
+                    && g.obj_flags
+                        .get(t.owner as usize)
+                        .is_some_and(|f| f & 0xF0000 == 0x10000)
+            })
+            .copied()
+            .expect("a burning floor");
+        let pos = (tri.v[0] + tri.v[1] + tri.v[2]) / 3.0;
+        g.pending_enemies.clear();
+        g.entities
+            .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
+        g.players[0].pos = pos + Vec3::Y * 0.05;
+        g.players[0].health = 10_000.0;
+        g.cam_focus = pos;
+        let mut hits = 0;
+        let mut last = g.players[0].health;
+        for _ in 0..600 {
+            g.players[0].pos.x = pos.x;
+            g.players[0].pos.z = pos.z;
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            if g.players[0].health < last {
+                hits += 1;
+            }
+            last = g.players[0].health;
+        }
+        println!("{hits} burns in 10 s");
+        assert!((9..=11).contains(&hits), "{hits} burns in 10 s");
     }
 
     #[test]

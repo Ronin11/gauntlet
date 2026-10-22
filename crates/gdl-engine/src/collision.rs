@@ -149,8 +149,13 @@ impl Collision {
 
     /// Highest floor at (x, z) that is no higher than `max_y`.
     pub fn ground_height(&self, pos: Vec3, max_y: f32) -> Option<f32> {
+        self.ground_hit(pos, max_y).map(|(y, _)| y)
+    }
+
+    /// The highest floor and its triangle's owner.
+    pub fn ground_hit(&self, pos: Vec3, max_y: f32) -> Option<(f32, i32)> {
         let p = Vec2::new(pos.x, pos.z);
-        let mut best: Option<f32> = None;
+        let mut best: Option<(f32, i32)> = None;
         for i in self.cells_around(p, 0.0) {
             let t = &self.tris[i as usize];
             if t.n.y < FLOOR_NY || !point_in_tri_xz(p, t) {
@@ -158,15 +163,28 @@ impl Collision {
             }
             // Plane: n . (x - v0) = 0 -> y = v0.y - (n.x (x - v0.x) + n.z (z - v0.z)) / n.y
             let y = t.v[0].y - (t.n.x * (p.x - t.v[0].x) + t.n.z * (p.y - t.v[0].z)) / t.n.y;
-            if y <= max_y && best.is_none_or(|b| y > b) {
-                best = Some(y);
+            if y <= max_y && best.is_none_or(|b| y > b.0) {
+                best = Some((y, t.owner));
             }
         }
         best
     }
 
     /// Push a vertical cylinder (feet at `pos.y`) out of walls. Returns the corrected position.
-    pub fn resolve_walls(&self, mut pos: Vec3, radius: f32, height: f32, step: f32) -> Vec3 {
+    pub fn resolve_walls(&self, pos: Vec3, radius: f32, height: f32, step: f32) -> Vec3 {
+        self.resolve_walls_hit(pos, radius, height, step).0
+    }
+
+    /// resolve_walls, also giving the last wall touched: its owner and the
+    /// contact point.
+    pub fn resolve_walls_hit(
+        &self,
+        mut pos: Vec3,
+        radius: f32,
+        height: f32,
+        step: f32,
+    ) -> (Vec3, Option<(i32, Vec3)>) {
+        let mut hit = None;
         for _ in 0..3 {
             let mut moved = false;
             let p2 = Vec2::new(pos.x, pos.z);
@@ -199,13 +217,14 @@ impl Collision {
                     pos.x += push.x * amt;
                     pos.z += push.y * amt;
                     moved = true;
+                    hit = Some((t.owner, c));
                 }
             }
             if !moved {
                 break;
             }
         }
-        pos
+        (pos, hit)
     }
 }
 
