@@ -218,6 +218,8 @@ pub struct DmgType;
 impl DmgType {
     pub const MAGIC: u32 = 0x200;
     pub const POISON_GAS: u32 = 0x800;
+    /// Death's drain: armour doesn't stop it.
+    pub const NO_ARMOR: u32 = 0x1000;
 }
 
 /// ModifyDamage: an elemental hit on a target with no affinity does 1.5x. Every
@@ -237,6 +239,38 @@ pub struct Ring {
     hit: Vec<u64>,
 }
 
+/// A monster's missile to launch.
+#[derive(Clone, Copy, Debug)]
+struct Shot {
+    from: Vec3,
+    to: Vec3,
+    etype: usize,
+    /// 0 arrow, 1 bomb, 2 fireball.
+    slot: usize,
+    class: usize,
+}
+
+/// EnemyMissileInfo: (damage, speed, burst radius, gravity) of a type's arrow,
+/// bomb and fireball.
+fn missile(etype: usize, slot: usize) -> (f32, f32, f32, f32) {
+    match (etype, slot) {
+        (17, 0) => (5.0, 15.0, 0.0, 0.0),
+        (17, 1) => (10.0, 20.0, 0.0, 0.0),
+        (17, 2) => (15.0, 25.0, 0.0, 0.0),
+        (2 | 20 | 14, 2) => (15.0, 25.0, 0.0, 0.0),
+        (7 | 24, 2) => (20.0, 20.0, 0.0, 0.0),
+        (27, 2) => (25.0, 80.0, 0.0, 0.0),
+        (_, 1) => (10.0, 20.0, 3.0, 20.0),
+        (_, 0) => (10.0, 25.0, 0.0, 15.0),
+        _ => (15.0, 25.0, 0.0, 0.0),
+    }
+}
+
+/// Level-3 demons, sorcerers, plague, worms and warlocks cast fireballs.
+fn caster(etype: usize, strength: usize) -> bool {
+    strength == 3 && matches!(etype, 2 | 7 | 14 | 17 | 24)
+}
+
 /// A generator's request for a monster.
 #[derive(Clone, Copy, Debug)]
 struct Spawn {
@@ -247,6 +281,11 @@ struct Spawn {
     generator: u64,
     /// Every slot is taken: recycle the farthest monster off screen.
     recycle: bool,
+}
+
+thread_local! {
+    /// Set while a potion's ring is dealing its damage (DMG_MAGIC).
+    static MAGIC_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What one hit did.
@@ -379,6 +418,9 @@ pub struct MonsterSeqs {
     hit: Option<usize>,
     death: Option<usize>,
     start: Option<usize>,
+    /// THROW1 (or THROW2) and THROWF: archers and bombers.
+    throw: Option<(usize, Option<usize>)>,
+    run: Option<usize>,
 }
 
 impl MonsterSeqs {
@@ -393,6 +435,8 @@ impl MonsterSeqs {
             hit: s("HIT1").or(s("HIT2")),
             death: s("DEATH").or(s("HIT2")),
             start: s("START"),
+            throw: s("THROW1").or(s("THROW2")).map(|t| (t, s("THROWF"))),
+            run: s("RUN").or(s("RUNATTACK1")),
         }
     }
 }
@@ -417,6 +461,11 @@ pub enum EnemyState {
     },
     /// Placed with strength 0: drawn but inert until hurt.
     Asleep,
+    /// Throwing an arrow or bomb (THROW1 then THROWF), or casting a fireball;
+    /// the missile leaves when the first animation ends.
+    Throw {
+        fired: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -626,6 +675,11 @@ pub enum Kind {
         attacks: u32,
         /// The player a swing was aimed at, and whether it is the power attack.
         target: Option<(usize, bool)>,
+        /// Seconds until the next throw or cast (idle_secs / counter1), or the
+        /// suicide charge's clock.
+        reload: f32,
+        /// Death: health drained so far; IT and the rest: unused.
+        drained: f32,
     },
     Generator {
         class: usize,
@@ -683,6 +737,15 @@ pub enum Kind {
         life: f32,
         damage: f32,
     },
+    /// A monster's arrow, bomb or fireball.
+    EnemyShot {
+        vel: Vec3,
+        damage: f32,
+        life: f32,
+        /// Bombs burst over this radius.
+        splash: f32,
+        gravity: f32,
+    },
     /// Lever or pressure pad driving `Game::movers[mover]`.
     Trigger {
         mover: Option<usize>,
@@ -735,6 +798,8 @@ pub struct MonsterClass {
     models: [Option<usize>; 7],
     gen_models: [Option<usize>; 4],
     pub etype: usize,
+    /// <PREFIX>_ARROW, _BOMB and _FBALL missile models.
+    missiles: [Option<usize>; 3],
 }
 
 impl MonsterClass {
@@ -796,6 +861,8 @@ pub struct Game {
     pub tuning: gdl_formats::wdata::EnemyTuning,
     /// LEVL maxenemies: monsters alive at once.
     pub max_enemies: usize,
+    /// The player who is IT: every monster goes after them.
+    pub it_holder: Option<usize>,
     /// Round-robin counter for the Temple / Hell SPECIAL generators.
     special_counter: u32,
     /// Potion blasts spreading out.
@@ -1112,6 +1179,7 @@ impl Game {
             tuning: gdl_formats::wdata::EnemyTuning::default().normalized(1),
             max_enemies: 25,
             special_counter: 0,
+            it_holder: None,
             rings: Vec::new(),
             shield_cooldown: HashMap::new(),
             item_models: HashMap::new(),
@@ -1327,11 +1395,28 @@ impl Game {
         for (s, m) in gens {
             gen_models[s] = Some(self.add_model(m));
         }
+        let mut missiles = [None; 3];
+        for (i, kind) in ["ARROW", "BOMB", "FBALL"].iter().enumerate() {
+            let tree = format!("{desc}_{kind}");
+            let m = if anim
+                .atrees
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case(&tree))
+            {
+                Model::from_anim(&asset.objects, &asset.textures, anim, Some(&tree)).ok()
+            } else {
+                Model::from_objects(&asset.objects, &asset.textures, &[&tree])
+            };
+            missiles[i] = m
+                .filter(|m| !m.mesh.indices.is_empty())
+                .map(|m| self.add_model(m));
+        }
         self.classes.push(MonsterClass {
             name: dir,
             models,
             gen_models,
             etype,
+            missiles,
         });
         Some(self.classes.len() - 1)
     }
@@ -1439,6 +1524,8 @@ impl Game {
             recognized: false,
             attacks: 0,
             target: None,
+            reload: 0.0,
+            drained: 0.0,
         }
     }
 
@@ -1878,6 +1965,15 @@ impl Game {
                 }
             }
         }
+        // Death comes out of chests in any level without a boss.
+        if self
+            .roster
+            .subtype
+            .iter()
+            .any(|(t, _)| *t == crate::enemies::DEATH)
+        {
+            self.monster_class(fs, &mut cache, crate::enemies::DEATH);
+        }
         self.item_models = known
             .iter()
             .map(|(k, v)| (k.to_ascii_uppercase(), *v))
@@ -2052,6 +2148,7 @@ impl Game {
         let mut turbos: Vec<(usize, Vec3, f32, bool)> = Vec::new();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
         let in_tower = self.wave == Some(gdl_formats::wdata::TOWER_WAVE);
+        let mut it_cleared = false;
         // Things an attack can be aimed at, with their radius.
         let targets: Vec<(Vec3, f32)> = self
             .entities
@@ -2120,6 +2217,9 @@ impl Game {
                 p.health = 0.0;
                 p.power = 0.0;
                 p.powerups.clear();
+                if self.it_holder == Some(i) {
+                    it_cleared = true;
+                }
                 p.state = PlayerState::Dead { timer: 4.0 };
                 self.sfx.push(format!("S_{}DIE1", p.class));
                 if let Some(d) = seqs.death {
@@ -2427,6 +2527,9 @@ impl Game {
                 }
             }
         }
+        if it_cleared {
+            self.it_holder = None;
+        }
         for (pi, pos, yaw) in attacks {
             self.player_attack(pi, pos, yaw);
         }
@@ -2680,6 +2783,18 @@ impl Game {
         }
         let r = Self::apply_hit(&mut self.entities[t], dmg, push);
         // The monster staggers (HIT1) or dies (DEATH / HIT2).
+        if r.hit
+            && !MAGIC_HIT.with(|m| m.get())
+            && matches!(
+                self.entities[t].kind,
+                Kind::Enemy {
+                    etype: crate::enemies::DEATH,
+                    ..
+                }
+            )
+        {
+            self.post(0, Some(pi), &[]);
+        }
         if is_enemy && r.hit {
             let e = &mut self.entities[t];
             let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
@@ -2807,7 +2922,7 @@ impl Game {
         if armor & pu::A_GAS != 0 && flags & DmgType::POISON_GAS != 0 {
             return;
         }
-        if flags & DmgType::POISON_GAS == 0 {
+        if flags & (DmgType::POISON_GAS | DmgType::NO_ARMOR) == 0 {
             dmg = (dmg - p.derived.armor).max(0.0);
         }
         if dmg > 1.0 && p.state == PlayerState::Defending {
@@ -2862,11 +2977,13 @@ impl Game {
             }
         }
         self.rings.retain(|r| r.time < MAGIC_TIME);
+        MAGIC_HIT.with(|m| m.set(true));
         for (pi, i, dmg, push) in hits {
             if self.entities.get(i).is_some_and(|e| e.alive) {
                 self.hit_entity(pi, i, dmg, push, false);
             }
         }
+        MAGIC_HIT.with(|m| m.set(false));
     }
 
     fn world_letter(&self) -> char {
@@ -2936,10 +3053,17 @@ impl Game {
                 if matches!(state, EnemyState::Dying { .. }) {
                     return r;
                 }
-                // IT can't be hurt.
+                // IT can't be hurt; Death only loses 1 a hit to anything but magic.
                 if *etype == crate::enemies::IT {
                     return r;
                 }
+                let dmg = if *etype == crate::enemies::DEATH && !MAGIC_HIT.with(|m| m.get()) {
+                    1.0
+                } else if *etype == crate::enemies::DEATH {
+                    999.0
+                } else {
+                    dmg
+                };
                 r.hit = true;
                 r.tier = *etype;
                 *hp -= dmg.max(1.0);
@@ -2995,6 +3119,22 @@ impl Game {
         else {
             return;
         };
+        // Death waits in some chests.
+        if info.item_type == ItemType::Enemy {
+            if let Some(c) = self
+                .classes
+                .iter()
+                .position(|c| c.etype == crate::enemies::DEATH)
+            {
+                let model = self.classes[c].model(1);
+                let mut kind = self.new_enemy(c, 1, EnemyState::Chase);
+                if let Kind::Enemy { recognized, .. } = &mut kind {
+                    *recognized = true;
+                }
+                self.spawn(kind, model, pos, 0.0);
+            }
+            return;
+        }
         if info.item_type != ItemType::Powerup {
             return;
         }
@@ -3043,7 +3183,14 @@ impl Game {
             .iter()
             .map(|p| p.fx.special & pu::S_LEVITATE != 0)
             .collect();
+        let it = self
+            .it_holder
+            .filter(|&pi| player_pos.get(pi).is_some_and(|p| p.1));
         let nearest = |pos: Vec3| -> Option<(usize, f32)> {
+            // Every monster goes after the player who is IT, at any range.
+            if let Some(pi) = it {
+                return Some((pi, (player_pos[pi].0 - pos).length().min(1.0)));
+            }
             player_pos
                 .iter()
                 .enumerate()
@@ -3071,6 +3218,16 @@ impl Game {
             .collect();
         let sight = 30.0 * self.tuning.visrad;
         let mut spawns: Vec<Spawn> = Vec::new();
+        let mut shots: Vec<Shot> = Vec::new();
+        let mut blasts: Vec<(Vec3, f32)> = Vec::new();
+        let mut drains: Vec<(usize, f32)> = Vec::new();
+        let mut death_done: Vec<usize> = Vec::new();
+        let mut tagged: Option<usize> = None;
+        let halo: Vec<bool> = self
+            .players
+            .iter()
+            .map(|p| p.fx.armor & crate::powerups::A_ANTIDEATH != 0)
+            .collect();
         let mut damage: Vec<(usize, f32)> = Vec::new();
         // Monster melee hits: (monster, player, damage).
         let mut melee: Vec<(usize, usize, f32)> = Vec::new();
@@ -3154,6 +3311,8 @@ impl Game {
                     recognized,
                     attacks,
                     target,
+                    reload,
+                    drained,
                     ..
                 } => {
                     let Some(model) = e.model else { continue };
@@ -3236,7 +3395,89 @@ impl Game {
                                 }
                                 let turn = 0.0491 * 60.0 * dt;
                                 e.yaw += d.clamp(-turn, turn);
-                                if let (Some(pi), Some((swing, _))) = (contact, seqs.attack) {
+                                let dist = (player_pos[pi].0 - e.pos).length();
+                                let on = visible[ei] && (player_pos[pi].0.y - e.pos.y).abs() < 10.0;
+                                *reload -= dt;
+                                use crate::enemies::{DEATH, IT};
+                                if *etype == IT {
+                                    // Tag: the touched player becomes IT.
+                                    if let Some(pi) = contact {
+                                        tagged = Some(pi);
+                                        e.alive = false;
+                                        continue;
+                                    }
+                                    let dir = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
+                                    e.pos += dir * *speed * dt;
+                                    play_loop(&mut e.animator, seqs.walk);
+                                } else if *etype == DEATH {
+                                    // Death drains whoever it touches, 3 ticks at a
+                                    // time, until it has taken 100, then leaves.
+                                    if let Some(pi) = contact.filter(|&pi| !halo[pi]) {
+                                        *reload -= 0.0;
+                                        if *reload <= 0.0 {
+                                            *reload = 3.0 / 60.0;
+                                            let f = self.tuning.damage;
+                                            drains.push((pi, f));
+                                            *drained += f;
+                                            if *drained >= 100.0 {
+                                                *state = EnemyState::Dying { timer: 1.0 };
+                                                death_done.push(pi);
+                                            }
+                                        }
+                                        if let Some((a, _)) = seqs.attack {
+                                            if e.animator.seq != a {
+                                                e.animator.restart(a);
+                                            }
+                                        }
+                                    } else {
+                                        let dir = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
+                                        e.pos += dir * *speed * dt;
+                                        play_loop(&mut e.animator, seqs.walk);
+                                    }
+                                } else if *strength == 6 {
+                                    // The suicide grunt: waits a second, then charges
+                                    // at 1.5x; on contact or after 4 s it explodes.
+                                    if *reload > -1.0 {
+                                        play_loop(&mut e.animator, seqs.ready);
+                                    } else {
+                                        let dir = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
+                                        e.pos += dir * *speed * 1.5 * dt;
+                                        play_loop(&mut e.animator, seqs.run.or(seqs.walk));
+                                        if contact.is_some() || *reload < -5.0 {
+                                            blasts.push((e.pos, 50.0 * self.tuning.damage));
+                                            *state = EnemyState::Dying { timer: 0.1 };
+                                        }
+                                    }
+                                } else if (*strength == 4 || *strength == 5) && seqs.throw.is_some()
+                                {
+                                    // Archers and bombers stand and shoot while the
+                                    // player is in sight and on screen.
+                                    play_loop(&mut e.animator, seqs.ready);
+                                    if on && dist <= sight && *reload <= 0.0 && d.abs() < 0.785 {
+                                        *state = EnemyState::Throw { fired: false };
+                                        *target = Some((pi, false));
+                                        e.animator.restart(seqs.throw.unwrap().0);
+                                        e.animator.force_loop = false;
+                                    }
+                                } else if caster(*etype, *strength)
+                                    && contact.is_none()
+                                    && dist > 6.0
+                                    && on
+                                    && *reload <= 0.0
+                                    && seqs.power.or(seqs.attack).is_some()
+                                {
+                                    // Level-3 casters roam and throw fireballs every
+                                    // so often (90 x mrate ticks, randomised).
+                                    let n = 90.0 * self.tuning.mrate;
+                                    *reload =
+                                        (20.0 + n + (ei as f32 * 7.3) % (n * 0.5 + 10.0)) / 60.0;
+                                    *state = EnemyState::Throw { fired: false };
+                                    *target = Some((pi, true));
+                                    let a = seqs.power.or(seqs.attack).unwrap().0;
+                                    e.animator.restart(a);
+                                    e.animator.force_loop = false;
+                                } else if let (Some(pi), Some((swing, _))) = (contact, seqs.attack)
+                                {
                                     // Every 8th swing is the power attack.
                                     let power = *attacks & 7 == 7 && seqs.power.is_some();
                                     let a = if power { seqs.power.unwrap().0 } else { swing };
@@ -3286,6 +3527,44 @@ impl Game {
                         }
                         EnemyState::Recover => {
                             if e.animator.finished {
+                                *state = EnemyState::Chase;
+                            }
+                        }
+                        EnemyState::Throw { fired } => {
+                            if !*fired && e.animator.finished {
+                                *fired = true;
+                                if let Some((pi, cast)) = target.take() {
+                                    let slot = if cast {
+                                        2
+                                    } else if *strength == 5 {
+                                        1
+                                    } else {
+                                        0
+                                    };
+                                    shots.push(Shot {
+                                        from: e.pos,
+                                        to: player_pos[pi].0 + Vec3::Y * 2.5,
+                                        etype: *etype,
+                                        slot,
+                                        class: self
+                                            .classes
+                                            .iter()
+                                            .position(|c| Some(model) == c.model(*strength))
+                                            .unwrap_or(0),
+                                    });
+                                }
+                                // The throw cooldown: 1 s x the missile rate, plus
+                                // the finish.
+                                if !matches!(target, Some((_, true))) && *strength != 6 {
+                                    *reload = self.tuning.mrate;
+                                }
+                                match seqs.throw.and_then(|t| t.1) {
+                                    Some(f) if *strength == 4 || *strength == 5 => {
+                                        e.animator.restart(f)
+                                    }
+                                    _ => *state = EnemyState::Chase,
+                                }
+                            } else if *fired && e.animator.finished {
                                 *state = EnemyState::Chase;
                             }
                         }
@@ -3444,6 +3723,44 @@ impl Game {
                         if *open && *alive && (*pp - e.pos).length() < *radius {
                             exits.push((pi, *dest));
                         }
+                    }
+                }
+                Kind::EnemyShot {
+                    vel,
+                    damage: dmg,
+                    life,
+                    splash,
+                    gravity,
+                } => {
+                    *life -= dt;
+                    vel.y -= *gravity * dt;
+                    let from = e.pos;
+                    let to = from + *vel * dt;
+                    let hit = player_pos.iter().position(|(pp, alive)| {
+                        *alive
+                            && Vec2::new(pp.x - to.x, pp.z - to.z).length() < 1.5
+                            && (to.y - pp.y) > -0.5
+                            && (to.y - pp.y) < 5.0
+                    });
+                    let wall = self.collision.raycast(from, to).is_some();
+                    let floor = self
+                        .collision
+                        .ground_height(to, to.y + 0.5)
+                        .is_some_and(|g| to.y <= g);
+                    if hit.is_some() || wall || floor || *life <= 0.0 {
+                        e.alive = false;
+                        let k = if shrunk { 0.5 } else { 1.0 };
+                        if *splash > 0.0 {
+                            for (pi, (pp, alive)) in player_pos.iter().enumerate() {
+                                if *alive && (*pp - to).length() < *splash + PLAYER_RADIUS {
+                                    damage.push((pi, *dmg * k));
+                                }
+                            }
+                        } else if let Some(pi) = hit {
+                            damage.push((pi, *dmg * k));
+                        }
+                    } else {
+                        e.pos = to;
                     }
                 }
                 Kind::Projectile {
@@ -3717,6 +4034,56 @@ impl Game {
         }
         for sp in spawns {
             self.spawn_from_generator(sp);
+        }
+        // Monster missiles: fireballs fly straight at the player; arrows and
+        // bombs are lobbed.
+        for sh in shots {
+            let (dmg, spd, splash, gravity) = missile(sh.etype, sh.slot);
+            let speed = spd * self.tuning.mspeed;
+            let up = if sh.slot == 2 { 1.5 } else { 2.5 };
+            let from = sh.from + Vec3::Y * up;
+            let to = sh.to - from;
+            let flat = Vec3::new(to.x, 0.0, to.z);
+            let dir = flat.normalize_or_zero();
+            let vel = if gravity == 0.0 {
+                to.normalize_or_zero() * speed
+            } else {
+                let t = (flat.length() / speed).max(0.1);
+                dir * speed + Vec3::Y * (to.y / t + 0.5 * gravity * t)
+            };
+            let model = self.classes.get(sh.class).and_then(|c| c.missiles[sh.slot]);
+            self.spawn(
+                Kind::EnemyShot {
+                    vel,
+                    damage: dmg,
+                    life: 4.0,
+                    splash,
+                    gravity,
+                },
+                model,
+                from + dir * 3.0,
+                dir.x.atan2(dir.z),
+            );
+        }
+        // The suicide grunt's blast hurts everyone near it.
+        for (pos, dmg) in blasts {
+            self.sfx.push("S_EXPLODE1|S_SUICIDEEXP".into());
+            for pi in 0..self.players.len() {
+                if (self.players[pi].pos - pos).length() < 8.0 {
+                    self.damage_player(pi, dmg, 0);
+                }
+            }
+        }
+        // Death's drain goes round armour; once it has had 100 it leaves.
+        for (pi, f) in drains {
+            self.damage_player(pi, f, DmgType::NO_ARMOR);
+        }
+        for pi in death_done {
+            self.post(0x83, Some(pi), &[]);
+        }
+        if let Some(pi) = tagged {
+            self.it_holder = Some(pi);
+            self.post(0x32, Some(pi), &[]);
         }
         // Forget dead spawns so generators can replace them.
         let alive_ids: std::collections::HashSet<u64> = self
@@ -4192,6 +4559,45 @@ mod tests {
         // Big levels: the generators make the large monster.
         let b4 = names("levelB4");
         assert!(b4.contains(&"DEM".to_string()), "{b4:?}");
+    }
+
+    #[test]
+    fn archers_shoot() {
+        let Some(fs) = data() else { return };
+        for level in ["levelA3", "levelB4", "levelC4", "levelJ3"] {
+            let mut g = Game::new(&fs, level, &[("WAR", "RED")]).unwrap();
+            let Some(archer) = g
+                .entities
+                .iter()
+                .find(|e| {
+                    matches!(
+                        e.kind,
+                        Kind::Enemy {
+                            strength: 4 | 5,
+                            ..
+                        }
+                    )
+                })
+                .map(|e| (e.pos, e.yaw))
+            else {
+                continue;
+            };
+            // Stand 12 units in front of it.
+            let (pos, yaw) = archer;
+            g.players[0].pos = pos + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 12.0 + Vec3::Y;
+            let mut shots = 0;
+            for _ in 0..600 {
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                shots += g
+                    .entities
+                    .iter()
+                    .filter(|e| matches!(e.kind, Kind::EnemyShot { .. }))
+                    .count();
+            }
+            assert!(shots > 0, "{level}: the archer never shot");
+            return;
+        }
+        panic!("no archer found");
     }
 
     #[test]
