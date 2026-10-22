@@ -67,6 +67,14 @@ enum Screen {
         panels: Vec<PanelInfo>,
         shown: bool,
     },
+    /// The map screen (init_mapscreen) while the next level "loads", then its
+    /// intro movie.
+    Map {
+        map: Box<crate::mapscreen::MapScreen>,
+        movie: String,
+        level: String,
+        panels: Vec<PanelInfo>,
+    },
     /// A level's intro movie (init_gamemovie), then the level.
     Intro {
         movie: Box<crate::movie::Movie>,
@@ -496,6 +504,22 @@ impl App {
                     }
                 }
                 Screen::Loading { .. } => {}
+                Screen::Map {
+                    map,
+                    movie,
+                    level,
+                    panels,
+                } => {
+                    let done = map.update();
+                    for snd in map.sfx.drain(..) {
+                        r.audio.play(fs, &snd);
+                    }
+                    if done {
+                        r.audio.stop();
+                        map.release(&mut r.hud);
+                        next = Some(intro_or_level(fs, &mut r.audio, movie, level, panels));
+                    }
+                }
                 Screen::Intro {
                     movie,
                     level,
@@ -633,6 +657,7 @@ impl App {
                 r.attract
                     .draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), r.movie_tex);
             }
+            Screen::Map { map, .. } => map.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
             Screen::Intro { movie, .. } => {
                 if movie.dirty {
                     movie.dirty = false;
@@ -774,26 +799,18 @@ impl App {
                 r.screen = match (wave, end) {
                     (Some(TOWER_WAVE), LevelEnd::Exit(Some(w))) => {
                         let level = worlds.dir(w).unwrap_or(tower);
-                        let intro = worlds
-                            .level(w)
-                            .filter(|l| !l.movie.is_empty())
-                            .and_then(|l| crate::movie::Movie::open(fs, &l.movie).ok());
-                        match intro {
-                            Some(mut movie) => {
-                                if let Some(a) = movie.audio.take() {
-                                    r.audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
-                                }
-                                Screen::Intro {
-                                    movie: Box::new(movie),
-                                    level,
-                                    panels,
-                                }
-                            }
-                            None => Screen::Loading {
-                                level,
-                                panels,
-                                shown: false,
-                            },
+                        let movie = worlds.level(w).map(|l| l.movie.clone()).unwrap_or_default();
+                        let map =
+                            crate::mapscreen::MapScreen::new(fs, &r.gpu, &mut r.hud, &worlds, w);
+                        match &map.music {
+                            Some(m) => r.audio.play_bank_music(fs, m),
+                            None => r.audio.stop(),
+                        }
+                        Screen::Map {
+                            map: Box::new(map),
+                            movie,
+                            level,
+                            panels,
                         }
                     }
                     (Some(TOWER_WAVE), _) => Screen::Loading {
@@ -810,13 +827,26 @@ impl App {
                         if let Some(w) = w {
                             r.progress.record_beaten(w);
                         }
-                        match dest.and_then(|d| worlds.dir(d)) {
-                            // E1 -> E2 and F1 -> F2 chain straight on.
-                            Some(level) => Screen::Loading {
-                                level,
-                                panels,
-                                shown: false,
-                            },
+                        match dest.and_then(|d| Some((d, worlds.dir(d)?))) {
+                            // E1 -> E2 and F1 -> F2 chain straight on, through the
+                            // map screen.
+                            Some((d, level)) => {
+                                let movie =
+                                    worlds.level(d).map(|l| l.movie.clone()).unwrap_or_default();
+                                let map = crate::mapscreen::MapScreen::new(
+                                    fs, &r.gpu, &mut r.hud, &worlds, d,
+                                );
+                                match &map.music {
+                                    Some(m) => r.audio.play_bank_music(fs, m),
+                                    None => r.audio.stop(),
+                                }
+                                Screen::Map {
+                                    map: Box::new(map),
+                                    movie,
+                                    level,
+                                    panels,
+                                }
+                            }
                             // TODO: the shop comes first (init_shop(0)).
                             None => {
                                 r.audio.play_select_music(fs);
@@ -916,4 +946,34 @@ fn game_over_screen(fs: &GameFs) -> Screen {
         .and_then(|r| r.messages.get(169).and_then(|m| m.lines.first().cloned()))
         .unwrap_or_else(|| "GAME OVER".into());
     Screen::GameOver { ticks: 0, text }
+}
+
+/// init_gamemovie: the level's intro movie if it has one, else straight to it.
+fn intro_or_level(
+    fs: &GameFs,
+    audio: &mut Audio,
+    movie: &str,
+    level: &str,
+    panels: &[PanelInfo],
+) -> Screen {
+    let intro = (!movie.is_empty())
+        .then(|| crate::movie::Movie::open(fs, movie).ok())
+        .flatten();
+    match intro {
+        Some(mut m) => {
+            if let Some(a) = m.audio.take() {
+                audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
+            }
+            Screen::Intro {
+                movie: Box::new(m),
+                level: level.to_string(),
+                panels: panels.to_vec(),
+            }
+        }
+        None => Screen::Loading {
+            level: level.to_string(),
+            panels: panels.to_vec(),
+            shown: false,
+        },
+    }
 }
