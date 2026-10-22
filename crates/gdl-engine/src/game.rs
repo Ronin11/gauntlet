@@ -31,6 +31,7 @@ const ENEMY_ACTIVATE_DIST: f32 = 60.0;
 const GENERATOR_ACTIVATE_DIST: f32 = 40.0;
 const MAX_ENEMIES: usize = 48;
 const PROJECTILE_SPEED: f32 = 42.0;
+const POTION_RADIUS: f32 = 30.0;
 const PROJECTILE_LIFE: f32 = 0.9;
 /// Players are kept within this distance of the group's centre (stay on screen).
 const PARTY_RADIUS: f32 = 13.0;
@@ -81,6 +82,9 @@ pub struct Player {
     pub hurt_flash: f32,
     /// Model thrown by this hero's ranged attack.
     pub proj_model: Option<usize>,
+    /// Display name ("WARRIOR"), for announcer messages.
+    pub name: String,
+    low_health_warned: bool,
     walk_phase: u8,
 }
 
@@ -426,6 +430,12 @@ impl Game {
                 score: 0,
                 hurt_flash: 0.0,
                 proj_model: None,
+                name: crate::select::HEROES
+                    .iter()
+                    .find(|(k, _)| *k == classes[i].0)
+                    .map(|(_, n)| n.to_string())
+                    .unwrap_or_else(|| classes[i].0.to_string()),
+                low_health_warned: false,
                 walk_phase: 0,
             });
         }
@@ -918,6 +928,7 @@ impl Game {
         let (fwd, right) = self.camera_basis();
         let mut attacks: Vec<(usize, Vec3, f32, f32)> = Vec::new();
         let mut throws: Vec<(usize, Vec3, f32)> = Vec::new();
+        let mut blasts: Vec<(usize, Vec3)> = Vec::new();
         // Things a melee swing could hit, to choose between melee and a throw.
         let targets: Vec<Vec3> = self
             .entities
@@ -950,6 +961,18 @@ impl Game {
             }
 
             p.health -= HEALTH_DRAIN_PER_SEC * dt;
+            // The announcer's most famous line.
+            if p.health < 200.0 && !p.low_health_warned {
+                p.low_health_warned = true;
+                self.messages
+                    .push((format!("{} NEEDS FOOD, BADLY!", p.name), 3.0));
+            } else if p.health > 300.0 {
+                p.low_health_warned = false;
+            }
+            if inp.magic_pressed && p.potions > 0 {
+                p.potions -= 1;
+                blasts.push((i, p.pos));
+            }
             if p.health <= 0.0 {
                 p.health = 0.0;
                 p.state = PlayerState::Dead { timer: 4.0 };
@@ -1097,6 +1120,25 @@ impl Game {
         }
         for (pi, pos, yaw, dmg) in attacks {
             self.player_attack(pi, pos, yaw, dmg);
+        }
+        // Potions: magic that hurts every monster and generator nearby.
+        for (pi, pos) in blasts {
+            self.messages
+                .push((format!("{} USED MAGIC!", self.players[pi].name), 2.0));
+            let mut score = 0;
+            let mut drops = Vec::new();
+            for e in self.entities.iter_mut().filter(|e| e.alive) {
+                let d = Vec2::new(e.pos.x - pos.x, e.pos.z - pos.z);
+                if d.length() < POTION_RADIUS
+                    && matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. })
+                {
+                    let (sc, drop) = Self::apply_hit(e, 40.0, d.normalize_or_zero());
+                    score += sc;
+                    drops.extend(drop);
+                }
+            }
+            self.players[pi].score += score;
+            self.spawn_drops(drops);
         }
         for (pi, pos, yaw) in throws {
             let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
@@ -1772,5 +1814,29 @@ mod tests {
             g.players[0].pos.z
         );
         assert_eq!(g.players[0].keys, 0);
+    }
+
+    #[test]
+    fn potion_clears_nearby_monsters() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let p = g.players[0].pos;
+        let near = |e: &Entity| matches!(e.kind, Kind::Enemy { .. }) && (e.pos - p).length() < 25.0;
+        let before = g.entities.iter().filter(|e| near(e)).count();
+        g.players[0].potions = 1;
+        let magic = PlayerInput {
+            magic_pressed: true,
+            ..Default::default()
+        };
+        g.update(1.0 / 60.0, &[magic]);
+        for _ in 0..60 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let after = g.entities.iter().filter(|e| near(e)).count();
+        assert_eq!(g.players[0].potions, 0);
+        assert!(
+            before == 0 || after < before,
+            "before {before} after {after}"
+        );
     }
 }
