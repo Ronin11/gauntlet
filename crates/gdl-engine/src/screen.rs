@@ -106,6 +106,20 @@ impl<'a> Scr<'a> {
             .sprite(t, self.x0 + x * k, self.y0 + y * k, w * k, h * k, color);
     }
 
+    /// Part of a texture (uv = u0, v0, u1, v1 in 0..1) over (x, y, w, h).
+    pub fn blit_uv(&mut self, t: Tex, x: f32, y: f32, w: f32, h: f32, uv: [f32; 4], fade: i32) {
+        let k = self.k;
+        self.c.quad(
+            t,
+            self.x0 + x * k,
+            self.y0 + y * k,
+            w * k,
+            h * k,
+            uv,
+            [1.0, 1.0, 1.0, fade_opacity(fade)],
+        );
+    }
+
     /// A texture over (x, y, w, h) with MBBlitSetAlpha `fade`.
     pub fn blit(&mut self, t: Tex, x: f32, y: f32, w: f32, h: f32, fade: i32) {
         self.blit_tint(t, x, y, w, h, [1.0, 1.0, 1.0, fade_opacity(fade)]);

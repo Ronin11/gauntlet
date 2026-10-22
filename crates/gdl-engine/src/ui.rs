@@ -121,7 +121,7 @@ pub fn load_bank_images(fs: &GameFs, dir: &str) -> anyhow::Result<Vec<(String, I
 }
 
 /// Texture banks loaded for the front end, in lookup order.
-const BANKS: [&str; 5] = ["STATIC", "SELECT", "TITLE", "SONY", "GROUP1"];
+const BANKS: [&str; 6] = ["STATIC", "SELECT", "TITLE", "SONY", "GROUP1", "POWERUPS"];
 
 /// Every front-end texture by name plus the fonts, ready for upload.
 #[derive(Default)]

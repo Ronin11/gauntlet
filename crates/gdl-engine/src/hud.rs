@@ -631,6 +631,33 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
             );
         }
     }
+    // A secret level's hourglass (gamemain.c fn_800552A4): the top sand drains
+    // and the bottom fills as the time runs out.
+    if let Some((total, left)) = game.secret_timer {
+        let p = ((total - left.max(0.0)) / total).clamp(0.0, 1.0);
+        if let Some(t) = s.ui.get("TIMER") {
+            s.blit(t, 1.0, 1.0, t.w as f32, t.h as f32, 0);
+        }
+        if let Some(t) = s.ui.get("TIMER_SAND") {
+            let w = t.w as f32;
+            let th = t.h as f32;
+            let drop = (39.0 * p).round();
+            let v0 = (41.0 * p + 23.0) / 128.0;
+            s.blit_uv(
+                t,
+                1.0,
+                drop + 24.0,
+                w,
+                41.0 - drop,
+                [0.0, v0, 1.0, 64.0 / 128.0],
+                0,
+            );
+            let rise = (38.0 * p).round();
+            let v0 = (105.0 - 38.0 * p) / 128.0;
+            let _ = th;
+            s.blit_uv(t, 1.0, 106.0 - rise, w, rise + 23.0, [0.0, v0, 1.0, 1.0], 0);
+        }
+    }
     // msgDraw: over the player it's about (62 pixels above them on screen), or
     // over slot 0 at y 250 for party messages.
     if let Some(m) = &game.msgs.shown {

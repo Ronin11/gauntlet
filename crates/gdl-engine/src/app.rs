@@ -74,6 +74,8 @@ enum Screen {
         movie: String,
         level: String,
         panels: Vec<PanelInfo>,
+        /// Back from a secret level: resume the suspended level afterwards.
+        resume: bool,
     },
     /// A level's intro movie (init_gamemovie), then the level.
     Intro {
@@ -99,6 +101,8 @@ struct Running {
     attract: Attract,
     /// The party's realm progress.
     progress: Progress,
+    /// The level a secret icon was found in, kept while the secret level runs.
+    suspended: Option<Box<Playing>>,
     /// Options settings (volumes, difficulty, controls).
     prefs: Prefs,
     /// Each player's health, gold, keys and potions now, and as they were when
@@ -211,6 +215,7 @@ impl App {
             attract: Attract::new(),
             progress: Progress::default(),
             prefs: Prefs::default(),
+            suspended: None,
             carry: None,
             checkpoint: None,
             movie_tex: None,
@@ -509,6 +514,7 @@ impl App {
                     movie,
                     level,
                     panels,
+                    resume,
                 } => {
                     let done = map.update();
                     for snd in map.sfx.drain(..) {
@@ -517,7 +523,32 @@ impl App {
                     if done {
                         r.audio.stop();
                         map.release(&mut r.hud);
-                        next = Some(intro_or_level(fs, &mut r.audio, movie, level, panels));
+                        next = Some(match r.suspended.take().filter(|_| *resume) {
+                            // Back where the secret was found, with what was
+                            // gained there.
+                            Some(mut play) => {
+                                if let Some(carry) = &r.carry {
+                                    for (p, info) in play.game.players.iter_mut().zip(&play.panels)
+                                    {
+                                        if let Some(c) = &carry[info.slot % 4] {
+                                            p.restore(c);
+                                        }
+                                    }
+                                }
+                                play.game.crystals = r.progress.crystals;
+                                play.game.garg_items = r.progress.garg_items;
+                                play.game.shards = r.progress.shards;
+                                let streams = play
+                                    .game
+                                    .wave
+                                    .map(|w| play.game.worlds.music(w))
+                                    .unwrap_or_default();
+                                r.audio.play_streams(fs, &streams);
+                                r.last = Instant::now();
+                                Screen::Playing { play, pause: None }
+                            }
+                            None => intro_or_level(fs, &mut r.audio, movie, level, panels),
+                        });
                     }
                 }
                 Screen::Intro {
@@ -755,6 +786,54 @@ impl App {
 
         // A finished level: tower portals lead to their level (after its intro
         // movie); a level leads back to the tower through player select.
+        // A secret icon: the level is kept as it is, to come back to when the
+        // secret level's time runs out (SaveAllRecords / LoadAllRecords).
+        let secret = match &mut r.screen {
+            Screen::Playing { play, .. } => match play.game.level_end {
+                Some(LevelEnd::Secret(w)) => Some(Some(w)),
+                Some(LevelEnd::SecretOver) => Some(None),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(to) = secret {
+            let Screen::Playing { mut play, .. } =
+                std::mem::replace(&mut r.screen, Screen::Legal(0))
+            else {
+                unreachable!()
+            };
+            play.game.level_end = None;
+            r.progress.crystals = play.game.crystals;
+            r.progress.garg_items = play.game.garg_items;
+            r.progress.shards = play.game.shards;
+            let mut carry: Carry = Default::default();
+            for (p, info) in play.game.players.iter().zip(&play.panels) {
+                carry[info.slot % 4] = Some(p.carried());
+            }
+            r.carry = Some(carry);
+            let panels = play.panels.clone();
+            let map_wave = to.or(play.game.wave).unwrap_or(0xC00);
+            let map = crate::mapscreen::MapScreen::new(
+                fs,
+                &r.gpu,
+                &mut r.hud,
+                &play.game.worlds,
+                map_wave,
+            );
+            r.audio.stop();
+            let level = to.and_then(|w| play.game.worlds.dir(w)).unwrap_or_default();
+            if to.is_some() {
+                r.suspended = Some(play);
+            }
+            r.screen = Screen::Map {
+                map: Box::new(map),
+                movie: String::new(),
+                level,
+                panels,
+                resume: to.is_none(),
+            };
+            return Ok(());
+        }
         if let Screen::Playing { play, .. } = &mut r.screen {
             if let Some(end) = play.game.level_end.take() {
                 // Crystals are kept whether or not the level was finished.
@@ -813,6 +892,7 @@ impl App {
                             movie,
                             level,
                             panels,
+                            resume: false,
                         }
                     }
                     (Some(TOWER_WAVE), _) => Screen::Loading {
@@ -820,6 +900,8 @@ impl App {
                         panels,
                         shown: false,
                     },
+                    // Handled above, before the level is torn down.
+                    (_, LevelEnd::Secret(_) | LevelEnd::SecretOver) => unreachable!(),
                     (_, LevelEnd::AllDead) => Screen::Loading {
                         level: tower,
                         panels,
@@ -847,6 +929,7 @@ impl App {
                                     movie,
                                     level,
                                     panels,
+                                    resume: false,
                                 }
                             }
                             // TODO: the shop comes first (init_shop(0)).

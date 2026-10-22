@@ -259,6 +259,10 @@ pub enum LevelEnd {
     Exit(Option<u32>),
     /// Every player died.
     AllDead,
+    /// A secret icon was touched: everyone goes to this secret level.
+    Secret(u32),
+    /// A secret level's time ran out: back to the level it was found in.
+    SecretOver,
 }
 
 pub struct Player {
@@ -622,6 +626,12 @@ pub enum Kind {
         radius: f32,
         damage: f32,
     },
+    /// A SECRET_ICON: touching it takes the party to a secret level, once.
+    Secret {
+        radius: f32,
+        wave: Option<u32>,
+        used: bool,
+    },
     Projectile {
         owner: usize,
         vel: Vec3,
@@ -734,6 +744,8 @@ pub struct Game {
     shield_cooldown: HashMap<(usize, u64), f32>,
     /// Item models loaded for the level, by item name.
     item_models: HashMap<String, Option<usize>>,
+    /// A secret level's countdown: (total, seconds left).
+    pub secret_timer: Option<(f32, f32)>,
     /// The party's shards (runestones, 13 bits) and gargoyle items (fangs,
     /// feathers, claws; -1 once their gate has opened).
     pub shards: u16,
@@ -1029,6 +1041,7 @@ impl Game {
             rings: Vec::new(),
             shield_cooldown: HashMap::new(),
             item_models: HashMap::new(),
+            secret_timer: None,
             shards: 0,
             garg_items: [0; 3],
             welcome: 300,
@@ -1058,6 +1071,15 @@ impl Game {
         match gdl_formats::wdata::Worlds::load(|p| fs.read(p)) {
             Ok(w) => {
                 game.wave = w.wave_of_dir(level_name);
+                // Secret levels last their wavetime (+0.99 s), then send the party back.
+                if let Some(l) = game
+                    .wave
+                    .filter(|w| w >> 8 == 12)
+                    .and_then(|wv| w.level(wv))
+                {
+                    let t = l.wavetime as f32 + 0.99;
+                    game.secret_timer = Some((t, t));
+                }
                 game.worlds = w;
             }
             Err(e) => log::warn!("realm tables: {e:#}"),
@@ -1494,6 +1516,24 @@ impl Game {
                     );
                     self.set_solid(id, item_shape(&info));
                 }
+                // A secret icon names its secret level ("S3").
+                ItemType::Exit if info.subtype == 50 => {
+                    let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
+                    let code = String::from_utf8_lossy(&inst.params[4..8])
+                        .trim_end_matches('\0')
+                        .to_string();
+                    let wave = self.worlds.find_wave(&code);
+                    self.spawn(
+                        Kind::Secret {
+                            radius: info.radius.max(2.0) + 0.5,
+                            wave,
+                            used: false,
+                        },
+                        model,
+                        pos,
+                        yaw,
+                    );
+                }
                 ItemType::Exit => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     let dest = self.exit_dest(&inst.params);
@@ -1702,6 +1742,17 @@ impl Game {
             *t -= dt;
             if *t <= 0.0 {
                 self.crystal_shown = None;
+            }
+        }
+        if let Some((_, left)) = &mut self.secret_timer {
+            let before = left.ceil() as i32;
+            *left -= dt;
+            let now = left.ceil() as i32;
+            if before != now && now == 8 {
+                self.sfx.push("S_TIMEISRUNNING".into());
+            }
+            if *left <= 0.0 && self.level_end.is_none() {
+                self.level_end = Some(LevelEnd::SecretOver);
             }
         }
         self.msgs.tick();
@@ -2700,6 +2751,7 @@ impl Game {
         let mut opened: Vec<(usize, usize)> = Vec::new();
         let mut key_used: Vec<usize> = Vec::new();
         let mut exits: Vec<(usize, Option<u32>)> = Vec::new();
+        let mut secret: Option<u32> = None;
         let mut chest_used: Vec<usize> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut chests_opened: Vec<(Vec3, Option<usize>)> = Vec::new();
@@ -2959,6 +3011,19 @@ impl Game {
                         }
                     }
                     *pressed = on;
+                }
+                Kind::Secret { radius, wave, used } => {
+                    if !*used && self.secret_timer.is_none() {
+                        if let Some(w) = *wave {
+                            if player_pos
+                                .iter()
+                                .any(|(pp, alive)| *alive && (*pp - e.pos).length() < *radius)
+                            {
+                                *used = true;
+                                secret = Some(w);
+                            }
+                        }
+                    }
                 }
                 Kind::Exit { radius, dest, open } => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
@@ -3274,6 +3339,10 @@ impl Game {
             }
         }
         self.entities.retain(|e| e.alive);
+        if let Some(w) = secret {
+            self.level_end = Some(LevelEnd::Secret(w));
+            self.sfx.push("S_SECRETCHAR|S_PICKUPSPECIAL".into());
+        }
         for (pi, dest) in exits {
             let p = &mut self.players[pi];
             if p.state.active() {
@@ -3698,6 +3767,24 @@ mod tests {
         }
         assert_eq!(most % 3, 0);
         assert!(most >= 3);
+    }
+
+    #[test]
+    fn secret_icon_leads_to_its_secret_level() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA6", &[("WAR", "RED")]).unwrap();
+        let icon = g
+            .entities
+            .iter()
+            .find(|e| matches!(e.kind, Kind::Secret { .. }))
+            .map(|e| e.pos)
+            .expect("A6 has a secret icon");
+        g.players[0].pos = icon;
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        // S3 (Space) is the secret realm's third level.
+        assert_eq!(g.level_end, Some(LevelEnd::Secret(0xC02)));
+        let s = Game::new(&fs, "levelS3", &[("WAR", "RED")]).unwrap();
+        assert_eq!(s.secret_timer.map(|t| t.0), Some(45.99));
     }
 
     #[test]
