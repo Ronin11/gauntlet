@@ -26,6 +26,21 @@ pub struct Scene {
     entities: HashMap<u64, Instance>,
 }
 
+/// Where a world point lands on the game's 512x384 screen (the 3D view is 4:3),
+/// or None behind the camera.
+pub fn project(game: &Game, pos: Vec3) -> Option<(f32, f32)> {
+    let (eye, at, near) = game.camera_view();
+    let m = mirror();
+    let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
+    let proj = Mat4::perspective_rh(45f32.to_radians(), 4.0 / 3.0, near, 1500.0);
+    let c = proj * view * m.transform_point3(pos).extend(1.0);
+    if c.w <= 0.0 {
+        return None;
+    }
+    let (x, y) = (c.x / c.w, c.y / c.w);
+    Some(((x + 1.0) * 256.0, (1.0 - y) * 192.0))
+}
+
 impl Scene {
     pub fn new(gpu: &Gpu, game: &Game) -> Result<Scene> {
         let moving: std::collections::HashSet<usize> = game

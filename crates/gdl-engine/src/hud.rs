@@ -621,11 +621,24 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
             );
         }
     }
-    // Messages not yet driven by the game's message table: drawn as msgPost does
-    // without a world position, in the parchment box over slot 0.
-    let lines: Vec<&str> = game.messages.iter().map(|(m, _)| m.as_str()).collect();
-    if !lines.is_empty() {
-        message_box(s, 64.0, 250.0, &lines, 0x160C03);
+    // msgDraw: over the player it's about (62 pixels above them on screen), or
+    // over slot 0 at y 250 for party messages.
+    if let Some(m) = &game.msgs.shown {
+        let lines: Vec<&str> = m.lines.iter().map(String::as_str).collect();
+        let at = m
+            .player
+            .and_then(|pi| game.players.get(pi))
+            .and_then(|p| crate::scene::project(game, p.pos + glam::Vec3::Y * 2.5));
+        let (cx, cy, rgb) = match (m.player, at) {
+            (Some(pi), Some((x, y))) => {
+                let slot = panels.get(pi).map_or(pi, |p| p.slot);
+                let colour = panels.get(pi).map_or(slot, |p| p.colour);
+                let _ = slot;
+                (x, y - 62.0, crate::messages::PLAYER_TEXT[colour % 4])
+            }
+            _ => (64.0, 250.0, crate::messages::NEUTRAL_TEXT),
+        };
+        message_box(s, cx, cy, &lines, rgb);
     }
 }
 

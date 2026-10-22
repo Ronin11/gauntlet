@@ -447,6 +447,82 @@ fn pickup_kind(info: &gdl_formats::worlds::ItemInfo, params: &[u8]) -> PickupKin
     }
 }
 
+/// The help message for picking something up (items.c fn_8005DE50's msgPost).
+fn pickup_message(kind: &PickupKind) -> Option<usize> {
+    use crate::powerups as pu;
+    Some(match *kind {
+        PickupKind::Food(v) if v < 0.0 => 28,
+        PickupKind::Food(v) if v >= 100.0 => 15,
+        PickupKind::Food(v) if v >= 50.0 => 16,
+        PickupKind::Gold(v) if v >= 25 => 17,
+        PickupKind::Key(_) => 8,
+        PickupKind::Potion(_) => 7,
+        PickupKind::Powerup { kind, flags: f, .. } => match kind {
+            pu::WEAPON if f & pu::W_3WAY != 0 => 37,
+            pu::WEAPON if f & pu::W_5WAY != 0 => 47,
+            pu::WEAPON if f & pu::W_REFLECT != 0 => 38,
+            pu::WEAPON if f & pu::W_SUPER != 0 => 48,
+            pu::WEAPON if f & pu::W_HAMMER != 0 => 86,
+            pu::WEAPON if f & pu::W_RAPID != 0 => 87,
+            pu::WEAPON => match f & 0xF {
+                1 => 40,
+                2 => 41,
+                3 => 42,
+                4 => 43,
+                _ => return None,
+            },
+            pu::ARMOR if f & pu::A_GOLD != 0 => 54,
+            pu::ARMOR if f & pu::A_INVULN != 0 => 35,
+            pu::ARMOR if f & pu::A_ANTIDEATH != 0 => 49,
+            pu::ARMOR if f & pu::A_REFLECT != 0 => 52,
+            pu::ARMOR if f & pu::A_FIRE != 0 => 91,
+            pu::ARMOR if f & pu::A_LIGHTNING != 0 => 92,
+            pu::ARMOR if f & pu::A_GAS != 0 => 132,
+            pu::SPEED => 32,
+            pu::MAGIC => 33,
+            pu::SPECIAL => {
+                const MAP: [(u32, usize); 18] = [
+                    (0x4, 36),
+                    (0x2, 39),
+                    (0x8, 51),
+                    (0x1, 53),
+                    (0x10, 81),
+                    (0x20, 82),
+                    (0x40, 83),
+                    (0x80, 84),
+                    (0x100, 88),
+                    (0x200, 89),
+                    (0x400, 93),
+                    (0x2000, 98),
+                    (0x1000, 99),
+                    (0x8000, 100),
+                    (0x4000, 100),
+                    (0x80000, 113),
+                    (0x100000, 148),
+                    (0x200000, 149),
+                ];
+                if f & 0x400000 != 0 {
+                    150
+                } else {
+                    MAP.iter().find(|(m, _)| f & m != 0)?.1
+                }
+            }
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// The message for a pickup a player can't take: full health, keys or potions.
+fn refused_message(kind: &PickupKind) -> Option<usize> {
+    match kind {
+        PickupKind::Food(_) => Some(133),
+        PickupKind::Key(_) => Some(4),
+        PickupKind::Potion(_) => Some(3),
+        _ => None,
+    }
+}
+
 /// Whether a player can take a pickup now: food isn't taken at full health,
 /// and keys and potions stop at 9 (the item stays on the floor).
 fn can_take(p: &Player, kind: &PickupKind) -> bool {
@@ -643,7 +719,8 @@ pub struct Game {
     pub hidden: HashSet<usize>,
     /// Set once every player has left or died.
     pub level_end: Option<LevelEnd>,
-    pub messages: Vec<(String, f32)>,
+    /// Help messages and announcements (msgPost).
+    pub msgs: crate::messages::Messages,
     /// Sound effects requested this frame (names from AUDATPS2.ROM); drained by the app.
     pub sfx: Vec<String>,
 }
@@ -791,6 +868,31 @@ impl Game {
         }
     }
 
+    /// msgPost about `player` (or the party).
+    pub fn post(&mut self, index: usize, player: Option<usize>, args: &[String]) -> bool {
+        let active: Vec<usize> = (0..self.players.len().min(4))
+            .filter(|&i| self.players[i].state.active())
+            .collect();
+        // "%s %s HAS SHRUNK ENEMIES" and friends name the player's colour and class.
+        let named;
+        let args = if args.is_empty() && [0x32, 0x59, 0x5D].contains(&index) {
+            let p = &self.players[player
+                .unwrap_or(0)
+                .min(self.players.len().saturating_sub(1))];
+            let colour = match p.color.as_str() {
+                "YEL" => "YELLOW",
+                "BLU" => "BLUE",
+                "RED" => "RED",
+                _ => "GREEN",
+            };
+            named = [colour.to_string(), p.name.clone()];
+            &named[..]
+        } else {
+            args
+        };
+        self.msgs.post(index, player, &active, args)
+    }
+
     /// Hide a world object (and its children) by name; false if there is none.
     pub fn hide_object(&mut self, name: &str) -> bool {
         let objs = &self.level.worlds.world_objects;
@@ -878,9 +980,16 @@ impl Game {
             crystal_shown: None,
             hidden: HashSet::new(),
             level_end: None,
-            messages: Vec::new(),
+            msgs: Default::default(),
             sfx: vec!["S_ENTRANCE".into()],
         };
+        if let Ok(rom) = fs.read("TEXT/ENGLISH.ROM") {
+            if let Ok(rom) = gdl_formats::text::TextRom::parse(&rom) {
+                game.msgs = crate::messages::Messages::new(
+                    rom.messages.into_iter().map(|m| m.lines).collect(),
+                );
+            }
+        }
         // SetScrollLevelMsgList: the scroll texts named after the level.
         if let Ok(rom) = fs.read("TEXT/SCROLL_E.ROM") {
             if let Ok(rom) = gdl_formats::text::TextRom::parse(&rom) {
@@ -1538,10 +1647,9 @@ impl Game {
                 self.crystal_shown = None;
             }
         }
-        self.messages.retain_mut(|(_, t)| {
-            *t -= dt;
-            *t > 0.0
-        });
+        self.msgs.tick();
+        let voices: Vec<String> = self.msgs.voice.drain(..).collect();
+        self.sfx.extend(voices);
         self.frame += 1;
         self.update_players(dt, inputs);
         self.update_rings(dt);
@@ -2244,9 +2352,7 @@ impl Game {
             p.health += 100.0 * (level - p.level) as f32;
             p.level = level;
             p.refresh_stats();
-            self.messages
-                .push((format!("LEVEL {level}\nEXPERIENCE"), 2.5));
-            self.sfx.push("S_GAINEDLEVEL".into());
+            self.post(0x22, Some(pi), &[level.to_string()]);
         }
     }
 
@@ -2537,6 +2643,7 @@ impl Game {
         let mut key_used: Vec<usize> = Vec::new();
         let mut exits: Vec<(usize, Option<u32>)> = Vec::new();
         let mut chest_used: Vec<usize> = Vec::new();
+        let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut chests_opened: Vec<(Vec3, Option<usize>)> = Vec::new();
         let mut proj_hits: Vec<(usize, usize, f32, Vec2)> = Vec::new();
 
@@ -2680,13 +2787,15 @@ impl Game {
                 Kind::Pickup { kind, radius } => {
                     e.spin += dt * 2.0;
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
-                        if *alive
-                            && (*pp - e.pos).length() < *radius + 0.5
-                            && can_take(&self.players[pi], kind)
-                        {
-                            pickups.push((pi, *kind));
-                            e.alive = false;
-                            break;
+                        if *alive && (*pp - e.pos).length() < *radius + 0.5 {
+                            if can_take(&self.players[pi], kind) {
+                                pickups.push((pi, *kind));
+                                e.alive = false;
+                                break;
+                            }
+                            if let Some(m) = refused_message(kind) {
+                                posts.push((m, pi));
+                            }
                         }
                     }
                 }
@@ -2698,8 +2807,12 @@ impl Game {
                     ..
                 } if *hp > 0.0 => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
-                        if *alive
-                            && Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length() < 3.0
+                        let close =
+                            *alive && Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length() < 3.0;
+                        if close && self.players[pi].keys == 0 {
+                            posts.push((2, pi));
+                        }
+                        if close
                             && self.players[pi].keys > 0
                             && !key_used.contains(&pi)
                             && !chest_used.contains(&pi)
@@ -2716,6 +2829,10 @@ impl Game {
                 }
                 Kind::Door { radius, coll } => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
+                        if *alive && (*pp - e.pos).length() < *radius && self.players[pi].keys == 0
+                        {
+                            posts.push((1, pi));
+                        }
                         if *alive
                             && (*pp - e.pos).length() < *radius
                             && self.players[pi].keys > 0
@@ -2925,7 +3042,7 @@ impl Game {
         }
         for pi in key_used {
             self.players[pi].keys -= 1;
-            self.messages.push(("Door unlocked".into(), 2.0));
+
             let w = self.world_letter();
             self.sfx.push(format!("S_GATE{w}1|S_SECRETWALL"));
         }
@@ -2955,6 +3072,11 @@ impl Game {
             }
         }
         let mut poisoned: Vec<(usize, f32)> = Vec::new();
+        for (pi, kind) in &pickups {
+            if let Some(m) = pickup_message(kind) {
+                posts.push((m, *pi));
+            }
+        }
         for (pi, kind) in pickups {
             let p = &mut self.players[pi];
             self.sfx.push(match kind {
@@ -3022,6 +3144,9 @@ impl Game {
                 }
                 PickupKind::Other(_) => {}
             }
+        }
+        for (m, pi) in posts {
+            self.post(m, Some(pi), &[]);
         }
         for (pi, dmg) in poisoned {
             self.damage_player(pi, dmg, DmgType::POISON_GAS);
