@@ -63,13 +63,19 @@ in `~/.android/gauntlet-rs.keystore`.
   (open with a key), exit portals (load the next level), damage tiles.
 - **Up to 4 players** on gamepads and keyboard, a Gauntlet-style HUD, health drain,
   kid-friendly respawning, a follow camera that keeps the party together.
+- **Combat**: melee when something is in reach, otherwise a thrown weapon; potions (B/K)
+  blast every monster nearby.
 - **Music**: each world's soundtrack, decoded from the disc's DSP-ADPCM streams.
+- **Sound effects and announcer**: weapon hits, monster deaths, pickups, gates, hero pain
+  and death voices, and "Red Warrior needs food, badly!", decoded from the `.VBK` banks
+  using the sound names in `AUDATPS2.ROM`.
+- **Camera** follows each area's original camera heading and cuts away roofs and walls
+  between it and the players.
 
 ## Not done yet (roadmap)
 
-- Sound effects and voices (DCS sound banks, `AUDIO/*.VBK` + `AUDATPS2.ROM`)
-- Ranged attacks, magic/potions, the class-specific combo and special moves, power-ups
-- Per-area scripted cameras (milestones). Some indoor and cave levels get a bad angle.
+- Class-specific combos and special moves, power-ups (only basic pickups work so far)
+- Scripted cameras for boss arenas, and some dark arena/boss levels
 - Bosses, moving platforms and elevators, triggers, teleporters, secret areas
 - Texture animations (flowing water, flames), particle effects
 - Save games, menus, shops
