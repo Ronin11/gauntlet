@@ -57,12 +57,26 @@ impl Rng {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AttackPhase {
+    Windup,
+    Strike,
+    Recover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PlayerState {
     Normal,
+    /// An attack in progress, played at the animations' native rate like the original
+    /// (action.c): throws go wind-up -> release -> recover; melee swings chain through the
+    /// quick combo while attack is pressed, otherwise recover.
     Attacking {
-        seq: usize,
-        hit_done: bool,
+        phase: AttackPhase,
         ranged: bool,
+        /// Index into the quick-attack combo (melee only).
+        combo: u8,
+        hit_done: bool,
+        /// Attack pressed again during the strike: chain the next swing.
+        queued: bool,
     },
     Dead {
         timer: f32,
@@ -98,10 +112,12 @@ pub struct PlayerSeqs {
     ready: usize,
     walk: [usize; 2],
     run: [usize; 2],
-    attack: Vec<usize>,
+    /// Quick-attack combo swings and the recovery played after each.
+    attack: Vec<(usize, Option<usize>)>,
     falling: Option<usize>,
     death: Option<usize>,
-    throw: Option<usize>,
+    /// Throw: wind-up, release, recovery.
+    throw: Option<(Option<usize>, usize, Option<usize>)>,
 }
 
 impl PlayerSeqs {
@@ -112,13 +128,21 @@ impl PlayerSeqs {
             ready,
             walk: [s("WALK1").unwrap_or(ready), s("WALK2").unwrap_or(ready)],
             run: [s("RUN1").unwrap_or(ready), s("RUN2").unwrap_or(ready)],
-            attack: ["ATTQUICK1", "ATTQUICK2", "ATTQUICK3"]
-                .iter()
-                .filter_map(|n| s(n))
-                .collect(),
+            // As in action.c, the first and third swings share ATTQUICK3R.
+            attack: [
+                ("ATTQUICK1", "ATTQUICK3R"),
+                ("ATTQUICK2", "ATTQUICK2R"),
+                ("ATTQUICK3", "ATTQUICK3R"),
+            ]
+            .iter()
+            .filter_map(|(a, r)| Some((s(a)?, s(r))))
+            .collect(),
             falling: s("FALLING"),
             death: s("DEATH"),
-            throw: s("THROW1").or(s("SSHOT1")).or(s("MAGICS")),
+            throw: match s("THROW1") {
+                Some(t) => Some((s("THROW1S"), t, s("THROW1R"))),
+                None => s("SSHOT1").or(s("MAGICS")).map(|t| (None, t, None)),
+            },
         }
     }
 }
@@ -1039,29 +1063,71 @@ impl Game {
             }
 
             // Attacks interrupt movement until the swing finishes.
+            let wants_attack = inp.attack_pressed || inp.attack;
+            let mut start_combo = None;
             if let PlayerState::Attacking {
-                seq,
-                hit_done,
+                phase,
                 ranged,
+                combo,
+                hit_done,
+                queued,
             } = &mut p.state
             {
-                let frames = model.skeleton.sequences[*seq].frame_count.max(1) as f32;
-                if !*hit_done && p.animator.frame >= frames * 0.4 {
-                    *hit_done = true;
-                    if *ranged {
-                        throws.push((i, p.pos, p.yaw));
-                    } else {
-                        attacks.push((i, p.pos, p.yaw, 10.0));
+                let frames = model.skeleton.sequences[p.animator.seq].frame_count.max(1) as f32;
+                match *phase {
+                    AttackPhase::Windup => {
+                        if p.animator.finished {
+                            if let Some((_, release, _)) = seqs.throw {
+                                *phase = AttackPhase::Strike;
+                                p.animator.restart(release);
+                            }
+                        }
+                    }
+                    AttackPhase::Strike => {
+                        if inp.attack_pressed {
+                            *queued = true;
+                        }
+                        // Thrown weapons leave the hand as the release begins; swings
+                        // connect partway through.
+                        let hit_at = if *ranged { 0.0 } else { frames * 0.4 };
+                        if !*hit_done && p.animator.frame >= hit_at {
+                            *hit_done = true;
+                            if *ranged {
+                                throws.push((i, p.pos, p.yaw));
+                            } else {
+                                attacks.push((i, p.pos, p.yaw, 10.0));
+                            }
+                        }
+                        if p.animator.finished {
+                            let recover = if *ranged {
+                                seqs.throw.and_then(|t| t.2)
+                            } else {
+                                seqs.attack.get(*combo as usize).and_then(|a| a.1)
+                            };
+                            if !*ranged && (*queued || inp.attack) {
+                                start_combo = Some(*combo + 1);
+                            } else if let Some(r) = recover {
+                                *phase = AttackPhase::Recover;
+                                p.animator.restart(r);
+                            } else {
+                                p.state = PlayerState::Normal;
+                            }
+                        }
+                    }
+                    AttackPhase::Recover => {
+                        // A new attack cuts the recovery short.
+                        if wants_attack {
+                            start_combo = Some(if *ranged { 0 } else { *combo + 1 });
+                        } else if p.animator.finished {
+                            p.state = PlayerState::Normal;
+                        }
                     }
                 }
-                if p.animator.finished {
+                if start_combo.is_some() {
                     p.state = PlayerState::Normal;
                 }
             }
-            if (inp.attack_pressed || inp.attack)
-                && p.state == PlayerState::Normal
-                && !seqs.attack.is_empty()
-            {
+            if wants_attack && p.state == PlayerState::Normal && !seqs.attack.is_empty() {
                 // Aim with the stick if it's held, then melee anything in reach or throw.
                 let aim = fwd * inp.stick.y + right * inp.stick.x;
                 if aim.length() > 0.3 {
@@ -1075,18 +1141,30 @@ impl Game {
                         && (t.y - p.pos.y).abs() < 5.0
                         && (dist < 1.0 || d.normalize().dot(facing) > ATTACK_ARC_COS)
                 });
-                let ranged = !in_reach && p.proj_model.is_some();
-                let seq = match (ranged, seqs.throw) {
-                    (true, Some(t)) => t,
-                    _ => seqs.attack[(self.time * 7.0) as usize % seqs.attack.len()],
+                let throw = seqs.throw.filter(|_| !in_reach && p.proj_model.is_some());
+                let (phase, seq, combo) = match throw {
+                    Some((Some(windup), _, _)) => (AttackPhase::Windup, windup, 0),
+                    Some((None, release, _)) => (AttackPhase::Strike, release, 0),
+                    None => {
+                        // Chained swings alternate 2 and 3 after the opener, as in the original.
+                        let n = seqs.attack.len() as u8;
+                        let c = match start_combo.unwrap_or(0) {
+                            c if c < n => c,
+                            c => 1 + (c - 1) % (n - 1).max(1),
+                        }
+                        .min(n - 1);
+                        (AttackPhase::Strike, seqs.attack[c as usize].0, c)
+                    }
                 };
                 p.state = PlayerState::Attacking {
-                    seq,
+                    phase,
+                    ranged: throw.is_some(),
+                    combo,
                     hit_done: false,
-                    ranged,
+                    queued: false,
                 };
                 p.animator.restart(seq);
-                p.animator.speed = if ranged { 2.0 } else { 1.6 };
+                p.animator.speed = 1.0;
             }
 
             let wish = fwd * inp.stick.y + right * inp.stick.x;
@@ -1934,6 +2012,25 @@ mod tests {
             "grunt should be dead"
         );
         assert!(g.players[0].score >= 10);
+    }
+
+    #[test]
+    fn holding_attack_throws_at_original_rate() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        let hold = PlayerInput {
+            attack: true,
+            ..Default::default()
+        };
+        let mut throws = 0;
+        for _ in 0..300 {
+            g.update(1.0 / 60.0, &[hold]);
+            throws += g.sfx.drain(..).filter(|s| s.ends_with("THROW")).count();
+        }
+        // Wind-up + release at native speed is ~0.54 s: about 9 throws in 5 s
+        // (the old double-speed release-only loop threw ~80).
+        assert!((7..=11).contains(&throws), "{throws} throws in 5 s");
     }
 
     #[test]
