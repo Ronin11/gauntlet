@@ -78,17 +78,17 @@ impl Title {
     }
 }
 
-/// Full-screen art shown while a level loads.
-pub fn draw_loading(c: &mut Canvas, st: &Style, level: &str) {
-    let (w, h) = (c.width(), c.height());
-    st.backdrop(c, 0.0);
-    let u = (h / 720.0).min(w / 1120.0);
-    let label = "Loading";
-    let lw = st.width(label, 44.0 * u);
-    st.text(c, w - lw - 40.0 * u, h - 80.0 * u, 44.0 * u, GOLD, label);
-    let code = level.trim_start_matches("level");
-    let cw = st.small_width(code, 18.0 * u);
-    st.small(c, w - cw - 40.0 * u, h - 30.0 * u, 18.0 * u, DIM, code);
+/// The loading screen, as shop.c draws it while the next level loads:
+/// TransitionBlitShow(0) then DrawGlowText(1.0, 340, 260, "Loading...").
+pub fn draw_loading(c: &mut Canvas, st: &Style, time: f32) {
+    st.transition(c, 1.0);
+    st.glow_text(c, 340.0, 260.0, "Loading...", time);
+}
+
+/// How opaque the loading art still is `t` seconds into a level: gauntworld.c
+/// fades it out as 255 * (1 - t / 2) over the first two seconds.
+pub fn loading_fade(t: f32) -> f32 {
+    (1.0 - 0.5 * t).clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

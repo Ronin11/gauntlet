@@ -34,6 +34,8 @@ struct Playing {
     game: Game,
     scene: Scene,
     players: Vec<(String, String)>,
+    /// Seconds played, for fading out the loading art.
+    intro: f32,
 }
 
 /// Health, score, keys and potions carried from one level to the next.
@@ -395,6 +397,7 @@ impl App {
                             *pause = Some(Pause::default());
                         } else {
                             play.game.update(TICK, &inputs);
+                            play.intro += TICK;
                         }
                     }
                 }
@@ -416,8 +419,8 @@ impl App {
         match &mut r.screen {
             Screen::Title(t) => t.draw(&mut canvas, &style, time),
             Screen::Select(sel) => sel.draw(&mut canvas, &style, time),
-            Screen::Loading { level, shown, .. } => {
-                menu::draw_loading(&mut canvas, &style, level);
+            Screen::Loading { shown, .. } => {
+                menu::draw_loading(&mut canvas, &style, time);
                 *shown = true;
             }
             Screen::Playing { play, pause } => {
@@ -433,6 +436,10 @@ impl App {
                 r.gpu
                     .render(&view, &r.depth, &g, CLEAR, &p.scene.draws(&p.game));
                 hud::build(&mut canvas, &r.hud.ui, &p.game, &hero_names(&p.players));
+                let fade = menu::loading_fade(p.intro);
+                if fade > 0.0 {
+                    style.transition(&mut canvas, fade);
+                }
                 if let Some(menu) = pause {
                     menu.draw(&mut canvas, &style, time);
                 }
@@ -493,6 +500,7 @@ fn start_game(
         game,
         scene,
         players,
+        intro: 0.0,
     })
 }
 

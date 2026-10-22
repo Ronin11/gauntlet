@@ -147,7 +147,7 @@ impl Canvas {
                     let (ux, uw) = (gx - pad, gw + pad * 2.0);
                     let uv = [ux / tw, gy / th, (ux + uw) / tw, (gy + f.height) / th];
                     self.quad(f.tex, cx - pad * k, y, uw * k, px, uv, color);
-                    cx += (gw + f.gap()) * k;
+                    cx += (gw + f.gap) * k;
                 }
                 None => cx += f.space * k,
             }
@@ -267,6 +267,59 @@ impl Style<'_> {
             Some(t) => c.sprite(t, x, y, w, h, tint),
             None => c.rect(x, y, w, 2.0, tint),
         }
+    }
+
+    /// The original's 512x384 screen, fitted 4:3 and centred in the window: returns
+    /// its top-left corner and window pixels per original pixel.
+    pub fn screen(c: &Canvas) -> (f32, f32, f32) {
+        let k = (c.width() / 512.0).min(c.height() / 384.0);
+        (
+            (c.width() - 512.0 * k) * 0.5,
+            (c.height() - 384.0 * k) * 0.5,
+            k,
+        )
+    }
+
+    /// TransitionBlitShow (gamemain.c): TRANSITION_SCREEN stretched over the whole
+    /// 512x384 screen, black either side of it, at opacity `alpha`.
+    pub fn transition(&self, c: &mut Canvas, alpha: f32) {
+        let (w, h) = (c.width(), c.height());
+        let (x0, y0, k) = Self::screen(c);
+        match self.ui.get("TRANSITION_SCREEN") {
+            Some(t) => {
+                c.rect(0.0, 0.0, x0, h, [0.0, 0.0, 0.0, alpha]);
+                c.rect(w - x0, 0.0, x0, h, [0.0, 0.0, 0.0, alpha]);
+                c.rect(x0, 0.0, w - 2.0 * x0, y0, [0.0, 0.0, 0.0, alpha]);
+                c.rect(x0, h - y0, w - 2.0 * x0, y0, [0.0, 0.0, 0.0, alpha]);
+                c.sprite(t, x0, y0, 512.0 * k, 384.0 * k, [1.0, 1.0, 1.0, alpha]);
+            }
+            None => c.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, alpha]),
+        }
+    }
+
+    /// DrawGlowText (btext.c) at scale 1, (x, y) in original screen pixels: FONT32
+    /// in white over its glow layer in glow_color 0x8200EA, whose opacity pulses
+    /// between 1/2 and 1 (glow_radius 40, glow_period 5 frames).
+    pub fn glow_text(&self, c: &mut Canvas, x: f32, y: f32, s: &str, time: f32) {
+        let (x0, y0, k) = Self::screen(c);
+        let Some(f) = &self.ui.font32 else {
+            self.text(c, x0 + x * k, y0 + y * k, 32.0 * k, [1.0; 4], s);
+            return;
+        };
+        let (px, x, y) = (f.height * k, x0 + x * k, y0 + y * k);
+        let frame = (time * 60.0) as i32 % 85;
+        let phase = match frame {
+            p if p > 80 => 0,
+            p if p > 40 => 80 - p,
+            p => p,
+        };
+        let a = (40 + phase * 255 - 1) / 40;
+        let glow = (128 - (127 - a / 2) / 2) as f32 / 128.0;
+        if let Some(g) = &self.ui.font32_glow {
+            let purple = [130.0 / 255.0, 0.0, 234.0 / 255.0, glow];
+            c.font_text_padded(g, x, y, px, purple, s, 3.0);
+        }
+        c.font_text(f, x, y, px, [1.0; 4], s);
     }
 
     /// Full-screen backdrop for menus: the loading-screen art, darkened.

@@ -310,7 +310,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         match args.screen.as_deref() {
             Some("title") => menu::Title::default().draw(&mut canvas, &style, t),
             Some("select") => select::Select::demo().draw(&mut canvas, &style, t),
-            Some("loading") => menu::draw_loading(&mut canvas, &style, &args.level),
+            Some("loading") => menu::draw_loading(&mut canvas, &style, t),
             Some("pause") => {
                 hud::build(&mut canvas, &hud.ui, &g, &names);
                 menu::Pause::default().draw(&mut canvas, &style, t);

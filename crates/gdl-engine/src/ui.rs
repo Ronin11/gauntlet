@@ -29,6 +29,8 @@ pub struct Font {
     pub glyphs: HashMap<char, (f32, f32, f32)>,
     /// Advance for characters without a glyph (space).
     pub space: f32,
+    /// Extra space between letters, in texture pixels.
+    pub gap: f32,
 }
 
 impl Font {
@@ -54,6 +56,7 @@ impl Font {
             height,
             glyphs,
             space,
+            gap: 0.0,
         })
     }
 
@@ -65,20 +68,11 @@ impl Font {
             .copied()
     }
 
-    /// Space between letters, in texture pixels.
-    pub fn gap(&self) -> f32 {
-        (self.height * 0.1).max(1.0)
-    }
-
     /// Width in pixels of `s` drawn `px` pixels tall.
     pub fn width(&self, s: &str, px: f32) -> f32 {
         let k = px / self.height;
         s.chars()
-            .map(|c| {
-                self.glyph(c)
-                    .map(|g| g.2 + self.gap())
-                    .unwrap_or(self.space)
-            })
+            .map(|c| self.glyph(c).map(|g| g.2 + self.gap).unwrap_or(self.space))
             .sum::<f32>()
             * k
     }
@@ -110,7 +104,9 @@ impl UiAssets {
             let data = fs.read(&format!("FONTS/{file}")).ok()?;
             Font::parse(&data, ui.get(tex)?)
         };
-        ui.font32 = font(&ui, "FONT32.FNT", "FONT32").map(|f| ui.tighten(f));
+        // FONT32 is laid out as the game does (MBDrawText): each glyph advances by
+        // its FNT width, and a space by 16 (gFontDefs in btext.c).
+        ui.font32 = font(&ui, "FONT32.FNT", "FONT32").map(|f| Font { space: 16.0, ..f });
         ui.font32_glow = font(&ui, "FONT32.FNT", "FONT32_GLOW");
         ui.font8 = font(&ui, "8Hifonts.fnt", "8HIFONTS").map(|f| ui.tighten(f));
         ui.name_font = font(&ui, "NAMEFONT.FNT", "NAMEFONT").map(|f| ui.tighten(f));
@@ -185,6 +181,7 @@ impl UiAssets {
             *g = (l as f32, g.1, (r - l + 1) as f32);
         }
         f.space = f.height * 0.3;
+        f.gap = (f.height * 0.1).max(1.0);
         f
     }
 
