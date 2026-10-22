@@ -132,6 +132,9 @@ pub struct Boss {
     /// Coin models (bronze, silver, gold) and Skorne's boss power-ups.
     pub coin_models: [Option<usize>; 3],
     pub key_model: Option<usize>,
+    /// BOSSKEY2, and the BOSSKEY effect waiting to change into it.
+    pub key2_model: Option<usize>,
+    pub key_effect: Option<u64>,
     /// Safe rocks (CollectSafeRocks): None until collected on the first boss
     /// frame; empty when the level has none.
     pub safe_rocks: Option<Vec<SafeRock>>,
@@ -454,6 +457,7 @@ impl Game {
         let coins = ["COIN_BRONZE", "COIN_SILVER", "COIN_GOLD"]
             .map(|n| self.item_model_pub(fs, &mut cache, &mut known, &dirs, n));
         let key = self.item_model_pub(fs, &mut cache, &mut known, &dirs, "BOSSKEY");
+        let key2 = self.item_model_pub(fs, &mut cache, &mut known, &dirs, "BOSSKEY2");
         // [CHOICE] The SAFEROCK item has models SAFEROCK0..3 (by damage, we
         // take it); the undamaged one is used.
         let safe_rock_model = self
@@ -477,6 +481,7 @@ impl Game {
         if let Some(b) = self.boss.as_mut() {
             b.coin_models = coins;
             b.key_model = key;
+            b.key2_model = key2;
             b.legend_models = legend_models;
             b.safe_rock_model = safe_rock_model;
         }
@@ -1178,9 +1183,35 @@ impl Game {
         if (34..=41).contains(&t) {
             b.key = Some((key_pos, self.time));
             self.sfx.push(format!("S_BOSSKEY{}", boss_letter(t)));
+            // StartFXSub plays BOSSKEY once, then SfxSetMorph(30) changes it
+            // into BOSSKEY2 for 30 s.
             if let Some(m) = key_model {
-                self.spawn(Kind::Effect { life: 1e9 }, Some(m), key_pos, 0.0);
+                let life = self.models[m].skeleton.sequences.first().map_or(1.0, |s| {
+                    s.frame_count.max(1) as f32 * s.frame_rate.max(1) as f32 / 900.0
+                });
+                let id = self.spawn(Kind::Effect { life }, Some(m), key_pos, 0.0);
+                if let Some(b) = self.boss.as_mut() {
+                    b.key_effect = Some(id);
+                }
             }
+        }
+    }
+
+    /// The BOSSKEY effect's morph into BOSSKEY2 once it has played.
+    fn update_boss_key(&mut self) {
+        let Some(b) = self.boss.as_ref() else { return };
+        let (Some(id), Some(pos)) = (b.key_effect, b.key.map(|k| k.0)) else {
+            return;
+        };
+        if self.entities.iter().any(|e| e.id == id && e.alive) {
+            return;
+        }
+        let key2 = b.key2_model;
+        if let Some(b) = self.boss.as_mut() {
+            b.key_effect = None;
+        }
+        if let Some(m) = key2 {
+            self.spawn(Kind::Effect { life: 30.0 }, Some(m), pos, 0.0);
         }
     }
 
@@ -1311,6 +1342,7 @@ impl Game {
         }
         self.update_meters(dt);
         self.update_fallers(dt);
+        self.update_boss_key();
         self.limit_players_to_camera();
         self.update_legend(dt);
         self.update_wizard(dt);
@@ -2422,6 +2454,25 @@ mod tests {
             p.distance(partner) < 6.0 && (p.y - partner.y).abs() <= 3.0,
             "{p:?} vs {partner:?}"
         );
+    }
+
+    #[test]
+    fn the_boss_key_changes_into_bosskey2() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA5", &[("WAR", "RED")]).unwrap();
+        let (k1, k2) = {
+            let b = g.boss.as_ref().unwrap();
+            (b.key_model, b.key2_model)
+        };
+        assert!(k1.is_some() && k2.is_some(), "{k1:?} {k2:?}");
+        let at = g.players[0].pos;
+        g.boss_death(at);
+        let mut seen2 = false;
+        for _ in 0..1200 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            seen2 |= g.entities.iter().any(|e| e.alive && e.model == k2);
+        }
+        assert!(seen2);
     }
 
     fn wake(g: &mut Game) {
