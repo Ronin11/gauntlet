@@ -90,8 +90,8 @@ fn party_in_game(
     progress.crystals = play.game.crystals;
     progress.garg_items = play.game.garg_items;
     progress.shards = play.game.shards;
-    progress.runes |= play.game.runes;
-    progress.legend_items |= play.game.legend_items;
+    progress.runes |= play.game.runes | play.game.boss_runes;
+    progress.legend = play.game.legend_held;
     party_for(card, &Some(carry), heroes, &progress)
 }
 

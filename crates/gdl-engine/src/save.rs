@@ -69,7 +69,7 @@ impl ClassProgress {
             garg_items: p.garg_items,
             boss_attempts: p.boss_attempts,
             level_masks: p.level_masks,
-            legend_items: p.legend_items,
+            legend_items: p.legend,
             banked_runes: p.banked_runes,
             banked_shards: p.banked_shards,
         }
@@ -111,7 +111,7 @@ impl ClassProgress {
         p.garg_items = m.garg_items;
         p.boss_attempts = m.boss_attempts;
         p.level_masks = m.level_masks;
-        p.legend_items = m.legend_items;
+        p.legend = m.legend_items;
         p.banked_runes = m.banked_runes;
         p.banked_shards = m.banked_shards;
     }
@@ -627,7 +627,7 @@ mod tests {
         p.garg_items = [1, -1, 0];
         p.boss_attempts = [0x2, 0];
         p.level_masks = [1, 0, 4, 0];
-        p.legend_items = 0x10;
+        p.legend = 0x10;
         p.banked_runes = 0x2;
         p.banked_shards = 0x1;
         p
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(party.shards, 0x101);
         assert_eq!(party.boss_attempts, [0x2, 0]);
         assert_eq!(party.level_masks, [1, 0, 4, 0]);
-        assert_eq!(party.legend_items, 0x10);
+        assert_eq!(party.legend, 0x10);
         assert_eq!((party.banked_runes, party.banked_shards), (0x2, 0x1));
     }
 
