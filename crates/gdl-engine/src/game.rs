@@ -276,6 +276,10 @@ pub struct Game {
     pub entities: Vec<Entity>,
     next_id: u64,
     pub cam_focus: Vec3,
+    /// Camera heading (game yaw convention; pi looks along +z) and pitch, smoothed
+    /// towards the nearest of the level's game-camera locators.
+    pub cam_yaw: f32,
+    pub cam_pitch: f32,
     pub time: f32,
     pub rng: Rng,
     /// Set when a player reaches the exit.
@@ -408,6 +412,8 @@ impl Game {
             entities: Vec::new(),
             next_id: 1,
             cam_focus: Vec3::ZERO,
+            cam_yaw: std::f32::consts::PI,
+            cam_pitch: 60f32.to_radians(),
             time: 0.0,
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             exit_to: None,
@@ -476,6 +482,10 @@ impl Game {
         }
         game.cam_focus = game.players.first().map(|p| p.pos).unwrap_or(Vec3::ZERO);
         game.populate(fs, classes.len());
+        if let Some((yaw, pitch)) = game.camera_locator(game.cam_focus) {
+            game.cam_yaw = yaw;
+            game.cam_pitch = pitch.clamp(0.7, 1.3);
+        }
         Ok(game)
     }
 
@@ -889,8 +899,25 @@ impl Game {
 
     /// Camera-relative movement basis on the ground plane (forward, right), in game coordinates.
     pub fn camera_basis(&self) -> (Vec2, Vec2) {
-        // The camera looks along +z; with the X mirror applied at render time, screen-right is +x.
-        (Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0))
+        // Forward on the ground plane, and screen-right (accounting for the render-time X mirror).
+        let f = Vec2::new(-self.cam_yaw.sin(), -self.cam_yaw.cos());
+        (f, Vec2::new(f.y, -f.x))
+    }
+
+    /// The level's game-camera locator nearest to `p`: (yaw, pitch).
+    fn camera_locator(&self, p: Vec3) -> Option<(f32, f32)> {
+        use gdl_formats::worlds::LocatorType;
+        self.level
+            .worlds
+            .locators
+            .iter()
+            .filter(|l| l.kind == LocatorType::CameraGame)
+            .min_by(|a, b| {
+                let da = (Vec3::from(a.pos) - p) * Vec3::new(1.0, 0.5, 1.0);
+                let db = (Vec3::from(b.pos) - p) * Vec3::new(1.0, 0.5, 1.0);
+                da.length_squared().total_cmp(&db.length_squared())
+            })
+            .map(|l| (l.rot[1], l.rot[0]))
     }
 
     fn snap_to_ground(collision: &Collision, pos: &mut Vec3, vy: &mut f32, dt: f32) -> bool {
@@ -931,6 +958,19 @@ impl Game {
             let c = pts.iter().copied().sum::<Vec3>() / pts.len() as f32;
             let k = 1.0 - (-dt * 6.0).exp();
             self.cam_focus = self.cam_focus.lerp(c, k);
+        }
+        // Turn the camera gently towards the local game camera's heading.
+        if let Some((yaw, pitch)) = self.camera_locator(self.cam_focus) {
+            let mut d = yaw - self.cam_yaw;
+            while d > std::f32::consts::PI {
+                d -= std::f32::consts::TAU;
+            }
+            while d < -std::f32::consts::PI {
+                d += std::f32::consts::TAU;
+            }
+            let k = 1.0 - (-dt * 1.5).exp();
+            self.cam_yaw += d * k;
+            self.cam_pitch += (pitch.clamp(0.7, 1.3) - self.cam_pitch) * k;
         }
     }
 
@@ -1748,9 +1788,15 @@ impl Game {
             .map(|p| (p.pos - self.cam_focus).length())
             .fold(0.0f32, f32::max);
         let dist = 36.0 + spread * 0.8;
-        let pitch = 60f32.to_radians();
+        let pitch = self.cam_pitch;
         let at = self.cam_focus + Vec3::Y * 2.0;
-        let eye = at + Vec3::new(0.0, pitch.sin() * dist, -pitch.cos() * dist);
+        let (f, _) = self.camera_basis();
+        let eye = at
+            + Vec3::new(
+                -f.x * pitch.cos() * dist,
+                pitch.sin() * dist,
+                -f.y * pitch.cos() * dist,
+            );
         let near = (dist - CUTAWAY_DEPTH).max(1.0);
         (eye, at, near)
     }
