@@ -5,6 +5,7 @@ pub mod app;
 pub mod attract;
 pub mod audio;
 pub mod boss;
+pub mod camera;
 pub mod character;
 pub mod collision;
 pub mod critter;

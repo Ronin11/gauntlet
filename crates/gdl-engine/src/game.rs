@@ -17,10 +17,10 @@ pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
 pub const PLAYER_COLORS: [&str; 4] = ["RED", "BLU", "YEL", "GRE"];
 
 const GRAVITY: f32 = 60.0;
-const STEP_HEIGHT: f32 = 1.2;
+pub(crate) const STEP_HEIGHT: f32 = 1.2;
 /// PDATA width and height (col_radius 1.5, height 5).
-const PLAYER_RADIUS: f32 = 1.5;
-const PLAYER_HEIGHT: f32 = 5.0;
+pub(crate) const PLAYER_RADIUS: f32 = 1.5;
+pub(crate) const PLAYER_HEIGHT: f32 = 5.0;
 /// PlayerGetTarget: the farthest a target is looked for, and the melee reach
 /// (2 plus the player's radius, from the target's surface).
 const TARGET_RANGE: f32 = 30.0;
@@ -37,12 +37,8 @@ const TURBO_FILL: f32 = 2.0;
 pub fn max_health(level: u32) -> f32 {
     (100.0 * (level.max(1) - 1) as f32 + 500.0).min(9999.0)
 }
-/// How far in front of the camera focus (towards the camera) geometry is kept.
-const CUTAWAY_DEPTH: f32 = 12.0;
 /// Thrown weapons fly until they hit something; this only bounds strays.
 const PROJECTILE_LIFE: f32 = 3.0;
-/// Players are kept within this distance of the group's centre (stay on screen).
-const PARTY_RADIUS: f32 = 13.0;
 
 /// Small deterministic RNG (xorshift) so simulations are reproducible.
 #[derive(Clone)]
@@ -866,11 +862,16 @@ pub struct Game {
     /// World geometry moved by levers and pads.
     pub movers: Vec<Mover>,
     next_id: u64,
+    /// The camera's attention point.
     pub cam_focus: Vec3,
-    /// Camera heading (game yaw convention; pi looks along +z) and pitch, smoothed
-    /// towards the nearest of the level's game-camera locators.
+    /// The yaw from the camera's attention point to its eye (pi: the eye is
+    /// toward -z) and its downward pitch; the controls are relative to them.
     pub cam_yaw: f32,
     pub cam_pitch: f32,
+    /// The gameplay camera (NEWCAM's standard camera, camera.rs).
+    pub camera: crate::camera::GameCamera,
+    /// The player start the party was put at (SetPlayerStart).
+    pub start_index: u16,
     pub time: f32,
     /// 60 Hz ticks since the level started.
     pub frame: u32,
@@ -1401,6 +1402,9 @@ impl Game {
             p.pos = base + Vec3::new((i as f32 - 1.5) * 2.5, 0.5, 0.0);
         }
         self.cam_focus = base;
+        // The camera starts over at the next update, from this start.
+        self.start_index = index;
+        self.camera = Default::default();
     }
 
     pub fn new(fs: &GameFs, level_name: &str, classes: &[(&str, &str)]) -> Result<Game> {
@@ -1432,6 +1436,8 @@ impl Game {
             cam_focus: Vec3::ZERO,
             cam_yaw: std::f32::consts::PI,
             cam_pitch: 60f32.to_radians(),
+            camera: Default::default(),
+            start_index: 0,
             time: 0.0,
             frame: 0,
             heartbeat: 0,
@@ -1646,10 +1652,6 @@ impl Game {
             p.refresh_stats();
         }
         game.populate(fs, classes.len());
-        if let Some((yaw, pitch)) = game.camera_locator(game.cam_focus) {
-            game.cam_yaw = yaw;
-            game.cam_pitch = pitch.clamp(0.7, 1.3);
-        }
         Ok(game)
     }
 
@@ -2540,7 +2542,8 @@ impl Game {
         (f, Vec2::new(f.y, -f.x))
     }
 
-    /// The level's game-camera locator nearest to `p`: (yaw, pitch).
+    /// The level's game-camera locator nearest to `p`, as its sTriggerCameras
+    /// record holds it: (locator yaw + pi, locator pitch).
     fn camera_locator(&self, p: Vec3) -> Option<(f32, f32)> {
         use gdl_formats::worlds::LocatorType;
         self.level
@@ -2553,7 +2556,12 @@ impl Game {
                 let db = (Vec3::from(b.pos) - p) * Vec3::new(1.0, 0.5, 1.0);
                 da.length_squared().total_cmp(&db.length_squared())
             })
-            .map(|l| (l.rot[1], l.rot[0]))
+            .map(|l| {
+                (
+                    crate::camera::wrap(l.rot[1] + std::f32::consts::PI),
+                    l.rot[0],
+                )
+            })
     }
 
     /// PlayerMotion_FloorFX: a world object flagged 0xF0000 (lava, fire, spikes)
@@ -2705,45 +2713,7 @@ impl Game {
         self.update_boss(dt);
         self.heartbeat();
         self.check_level_end();
-        if self
-            .boss
-            .as_ref()
-            .and_then(|b| b.cam.as_ref())
-            .is_some_and(|c| c.started)
-        {
-            return;
-        }
-
-        // Camera follows the centroid of living players.
-        let alive: Vec<Vec3> = self
-            .players
-            .iter()
-            .filter(|p| p.state.active())
-            .map(|p| p.pos)
-            .collect();
-        let pts = if alive.is_empty() {
-            self.players.iter().map(|p| p.pos).collect()
-        } else {
-            alive
-        };
-        if !pts.is_empty() {
-            let c = pts.iter().copied().sum::<Vec3>() / pts.len() as f32;
-            let k = 1.0 - (-dt * 6.0).exp();
-            self.cam_focus = self.cam_focus.lerp(c, k);
-        }
-        // Turn the camera gently towards the local game camera's heading.
-        if let Some((yaw, pitch)) = self.camera_locator(self.cam_focus) {
-            let mut d = yaw - self.cam_yaw;
-            while d > std::f32::consts::PI {
-                d -= std::f32::consts::TAU;
-            }
-            while d < -std::f32::consts::PI {
-                d += std::f32::consts::TAU;
-            }
-            let k = 1.0 - (-dt * 1.5).exp();
-            self.cam_yaw += d * k;
-            self.cam_pitch += (pitch.clamp(0.7, 1.3) - self.cam_pitch) * k;
-        }
+        self.update_camera(dt);
     }
 
     fn update_players(&mut self, dt: f32, inputs: &[PlayerInput]) {
@@ -3256,22 +3226,6 @@ impl Game {
                     let push = n * (min - len) * 0.5;
                     self.players[a].pos -= Vec3::new(push.x, 0.0, push.y);
                     self.players[b].pos += Vec3::new(push.x, 0.0, push.y);
-                }
-            }
-        }
-        // Keep the party together: nobody may wander too far from the group's centre.
-        let alive: Vec<usize> = (0..self.players.len())
-            .filter(|&i| self.players[i].state.active())
-            .collect();
-        if alive.len() > 1 {
-            let c = alive.iter().map(|&i| self.players[i].pos).sum::<Vec3>() / alive.len() as f32;
-            for &i in &alive {
-                let p = &mut self.players[i];
-                let d = Vec2::new(p.pos.x - c.x, p.pos.z - c.z);
-                if d.length() > PARTY_RADIUS {
-                    let lim = d.normalize() * PARTY_RADIUS;
-                    p.pos.x = c.x + lim.x;
-                    p.pos.z = c.z + lim.y;
                 }
             }
         }
@@ -5433,8 +5387,7 @@ impl Game {
         (eye, at)
     }
 
-    /// Camera eye, target and near-plane distance. The near plane is pushed out to just
-    /// in front of the players so roofs and walls between them and the camera are cut away.
+    /// Camera eye, target and near-plane distance.
     pub fn camera_view(&self) -> (Vec3, Vec3, f32) {
         if let Some((eye, at)) = self.fixed_camera {
             return (eye, at, 0.5);
@@ -5446,27 +5399,6 @@ impl Game {
             return v;
         }
         self.camera_view_normal()
-    }
-
-    /// The level camera (do_camera): behind the party's centre.
-    pub(crate) fn camera_view_normal(&self) -> (Vec3, Vec3, f32) {
-        let spread = self
-            .players
-            .iter()
-            .map(|p| (p.pos - self.cam_focus).length())
-            .fold(0.0f32, f32::max);
-        let dist = 36.0 + spread * 0.8;
-        let pitch = self.cam_pitch;
-        let at = self.cam_focus + Vec3::Y * 2.0;
-        let (f, _) = self.camera_basis();
-        let eye = at
-            + Vec3::new(
-                -f.x * pitch.cos() * dist,
-                pitch.sin() * dist,
-                -f.y * pitch.cos() * dist,
-            );
-        let near = (dist - CUTAWAY_DEPTH).max(1.0);
-        (eye, at, near)
     }
 }
 
@@ -5742,13 +5674,14 @@ mod tests {
             *speed = 0.0;
         }
         let id = g.spawn(kind, model, p + Vec3::new(0.0, 0.0, 12.0), 0.0);
-        let fire = PlayerInput {
-            stick: Vec2::new(0.0, 0.4),
-            attack: true,
-            attack_pressed: true,
-            ..Default::default()
-        };
         for _ in 0..120 {
+            // Toward +z (the stick is camera relative).
+            let fire = PlayerInput {
+                stick: g.stick_toward(Vec2::new(0.0, 0.4)),
+                attack: true,
+                attack_pressed: true,
+                ..Default::default()
+            };
             g.update(1.0 / 60.0, &[fire]);
             if !g.entities.iter().any(|e| e.id == id) {
                 break;
@@ -6161,12 +6094,13 @@ mod tests {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
         g.entities.retain(|e| matches!(e.kind, Kind::Door { .. }));
-        let walk = PlayerInput {
-            stick: Vec2::new(0.0, 1.0),
+        // Walk toward +z (the stick is camera relative).
+        let walk = |g: &Game| PlayerInput {
+            stick: g.stick_toward(Vec2::new(0.0, 1.0)),
             ..Default::default()
         };
         for _ in 0..400 {
-            g.update(1.0 / 60.0, &[walk]);
+            g.update(1.0 / 60.0, &[walk(&g)]);
         }
         assert!(
             g.players[0].pos.z < 27.0,
@@ -6175,7 +6109,7 @@ mod tests {
         );
         g.players[0].keys = 1;
         for _ in 0..200 {
-            g.update(1.0 / 60.0, &[walk]);
+            g.update(1.0 / 60.0, &[walk(&g)]);
         }
         assert!(
             g.players[0].pos.z > 29.0,

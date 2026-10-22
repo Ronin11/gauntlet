@@ -51,6 +51,8 @@ pub struct LevelDef {
     pub max_enemies: i16,
     /// Index into the realm's BCAM table (boss camera), or -1.
     pub boss_cam: i16,
+    /// Index into the realm's CAMS table (level_data.camidx @0x58).
+    pub cam_index: i16,
     pub rune: i16,
     pub legend: i16,
     pub player_level: f32,
@@ -210,6 +212,31 @@ pub struct Realm {
     pub enemy_variants: Vec<String>,
     /// BCAM: boss camera parameters, indexed by [`LevelDef::boss_cam`].
     pub boss_cams: Vec<BossCamDef>,
+    /// CAMS: level camera parameters, indexed by [`LevelDef::cam_index`].
+    pub cams: Vec<CamDef>,
+}
+
+/// One CAMS record (`camera_data`, 0x6C bytes; the fields NEWCAM and
+/// camera_mode_level read).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CamDef {
+    pub dir: i16,
+    pub pitch_dir: i16,
+    pub dp: f32,
+    /// Multiplayer pitch floor (radians, positive looks down).
+    pub minpitch: f32,
+    /// Bounds for the camera's attention point.
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    /// 0: min/max are derived from the world bounds (camera_mode_level).
+    pub limits: i8,
+    pub start_event: i8,
+    pub attcam: i16,
+    pub att_data: f32,
+    pub minrad: f32,
+    pub maxrad: f32,
+    pub enemax: i16,
+    pub special_radius: i16,
 }
 
 /// One BCAM record (`bosscam_data`, 0x54 bytes).
@@ -304,6 +331,7 @@ impl Realm {
                 audio_index: i16_at(o + 0x5A),
                 max_enemies: i16_at(o + 0x8E),
                 boss_cam: i16_at(o + 0x8C),
+                cam_index: i16_at(o + 0x58),
                 rune: i16_at(o + 0x90),
                 legend: i16_at(o + 0x92),
                 player_level: f32_at(o + 0x9C),
@@ -410,7 +438,34 @@ impl Realm {
                 });
             }
         }
+        let mut cams = Vec::new();
+        if let Some(&(_, co, n)) = dir.iter().find(|(t, _, _)| t == "CAMS") {
+            for k in 0..n {
+                let o = co + k * 0x6C;
+                if o + 0x6C > d.len() {
+                    bail!("CAMS record {k} past end of WAD");
+                }
+                let v3 = |j: usize| [f32_at(o + j), f32_at(o + j + 4), f32_at(o + j + 8)];
+                cams.push(CamDef {
+                    dir: i16_at(o),
+                    pitch_dir: i16_at(o + 2),
+                    dp: f32_at(o + 4),
+                    minpitch: f32_at(o + 8),
+                    min: v3(0xC),
+                    max: v3(0x18),
+                    limits: d[o + 0x24] as i8,
+                    start_event: d[o + 0x25] as i8,
+                    attcam: i16_at(o + 0x26),
+                    att_data: f32_at(o + 0x28),
+                    minrad: f32_at(o + 0x2C),
+                    maxrad: f32_at(o + 0x30),
+                    enemax: i16_at(o + 0x34),
+                    special_radius: i16_at(o + 0x36),
+                });
+            }
+        }
         Ok(Realm {
+            cams,
             realm_type,
             letter,
             levels,
@@ -517,6 +572,13 @@ impl Worlds {
         realm.boss_cams.get(usize::try_from(level.boss_cam).ok()?)
     }
 
+    /// The level camera record of a wave's level, if it has one.
+    pub fn cam(&self, wave: u32) -> Option<&CamDef> {
+        let realm = self.realm(wave >> 8)?;
+        let level = realm.levels.get((wave & 0xFF) as usize)?;
+        realm.cams.get(usize::try_from(level.cam_index).ok()?)
+    }
+
     /// The level directory for a wave ("levelA6").
     pub fn dir(&self, wave: u32) -> Option<String> {
         Some(format!("level{}", self.level(wave)?.name))
@@ -538,6 +600,22 @@ mod tests {
             return None;
         }
         Some(Worlds::load(|p| Ok(std::fs::read(dir.join(p))?)).unwrap())
+    }
+
+    #[test]
+    fn level_cameras() {
+        let Some(w) = worlds() else { return };
+        for r in &w.realms {
+            for (i, l) in r.levels.iter().enumerate() {
+                let wave = (r.realm_type << 8) | i as u32;
+                let c = w.cam(wave);
+                if std::env::var_os("GDL_DUMP_CAMS").is_some() {
+                    println!("{} {:?}", l.name, c);
+                }
+                let c = c.expect("every level has a camera record");
+                assert!(c.minrad > 0.0 && c.maxrad >= c.minrad, "{} {c:?}", l.name);
+            }
+        }
     }
 
     #[test]
