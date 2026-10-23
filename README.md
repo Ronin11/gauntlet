@@ -42,7 +42,7 @@ counts as a controller (Enter). In the tower, a new controller can join with Sta
 | Fullscreen | | | F11 |
 
 Other options: `--level levelB1` to start elsewhere, `--players WAR,VAL/BLU` to skip the
-join screen, `--mute`. See `gauntlet --help`.
+join screen, `--mute`. See `gauntlet --help`. Sound starts at 20% of the original's level (the Audio options scale on top); `GDL_VOLUME=0.5` sets another level.
 
 ## Debug menu (developer tool)
 

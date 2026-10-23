@@ -133,10 +133,20 @@ impl SoundLib {
     }
 }
 
+/// Not in the original: everything plays at this share of the game's own
+/// levels (the Audio options still scale on top), as full level is far too
+/// loud on a PC or tablet. GDL_VOLUME=<0..1> overrides it.
+pub fn master_gain() -> f32 {
+    std::env::var("GDL_VOLUME")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map_or(0.2, |v| v.clamp(0.0, 1.0))
+}
+
 /// Owns the audio thread. Dropping it stops playback.
 pub struct Audio {
     tx: Option<mpsc::Sender<Cmd>>,
-    /// Sound-effect volume from the options (1.0 = the default 128).
+    /// Sound-effect volume from the options (master_gain() = the default 128).
     sfx_vol: f32,
     /// Music volume from the options, and the fade applied on top of it.
     music_vol: f32,
@@ -181,7 +191,7 @@ impl Audio {
                     |c: Vec<(Pcm, u32)>| c.into_iter().map(|(pcm, rate)| buf(1, rate, &pcm));
                 // Keep the current music sink alive; replacing it stops the previous track.
                 let mut _music: Option<rodio::Sink> = None;
-                let mut music_vol = 1.0f32;
+                let mut music_vol = master_gain();
                 let voice = Some(new_sink());
                 let mut loops: std::collections::HashMap<u64, rodio::Sink> = Default::default();
                 while let Ok(cmd) = rx.recv() {
@@ -280,8 +290,8 @@ impl Audio {
                 }
             });
         Audio {
-            sfx_vol: 1.0,
-            music_vol: 1.0,
+            sfx_vol: master_gain(),
+            music_vol: master_gain(),
             music_fade: 1.0,
             loops: Default::default(),
             tx: spawned.ok().map(|_| tx),
@@ -373,7 +383,7 @@ impl Audio {
         }
         let vol = vol * gain;
         let _ = tx.send(if voice {
-            Cmd::Voice(all, vol.min(1.0))
+            Cmd::Voice(all, (vol * master_gain()).min(1.0))
         } else {
             Cmd::Sfx(all, (vol * 0.8 * self.sfx_vol).min(1.0))
         });
@@ -511,8 +521,8 @@ impl Audio {
 
     /// Apply the Audio options: music and sfx volumes (128 is the default).
     pub fn set_volumes(&mut self, prefs: &crate::options::Prefs) {
-        self.sfx_vol = prefs.sfx_vol as f32 / 128.0;
-        self.music_vol = prefs.music_vol as f32 / 128.0;
+        self.sfx_vol = master_gain() * prefs.sfx_vol as f32 / 128.0;
+        self.music_vol = master_gain() * prefs.music_vol as f32 / 128.0;
         self.send_music_volume();
     }
 
