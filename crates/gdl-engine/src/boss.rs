@@ -161,8 +161,10 @@ pub struct Boss {
     pub legend_aura: Option<(u64, f32)>,
     pub legend_hold: Option<u64>,
     pub legend_shot: Option<u64>,
-    /// The safe rock's model (SAFEROCK0 in the realm's item file).
-    pub safe_rock_model: Option<usize>,
+    /// The safe rock's model per damage tier (AddItemWobj's "%s%d":
+    /// SAFEROCK0 the rubble .. SAFEROCK3 whole, each found with or
+    /// without its L1 suffix, ItemFindMBObjectL1).
+    pub safe_rock_models: [Option<usize>; 4],
 }
 
 /// A safe rock (obstacle subtype 0x29): an eruption spot, and cover once it
@@ -171,13 +173,14 @@ pub struct Boss {
 pub struct SafeRock {
     pub pos: Vec3,
     pub yaw: f32,
-    pub model: Option<usize>,
     pub solid: Option<crate::game::Shape>,
+    /// The info's hit points (a tier's worth of health).
     pub hit_points: f32,
     pub armor: f32,
     /// The entity while it is shown.
     pub entity: Option<u64>,
-    /// data.obsticle.strength: -1 hidden, 0 risen; > 0 counts as active.
+    /// data.obsticle.strength: the damage tier shown (AddItemWobj), -1
+    /// hidden; > 0 counts as active, 0 is rubble.
     pub strength: i32,
     /// SafeRockActiveCounter: seconds until it rises.
     pub counter: f32,
@@ -484,11 +487,23 @@ impl Game {
             .map(|n| self.item_model_pub(fs, &mut cache, &mut known, &dirs, n));
         let key = self.item_model_pub(fs, &mut cache, &mut known, &dirs, "BOSSKEY");
         let key2 = self.item_model_pub(fs, &mut cache, &mut known, &dirs, "BOSSKEY2");
-        // [CHOICE] The SAFEROCK item has models SAFEROCK0..3 (by damage, we
-        // take it); the undamaged one is used.
-        let safe_rock_model = self
-            .item_model_pub(fs, &mut cache, &mut known, &dirs, "SAFEROCK0")
-            .or_else(|| self.item_model_pub(fs, &mut cache, &mut known, &dirs, "SAFEROCK"));
+        // The safe rock's tiers: "%s%d" of its info's name, through
+        // ItemFindMBObjectL1 (B6 and K5 name them SAFEROCK<n>L1, I5
+        // SAFEROCK<n>).
+        let rock_name = self
+            .level
+            .worlds
+            .item_infos
+            .iter()
+            .find(|i| i.item_type == gdl_formats::worlds::ItemType::Obstacle && i.subtype == 0x29)
+            .map_or_else(|| "SAFEROCK".to_string(), |i| i.name.clone());
+        let safe_rock_models = [0, 1, 2, 3].map(|t| {
+            let n = format!("{rock_name}{t}");
+            self.item_model_pub(fs, &mut cache, &mut known, &dirs, &n)
+                .or_else(|| {
+                    self.item_model_pub(fs, &mut cache, &mut known, &dirs, &format!("{n}L1"))
+                })
+        });
         let legend_models = (
             self.item_model_pub(fs, &mut cache, &mut known, &dirs, "LEGENDHLD"),
             self.item_model_pub(fs, &mut cache, &mut known, &dirs, "LEGENDPRJ"),
@@ -514,7 +529,7 @@ impl Game {
             b.key2_model = key2;
             b.legend_models = legend_models;
             b.legend_fx = legend_fx;
-            b.safe_rock_model = safe_rock_model;
+            b.safe_rock_models = safe_rock_models;
         }
         // Skorne's altar: the floor pieces his stages throw up (obstacles of
         // subtype 0x33 whose model is the level object named by the instance).
@@ -737,7 +752,8 @@ impl Game {
     }
 
     /// CritterProcessSafeRocks: collect the rocks once (hiding them when the
-    /// boss has a SPOUT2), then count down the risen-rock timers.
+    /// boss has a SPOUT2), then count down the risen-rock timers. Each frame
+    /// a shown rock also shows its damage tier (AddItemWobj).
     pub(crate) fn process_safe_rocks(&mut self, hide: bool, dt: f32) {
         if self.boss.as_ref().is_some_and(|b| b.safe_rocks.is_none()) {
             let rocks = self.collect_safe_rocks(hide);
@@ -767,13 +783,94 @@ impl Game {
         for i in rise {
             self.safe_rock_activate(i);
         }
+        let n = self
+            .boss
+            .as_ref()
+            .and_then(|b| b.safe_rocks.as_ref())
+            .map_or(0, |v| v.len());
+        for i in 0..n {
+            self.safe_rock_wobj(i);
+        }
+    }
+
+    /// AddItemWobj: the tier a rock's health makes (0 at none, 1 up to its
+    /// hit points, 2 up to twice them, else 3) picks its model; at 0 it is
+    /// rubble, no longer hit or in the way, and with no model for the tier
+    /// it is hidden (strength -1). A broken container counts as no health.
+    fn safe_rock_wobj(&mut self, i: usize) {
+        let Some(b) = self.boss.as_ref() else { return };
+        let models = b.safe_rock_models;
+        let Some(r) = b.safe_rocks.as_ref().and_then(|v| v.get(i)).cloned() else {
+            return;
+        };
+        let Some(id) = r.entity else { return };
+        if r.strength <= 0 {
+            return;
+        }
+        let ent = self.entities.iter().position(|e| e.id == id);
+        let hp = ent.map_or(0.0, |ei| match self.entities[ei].kind {
+            Kind::Container { hp, .. } if self.entities[ei].alive => hp.max(0.0),
+            _ => 0.0,
+        });
+        let base = r.hit_points;
+        let tier = if hp <= 0.0 {
+            0
+        } else if hp <= base {
+            1
+        } else if hp <= base * 2.0 {
+            2
+        } else {
+            3
+        };
+        if tier == r.strength {
+            return;
+        }
+        let model = models[tier as usize];
+        let (strength, entity) = match (tier, model) {
+            (_, None) => {
+                if let Some(ei) = ent {
+                    self.entities[ei].alive = false;
+                }
+                (-1, None)
+            }
+            (0, Some(m)) => {
+                if let Some(ei) = ent {
+                    self.entities[ei].alive = false;
+                }
+                (0, Some(self.spawn(Kind::Prop, Some(m), r.pos, r.yaw)))
+            }
+            // MBSetObject: the same rock in the tier's model (a new entity,
+            // so it gets an instance of that model).
+            (t, Some(m)) => {
+                let Some(ei) = ent else { return };
+                let kind = self.entities[ei].kind.clone();
+                self.entities[ei].alive = false;
+                let nid = self.spawn(kind, Some(m), r.pos, r.yaw);
+                if let Some(e) = self.entities.iter_mut().find(|e| e.id == nid) {
+                    e.solid = r.solid;
+                }
+                (t, Some(nid))
+            }
+        };
+        if let Some(rr) = self
+            .boss
+            .as_mut()
+            .and_then(|b| b.safe_rocks.as_mut())
+            .and_then(|v| v.get_mut(i))
+        {
+            rr.strength = strength;
+            rr.entity = entity;
+        }
     }
 
     /// CollectSafeRocks: the level's obstacle items of subtype 0x29 (at most
-    /// 16), hidden (strength -1) when `hide`.
+    /// 16), hidden (strength -1) when `hide`. SetItem case 10 shows each
+    /// with the placed strength (params[2]) as its tier and that many times
+    /// its hit points.
     fn collect_safe_rocks(&mut self, hide: bool) -> Vec<SafeRock> {
         use gdl_formats::worlds::ItemType;
         let np = self.players.len().max(1);
+        let models = self.boss.as_ref().map_or([None; 4], |b| b.safe_rock_models);
         let mut out = Vec::new();
         let insts = self.level.worlds.item_instances.clone();
         for inst in &insts {
@@ -789,6 +886,7 @@ impl Game {
             let pos = Vec3::from(inst.pos);
             let fwd = crate::character::ryp_matrix(inst.rot).transform_vector3(Vec3::Z);
             let yaw = fwd.x.atan2(fwd.z);
+            let strength = i16::from_le_bytes([inst.params[2], inst.params[3]]) as i32;
             let found = self
                 .entities
                 .iter_mut()
@@ -801,48 +899,59 @@ impl Game {
                     if hide {
                         e.alive = false;
                     }
-                    (e.id, e.model, e.solid)
+                    (e.id, e.solid)
                 });
-            let model = found
-                .and_then(|f| f.1)
-                .or(self.boss.as_ref().and_then(|b| b.safe_rock_model));
             let solid = found
-                .and_then(|f| f.2)
+                .and_then(|f| f.1)
                 .or(Some(crate::game::Shape::Cylinder {
                     radius: info.radius.clamp(0.4, 6.0),
                 }));
+            let hit_points = info.hit_points.max(1) as f32;
             let mut r = SafeRock {
                 pos,
                 yaw,
-                model,
                 solid,
-                hit_points: info.hit_points.max(1) as f32,
+                hit_points,
                 armor: info.armor.max(0) as f32,
                 entity: found.map(|f| f.0),
-                strength: 1,
+                strength: strength.clamp(0, 3),
                 counter: 0.0,
             };
             if hide {
                 r.entity = None;
                 r.strength = -1;
-            } else if r.entity.is_none() {
-                // Shown from the start (no SPOUT2): place it.
-                let id = self.spawn(
-                    Kind::Container {
-                        hp: r.hit_points,
-                        drop: None,
-                        chest: false,
-                        armor: r.armor,
-                        sub: 0,
-                    },
-                    model,
-                    pos,
-                    yaw,
-                );
+            } else {
+                // Shown from the start (no SPOUT2).
+                let model = models[r.strength as usize];
+                let kind = Kind::Container {
+                    hp: hit_points * r.strength as f32,
+                    drop: None,
+                    chest: false,
+                    armor: r.armor,
+                    sub: 0,
+                };
+                let id = match r.entity {
+                    Some(id) => {
+                        if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+                            e.kind = kind;
+                            e.model = model;
+                        }
+                        id
+                    }
+                    None => self.spawn(kind, model, pos, yaw),
+                };
                 if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
                     e.solid = solid;
                 }
                 r.entity = Some(id);
+                if model.is_none() {
+                    // SetItemGeo finds no object: nothing shows, nothing stands.
+                    if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+                        e.alive = false;
+                    }
+                    r.entity = None;
+                    r.strength = -1;
+                }
             }
             out.push(r);
             if out.len() >= 16 {
@@ -906,15 +1015,12 @@ impl Game {
         hp.is_some_and(|h| h > 0.0) && r.strength > 0
     }
 
-    /// SafeRockActivate: the rock is back, with 3x its hit points.
+    /// SafeRockActivate: the rock is back, with 3x its hit points (strength
+    /// 0, then AddItemWobj's tier: 3).
     fn safe_rock_activate(&mut self, i: usize) {
-        let Some(r) = self
-            .boss
-            .as_ref()
-            .and_then(|b| b.safe_rocks.as_ref())
-            .and_then(|v| v.get(i))
-            .cloned()
-        else {
+        let Some(b) = self.boss.as_ref() else { return };
+        let models = b.safe_rock_models;
+        let Some(r) = b.safe_rocks.as_ref().and_then(|v| v.get(i)).cloned() else {
             return;
         };
         if let Some(id) = r.entity {
@@ -922,29 +1028,35 @@ impl Game {
                 e.alive = false;
             }
         }
-        let id = self.spawn(
-            Kind::Container {
-                hp: r.hit_points * 3.0,
-                drop: None,
-                chest: false,
-                armor: r.armor,
-                sub: 0,
-            },
-            r.model,
-            r.pos,
-            r.yaw,
-        );
-        if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
-            e.solid = r.solid;
-        }
+        let (strength, entity) = match models[3] {
+            Some(m) => {
+                let id = self.spawn(
+                    Kind::Container {
+                        hp: r.hit_points * 3.0,
+                        drop: None,
+                        chest: false,
+                        armor: r.armor,
+                        sub: 0,
+                    },
+                    Some(m),
+                    r.pos,
+                    r.yaw,
+                );
+                if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
+                    e.solid = r.solid;
+                }
+                (3, Some(id))
+            }
+            None => (-1, None),
+        };
         if let Some(rr) = self
             .boss
             .as_mut()
             .and_then(|b| b.safe_rocks.as_mut())
             .and_then(|v| v.get_mut(i))
         {
-            rr.entity = Some(id);
-            rr.strength = 0;
+            rr.entity = entity;
+            rr.strength = strength;
         }
     }
 
@@ -2021,14 +2133,9 @@ impl Game {
         }
         let fwd = cam_forward(cam.yaw, cam.pitch);
         let eye = cam.attn - fwd * cam.dist;
-        // Keep the near plane short of the nearest player so nobody is cut away.
-        let near = self
-            .players
-            .iter()
-            .filter(|p| p.state.active())
-            .map(|p| (p.pos - eye).dot(fwd))
-            .fold(cam.dist, f32::min);
-        Some((eye, cam.attn, (near - 8.0).clamp(1.0, cam.dist)))
+        // The window's own near plane (pbWindow near_z): bosscam.c moves only
+        // the camera, it never pulls the clip plane in.
+        Some((eye, cam.attn, crate::camera::NEAR))
     }
 
     /// BossCameraUpdate: the player calc until the fight starts, then the
@@ -2818,7 +2925,7 @@ mod tests {
         }
         let r = rocks(&g);
         let id = r[3].entity.expect("the rock rose");
-        assert_eq!(r[3].strength, 0);
+        assert_eq!(r[3].strength, 3);
         let e = g.entities.iter().find(|e| e.id == id).unwrap();
         assert!(
             matches!(e.kind, Kind::Container { hp, .. } if (hp - 3.0 * r[3].hit_points).abs() < 1e-3)
@@ -2844,8 +2951,86 @@ mod tests {
         g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
         let r = rocks(&g);
         assert!(!r.is_empty());
-        assert!(r.iter().all(|r| r.strength == 1 && r.entity.is_some()));
+        assert!(r.iter().all(|r| r.strength == 3 && r.entity.is_some()));
         assert_eq!(g.safe_rock_positions().len(), r.len());
+    }
+
+    /// The Dragon's mountain places its safe rocks at strength 3 (SetItem:
+    /// SAFEROCK3L1, 3x the hit points); the 3-way shot lies inside one. The
+    /// rock stands in the way until it is broken down tier by tier to the
+    /// SAFEROCK0L1 rubble, which neither blocks nor takes hits; then the
+    /// power-up can be picked up.
+    #[test]
+    fn dragon_safe_rock_hides_the_three_way_shot() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelB6", &[("WAR", "RED")]).unwrap();
+        g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        let models = g.boss.as_ref().unwrap().safe_rock_models;
+        assert!(models.iter().all(|m| m.is_some()), "{models:?}");
+        let r = rocks(&g);
+        assert_eq!(r.len(), 6);
+        assert!(r.iter().all(|r| r.strength == 3 && r.entity.is_some()));
+        let (icon, icon_pos) = g
+            .entities
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    Kind::Pickup {
+                        kind: PickupKind::Powerup { flags: 0x80000, .. },
+                        ..
+                    }
+                )
+            })
+            .map(|e| (e.id, e.pos))
+            .expect("the 3-way shot");
+        let ri = r
+            .iter()
+            .position(|r| (r.pos - icon_pos).length() < 1.0)
+            .expect("a rock over it");
+        let rock_id = r[ri].entity.unwrap();
+        let rock = g.entities.iter().find(|e| e.id == rock_id).unwrap();
+        assert_eq!(rock.model, models[3]);
+        assert!(rock.solid.is_some());
+        let walk = |g: &mut Game, frames: usize| {
+            for _ in 0..frames {
+                g.players[0].health = 500.0;
+                let to = icon_pos - g.players[0].pos;
+                let input = crate::input::PlayerInput {
+                    stick: g.stick_toward(Vec2::new(to.x, to.z)).normalize_or_zero(),
+                    ..Default::default()
+                };
+                g.update(1.0 / 60.0, &[input]);
+                if !g.entities.iter().any(|e| e.id == icon && e.alive) {
+                    return true;
+                }
+            }
+            false
+        };
+        assert!(!walk(&mut g, 300), "picked up through the rock");
+        // Break it down: each tier shows its model, then the rubble.
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            let id = rocks(&g)[ri].entity;
+            let Some(t) = g.entities.iter().position(|e| {
+                Some(e.id) == id && e.alive && matches!(e.kind, Kind::Container { .. })
+            }) else {
+                break;
+            };
+            assert_eq!(g.entities[t].model, models[rocks(&g)[ri].strength as usize]);
+            g.hit_entity(0, t, 30.0, Vec2::ZERO, true);
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            let s = rocks(&g)[ri].strength;
+            if seen.last() != Some(&s) {
+                seen.push(s);
+            }
+        }
+        assert_eq!(seen, [3, 2, 1, 0]);
+        let rubble = rocks(&g)[ri].entity.expect("the rubble");
+        let e = g.entities.iter().find(|e| e.id == rubble).unwrap();
+        assert!(matches!(e.kind, Kind::Prop) && e.solid.is_none());
+        assert_eq!(e.model, models[0]);
+        assert!(walk(&mut g, 600), "the 3-way shot can't be picked up");
     }
 
     /// SafeRockSetup: the Lich's dirt mound is hidden; Skorne's stages throw
@@ -2961,9 +3146,30 @@ mod tests {
         let mut g = Game::new(&fs, "levelB6", &[("WAR", "RED")]).unwrap();
         let bp = g.boss_critter().unwrap().0.pos;
         assert!((bp.y - (29.65 + 18.5)).abs() < 0.5, "dragon at {bp:?}");
+        // The boss camera keeps the window's near plane: nothing between it
+        // and the heroes is cut away (the floor in front, the safe rocks, the
+        // Dragon's parts), and with an unchanging near plane the render
+        // interpolation never takes a tick as a camera cut.
+        let mut prev = None;
+        let mut blended = 0;
         for _ in 0..600 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            let walk = crate::input::PlayerInput {
+                stick: Vec2::new(0.6, 0.0),
+                ..Default::default()
+            };
+            g.update(1.0 / 60.0, &[walk]);
+            let view = g.camera_view();
+            assert_eq!(view.2, crate::camera::NEAR);
+            if let Some(a) = prev.filter(|a: &crate::interp::Cam| {
+                g.boss_camera_view().is_some() && a.0.distance(view.0) > 1e-4
+            }) {
+                let half = crate::interp::blend_cam(a, view, 0.5);
+                assert!(half.0.distance(view.0) > 1e-5, "taken as a cut");
+                blended += 1;
+            }
+            prev = Some(view);
         }
+        assert!(blended > 100, "{blended} blended ticks");
         let (eye, at, _) = g.camera_view();
         let p = g.players[0].pos;
         assert!(
