@@ -29,6 +29,11 @@ pub struct Progress {
     pub banked_shards: u16,
     /// EnterTower has run this session (lbl_80344C4C).
     pub entered_tower: bool,
+    /// Not in the original: the party has had Sumner's welcome. Kept in each
+    /// class record of the save, so a hero saved before earning any
+    /// experience isn't welcomed again every time the game is started
+    /// (sumnerUpdatePresence only looks at experience).
+    pub welcomed: bool,
     /// boss_attempt1/2: realms (bit = realm type) whose Guardian has killed a
     /// player once / twice.
     pub boss_attempts: [u16; 2],

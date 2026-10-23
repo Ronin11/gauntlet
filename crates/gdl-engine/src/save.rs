@@ -59,6 +59,8 @@ pub struct ClassProgress {
     pub legend_items: u16,
     pub banked_runes: u16,
     pub banked_shards: u16,
+    /// Not in the original: Sumner has welcomed the party (Progress::welcomed).
+    pub welcomed: bool,
 }
 
 /// Counts that end at -1 once done: done wins, otherwise the larger count.
@@ -83,6 +85,7 @@ impl ClassProgress {
             legend_items: p.legend,
             banked_runes: p.banked_runes,
             banked_shards: p.banked_shards,
+            welcomed: p.welcomed,
         }
     }
 
@@ -109,6 +112,7 @@ impl ClassProgress {
         self.legend_items |= o.legend_items;
         self.banked_runes |= o.banked_runes;
         self.banked_shards |= o.banked_shards;
+        self.welcomed |= o.welcomed;
     }
 
     /// Bring a loaded hero's achievements into the party's progress.
@@ -125,6 +129,7 @@ impl ClassProgress {
         p.legend = m.legend_items;
         p.banked_runes = m.banked_runes;
         p.banked_shards = m.banked_shards;
+        p.welcomed = m.welcomed;
     }
 }
 
@@ -409,8 +414,13 @@ fn join<T: std::fmt::Display>(v: &[T]) -> String {
 /// powerup <time> <kind> <amount> <flags> <state>     (11 lines)
 /// beaten <u16 x16>  runes  shards  crystals <x9>  garg <x3>
 /// boss <x2>  masks <x4>  legend  banked <runes> <shards>
+/// welcomed 1                                         (only once welcomed)
 /// end
 /// ```
+///
+/// Per-class keys a build doesn't know are skipped, so `welcomed` (added
+/// after version 2) needs no version bump: older builds still read the card,
+/// and older cards load as not yet welcomed.
 pub fn serialize(opts: Option<&GameOpts>, entries: &[Option<HeroSave>; FILES]) -> String {
     let mut s = format!("{MAGIC} {VERSION}\n");
     if let Some(o) = opts {
@@ -481,6 +491,9 @@ pub fn serialize(opts: Option<&GameOpts>, entries: &[Option<HeroSave>; FILES]) -
                 "legend {}\nbanked {} {}\n",
                 p.legend_items, p.banked_runes, p.banked_shards
             );
+            if p.welcomed {
+                s += "welcomed 1\n";
+            }
         }
         s += "end\n";
     }
@@ -662,6 +675,7 @@ pub fn parse(text: &str) -> Result<CardFile, String> {
                         "masks" => p.level_masks = nums(rest)?,
                         "legend" => p.legend_items = num(rest)?,
                         "banked" => [p.banked_runes, p.banked_shards] = nums(rest)?,
+                        "welcomed" => p.welcomed = num::<u8>(rest)? != 0,
                         // Keys from a later version are skipped.
                         _ => {}
                     }
@@ -731,6 +745,7 @@ mod tests {
         p.legend = 0x10;
         p.banked_runes = 0x2;
         p.banked_shards = 0x1;
+        p.welcomed = true;
         p
     }
 
