@@ -31,6 +31,26 @@ pub struct Entry {
     pub last_beaten: Option<u32>,
 }
 
+/// sumnerUpdatePresence: Sumner welcomes the party (gSumnerReady) on the
+/// session's first tower entry (lbl_80344C4C == 0) when no active player has
+/// experience in any of the 16 class slots of their save image
+/// (`save.atts[k].exp`). `exps` is every active player's live experience and
+/// every class slot of their hero's save.
+///
+/// Not in the original: a party that has been welcomed (`welcomed`, kept in
+/// the save) or has already collected the orange crystals his welcome drops
+/// is not welcomed again. The original would repeat it each time a hero
+/// saved with no experience is loaded.
+pub fn welcome_due(
+    progress: &crate::progress::Progress,
+    exps: impl IntoIterator<Item = u32>,
+) -> bool {
+    !progress.entered_tower
+        && !progress.welcomed
+        && progress.crystals[1] >= 0
+        && exps.into_iter().all(|e| e == 0)
+}
+
 /// TriggerCameraActivate: a fixed camera from a type-9 locator.
 #[derive(Clone, Copy, Debug)]
 pub struct TriggerCam {
@@ -1009,6 +1029,31 @@ mod tests {
         assert!(g
             .model_named("SHARD1")
             .is_some_and(|m| g.entities.iter().any(|e| e.model == Some(m) && e.alive)));
+    }
+
+    /// After a reload, what was banked stays banked: only a newly brought
+    /// rune starts a speech.
+    #[test]
+    fn reloaded_banks_only_speak_about_new_runes() {
+        let Some((fs, mut g)) = tower() else { return };
+        g.runes = 0x2;
+        g.shards = 0x1;
+        let entry = Entry {
+            banked_runes: 0x2,
+            banked_shards: 0x1,
+            ..Entry::default()
+        };
+        g.sumner = Some(Box::new(Sumner::new(&fs, &mut g, entry)));
+        run(&mut g, 61 + 400);
+        let s = g.sumner.as_ref().unwrap();
+        assert_eq!(s.speech, -1, "nothing new to bank");
+        assert!(g.scroll_box.is_none() && !s.controls_locked());
+        // A second rune brought back now: its speech plays.
+        g.runes |= 0x4;
+        run(&mut g, 30);
+        let s = g.sumner.as_ref().unwrap();
+        assert_eq!(s.speech, 2);
+        assert_eq!(s.banked(), (0x6, 0x1));
     }
 
     #[test]

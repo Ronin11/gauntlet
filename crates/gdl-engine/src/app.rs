@@ -187,15 +187,27 @@ fn party_in_game(
     for (info, p) in play.panels.iter().zip(&play.game.players) {
         carry[info.slot % 4] = Some(p.carried());
     }
+    let progress = live_progress(play, progress);
+    let mut heroes = heroes.clone();
+    bank_heroes(&play.game, &play.panels, &mut heroes);
+    party_for(card, &Some(carry), &heroes, &progress, prefs)
+}
+
+/// The party's progress as it stands in the level being played, with what
+/// Sumner has banked in the tower so far: a hero saved from the tower (or the
+/// tower re-entered after player select) keeps the speeches already given.
+fn live_progress(play: &Playing, progress: &Progress) -> Progress {
     let mut progress = progress.clone();
     progress.crystals = play.game.crystals;
     progress.garg_items = play.game.garg_items;
     progress.shards = play.game.shards;
     progress.runes |= play.game.runes | play.game.boss_runes;
     progress.legend = play.game.legend_held;
-    let mut heroes = heroes.clone();
-    bank_heroes(&play.game, &play.panels, &mut heroes);
-    party_for(card, &Some(carry), &heroes, &progress, prefs)
+    if let Some(sm) = &play.game.sumner {
+        (progress.banked_runes, progress.banked_shards) = sm.banked();
+        progress.last_beaten = sm.last_beaten();
+    }
+    progress
 }
 
 /// What lives in each player's save image during play goes back to the
@@ -653,10 +665,19 @@ impl App {
                             p.game.enter_tower();
                             p.game.set_start(progress.tower_start());
                             // sumnerUpdatePresence: the welcome is for a new party's
-                            // first visit.
-                            let welcome = !progress.entered_tower
-                                && p.game.players.iter().all(|pl| pl.exp == 0);
+                            // first visit (no experience in any class of any
+                            // player's save).
+                            let exps =
+                                p.game.players.iter().zip(&p.panels).flat_map(|(pl, info)| {
+                                    let saved = r.heroes[info.slot % 4]
+                                        .iter()
+                                        .flat_map(|h| h.classes.iter())
+                                        .filter_map(|c| c.carried.as_ref().map(|k| k.exp));
+                                    std::iter::once(pl.exp).chain(saved)
+                                });
+                            let welcome = crate::tower::welcome_due(&progress, exps);
                             r.progress.entered_tower = true;
+                            r.progress.welcomed |= welcome;
                             let entry = crate::tower::Entry {
                                 welcome,
                                 banked_runes: progress.banked_runes,
@@ -1096,6 +1117,7 @@ impl App {
                                 play.game.level_end = Some(LevelEnd::AllDead);
                             }
                             OptionsAction::ManageCharacter => {
+                                r.progress = live_progress(play, &r.progress);
                                 let party =
                                     party_in_game(play, &r.card, &r.heroes, &r.progress, &r.prefs);
                                 next = Some(Screen::Select(
@@ -1154,6 +1176,7 @@ impl App {
                     {
                         // check_active_players: a new pad joins in the tower, which
                         // opens player select for it (init_player_select(1)).
+                        r.progress = live_progress(play, &r.progress);
                         let party = party_in_game(play, &r.card, &r.heroes, &r.progress, &r.prefs);
                         let mut sel = Select::from_game(&play.panels, &r.sources).with_party(party);
                         sel.join(src);

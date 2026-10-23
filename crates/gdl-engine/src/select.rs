@@ -2336,4 +2336,69 @@ mod tests {
         assert_eq!(sel.controls()[0], mine, "player_get_from_save");
         assert_eq!(pl(&sel, 0).hero.help_disp[5], crate::save::SEEN_EVER);
     }
+
+    /// Sumner's welcome plays for a new party, and not again once the hero
+    /// saved in the tower (still with no experience) is loaded in a new run.
+    #[test]
+    fn sumner_welcomes_a_new_party_only_once_across_save_and_load() {
+        use crate::progress::Progress;
+        use crate::tower::welcome_due;
+        let dir = std::env::temp_dir().join(format!("gdl-welcome-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut progress = Progress::default();
+        assert!(welcome_due(&progress, [0]), "a new party is welcomed");
+        // What app.rs records on that tower entry.
+        progress.entered_tower = true;
+        progress.welcomed = true;
+        assert!(!welcome_due(&progress, [0]), "once a session");
+        // Saved from the tower before any experience, with a few of the
+        // orange crystals picked up.
+        progress.crystals[1] = 4;
+        let panels = [crate::hud::PanelInfo {
+            slot: 0,
+            name: "BOB".into(),
+            colour: 2,
+            class: 0,
+            hidden: None,
+        }];
+        let mut sel = Select::from_game(&panels, &[Source::Keyboard]).with_party(Party {
+            card: MemCard::open(Some(&dir)),
+            carry: [Some(Carried::new_character()), None, None, None],
+            heroes: Default::default(),
+            progress,
+            controls: Default::default(),
+        });
+        save_to(&mut sel, 0);
+        idle(&mut sel, 30);
+        assert!(pl(&sel, 0).step >= 4, "Save Complete");
+
+        // The game is started again: the card is read back from disk and the
+        // hero loaded from the title's player select.
+        let sel = load_from(MemCard::open(Some(&dir)));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut party = Progress::default();
+        sel.merge_progress(&mut party);
+        assert!(party.welcomed);
+        assert_eq!(party.crystals[1], 4);
+        let exps: Vec<u32> = sel
+            .heroes()
+            .iter()
+            .flatten()
+            .flat_map(|h| h.classes.iter())
+            .filter_map(|c| c.carried.as_ref().map(|k| k.exp))
+            .collect();
+        assert_eq!(exps, [0], "still no experience");
+        assert!(!welcome_due(&party, exps), "not welcomed again");
+
+        // A card from before the flag: a hero with the orange crystals done
+        // has had the welcome; one without them still gets it (as the
+        // original does for a hero with no experience).
+        let mut old = Progress::default();
+        assert!(welcome_due(&old, [0]));
+        old.crystals[1] = -1;
+        assert!(!welcome_due(&old, [0]));
+        // sumnerUpdatePresence: experience in any class slot means no welcome.
+        assert!(!welcome_due(&Progress::default(), [0, 0, 120]));
+    }
 }
