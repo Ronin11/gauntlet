@@ -6483,7 +6483,7 @@ impl Game {
         let mut chest_used: Vec<usize> = Vec::new();
         let mut chest_refused: Vec<(usize, i32)> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
-        let mut chests_opened: Vec<(Vec3, Option<usize>)> = Vec::new();
+        let mut chests_opened: Vec<usize> = Vec::new();
         let mut proj_hits: Vec<(usize, usize, f32, Vec2, f32)> = Vec::new();
         // Hero missiles that burst on the world: (id, where, yaw, scale).
         let mut missile_walls: Vec<(u64, Vec3, f32, f32)> = Vec::new();
@@ -7184,7 +7184,6 @@ impl Game {
                 // 23 for a silver chest when 2 is refused).
                 Kind::Container {
                     hp,
-                    drop,
                     chest: true,
                     sub,
                     ..
@@ -7209,11 +7208,53 @@ impl Game {
                         {
                             chest_used.push(pi);
                             *hp = 0.0;
-                            chests_opened.push((e.pos, *drop));
-                            if let Some(s) = e.model.and_then(|m| self.models[m].sequence("OPEN")) {
-                                e.animator.restart(s);
-                            }
+                            chests_opened.push(ei);
                             break;
+                        }
+                    }
+                }
+                // fn_800606FC: an opened chest runs its cycle (the lid opens
+                // in ACTIVE, OPEN is action 2). At action 2 a chest with no
+                // contents attached (all of them) is gone, its item left
+                // standing free; a trap goes off (update_trap_chests); a gold
+                // chest stays, and touching it (fn_8005D730 case 2, action 2)
+                // gives its gold, gone 8 ticks later.
+                Kind::Container {
+                    chest: true,
+                    drop,
+                    sub,
+                    ..
+                } if self.items.chests.contains_key(&e.id) => {
+                    let open = self.items.chests.get_mut(&e.id).unwrap();
+                    open.cycle.update(dt, true, &mut self.rng);
+                    if !open.cycle.slots.is_empty() {
+                        e.animator.seq = open.cycle.anim.seq;
+                        e.animator.frame = open.cycle.anim.frame;
+                    }
+                    if let Some(t) = &mut open.gone_in {
+                        *t -= 1;
+                        if *t <= 0 {
+                            e.alive = false;
+                        }
+                    } else if open.cycle.action >= 2 {
+                        match *sub {
+                            items::SUB_EXPLODE => {}
+                            items::SUB_GOLDCHEST => {
+                                let gold = drop
+                                    .and_then(|i| self.level.worlds.item_infos.get(i))
+                                    .map_or(0, |i| i.value.max(0) as u32);
+                                let toucher = player_pos.iter().position(|(pp, alive)| {
+                                    *alive
+                                        && Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length() < 3.0
+                                });
+                                if let Some(pi) = toucher {
+                                    pickups.push((pi, PickupKind::Gold(gold)));
+                                    pickup_food.push(0);
+                                    open.gone_in = Some(8);
+                                    *drop = None;
+                                }
+                            }
+                            _ => e.alive = false,
                         }
                     }
                 }
@@ -7578,7 +7619,8 @@ impl Game {
             if !matches!(
                 e.kind,
                 Kind::Enemy { .. } | Kind::Critter(_) | Kind::Hazard { .. }
-            ) {
+            ) && !self.items.chests.contains_key(&e.id)
+            {
                 if let Some(m) = e.model {
                     e.animator.update(&self.models[m].skeleton, dt);
                 }
@@ -7932,9 +7974,17 @@ impl Game {
         for pi in chest_used {
             self.players[pi].keys -= 1;
         }
-        for (pos, item) in chests_opened {
+        // fn_8005E90C: what is in it comes out where the chest stands (SetItem
+        // at its matrix; no attach node is ever set, so it is free) — except
+        // a gold chest's gold, given on touch once open, and a trap's nothing.
+        for t in chests_opened {
             self.sfx.push("S_CHEST".into());
-            self.spawn_content(pos + Vec3::Y, item);
+            self.open_chest(t, false);
+            if let Kind::Container { drop, sub, .. } = self.entities[t].kind {
+                if sub != items::SUB_GOLDCHEST && sub != items::SUB_EXPLODE {
+                    self.spawn_content(self.entities[t].pos, drop);
+                }
+            }
         }
         for pi in key_used {
             self.players[pi].keys -= 1;

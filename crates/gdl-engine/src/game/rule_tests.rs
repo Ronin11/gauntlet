@@ -212,6 +212,118 @@ fn placements_with_flag_2_get_no_geometry() {
                 hidden += 1;
             }
         }
-        assert!(hidden > 0 && shown > 0, "{level}: {hidden} hidden, {shown} shown");
+        assert!(
+            hidden > 0 && shown > 0,
+            "{level}: {hidden} hidden, {shown} shown"
+        );
     }
+}
+
+/// levelA1 with nothing but chests, and the hero, settled on a side of the
+/// chest nearest `at` that he can stand at, holding a key.
+fn at_chest(fs: &GameFs, at: Vec3) -> (Game, u64, Vec3) {
+    for side in 0..8 {
+        let mut g = Game::new(fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.pending_enemies.clear();
+        g.entities
+            .retain(|e| matches!(e.kind, Kind::Container { chest: true, .. }));
+        let e = g
+            .entities
+            .iter()
+            .min_by(|a, b| a.pos.distance(at).total_cmp(&b.pos.distance(at)))
+            .unwrap();
+        let (id, pos) = (e.id, e.pos);
+        let a = side as f32 * std::f32::consts::FRAC_PI_4;
+        let stand = pos + Vec3::new(a.cos(), 0.0, a.sin()) * 2.8;
+        for _ in 0..30 {
+            g.players[0].pos = stand;
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = g.players[0].pos;
+        if Vec2::new(p.x - pos.x, p.z - pos.z).length() < 2.9 && (p.y - pos.y).abs() < 1.0 {
+            g.players[0].keys = 1;
+            return (g, id, pos);
+        }
+    }
+    panic!("no side of the chest at {at} to stand at");
+}
+
+#[test]
+fn an_opened_chest_lifts_its_lid_then_leaves_its_item_to_take() {
+    // fn_8005D730 case 2 sets active |= 1; fn_800606FC steps the chest's
+    // cycle (activetype 0x16) through ACTIVE, the lid opening, to OPEN; at
+    // action 2 the chest (no contents attached) is gone and fn_8005E90C's
+    // item stands where it was.
+    let Some(fs) = data() else { return };
+    let (mut g, id, pos) = at_chest(&fs, Vec3::new(22.625, -2.40625, -3.75));
+    let chest = |g: &Game| {
+        g.entities
+            .iter()
+            .find(|e| e.id == id && e.alive)
+            .map(|e| (e.model, e.animator.seq, e.animator.frame))
+    };
+    let model = chest(&g).unwrap().0.unwrap();
+    let active = g.models[model].sequence("ACTIVE").unwrap();
+    let step = |g: &mut Game| g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    step(&mut g);
+    assert_eq!(g.players[0].keys, 0);
+    let item = g
+        .entities
+        .iter()
+        .find(|e| matches!(e.kind, Kind::Pickup { .. }))
+        .map(|e| (e.id, e.pos))
+        .expect("the chest's item");
+    assert!(Vec2::new(item.1.x - pos.x, item.1.z - pos.z).length() < 1e-3);
+    // The lid opens: ACTIVE plays through.
+    let mut last = -1.0;
+    for _ in 0..30 {
+        step(&mut g);
+        let (_, seq, frame) = chest(&g).expect("still there while opening");
+        assert_eq!(seq, active);
+        assert!(frame > last, "the opening plays");
+        last = frame;
+    }
+    // Then OPEN, and the chest is gone.
+    let mut ticks = 0;
+    while chest(&g).is_some() {
+        step(&mut g);
+        ticks += 1;
+        assert!(ticks < 300, "the chest never finished opening");
+    }
+    // Its item is there for the taking.
+    assert!(g.entities.iter().any(|e| e.id == item.0 && e.alive));
+    g.players[0].health = 100.0;
+    g.players[0].pos = item.1;
+    for _ in 0..3 {
+        step(&mut g);
+    }
+    assert!(
+        !g.entities.iter().any(|e| e.id == item.0 && e.alive),
+        "taken"
+    );
+    assert!(g.players[0].health > 100.0, "BANANNA eaten");
+}
+
+#[test]
+fn an_opened_gold_chest_gives_its_gold_on_touch() {
+    // fn_8005E90C keeps a gold chest's treasure value; touching the open
+    // chest gives it (fn_8005D730 case 2, action 2) and it goes 8 ticks on.
+    let Some(fs) = data() else { return };
+    let (mut g, id, _) = at_chest(&fs, Vec3::new(6.46875, -2.34375, -20.4375));
+    assert!(matches!(
+        g.entities.iter().find(|e| e.id == id).unwrap().kind,
+        Kind::Container {
+            sub: items::SUB_GOLDCHEST,
+            ..
+        }
+    ));
+    for _ in 0..300 {
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    }
+    assert_eq!(g.players[0].gold, 100, "TREAS_SILVER");
+    assert!(!g.entities.iter().any(|e| e.id == id && e.alive));
+    assert!(!g
+        .entities
+        .iter()
+        .any(|e| matches!(e.kind, Kind::Pickup { .. })));
 }
