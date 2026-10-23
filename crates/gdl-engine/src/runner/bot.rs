@@ -1418,7 +1418,7 @@ impl Bot {
         let pos = p.pos;
         let maxh = crate::game::max_health(p.level);
         // Low health: god mode (recorded), so the level can still be checked.
-        if p.health < maxh * 0.2 && !g.debug_god {
+        if p.health < maxh * 0.35 && !g.debug_god {
             let why = format!(
                 "hero {i} health {:.0}/{maxh:.0} at ({:.1},{:.1},{:.1}) during {}",
                 p.health,
@@ -1971,7 +1971,7 @@ impl Bot {
             });
         }
         if g.players.iter().any(|p| matches!(p.state, PlayerState::Dead { .. })) && g.debug_god {
-            return Some(Outcome::Died("a hero died in god mode".into()));
+            return Some(Outcome::Died("a hero died (a blow bigger than the god-mode margin, or in god mode)".into()));
         }
         // Pinned: hero 0 hasn't got 3 units from one spot in 150 s (outside
         // boss fights, timed levels and the exit wait).

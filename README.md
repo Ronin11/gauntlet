@@ -174,7 +174,7 @@ gauntlet --runner-merge runner-out           # rebuild runner-out/summary.md
   lectern and walks into a portal; on boss levels fights the boss (a debug kill after a
   few minutes, recorded) and waits for the good wizard; timed levels are played out.
   With several heroes the others follow the first and gather on the exit.
-- **God mode** (`Game::debug_god`) goes on when a hero drops below 20% health, and the
+- **God mode** (`Game::debug_god`) goes on when a hero drops below 35% health, and the
   result says so (`completed_god`).
 - **On failure** (stuck, unreachable, timeout, exit reached but no end, NaN, a door that
   won't open to a hero with a key, falling out of the world): a bug report with a
