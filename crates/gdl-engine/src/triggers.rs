@@ -498,6 +498,32 @@ impl Mover {
             collision.tris[i].v = rest.map(|v| v + Vec3::Y * self.offset);
         }
     }
+
+    /// A debug save state's mover (savestate.rs): put it at `offset` with its
+    /// collision (or node) there, `active` and `shown` as saved.
+    pub fn restore_state(
+        &mut self,
+        active: bool,
+        offset: f32,
+        shown: bool,
+        collision: &mut Collision,
+        wa: &mut WorldAnims,
+    ) {
+        self.active = active;
+        self.shown = shown;
+        if self.fades() {
+            for &i in &self.owned {
+                collision.enabled[i] = shown;
+            }
+        }
+        if !self.animated {
+            self.offset = offset;
+            if self.node {
+                wa.slide(self.root, offset);
+            }
+            self.place(collision);
+        }
+    }
 }
 
 #[cfg(test)]

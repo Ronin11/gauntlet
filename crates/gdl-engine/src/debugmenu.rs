@@ -195,6 +195,7 @@ pub enum Page {
     Unlocks,
     Party,
     Level,
+    States,
 }
 
 impl Page {
@@ -206,6 +207,7 @@ impl Page {
             Page::Unlocks => "DEBUG: UNLOCKS",
             Page::Party => "DEBUG: PARTY",
             Page::Level => "DEBUG: LEVEL",
+            Page::States => "DEBUG: SAVE STATES",
         }
     }
 }
@@ -249,6 +251,9 @@ pub enum Item {
     FinishLevel,
     XRay,
     Compass,
+    StateSlot,
+    SaveState,
+    LoadState,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -277,6 +282,10 @@ pub enum Action {
     /// Load this level (directory name, "levelA1") with the party (the
     /// context's panels, which may have been changed).
     Warp(String),
+    /// Write a save state (savestate.rs) of the running level to this slot.
+    SaveState(String),
+    /// Load the save state in this slot (the menu closes if it loads).
+    LoadState(String),
 }
 
 /// The game state the menu reads and changes.
@@ -331,6 +340,8 @@ pub struct DebugMenu {
     cheat: usize,
     hero_class: usize,
     skin: usize,
+    /// The save-state slot chosen (savestate::SLOTS, then the autosave).
+    state_slot: usize,
     status: Option<(String, u32)>,
     rows: Vec<Row>,
     hold: [u32; 4],
@@ -364,6 +375,7 @@ impl DebugMenu {
             cheat: 0,
             hero_class: 0,
             skin: 0,
+            state_slot: 0,
             status: None,
             rows: Vec::new(),
             hold: [0; 4],
@@ -424,6 +436,17 @@ impl DebugMenu {
 
     pub fn status(&self) -> Option<&str> {
         self.status.as_ref().map(|s| s.0.as_str())
+    }
+
+    /// Show a message on the menu (the app's save-state results).
+    pub fn report(&mut self, s: impl Into<String>) {
+        self.say(s);
+    }
+
+    /// The save-state slot chosen: "1".."3" or "autosave".
+    fn slot_name(&self) -> &'static str {
+        use crate::savestate::{AUTOSAVE, SLOTS};
+        SLOTS.get(self.state_slot).copied().unwrap_or(AUTOSAVE)
     }
 
     fn say(&mut self, s: impl Into<String>) {
@@ -789,6 +812,13 @@ impl DebugMenu {
                 *ctx.compass = !*ctx.compass;
                 Action::None
             }
+            Item::StateSlot => {
+                self.state_slot = step(self.state_slot, d, crate::savestate::SLOTS.len() + 1);
+                Action::None
+            }
+            Item::SaveState if d == 0 => Action::SaveState(self.slot_name().into()),
+            Item::LoadState if d == 0 => Action::LoadState(self.slot_name().into()),
+            Item::SaveState | Item::LoadState => Action::None,
         };
         if progress_changed {
             match ctx.game.as_deref_mut() {
@@ -896,6 +926,7 @@ impl DebugMenu {
                 let mut r = row(Item::Open(Page::Level), "Level", ">");
                 r.enabled = in_game;
                 rows.push(r);
+                rows.push(row(Item::Open(Page::States), "Save / load state", ">"));
                 rows.push(row(Item::Close, "Close", ""));
             }
             Page::Warp => {
@@ -1058,6 +1089,17 @@ impl DebugMenu {
                 rows.push(r);
                 rows.push(row(Item::XRay, "X-ray", on_off(xray_on(g))));
                 rows.push(row(Item::Compass, "Compass", on_off(*ctx.compass)));
+            }
+            Page::States => {
+                rows.push(row(
+                    Item::StateSlot,
+                    "Slot",
+                    format!("< {} >", self.slot_name()),
+                ));
+                let mut r = row(Item::SaveState, "Save state", "");
+                r.enabled = in_game;
+                rows.push(r);
+                rows.push(row(Item::LoadState, "Load state", ""));
             }
         }
         self.rows = rows;
@@ -1549,6 +1591,33 @@ mod tests {
             out.push(m.update(&[PlayerInput::default()], &mut w.ctx()));
         }
         out
+    }
+
+    #[test]
+    fn save_state_page_picks_a_slot() {
+        let mut m = DebugMenu::new(realms());
+        let mut w = World::new();
+        m.show(Some(Source::Keyboard), &mut w.ctx());
+        let i = m
+            .rows()
+            .iter()
+            .position(|r| r.item == Item::Open(Page::States))
+            .unwrap();
+        m.goto(Page::Main, i, &mut w.ctx());
+        drive(&mut m, &mut w, &["a"]);
+        assert_eq!(m.page(), Page::States);
+        // From the title only loading is offered.
+        assert!(!m.rows()[1].enabled && m.rows()[2].enabled);
+        // Slot 1 -> 2 -> 3 -> autosave.
+        let acts = drive(
+            &mut m,
+            &mut w,
+            &["right", "right", "right", "down", "down", "a"],
+        );
+        assert!(
+            acts.contains(&Action::LoadState("autosave".into())),
+            "{acts:?}"
+        );
     }
 
     #[test]

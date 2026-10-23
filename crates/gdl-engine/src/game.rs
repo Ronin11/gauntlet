@@ -20,6 +20,7 @@ mod magic;
 mod particles;
 #[cfg(test)]
 mod rule_tests;
+pub mod savestate;
 pub mod sounds;
 pub(crate) mod unlock;
 pub mod worn;
@@ -1247,6 +1248,9 @@ pub struct Game {
     pub particles: crate::psys::Particles,
     /// WEAPONS', POWERUPS' and STATIC's textures, for MBOX_FindTexture.
     psys_banks: Vec<(Objects, Vec<u8>)>,
+    /// Each entity made from a placed item: its instance index in the
+    /// level file (savestate.rs matches saved state by it).
+    pub(crate) placed: HashMap<u64, u32>,
 }
 
 /// items.c's animated-item cycle (an item with an atree and active & 1): it
@@ -1369,6 +1373,8 @@ struct PendingEnemy {
     visrad: f32,
     /// Death waiting as its statue (enemydata.flags bit 1 clear).
     statue: Option<crate::triggers::Statue>,
+    /// The item instance it was placed by (savestate.rs).
+    inst: u32,
 }
 
 /// Parsed objects/textures/anim files shared by several models.
@@ -1853,6 +1859,7 @@ impl Game {
             effects: Default::default(),
             particles: Default::default(),
             psys_banks: Vec::new(),
+            placed: HashMap::new(),
         };
         game.ai_paths =
             crate::ai::Paths::new(&game.level.worlds.locators, game.level.start_positions()[0]);
@@ -2291,7 +2298,8 @@ impl Game {
             .collect();
         for i in ready.into_iter().rev() {
             let p = self.pending_enemies.remove(i);
-            self.spawn(p.kind, p.model, p.pos, p.yaw);
+            let id = self.spawn(p.kind, p.model, p.pos, p.yaw);
+            self.placed.insert(id, p.inst);
         }
     }
 
@@ -2817,7 +2825,11 @@ impl Game {
         let items_option = items::items_option();
         // Golems, gargoyles and generals placed, for what they carry.
         let mut carriers: Vec<(u64, Vec3)> = Vec::new();
-        for inst in &instances {
+        // (instance, first entity id) of the item placed last (savestate.rs).
+        let mut placing: (u32, u64) = (0, self.next_id);
+        for (inst_idx, inst) in instances.iter().enumerate() {
+            self.note_placed(placing);
+            placing = (inst_idx as u32, self.next_id);
             // ItemVisible: placed for this many players.
             if !items::item_visible(inst.min_players, num_players.max(1), items_option) {
                 continue;
@@ -2993,6 +3005,7 @@ impl Game {
                             yaw,
                             visrad: info.radius.max(1.0),
                             statue,
+                            inst: inst_idx as u32,
                         });
                     }
                 }
@@ -3382,6 +3395,7 @@ impl Game {
                 }
             }
         }
+        self.note_placed(placing);
         self.link_carried(&carriers);
         self.load_item_fx(fs, &mut cache, &mut known, &dirs);
         self.append_bigape_powerups(fs, &mut cache, &mut known);

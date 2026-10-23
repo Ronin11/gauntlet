@@ -26,6 +26,7 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         mute: false,
         // The memory card lives in the app's private storage.
         save_dir: app.internal_data_path(),
+        load_state: None,
     };
     if let Err(e) = app::run_android(cfg, app) {
         log::error!("fatal: {e:#}");

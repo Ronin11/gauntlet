@@ -14,6 +14,7 @@ use crate::menu::{self, Title};
 use crate::options::{Options, OptionsAction, Prefs};
 use crate::progress::Progress;
 use crate::save::{HeroSave, MemCard};
+use crate::savestate::{self, SaveState};
 use crate::scene::{Scene, CLEAR};
 use crate::screen::Scr;
 use crate::select::{Select, CLASSES, COLOURS};
@@ -39,6 +40,8 @@ pub struct Config {
     /// Where the memory card's save file is kept (None: saves last only
     /// for this run).
     pub save_dir: Option<std::path::PathBuf>,
+    /// A debug save state to start in (`--load-state`: a slot or a file).
+    pub load_state: Option<String>,
 }
 
 struct Playing {
@@ -330,6 +333,12 @@ struct Running {
     saver_models: Option<crate::screensaver::SaverModels>,
     /// The developer debug menu (F1 / L+R+Z+Start; not in the original).
     debug: crate::debugmenu::DebugMenu,
+    /// Debug save states (savestate.rs): the folder they are kept under
+    /// (states/ in it), the state to apply once its level has loaded, and
+    /// the level time of the last autosave.
+    save_dir: Option<std::path::PathBuf>,
+    pending_state: Option<SaveState>,
+    autosaved: f32,
     last: Instant,
     acc: f32,
     window: Arc<Window>,
@@ -423,7 +432,7 @@ impl App {
             prefs.apply_game_opts(&o);
         }
         audio.set_volumes(&prefs);
-        Ok(Running {
+        let mut r = Running {
             surface,
             config,
             gpu,
@@ -453,10 +462,25 @@ impl App {
             saver: None,
             saver_models: None,
             debug: Default::default(),
+            save_dir: self.cfg.save_dir.clone(),
+            pending_state: None,
+            autosaved: 0.0,
             last: Instant::now(),
             acc: 0.0,
             window,
-        })
+        };
+        // --load-state: straight into the saved level.
+        if let Some(spec) = &self.cfg.load_state {
+            let path = savestate::resolve(spec, r.save_dir.as_deref());
+            match SaveState::read(&path) {
+                Ok(st) => {
+                    log::info!("loading state {}: {}", path.display(), st.summary());
+                    r.screen = begin_state(&mut r, st);
+                }
+                Err(e) => log::error!("--load-state: {e:#}"),
+            }
+        }
+        Ok(r)
     }
 }
 
@@ -541,6 +565,9 @@ impl ApplicationHandler for App {
     /// Tear down GPU and audio while the window system connection is still open;
     /// dropping them after the event loop returns crashes inside the EGL/Wayland driver.
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        if let Some(r) = &self.run {
+            autosave(r);
+        }
         if let Some(r) = self.run.take() {
             let _ = r.gpu.device.poll(wgpu::PollType::Wait);
             drop(r);
@@ -637,6 +664,12 @@ impl App {
                         }
                         Some(w) => r.progress.last_realm = Some(w >> 8),
                         None => {}
+                    }
+                    // A debug save state: the level's changes and the party.
+                    if let Some(st) = r.pending_state.take() {
+                        st.apply(&mut p.game);
+                        r.autosaved = p.game.time;
+                        log::info!("state applied: {}", st.summary());
                     }
                     log::info!("entering {level}");
                     let streams = p
@@ -1049,6 +1082,7 @@ impl App {
                             // "Abort Level?" Yes: everyone is put out of the level
                             // and the party goes back to the tower.
                             OptionsAction::QuitLevel => {
+                                autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
                                 *pause = None;
                                 for p in &mut play.game.players {
                                     p.state = PlayerState::InTower;
@@ -1086,6 +1120,7 @@ impl App {
                                 menu_shop = Some((shop, play.panels.clone()));
                             }
                             OptionsAction::QuitGame => {
+                                autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
                                 r.audio.stop();
                                 next = Some(game_over_screen(fs));
                             }
@@ -1151,6 +1186,13 @@ impl App {
                         play.game.debug_god = r.debug.god;
                         play.game.update(TICK, &inputs);
                         play.intro += TICK;
+                        // Debug save states: an autosave every minute of play.
+                        if play.game.time < r.autosaved {
+                            r.autosaved = play.game.time;
+                        } else if play.game.time - r.autosaved >= AUTOSAVE_EVERY {
+                            r.autosaved = play.game.time;
+                            autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
+                        }
                         // do_vibe: only for players with the Vibration option on.
                         for v in play.game.snd.rumble.drain(..) {
                             let slot = play.panels.get(v.player).map_or(v.player, |p| p.slot);
@@ -1766,6 +1808,115 @@ fn debug_tick(
             r.debug.close();
             Some(Some(debug_warp(r, level)))
         }
+        Action::SaveState(slot) => {
+            let msg = match save_state(r, &slot) {
+                Ok(p) => format!("Saved state {slot} ({})", p.display()),
+                Err(e) => format!("Save failed: {e:#}"),
+            };
+            log::info!("{msg}");
+            r.debug.report(msg);
+            Some(None)
+        }
+        Action::LoadState(slot) => {
+            let path = savestate::resolve(&slot, r.save_dir.as_deref());
+            match SaveState::read(&path) {
+                Ok(st) => {
+                    log::info!("loading state {}: {}", path.display(), st.summary());
+                    r.debug.close();
+                    Some(Some(begin_state(r, st)))
+                }
+                Err(e) => {
+                    r.debug.report(format!("No state {slot}: {e:#}"));
+                    Some(None)
+                }
+            }
+        }
+    }
+}
+
+/// Seconds of level play between autosaves.
+const AUTOSAVE_EVERY: f32 = 60.0;
+
+/// Write a debug save state of the running level to `slot` (or a file).
+fn save_state(r: &Running, slot: &str) -> Result<std::path::PathBuf> {
+    let Screen::Playing { play, .. } = &r.screen else {
+        anyhow::bail!("not in a level");
+    };
+    write_state(play, &r.sources, &r.input, &r.progress, &r.save_dir, slot)
+}
+
+fn write_state(
+    play: &Playing,
+    sources: &[Source],
+    input: &Input,
+    progress: &Progress,
+    save_dir: &Option<std::path::PathBuf>,
+    slot: &str,
+) -> Result<std::path::PathBuf> {
+    let st = SaveState::capture(&play.game, &play.panels, sources, &input.pads(), progress);
+    let path = savestate::resolve(slot, save_dir.as_deref());
+    st.write(&path)?;
+    Ok(path)
+}
+
+/// The autosave slot, written when a level is quit (and every minute of
+/// play), so `--load-state autosave` picks up after a crash or a rebuild.
+fn autosave(r: &Running) {
+    if let Screen::Playing { play, .. } = &r.screen {
+        autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
+    }
+}
+
+fn autosave_play(
+    play: &Playing,
+    sources: &[Source],
+    input: &Input,
+    progress: &Progress,
+    save_dir: &Option<std::path::PathBuf>,
+) {
+    // Not a finished level or a party that is all out of it.
+    if play.game.level_end.is_some() || play.game.players.iter().all(|p| !p.state.active()) {
+        return;
+    }
+    match write_state(
+        play,
+        sources,
+        input,
+        progress,
+        save_dir,
+        savestate::AUTOSAVE,
+    ) {
+        Ok(p) => log::info!("autosaved {}", p.display()),
+        Err(e) => log::warn!("autosave: {e:#}"),
+    }
+}
+
+/// Start a debug save state: its party, controllers and progress, then its
+/// level (the changes are applied once it has loaded).
+fn begin_state(r: &mut Running, st: SaveState) -> Screen {
+    r.audio.stop();
+    r.suspended = None;
+    if let Screen::Playing { mut play, .. } = std::mem::replace(&mut r.screen, Screen::Legal(0)) {
+        if let Some(bank) = play.boss_bank.take() {
+            r.hud.free_bank(bank);
+        }
+    }
+    r.sources = savestate::bind_sources(&st.heroes, &r.input.pads(), &r.sources);
+    r.progress = st.progress.clone();
+    let mut carry: Carry = Default::default();
+    for h in &st.heroes {
+        carry[h.panel.slot % 4] = Some(h.carried());
+    }
+    r.carry = Some(carry);
+    r.checkpoint = r.carry.clone();
+    r.prefs.difficulty = st.difficulty.min(2);
+    let panels: Vec<PanelInfo> = st.heroes.iter().map(|h| h.panel.clone()).collect();
+    let level = st.level.clone();
+    r.pending_state = Some(st);
+    Screen::Loading {
+        level,
+        panels,
+        shown: false,
     }
 }
 
