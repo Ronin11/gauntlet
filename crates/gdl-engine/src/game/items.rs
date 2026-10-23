@@ -14,6 +14,16 @@ use super::*;
 pub(crate) const SUB_BARREL: i32 = 0x2B;
 pub(crate) const SUB_EXPLODE: i32 = 0x2C;
 pub(crate) const SUB_POISON: i32 = 0x2D;
+/// A gold chest (CHESTG1..5): it gives its gold where it stands.
+pub(crate) const SUB_GOLDCHEST: i32 = 0x2F;
+
+/// An opened chest (active & 1): its cycle, and the ticks left once a gold
+/// chest has given its gold (activetime 8 with active 0x100).
+#[derive(Clone, Debug)]
+pub(crate) struct ChestOpen {
+    pub cycle: ItemCycle,
+    pub gone_in: Option<i32>,
+}
 
 /// sEnemyDefaultAlgorithm (enemy.c:255): the AI routine by monster type.
 pub(crate) const DEFAULT_AI: [i32; 34] = [
@@ -171,6 +181,8 @@ pub struct ItemsState {
     fxhit: HashMap<u64, f32>,
     /// The debris models above.
     models: HashMap<&'static str, Option<usize>>,
+    /// Opened chests, by entity id.
+    pub(crate) chests: HashMap<u64, ChestOpen>,
 }
 
 /// gGameOptions.items (a debug option; GDL_ITEMS): a player count every item
@@ -577,9 +589,10 @@ impl Game {
                     return -1.0;
                 }
                 if sub == SUB_EXPLODE {
+                    // daction = action = 2: it goes off straight away
+                    // (fn_8005E90C leaves a trap chest empty).
                     if hp > 0.0 {
-                        self.open_chest(t);
-                        self.spawn_content(pos + Vec3::Y, drop);
+                        self.open_chest(t, true);
                     }
                     return -1.0;
                 }
@@ -628,16 +641,49 @@ impl Game {
         }
     }
 
-    /// Open a chest (as a key does): its OPEN animation from the start.
-    fn open_chest(&mut self, t: usize) {
+    /// fn_8005D730 case 2's `active |= 1`: a chest starts its cycle
+    /// (activetype 0x16: advance, stop at the end) — CLOSED, then ACTIVE as
+    /// the lid opens, held for its own length, then OPEN, which is action 2.
+    /// `blown`: fn_8005C1DC's trap chest, put at action 2 at once.
+    pub(super) fn open_chest(&mut self, t: usize, blown: bool) {
         let e = &mut self.entities[t];
         if let Kind::Container { hp, .. } = &mut e.kind {
             *hp = 0.0;
         }
-        if let Some(s) = e.model.and_then(|m| self.models[m].sequence("OPEN")) {
-            e.animator.restart(s);
-            e.animator.force_loop = false;
+        let id = e.id;
+        let info = self
+            .items
+            .info
+            .get(&id)
+            .and_then(|&i| self.level.worlds.item_infos.get(i));
+        let (active, on, off) =
+            info.map_or((0x16, 0, 0), |i| (i.active_type, i.active_on, i.active_off));
+        let Some(m) = e.model else {
+            return;
+        };
+        let mut cycle = ItemCycle::new(&self.models[m], active | 1, on, off, 1.0, &mut self.rng);
+        cycle.activetime = 0;
+        if blown {
+            cycle.action = 2;
+            cycle.daction = 2;
         }
+        e.animator.force_loop = false;
+        self.items.chests.insert(
+            id,
+            ChestOpen {
+                cycle,
+                gone_in: None,
+            },
+        );
+    }
+
+    /// Whether an opened chest's cycle has reached action 2 (OPEN); one
+    /// without a model gets there at once.
+    pub(super) fn chest_open_done(&self, id: u64) -> bool {
+        self.items
+            .chests
+            .get(&id)
+            .is_none_or(|c| c.cycle.action >= 2)
     }
 
     /// fn_8005C1DC's type-10 / type-2 barrel branches after a hit on entity
@@ -1205,8 +1251,7 @@ impl Game {
                 let e = &self.entities[i];
                 e.alive
                     && matches!(e.kind, Kind::Container { chest: true, sub: SUB_EXPLODE, hp, .. } if hp <= 0.0)
-                    && (e.animator.finished
-                        || e.model.and_then(|m| self.models[m].sequence("OPEN")).is_none())
+                    && self.chest_open_done(e.id)
             })
             .collect();
         for i in done {

@@ -303,6 +303,10 @@ fn snapshot_game(args: &Args) -> Result<()> {
         let realm = g.wave.map_or(0, |w| w >> 8);
         g.set_legend_held(1 << realm);
     }
+    // GDL_KEYS=n: player 0 holds n keys (for opening chests and doors).
+    if let Some(n) = std::env::var("GDL_KEYS").ok().and_then(|v| v.parse().ok()) {
+        g.players[0].keys = n;
+    }
     // GDL_INV=1: player 0 holds a 3-way shot and levitation, the inventory
     // open on levitation and switched on.
     if std::env::var_os("GDL_INV").is_some() {
