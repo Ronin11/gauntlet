@@ -29,6 +29,9 @@ pub const PLAYER_COLORS: [&str; 4] = ["RED", "BLU", "YEL", "GRE"];
 
 const GRAVITY: f32 = 60.0;
 pub(crate) const STEP_HEIGHT: f32 = 1.2;
+/// PlayerCollideFloor's limit on a floor change in one move (lbl_80347BF8):
+/// how high a stairs (or ramp) object's wall a player walks up.
+pub(crate) const STAIR_RISE: f32 = 3.0;
 /// PDATA width and height (col_radius 1.5, height 5).
 pub(crate) const PLAYER_RADIUS: f32 = 1.5;
 pub(crate) const PLAYER_HEIGHT: f32 = 5.0;
@@ -1733,6 +1736,14 @@ impl Game {
         let model_dir = |i: usize| models.get(i).copied().flatten();
         let level = Level::load(fs, level_name)?;
         let mut collision = Collision::new(build_collision(&level));
+        // fn_80088714: a wall of a world object flagged 0x38 (the STAIRS and
+        // RAMP objects) doesn't slide or stop the player.
+        for (i, t) in collision.tris.iter().enumerate() {
+            collision.stairs[i] = usize::try_from(t.owner)
+                .ok()
+                .and_then(|o| level.worlds.world_objects.get(o))
+                .is_some_and(|o| o.flags & 0x38 != 0);
+        }
         let world_anim = crate::worldanim::WorldAnims::new(&level, &mut collision);
 
         let mut game = Game {
@@ -4408,12 +4419,22 @@ impl Game {
                 p.pos += p.knock_vel * dt;
                 p.knock_vel *= 0.667f32.powf(dt * 30.0);
                 p.trial_move = p.pos - start;
-                let (pos, wall) = self.collision.resolve_walls_hit(
+                let (mut pos, wall) = self.collision.resolve_walls_stairs(
                     p.pos,
                     PLAYER_RADIUS,
                     PLAYER_HEIGHT,
                     STEP_HEIGHT,
+                    STAIR_RISE,
                 );
+                // PlayerCollideFloor: a stairs floor up to 3 above the feet is
+                // stepped straight onto (floor_base follows it).
+                if p.on_ground {
+                    if let Some((y, t)) = self.collision.ground_tri(pos, pos.y + STAIR_RISE) {
+                        if self.collision.stairs[t] && y > pos.y {
+                            pos.y = y;
+                        }
+                    }
+                }
                 p.pos = Self::resolve_solids(&self.entities, pos, PLAYER_RADIUS, 0);
                 p.on_ground = Self::snap_to_ground(&self.collision, &mut p.pos, &mut p.vy, dt);
                 // PlayerMotion_FloorFX: the wall touched, then the floor stood on.

@@ -251,6 +251,10 @@ pub struct Mover {
     pub objects: Vec<usize>,
     /// Collision triangles that move with it, and their resting vertices.
     tris: Vec<(usize, [Vec3; 3])>,
+    /// All its (and its children's) collision triangles: a fading target's
+    /// nocol switches them off while it is faded out (fn_80062A00), animated
+    /// or not.
+    owned: Vec<usize>,
     /// Current vertical offset from the modelled position.
     pub offset: f32,
     off: f32,
@@ -284,17 +288,19 @@ impl Mover {
         on: f32,
     ) -> Mover {
         let objects = level.subtree(root);
-        let tris = collision
+        let tris: Vec<(usize, [Vec3; 3])> = collision
             .tris
             .iter()
             .enumerate()
             .filter(|(_, t)| t.owner >= 0 && objects.contains(&(t.owner as usize)))
             .map(|(i, t)| (i, t.v))
             .collect();
+        let owned = tris.iter().map(|&(i, _)| i).collect();
         Mover {
             root,
             objects,
             tris,
+            owned,
             offset: off,
             off,
             on,
@@ -406,7 +412,7 @@ impl Mover {
         }
         if self.fades() {
             self.shown = self.fade_shown();
-            for &(i, _) in &self.tris {
+            for &i in &self.owned {
                 collision.enabled[i] = self.shown;
             }
             self.moving = false;

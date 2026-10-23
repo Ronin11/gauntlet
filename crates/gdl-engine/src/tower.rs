@@ -1075,4 +1075,32 @@ mod tests {
         );
         assert!(typewrite("Hi\tthere", 100.0).0 == "Hithere");
     }
+
+    /// The podium's stairs (L1STAIRS_PODIUM, flag 8) are climbed, and the
+    /// faded-out lit podium (a trigger target that also has a world
+    /// animation) has no collision: a hero walks from the tower floor up to
+    /// the lectern and Sumner welcomes them.
+    #[test]
+    fn a_hero_walks_up_the_podium_stairs_to_the_lectern() {
+        let Some((fs, mut g)) = tower() else { return };
+        let s = Sumner::new(&fs, &mut g, Entry::default());
+        g.sumner = Some(Box::new(s));
+        g.players[0].pos = Vec3::new(3.3, -0.27, -32.0);
+        let mut top = f32::MIN;
+        for _ in 0..240 {
+            let stick = g.stick_toward(glam::Vec2::new(0.0, -1.0));
+            let inp = crate::input::PlayerInput {
+                stick,
+                ..Default::default()
+            };
+            g.update(1.0 / 60.0, &[inp]);
+            top = top.max(g.players[0].pos.y);
+            if g.sumner.as_ref().unwrap().gwiz_seq == 3 {
+                break;
+            }
+        }
+        let p = g.players[0].pos;
+        assert!(top > 1.2 && p.z < -48.0, "up the stairs: {p:?}");
+        assert_eq!(g.sumner.as_ref().unwrap().gwiz_seq, 3, "WELCOME at {p:?}");
+    }
 }
