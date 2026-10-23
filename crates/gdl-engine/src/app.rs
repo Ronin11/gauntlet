@@ -330,6 +330,10 @@ struct Running {
     saver_models: Option<crate::screensaver::SaverModels>,
     /// The developer debug menu (F1 / L+R+Z+Start; not in the original).
     debug: crate::debugmenu::DebugMenu,
+    /// Watches the running level for the bug reports' event log.
+    bugs: crate::bugreport::Recorder,
+    /// Frames drawn.
+    frames: u64,
     last: Instant,
     acc: f32,
     window: Arc<Window>,
@@ -453,6 +457,8 @@ impl App {
             saver: None,
             saver_models: None,
             debug: Default::default(),
+            bugs: Default::default(),
+            frames: 0,
             last: Instant::now(),
             acc: 0.0,
             window,
@@ -1150,6 +1156,7 @@ impl App {
                         }
                         play.game.debug_god = r.debug.god;
                         play.game.update(TICK, &inputs);
+                        r.bugs.observe(&play.game, &inputs);
                         play.intro += TICK;
                         // do_vibe: only for players with the Vibration option on.
                         for v in play.game.snd.rumble.drain(..) {
@@ -1325,6 +1332,7 @@ impl App {
                 in_game = true;
                 let p = &mut **play;
                 for snd in p.game.sfx.drain(..) {
+                    crate::bugreport::sound(&snd);
                     r.audio.play(fs, &snd);
                 }
                 // fn_80052134: the compass hides while the options are open.
@@ -1432,6 +1440,7 @@ impl App {
             m.draw(s, &r.gpu, &view, &r.depth, vp);
         }
         frame.present();
+        r.frames += 1;
 
         // A finished level: tower portals lead to their level (after its intro
         // movie); a level leads back to the tower through player select.
@@ -1766,7 +1775,118 @@ fn debug_tick(
             r.debug.close();
             Some(Some(debug_warp(r, level)))
         }
+        Action::FileBug(tags) => {
+            r.debug.tower_dirty = dirty;
+            let res = file_bug(r, &tags);
+            if let Err(e) = &res {
+                log::warn!("bug report: {e}");
+            }
+            r.debug.bug_filed(res);
+            Some(None)
+        }
     }
+}
+
+/// The debug menu's "File bug report" (bugreport.rs; not in the original).
+fn file_bug(r: &Running, tags: &[&'static str]) -> std::result::Result<std::path::PathBuf, String> {
+    let root = crate::bugreport::dir().ok_or("no folder for reports")?;
+    let shot = match bug_screenshot(r) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("bug report screenshot: {e:#}");
+            None
+        }
+    };
+    let (game, panels): (Option<&Game>, &[PanelInfo]) = match &r.screen {
+        Screen::Playing { play, .. } => (Some(&play.game), &play.panels),
+        _ => (None, &[]),
+    };
+    let screen = match &r.screen {
+        Screen::Legal(_) => "legal",
+        Screen::Attract => "attract",
+        Screen::Flyby { .. } => "flyby",
+        Screen::GameOver { .. } => "game over",
+        Screen::Title(_) => "title",
+        Screen::Select(_) => "select",
+        Screen::Loading { .. } => "loading",
+        Screen::Map { .. } => "map",
+        Screen::Shop { .. } => "shop",
+        Screen::Intro { .. } => "intro movie",
+        Screen::Playing { pause: Some(_), .. } => "playing (game menu open)",
+        Screen::Playing { .. } => "playing",
+    };
+    let report = crate::bugreport::Report {
+        game,
+        panels,
+        progress: Some(&r.progress),
+        heroes: &r.heroes,
+        prefs: Some(&r.prefs),
+        card_file: r.card.path(),
+        tags,
+        screen,
+        frames: r.frames,
+        via: "debug menu",
+    };
+    crate::bugreport::file(&root, &report, shot.as_ref()).map_err(|e| format!("{e:#}"))
+}
+
+/// The level as last drawn, with its HUD but not the debug menu (1024x768).
+fn bug_screenshot(r: &Running) -> Result<Option<gdl_formats::Image>> {
+    let Screen::Playing { play, .. } = &r.screen else {
+        return Ok(None);
+    };
+    let p = &**play;
+    let (w, h) = (1024, 768);
+    let ticks = 100;
+    let globals = p.scene.globals(&p.game, 4.0 / 3.0);
+    let draw = |view: &wgpu::TextureView| {
+        let mut canvas = hud::Canvas::new(w, h);
+        hud::build(
+            &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+            &p.game,
+            &p.panels,
+        );
+        hud::build_coins(
+            &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+            &p.game,
+            &p.panels,
+            p.boss_bank.as_ref(),
+        );
+        hud::build_boss(
+            &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+            &p.game,
+            p.boss_bank.as_ref(),
+        );
+        if let Some(b) = &p.game.scroll_box {
+            menu::draw_scroll(
+                &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+                b.text(),
+                b.scale,
+            );
+        }
+        r.hud.draw(&r.gpu.device, &r.gpu.queue, view, &canvas);
+    };
+    let mut img = r.gpu.render_to_image(
+        w,
+        h,
+        &globals,
+        CLEAR,
+        &p.scene.draws(&p.game),
+        Some(p.scene.sprites()),
+        Some(&draw),
+    )?;
+    if matches!(
+        r.gpu.color_format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    ) {
+        for px in img.rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+    }
+    for px in img.rgba.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    Ok(Some(img))
 }
 
 /// The debug menu's warp: the party (as it is now) into `level`; from the

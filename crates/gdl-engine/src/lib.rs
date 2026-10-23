@@ -6,6 +6,7 @@ pub mod app;
 pub mod attract;
 pub mod audio;
 pub mod boss;
+pub mod bugreport;
 pub mod camera;
 pub mod character;
 pub mod cheats;

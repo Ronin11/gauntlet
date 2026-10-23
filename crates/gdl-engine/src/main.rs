@@ -60,13 +60,15 @@ Testing:
   --snapshot <png>      Render one frame headless and exit
   --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
                         select:load|save|result|char (memory card screens),
-                        debug[:main|warp|progress|unlocks|party|level[:row]]
+                        debug[:main|warp|progress|unlocks|party|level|bug[:row]]
                         (the developer debug menu over --level),
                         map:<level>[:ticks] (e.g. map:A6:300),
                         shop[:after|menu|inv|final[:ticks[:events]]] with a fake
                         2-player party after A1; events are <tick><key>[<player>]
                         joined by commas, keys a b x u d (e.g. shop:after:900:600a)
   --simulate <frames>   Simulate N 60 Hz frames before the snapshot
+                        (GDL_BUGREPORT=<frame>: stop there and file a bug report,
+                        GDL_BUGTAGS=stuck,other its tags)
   --hold <x,y>          Stick input held during simulation
   --attack-at <frame>   Press attack on that frame
   --block-at <frame>    Press B (block) on that frame and hold it after
@@ -412,7 +414,15 @@ fn snapshot_game(args: &Args) -> Result<()> {
         gdl_engine::flyby::FlybyCam::new(&g.level.worlds)
     });
     let mut sfx_seen: Vec<String> = Vec::new();
-    for f in 0..args.simulate {
+    // GDL_BUGREPORT=<frame>: file a bug report as the debug menu would, after
+    // that frame (the simulation stops there; the snapshot is its screenshot).
+    let bug_at: Option<u32> = std::env::var("GDL_BUGREPORT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let simulate = bug_at.map_or(args.simulate, |b| b.min(args.simulate));
+    let mut bugs = gdl_engine::bugreport::Recorder::new();
+    gdl_engine::bugreport::use_tick_clock();
+    for f in 0..simulate {
         if let Some(cam) = &mut flyby {
             if f % 2 == 1 {
                 cam.update(2);
@@ -481,6 +491,10 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
         let ended = g.level_end.is_some();
         g.update(1.0 / 60.0, &inputs);
+        bugs.observe(&g, &inputs);
+        for s in &g.sfx {
+            gdl_engine::bugreport::sound(s);
+        }
         if !ended {
             if let Some(end) = &g.level_end {
                 println!("t={f} level end {end:?}");
@@ -737,6 +751,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 "unlocks" => Page::Unlocks,
                 "party" => Page::Party,
                 "level" => Page::Level,
+                "bug" => Page::Bug,
                 p => anyhow::bail!("--screen debug: unknown page {p}"),
             };
             let row: usize = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -954,14 +969,48 @@ fn snapshot_game(args: &Args) -> Result<()> {
             Some(&draw_hud),
         )?,
     };
+    if bug_at.is_some() {
+        let dir = gdl_engine::bugreport::dir().context("no folder for bug reports")?;
+        let card =
+            gdl_engine::save::MemCard::default_dir().map(|d| d.join(gdl_engine::save::CARD_FILE));
+        let progress = progress::Progress::default();
+        let prefs = options::Prefs::default();
+        let tags: Vec<&str> = std::env::var("GDL_BUGTAGS")
+            .ok()
+            .map(|v| {
+                gdl_engine::bugreport::TAGS
+                    .iter()
+                    .copied()
+                    .filter(|t| v.split(',').any(|w| w.trim() == *t))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let report = gdl_engine::bugreport::Report {
+            game: Some(&g),
+            panels: &panels,
+            progress: Some(&progress),
+            heroes: &[None, None, None, None],
+            prefs: Some(&prefs),
+            card_file: card.as_deref(),
+            tags: &tags,
+            screen: "playing (headless)",
+            frames: simulate as u64,
+            via: "GDL_BUGREPORT",
+        };
+        let out = gdl_engine::bugreport::file(&dir, &report, Some(&img))?;
+        println!("bug report {}", out.display());
+    }
     write_png(args.snapshot.as_ref().unwrap(), &img)
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(
+    // env_logger, with the bug reports' event ring beside it (bugreport.rs).
+    let logger = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"),
     )
-    .init();
+    .build();
+    let max = logger.filter();
+    gdl_engine::bugreport::install_logger(Box::new(logger), max);
     let args = parse_args()?;
     if args.snapshot.is_some() {
         return match &args.character {
