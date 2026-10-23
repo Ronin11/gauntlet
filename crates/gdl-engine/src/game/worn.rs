@@ -873,8 +873,14 @@ impl Game {
                 }
             }
             _ => {
-                // StartGemFX's sparkles every 10 frames of the first 60 have
-                // no effect here yet.
+                // StartGemFX's sparkles every 10 frames of the first 60.
+                let t = p.worn.mikey.state;
+                if t < 0x3C && t % 10 == 0 {
+                    let at = p.worn.mikey.pos + Vec3::Y * (PLAYER_HEIGHT * 0.5);
+                    let n = (self.rng.next_u32() % 4 + 1) as i32;
+                    self.start_gem_fx(at, n);
+                }
+                let p = &mut self.players[pi];
                 p.worn.mikey.state += 1;
                 if on {
                     p.worn.mikey.state = 300;

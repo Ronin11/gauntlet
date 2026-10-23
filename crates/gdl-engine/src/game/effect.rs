@@ -759,6 +759,17 @@ impl Game {
         Some(id)
     }
 
+    /// StartGemFX: a pickup sparkle — GETRUNE (0x400), GETGARG (0x100), else
+    /// row 69 + `sel` (the GETGEM colours).
+    pub(crate) fn start_gem_fx(&mut self, pos: Vec3, sel: i32) -> Option<u64> {
+        let ty = match sel {
+            0x400 => 79,
+            0x100 => 78,
+            s => usize::try_from(s + 69).ok()?,
+        };
+        self.start_fx(ty, pos, 0.0, 0.0)
+    }
+
     /// StartEnterFX: STARTFX where the party starts.
     pub(crate) fn start_enter_fx(&mut self, pos: Vec3) -> Option<u64> {
         self.start_fx(FX_ENTER, pos, 0.0, 0.0)
@@ -828,7 +839,7 @@ impl Game {
             self.scale_fx(id, Vec3::new(wide, 1.0, wide));
         }
         let maxtime = self.fx_time(ty);
-        self.items.blasts.push(items::Blast::new(
+        self.items.blasts.push(owner_less_blast(
             at,
             WORLD_EXP_DAMAGE,
             dtype,
@@ -856,7 +867,7 @@ impl Game {
                 self.scale_fx(id, Vec3::new(2.5, 1.0, 2.5));
             }
             let maxtime = self.fx_time(FX_EXPPOISON);
-            self.items.blasts.push(items::Blast::new(
+            self.items.blasts.push(owner_less_blast(
                 at,
                 dmg,
                 DmgType::POISON_GAS,
@@ -869,7 +880,7 @@ impl Game {
         } else {
             let fx = self.start_fx(FX_EXPLODE, pos, 0.0, 0.0);
             let maxtime = self.fx_time(FX_EXPLODE);
-            self.items.blasts.push(items::Blast::new(
+            self.items.blasts.push(owner_less_blast(
                 pos,
                 dmg,
                 0x421,
@@ -1063,6 +1074,24 @@ impl Game {
     pub fn fx_look(&self, id: u64) -> Option<FxLook> {
         self.effects.looks.get(&id).copied()
     }
+}
+
+/// An owner-less expanding effect (flags 0x20) over `maxtime`, with its
+/// morph chain.
+#[allow(clippy::too_many_arguments)]
+fn owner_less_blast(
+    pos: Vec3,
+    damage: f32,
+    dtype: u32,
+    radius: f32,
+    flags: u32,
+    maxtime: f32,
+    morph: Vec<(usize, f32)>,
+    fx: Option<u64>,
+) -> items::Blast {
+    let mut b = items::Blast::new(pos, damage, dtype, radius, flags, None, maxtime, 0.0, fx);
+    b.morph = morph;
+    b
 }
 
 /// The distance from `p` to the segment `a`-`b`.

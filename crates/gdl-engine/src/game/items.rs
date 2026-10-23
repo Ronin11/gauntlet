@@ -138,35 +138,6 @@ impl Blast {
     }
 }
 
-impl Blast {
-    /// An owner-less expanding effect (flags 0x20) over `maxtime`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        pos: Vec3,
-        damage: f32,
-        dtype: u32,
-        radius: f32,
-        flags: u32,
-        maxtime: f32,
-        morph: Vec<(usize, f32)>,
-        fx: Option<u64>,
-    ) -> Blast {
-        Blast {
-            pos,
-            damage,
-            dtype,
-            radius,
-            flags,
-            owner: None,
-            remaining: maxtime,
-            maxtime,
-            morph,
-            fx,
-            hit: Vec::new(),
-        }
-    }
-}
-
 /// A bag thrown out of a dying monster (StartBagFX): up at 20, pitching
 /// over, falling at 50 for at most 3 s; whatever it hits it becomes BAG_HIT
 /// (fxhit, placed on the floor), and its item is placed where that ends.
