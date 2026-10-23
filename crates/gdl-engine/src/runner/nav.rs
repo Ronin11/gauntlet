@@ -57,6 +57,14 @@ pub fn xz(v: Vec3) -> Vec2 {
     Vec2::new(v.x, v.z)
 }
 
+/// A walking hero: where, falling speed, and on the floor or not.
+#[derive(Clone, Copy, Debug)]
+pub struct Hero {
+    pub pos: Vec3,
+    pub vy: f32,
+    pub on_ground: bool,
+}
+
 /// The world as the walking simulation sees it.
 pub struct WalkWorld<'a> {
     pub col: &'a Collision,
@@ -64,6 +72,9 @@ pub struct WalkWorld<'a> {
     /// Solid entities to walk through (breakables the runner will smash).
     pub ignore: &'a HashSet<u64>,
     pub min_y: f32,
+    /// Where a step was refused for want of floor although floor goes on
+    /// just beyond (a seam between floor objects narrower than a step).
+    pub cracks: std::cell::RefCell<Vec<Vec3>>,
 }
 
 impl WalkWorld<'_> {
@@ -118,60 +129,98 @@ impl WalkWorld<'_> {
         pos
     }
 
-    /// One tick of a hero's walk from `p` along `dir` for `s` units, as
-    /// Game::update moves heroes: no step off a ledge, walls, stairs, solid
-    /// items, then the floor. None when the hero would leave the world.
-    pub fn step(&self, p: Vec3, dir: Vec2, s: f32) -> Option<Vec3> {
+    /// One tick of a hero's walk from `h` along `dir` for `s` units, as
+    /// Game::update moves heroes: no step off a ledge (unless airborne),
+    /// walls, stairs, solid items, then gravity and the floor
+    /// (snap_to_ground). None when the hero would leave the world.
+    pub fn step(&self, h: Hero, dir: Vec2, s: f32) -> Option<Hero> {
+        const DT: f32 = 1.0 / 60.0;
         let col = self.col;
+        let p = h.pos;
         let target = p + Vec3::new(dir.x, 0.0, dir.y) * s;
         let probe = col.ground_hit(target, p.y + STEP_HEIGHT);
         let under = col.ground_hit(p, p.y + 0.1).map(|(_, o)| o);
         let ok = probe.is_some_and(|(g, o)| {
             p.y - g <= STAIR_RISE + if Some(o) == under { 1.0 } else { 0.0 }
         });
-        let q = if ok { target } else { p };
+        if probe.is_none() && h.on_ground && s > 0.0 {
+            let beyond = |d: f32| {
+                let t = p + Vec3::new(dir.x, 0.0, dir.y) * d;
+                col.ground_height(t, p.y + STEP_HEIGHT).is_some_and(|g| p.y - g <= STAIR_RISE)
+            };
+            if beyond(s + 0.25) || beyond(s + 0.5) {
+                self.cracks.borrow_mut().push(target);
+            }
+        }
+        let q = if ok || !h.on_ground { target } else { p };
         let (mut pos, wall_hit) =
             col.resolve_walls_stairs(q, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT, STAIR_RISE);
-        if let Some((y, t)) = col.ground_tri(pos, pos.y + STAIR_RISE) {
-            if col.stairs[t] && y > pos.y {
-                pos.y = y;
+        if h.on_ground {
+            if let Some((y, t)) = col.ground_tri(pos, pos.y + STAIR_RISE) {
+                if col.stairs[t] && y > pos.y {
+                    pos.y = y;
+                }
             }
         }
         let walled = pos;
         pos = self.solids(pos);
+        // snap_to_ground.
+        let mut vy = h.vy - 60.0 * DT;
+        pos.y += vy * DT;
+        let g = col.ground_height(pos, pos.y + STEP_HEIGHT);
+        let on_ground = match g {
+            Some(g) if pos.y <= g || (pos.y - g < 0.3 && vy <= 0.0) => {
+                pos.y = g;
+                vy = 0.0;
+                true
+            }
+            _ => false,
+        };
         if std::env::var_os("GDL_NAV_DEBUG").is_some() {
             println!(
-                "    step {p:?} -> target {target:?} probe {probe:?} under {under:?} ok {ok} walls {walled:?} solids {pos:?} ground {:?} wall {wall_hit:?}",
-                col.ground_height(pos, pos.y + STEP_HEIGHT)
+                "    step {p:?} -> target {target:?} probe {probe:?} under {under:?} ok {ok} walls {walled:?} solids {pos:?} ground {g:?} on {on_ground} wall {wall_hit:?}",
             );
         }
-        let g = col.ground_height(pos, pos.y + STEP_HEIGHT)?;
-        pos.y = g;
-        (pos.y > self.min_y).then_some(pos)
+        (pos.y > self.min_y).then_some(Hero { pos, vy, on_ground })
     }
 
-    /// Walk from `from` toward `to`: where the hero ends up.
+    /// Walk from `from` toward `to`: where the hero ends up (landed).
     pub fn walk(&self, from: Vec3, to: Vec3) -> Vec3 {
-        let mut p = from;
+        let mut h = Hero {
+            pos: from,
+            vy: 0.0,
+            on_ground: true,
+        };
         let dist = xz(to - from).length();
         let max = (dist / STEP * 2.0) as usize + 4;
         for _ in 0..max {
-            let d = xz(to - p);
+            let d = xz(to - h.pos);
             let len = d.length();
             if len < 0.05 {
                 break;
             }
-            match self.step(p, d / len, STEP.min(len)) {
+            match self.step(h, d / len, STEP.min(len)) {
                 Some(q) => {
-                    if xz(q - p).length() < 0.01 && (q.y - p.y).abs() < 0.01 {
+                    let still = xz(q.pos - h.pos).length() < 0.01 && (q.pos.y - h.pos.y).abs() < 0.01;
+                    h = q;
+                    if still && h.on_ground {
                         break;
                     }
-                    p = q;
                 }
-                None => break,
+                None => return h.pos - Vec3::Y * 1000.0,
             }
         }
-        p
+        // Land.
+        for _ in 0..120 {
+            if h.on_ground {
+                break;
+            }
+            match self.step(h, Vec2::ZERO, 0.0) {
+                Some(q) => h = q,
+                None => return h.pos - Vec3::Y * 1000.0,
+            }
+        }
+        h.pos
     }
 
     /// Whether a hero walks from `from` to `to`.
@@ -198,6 +247,14 @@ pub struct Nav {
     last_solids: HashMap<u64, Vec3>,
     pub ignore: HashSet<u64>,
     min_y: f32,
+    /// Floor seams that stopped an edge walk (see WalkWorld::cracks).
+    pub cracks: Vec<Vec3>,
+    /// Refresh bookkeeping: looks taken, and how many looks in a row each
+    /// triangle has moved.
+    checks: u64,
+    streak: Vec<u8>,
+    /// Damage tiles: (position, radius).
+    hazards: Vec<(Vec3, f32)>,
     /// Edge walks done (for the stats).
     pub walks: u64,
 }
@@ -236,6 +293,17 @@ impl Nav {
             last_solids: solid_set(g),
             ignore: HashSet::new(),
             min_y: w.min_bounds[1],
+            cracks: Vec::new(),
+            checks: 0,
+            streak: Vec::new(),
+            hazards: g
+                .entities
+                .iter()
+                .filter_map(|e| match e.kind {
+                    crate::game::Kind::Hazard { radius, .. } => Some((e.pos, radius)),
+                    _ => None,
+                })
+                .collect(),
             walks: 0,
         };
         for iz in 0..nz {
@@ -264,6 +332,7 @@ impl Nav {
             ents: &g.entities,
             ignore: &self.ignore,
             min_y: self.min_y,
+            cracks: Default::default(),
         }
     }
 
@@ -271,52 +340,64 @@ impl Nav {
     fn build_cell(&mut self, g: &Game, c: (i32, i32)) {
         let col = &g.collision;
         let ctr = self.centre(c);
-        let mut top = g.level.worlds.max_bounds[1].max(self.min_y + 1.0) + 20.0;
-        let mut ids = Vec::new();
-        for _ in 0..MAX_LAYERS {
-            let at = Vec3::new(ctr.x, top, ctr.y);
-            let Some(y) = col.ground_height(at, top) else { break };
-            top = y - 1.5;
-            if y <= self.min_y {
-                break;
+        let top0 = g.level.worlds.max_bounds[1].max(self.min_y + 1.0) + 20.0;
+        let mut ids: Vec<u32> = Vec::new();
+        // The centre first, then spots around it: a narrow ledge may miss
+        // the centre, or have no room for a hero there.
+        let k = CELL * 0.3;
+        const OFFS: [(f32, f32); 9] = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (-1.0, 0.0),
+            (0.0, 1.0),
+            (0.0, -1.0),
+            (1.0, 1.0),
+            (-1.0, 1.0),
+            (1.0, -1.0),
+            (-1.0, -1.0),
+        ];
+        for (ox, oz) in OFFS {
+            let q = ctr + Vec2::new(ox, oz) * k;
+            let mut top = top0;
+            for _ in 0..MAX_LAYERS {
+                let at = Vec3::new(q.x, top, q.y);
+                let Some(y) = col.ground_height(at, top) else { break };
+                top = y - 1.5;
+                if y <= self.min_y {
+                    break;
+                }
+                if ids.iter().any(|&i| (self.nodes[i as usize].pos.y - y).abs() < 1.0) {
+                    continue;
+                }
+                let p0 = Vec3::new(q.x, y, q.y);
+                let (p1, _) = col.resolve_walls_stairs(p0, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT, STAIR_RISE);
+                let (p2, _) = col.resolve_walls_stairs(p1, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT, STAIR_RISE);
+                if xz(p2 - p1).length() > 0.05 || xz(p2 - ctr3(ctr, y)).length() > CELL * 0.75 {
+                    continue;
+                }
+                let Some((y2, owner)) = col.ground_hit(p2, y + STEP_HEIGHT) else {
+                    continue;
+                };
+                if (y2 - y).abs() > 1.5 {
+                    continue;
+                }
+                let pos = Vec3::new(p2.x, y2, p2.z);
+                if ids.iter().any(|&i| (self.nodes[i as usize].pos.y - y2).abs() < 1.0) {
+                    continue;
+                }
+                let id = self.nodes.len() as u32;
+                self.nodes.push(Node {
+                    pos,
+                    cell: c,
+                    alive: true,
+                    hurts: g.hurting_surface(owner).is_some()
+                        || self.hazards.iter().any(|&(hp, r)| {
+                            xz(hp - pos).length() < r + PLAYER_RADIUS && (hp.y - pos.y).abs() < 4.0
+                        }),
+                });
+                self.edges.push(None);
+                ids.push(id);
             }
-            let p0 = Vec3::new(ctr.x, y, ctr.y);
-            let (p1, _) =
-                col.resolve_walls_stairs(p0, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT, STAIR_RISE);
-            let (p2, _) =
-                col.resolve_walls_stairs(p1, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT, STAIR_RISE);
-            if xz(p2 - p1).length() > 0.05 || xz(p2 - p0).length() > CELL * 0.7 {
-                continue;
-            }
-            let Some((y2, owner)) = col.ground_hit(p2, y + STEP_HEIGHT) else {
-                continue;
-            };
-            if (y2 - y).abs() > 1.5 {
-                continue;
-            }
-            let pos = Vec3::new(p2.x, y2, p2.z);
-            if ids
-                .iter()
-                .any(|&i: &u32| (self.nodes[i as usize].pos.y - y2).abs() < 1.0)
-            {
-                continue;
-            }
-            let id = self.nodes.len() as u32;
-            self.nodes.push(Node {
-                pos,
-                cell: c,
-                alive: true,
-                hurts: g.hurting_surface(owner).is_some()
-                    || g.entities.iter().any(|e| match e.kind {
-                        crate::game::Kind::Hazard { radius, .. } => {
-                            xz(e.pos - pos).length() < radius + PLAYER_RADIUS
-                                && (e.pos.y - pos.y).abs() < 4.0
-                        }
-                        _ => false,
-                    }),
-            });
-            self.edges.push(None);
-            ids.push(id);
         }
         if ids.is_empty() {
             self.cells.remove(&c);
@@ -407,11 +488,21 @@ impl Nav {
                     };
                     for &m in ids.clone().iter() {
                         let mn = self.nodes[m as usize];
-                        if !mn.alive || (mn.pos.y - node.pos.y).abs() > STAIR_RISE + 1.5 {
+                        let dy = mn.pos.y - node.pos.y;
+                        // Up a step or stairs; down a step, or a fall off an edge.
+                        if !mn.alive || dy > STAIR_RISE + 1.5 || dy < -30.0 {
                             continue;
                         }
                         self.walks += 1;
-                        if self.world(g).walks(node.pos, mn.pos) {
+                        let w = self.world(g);
+                        let ok = w.walks(node.pos, mn.pos);
+                        let cr = w.cracks.take();
+                        if !ok {
+                            if let Some(c) = cr.last() {
+                                self.cracks.push(*c);
+                            }
+                        }
+                        if ok {
                             let d = (mn.pos - node.pos).length();
                             let cost = if mn.hurts { d * 12.0 + 20.0 } else { d };
                             out.push(Edge {
@@ -448,22 +539,53 @@ impl Nav {
         let mut boxes: Vec<(Vec2, Vec2)> = Vec::new();
         let col = &g.collision;
         if col.tris.len() == self.last_verts.len() {
-            let mut lo = Vec2::splat(f32::MAX);
-            let mut hi = Vec2::splat(f32::MIN);
+            // Per moving object; objects that never stop (spinners,
+            // conveyors) only every 20th look.
+            self.checks += 1;
+            if self.streak.len() != col.tris.len() {
+                self.streak = vec![0; col.tris.len()];
+            }
+            let mut per: HashMap<i32, (Vec2, Vec2, bool)> = HashMap::new();
+            let mut changed: Vec<usize> = Vec::new();
             for (i, t) in col.tris.iter().enumerate() {
                 let was = &self.last_verts[i];
-                let moved = t.v != *was;
-                if moved || col.enabled[i] != self.last_enabled[i] {
+                if t.v != *was || col.enabled[i] != self.last_enabled[i] {
+                    self.streak[i] = self.streak[i].saturating_add(1);
+                    let e = per
+                        .entry(t.owner)
+                        .or_insert((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN), false));
                     for v in t.v.iter().chain(was.iter()) {
-                        lo = lo.min(xz(*v));
-                        hi = hi.max(xz(*v));
+                        e.0 = e.0.min(xz(*v));
+                        e.1 = e.1.max(xz(*v));
                     }
-                    self.last_verts[i] = t.v;
+                    e.2 |= self.streak[i] >= 4;
+                    changed.push(i);
+                } else {
+                    self.streak[i] = 0;
+                }
+            }
+            let due = self.checks % 20 == 0;
+            // ...or when a hero is close by (riding it, say).
+            let near = |lo: Vec2, hi: Vec2| {
+                g.players.iter().any(|p| {
+                    let q = xz(p.pos).clamp(lo, hi);
+                    (q - xz(p.pos)).length() < 16.0
+                })
+            };
+            let take: HashMap<i32, bool> = per
+                .iter()
+                .map(|(o, e)| (*o, !e.2 || due || near(e.0, e.1)))
+                .collect();
+            for i in changed {
+                if take.get(&col.tris[i].owner).copied().unwrap_or(true) {
+                    self.last_verts[i] = col.tris[i].v;
                     self.last_enabled[i] = col.enabled[i];
                 }
             }
-            if lo.x <= hi.x {
-                boxes.push((lo, hi));
+            for (o, (lo, hi, _)) in per {
+                if take[&o] {
+                    boxes.push((lo, hi));
+                }
             }
         }
         let now = solid_set(g);
@@ -652,4 +774,8 @@ impl PartialOrd for Open {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
         Some(self.cmp(o))
     }
+}
+
+fn ctr3(c: Vec2, y: f32) -> Vec3 {
+    Vec3::new(c.x, y, c.y)
 }

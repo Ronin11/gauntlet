@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 jobs=4
 out=runner-out
 party=WAR
-timeout=900
+timeout=1800
 while getopts "j:o:p:t:" opt; do
   case $opt in
     j) jobs=$OPTARG ;;

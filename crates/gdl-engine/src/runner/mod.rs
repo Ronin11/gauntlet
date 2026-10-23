@@ -51,7 +51,7 @@ pub struct RunResult {
 const HELP: &str = "\
 gauntlet --run-level <name|all|realm letter|a,b,c> [options]
   --runner-party WAR,VAL     heroes (default WAR); the 2nd and later follow the 1st
-  --runner-timeout <secs>    game seconds per level (default 900)
+  --runner-timeout <secs>    game seconds per level (default 1800)
   --runner-out <dir>         results folder (default runner-out)
   --runner-verbose           print the runner's decisions
   --runner-no-capture        no bug reports / snapshots on failure
@@ -78,7 +78,7 @@ fn parse(args: &[String]) -> Result<Opts> {
     let mut o = Opts {
         levels: Vec::new(),
         party: vec![("WAR".into(), "RED".into())],
-        timeout: 900.0,
+        timeout: 1800.0,
         out: PathBuf::from("runner-out"),
         verbose: false,
         data: None,
@@ -138,7 +138,8 @@ pub fn all_levels(fs: &GameFs) -> Vec<String> {
     let mut v: Vec<String> = fs
         .list_dirs("LEVELS")
         .into_iter()
-        .filter(|n| n.starts_with("level"))
+        // levelT*: the unused test levels (game.rs's music test skips them too).
+        .filter(|n| n.starts_with("level") && !n.starts_with("levelT"))
         .collect();
     v.sort();
     v.dedup();
@@ -264,6 +265,16 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
     let mut rec = crate::bugreport::Recorder::new();
     let mut reports = Vec::new();
     let mut notes = Vec::new();
+    if let Some(w) = g.wave {
+        let title = g.worlds.level(w).map_or(String::new(), |l| format!("{} {}", l.prep, l.title));
+        notes.push(format!("wave {w:#x} \"{}\"", title.trim()));
+    }
+    if g.boss.is_some() {
+        notes.push("boss level".into());
+    }
+    if let Some((t, _)) = g.secret_timer {
+        notes.push(format!("timed (secret) level, {t:.0} s"));
+    }
     let mut captured = 0;
     let n = g.players.len();
     let dbg_from: Option<f32> = std::env::var("GDL_RUNNER_DEBUG").ok().and_then(|v| v.parse().ok());
@@ -392,6 +403,7 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
         ents: &g.entities,
         ignore: &ignore,
         min_y: g.level.worlds.min_bounds[1],
+        cracks: Default::default(),
     };
     // GDL_NAV_NODES=r: the nav nodes within r of the target and their edges.
     if let Some(r) = std::env::var("GDL_NAV_NODES").ok().and_then(|v| v.parse::<f32>().ok()) {

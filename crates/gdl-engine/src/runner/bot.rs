@@ -155,6 +155,9 @@ pub struct Bot {
     last_pos: Vec<Vec3>,
     falls: u32,
     pub verbose: bool,
+    giveup_t: Option<f32>,
+    /// Wall seconds: inputs, planning, lookahead, nav refresh.
+    pub timing: [f64; 4],
 }
 
 const MAX_EXPAND: usize = 300_000;
@@ -226,6 +229,8 @@ impl Bot {
             last_pos: g.players.iter().map(|p| p.pos).collect(),
             falls: 0,
             verbose,
+            giveup_t: None,
+            timing: [0.0; 4],
         }
     }
 
@@ -281,6 +286,16 @@ impl Bot {
                 }
                 _ => return None,
             },
+            (Obj::Smash(_), Some(e)) if wall_points(g, e).is_some() => {
+                // A breakable wall: up against its collision, anywhere along it.
+                let pts = wall_points(g, e)?;
+                let me = g.players.first().map_or(e.pos, |p| p.pos);
+                let near = pts
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| (*a - me).length().total_cmp(&(*b - me).length()))?;
+                (pts.iter().map(|&p| Goal::new(p, PLAYER_RADIUS + 1.6, 4.0)).collect(), near)
+            }
             (Obj::Smash(_), Some(e)) => {
                 let r = solid_radius(e) + PLAYER_RADIUS + 1.2;
                 (vec![Goal::new(e.pos, r, 3.0)], e.pos)
@@ -307,6 +322,18 @@ impl Bot {
 
     /// A path for hero `i` to the nearest of `cands` (objective, goals).
     fn plan_any(
+        &mut self,
+        g: &Game,
+        i: usize,
+        cands: &[(Obj, Vec<Goal>, Vec3)],
+    ) -> Option<(Obj, Vec<u32>, f32)> {
+        let t0 = std::time::Instant::now();
+        let r = self.plan_any_inner(g, i, cands);
+        self.timing[1] += t0.elapsed().as_secs_f64();
+        r
+    }
+
+    fn plan_any_inner(
         &mut self,
         g: &Game,
         i: usize,
@@ -415,8 +442,9 @@ impl Bot {
                     self.lectern_ok = Some(false);
                 }
             }
-            if self.portals_reachable.is_empty() {
+            {
                 // Which open portals can be walked to at all.
+                self.portals_reachable.clear();
                 let portals = self.cands(g, |e| match e.kind {
                     Kind::Exit { open: true, dest: Some(_), .. } => Some(Obj::Portal(e.id)),
                     _ => None,
@@ -442,7 +470,37 @@ impl Bot {
                 self.set_obj(g, i, o, path, cost);
                 return Ok(());
             }
-            return Err(Outcome::Unreachable("no open tower portal is reachable".into()));
+            // A new party's way out: the tower's crystals open its first
+            // barrier (the barrier opens to a touch once enough are found).
+            let crystals = self.cands(g, |e| match e.kind {
+                Kind::Pickup { kind: PickupKind::Crystal(_), .. } => Some(Obj::Pickup(e.id)),
+                _ => None,
+            });
+            if let Some((o, path, cost)) = self.plan_any(g, i, &crystals) {
+                self.set_obj(g, i, o, path, cost);
+                return Ok(());
+            }
+            let tried_map = self.tried.clone();
+            let barriers: Vec<_> = self
+                .cands(g, |e| match e.kind {
+                    Kind::Trigger { gate: Some(c), .. }
+                        if c < 100 && crate::game::crystals_met(&g.crystals, c) =>
+                    {
+                        Some(Obj::Trigger(e.id))
+                    }
+                    _ => None,
+                })
+                .into_iter()
+                .filter(|c| tried_map.get(&c.0).copied().unwrap_or(0) < 2)
+                .collect();
+            if let Some((o, path, cost)) = self.plan_any(g, i, &barriers) {
+                self.set_obj(g, i, o, path, cost);
+                return Ok(());
+            }
+            return Err(Outcome::Unreachable(format!(
+                "no open tower portal is reachable (crystals {:?})",
+                g.crystals
+            )));
         }
         // Low on health: food close by first.
         if health < 0.5 {
@@ -462,6 +520,19 @@ impl Bot {
             Kind::Exit { open: true, .. } => Some(Obj::Exit(e.id)),
             _ => None,
         });
+        // A timed (secret) level: gather what is there until the time runs out.
+        if exits.is_empty() && g.secret_timer.is_some() {
+            let picks = self.cands(g, |e| match e.kind {
+                Kind::Pickup { .. } => Some(Obj::Pickup(e.id)),
+                _ => None,
+            });
+            if let Some((o, path, cost)) = self.plan_any(g, i, &picks) {
+                self.set_obj(g, i, o, path, cost);
+            } else {
+                self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
+            }
+            return Ok(());
+        }
         if exits.is_empty() && !self.failed.iter().any(|o| matches!(o, Obj::Exit(_))) {
             return Err(Outcome::Unreachable("the level has no open exit".into()));
         }
@@ -702,9 +773,24 @@ impl Bot {
             .filter(|o| matches!(o, Obj::Exit(_)))
             .map(|o| o.name())
             .collect();
+        let cracks = self.frontier_cracks(g);
+        let crack_note = if cracks.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} floor seams stop walks at the edge of the reachable area, e.g. {}",
+                cracks.len(),
+                cracks
+                    .iter()
+                    .take(3)
+                    .map(|c| format!("({:.1},{:.1},{:.1})", c.x, c.y, c.z))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
         Err(if exits_failed.is_empty() {
             Outcome::Unreachable(format!(
-                "no path to any exit; enablers exhausted (reachable {reach} nodes, keys {keys}, tried {})",
+                "no path to any exit; enablers exhausted (reachable {reach} nodes, keys {keys}, tried {}){crack_note}",
                 self.tried.len()
             ))
         } else {
@@ -878,6 +964,13 @@ impl Bot {
     /// the hero then stands (riding the target if it stands on it), and how
     /// many more nodes could be reached than `base`.
     fn lookahead(&mut self, g: &mut Game, tid: u64, exits: &[Goal], base: usize) -> Option<(bool, i64)> {
+        let t0 = std::time::Instant::now();
+        let r = self.lookahead_inner(g, tid, exits, base);
+        self.timing[2] += t0.elapsed().as_secs_f64();
+        r
+    }
+
+    fn lookahead_inner(&mut self, g: &mut Game, tid: u64, exits: &[Goal], base: usize) -> Option<(bool, i64)> {
         use crate::worldanim::wflags;
         let e = Self::ent(g, tid)?;
         let (mi, tpos, radius) = match e.kind {
@@ -1045,9 +1138,19 @@ impl Bot {
 
     /// One tick: decide, steer, fight. The inputs for every hero.
     pub fn inputs(&mut self, g: &mut Game) -> Result<Vec<PlayerInput>, Outcome> {
+        let t0 = std::time::Instant::now();
+        let r = self.inputs_inner(g);
+        self.timing[0] += t0.elapsed().as_secs_f64();
+        r
+    }
+
+    fn inputs_inner(&mut self, g: &mut Game) -> Result<Vec<PlayerInput>, Outcome> {
         let n = g.players.len();
         let mut out = vec![PlayerInput::default(); n];
-        if g.frame % 30 == 0 && self.nav.refresh(g) {
+        let tr = std::time::Instant::now();
+        let changed = g.frame % 30 == 0 && self.nav.refresh(g);
+        self.timing[3] += tr.elapsed().as_secs_f64();
+        if changed {
             for a in &mut self.agents {
                 a.replan = true;
             }
@@ -1094,7 +1197,22 @@ impl Bot {
                     }
                     if !kept {
                         self.agents[i].obj = None;
-                        self.decide_leader(g, i)?;
+                        match self.decide_leader(g, i) {
+                            Ok(()) => {
+                                if self.agents[i].obj != Some(Obj::Idle) {
+                                    self.giveup_t = None;
+                                }
+                            }
+                            // Give the world a few seconds (a fall, a mover
+                            // still on its way) before calling it.
+                            Err(e) => {
+                                let t0 = *self.giveup_t.get_or_insert(g.time);
+                                if g.time - t0 > 8.0 {
+                                    return Err(e);
+                                }
+                                self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
+                            }
+                        }
                     }
                 } else {
                     self.decide_follower(g, i, lead);
@@ -1298,6 +1416,7 @@ impl Bot {
                 ents: &g.entities,
                 ignore: &self.nav.ignore,
                 min_y: g.level.worlds.min_bounds[1],
+                cracks: Default::default(),
             };
             let far = (a.wp + 4).min(a.path.len() - 1);
             for k in (a.wp + 1..=far).rev() {
@@ -1599,6 +1718,10 @@ impl Bot {
             s += &format!("  {h}\n");
         }
         s += &format!(
+            "\nWall time: bot {:.1} s (planning {:.1}, lookahead {:.1}, nav refresh {:.1})\n",
+            self.timing[0], self.timing[1], self.timing[2], self.timing[3]
+        );
+        s += &format!(
             "\nFailed objectives: {}\nBlocked edges: {}\nNav: {} live nodes, {} edge walks\n",
             self.failed.iter().map(|o| o.name()).collect::<Vec<_>>().join(", "),
             self.nav.blocked.len(),
@@ -1720,6 +1843,9 @@ impl Bot {
             };
             put(&mut rgba, self.nav.cell_of(e.pos), col, 10);
         }
+        for c in self.frontier_cracks(g) {
+            put(&mut rgba, self.nav.cell_of(c), [255, 120, 200], 8);
+        }
         for p in &g.transport.pads {
             put(&mut rgba, self.nav.cell_of(p.pos), [150, 0, 200], 10);
         }
@@ -1727,5 +1853,47 @@ impl Bot {
             put(&mut rgba, self.nav.cell_of(p.pos), [255, 0, 0], 14);
         }
         gdl_formats::Image { width: w, height: h, rgba }
+    }
+}
+
+/// Points along a breakable wall's collision (its triangles' corners, edge
+/// middles and centres, at their lowest height), for standing against it.
+pub fn wall_points(g: &Game, e: &crate::game::Entity) -> Option<Vec<Vec3>> {
+    let Kind::Wall(w) = &e.kind else { return None };
+    let (a, n) = w.tris?;
+    let tris = g.collision.tris.get(a..a + n)?;
+    let floor = tris
+        .iter()
+        .flat_map(|t| t.v.iter().map(|v| v.y))
+        .fold(f32::MAX, f32::min);
+    let mut pts = Vec::new();
+    for t in tris {
+        let c = (t.v[0] + t.v[1] + t.v[2]) / 3.0;
+        for p in [t.v[0], t.v[1], t.v[2], (t.v[0] + t.v[1]) * 0.5, (t.v[1] + t.v[2]) * 0.5, (t.v[2] + t.v[0]) * 0.5, c] {
+            pts.push(Vec3::new(p.x, floor, p.z));
+        }
+    }
+    (!pts.is_empty()).then_some(pts)
+}
+
+impl Bot {
+    /// Floor seams (see nav::WalkWorld::cracks) next to the area hero 0 can
+    /// reach: places where a step found no floor though floor goes on.
+    pub fn frontier_cracks(&mut self, g: &Game) -> Vec<Vec3> {
+        let Some(s) = self.nav.start_node(g, g.players[0].pos) else {
+            return Vec::new();
+        };
+        let reach = self.nav.reachable(g, s, 400_000);
+        let mut out: Vec<Vec3> = Vec::new();
+        for &c in &self.nav.cracks {
+            let near = reach.iter().any(|&n| {
+                let p = self.nav.nodes[n as usize].pos;
+                xz(p - c).length() < 2.5 && (p.y - c.y).abs() < 2.0
+            });
+            if near && !out.iter().any(|o| (*o - c).length() < 2.0) {
+                out.push(c);
+            }
+        }
+        out
     }
 }
