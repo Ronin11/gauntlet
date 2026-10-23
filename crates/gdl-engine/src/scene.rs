@@ -194,11 +194,16 @@ impl Scene {
                 .entry(e.id)
                 .or_insert_with(|| gpu.new_instance(mesh));
             let yaw = e.yaw + e.spin;
+            // An effect's ScaleFX may be uneven, and MBTreeSetColor tints it.
+            let look = matches!(e.kind, Kind::Effect { .. })
+                .then(|| game.fx_look(e.id))
+                .flatten();
+            let scale = look.and_then(|l| l.scale).unwrap_or(Vec3::splat(e.scale));
             inst.transform = mirror()
                 * Mat4::from_translation(e.pos)
                 * Mat4::from_rotation_y(yaw)
                 * Mat4::from_rotation_x(e.pitch)
-                * Mat4::from_scale(Vec3::splat(e.scale));
+                * Mat4::from_scale(scale);
             let model = &game.models[m];
             if let Kind::Critter(c) = &e.kind {
                 inst.transform = inst.transform * Mat4::from_scale(Vec3::splat(c.scale));
@@ -285,7 +290,10 @@ impl Scene {
                     state: EnemyState::Dying { timer },
                     ..
                 } => Vec4::new(1.0, 0.3, 0.3, (timer * 2.0).min(1.0)),
-                _ => Vec4::ONE,
+                _ => match look.and_then(|l| l.tint) {
+                    Some([r, g, b]) => Vec4::new(r, g, b, 1.0),
+                    None => Vec4::ONE,
+                },
             };
             inst.tint.w *= e.fade;
             if game.snd.xray.iter().flatten().any(|x| x.chest == e.id) {

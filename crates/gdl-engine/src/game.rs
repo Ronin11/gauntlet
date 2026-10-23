@@ -13,6 +13,7 @@ use gdl_formats::Objects;
 use glam::{Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 
+pub(crate) mod effect;
 pub(crate) mod items;
 mod magic;
 pub mod sounds;
@@ -1112,6 +1113,8 @@ pub struct Game {
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
     pub(crate) hit_from: Option<Vec3>,
+    /// The effect table and the effects it runs (effect.rs).
+    pub(crate) effects: effect::Effects,
 }
 
 /// items.c's animated-item cycle (an item with an atree and active & 1): it
@@ -1636,6 +1639,7 @@ impl Game {
             critter_wads: HashMap::new(),
             wizard_model: None,
             hit_from: None,
+            effects: Default::default(),
         };
         game.ai_paths =
             crate::ai::Paths::new(&game.level.worlds.locators, game.level.start_positions()[0]);
@@ -2133,6 +2137,13 @@ impl Game {
                 {
                     brain.zigzag(chain.generated & 1 != 0);
                 }
+            }
+            // generate_enemy: a tall tier 1-3 monster comes out of GENFX.
+            if 0.5 * t.height > 2.0
+                && sp.strength <= 3
+                && self.effects.genfx.get(etype).copied().unwrap_or(false)
+            {
+                self.start_gen_fx(Vec3::new(p.x, g, p.z), sp.strength);
             }
             if let Some(Kind::Generator { chain, .. }) = self
                 .entities
@@ -2939,6 +2950,7 @@ impl Game {
             .map(|(k, v)| (k.to_ascii_uppercase(), *v))
             .collect();
         self.snd.compass_model = self.item_models.get("COMPASS").copied().flatten();
+        self.init_effects(fs, &mut cache);
         let count = |f: fn(&Kind) -> bool| self.entities.iter().filter(|e| f(&e.kind)).count();
         log::info!(
             "{}: {} enemies, {} generators, {} pickups, {} containers, {} doors, {} models loaded",
@@ -3215,6 +3227,7 @@ impl Game {
         self.spawn_placed_enemies();
         self.update_entities(dt);
         self.update_items(dt);
+        self.update_effects(dt);
         self.update_critters(dt);
         self.update_waves(dt);
         self.update_spews(dt);
@@ -4027,6 +4040,10 @@ impl Game {
                 e.scale = size;
                 e.pitch = Self::missile_pitch(v, desc.angular_velocity[0], 0.0);
             }
+            // SfxSetHit / SfxSetDamage: its hit row and damage type.
+            self.effects
+                .missiles
+                .insert(id, (desc.hit_effect, flags | desc.damage_type));
         }
         shots
     }
@@ -4820,6 +4837,24 @@ impl Game {
         {
             self.post(0, Some(pi), &[]);
         }
+        // damage_enemy's burst by the hit's element (the potion's, the
+        // weapon's, or what the caller dealt).
+        let dtype = self.effects.hit_dtype.take().unwrap_or_else(|| {
+            let magic = MAGIC_HIT.with(|m| m.get());
+            if magic != 0 {
+                magic | DmgType::MAGIC
+            } else {
+                self.players
+                    .get(pi)
+                    .map_or(0, |p| p.fx.weapon & crate::powerups::W_ELEMENT)
+            }
+        });
+        if is_enemy && r.hit {
+            self.enemy_hit_fx(t, dtype, r.killed);
+        }
+        if is_gen && r.killed {
+            self.generator_fx(t, true);
+        }
         if is_enemy && r.hit {
             let e = &mut self.entities[t];
             let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
@@ -4841,6 +4876,7 @@ impl Game {
         }
         // Generators drop a tier at 2/3 and 1/3 of their health: they then spawn
         // the lower tier, allow twice as many alive, and change model.
+        let mut dropped = false;
         if is_gen && !r.killed {
             let thr = 10.0 * self.tuning.gen_health;
             let e = &mut self.entities[t];
@@ -4865,8 +4901,12 @@ impl Game {
                     if let Some(m) = self.classes[*class].gen_model(tier) {
                         e.model = Some(m);
                     }
+                    dropped = true;
                 }
             }
+        }
+        if dropped {
+            self.generator_fx(t, false);
         }
         let e = &self.entities[t];
         if let Some(snd) = self.hit_sound(e, Self::is_destroyed(e)) {
@@ -5024,12 +5064,18 @@ impl Game {
         }
         // damage_player: a block (DEFEND2) stops the hit; a charge halves it;
         // either way a heavy knock becomes a plain knockback.
+        let mut clank = None;
         if dmg > 1.0 && p.act.hud & (crate::paction::hud::BLOCK | crate::paction::hud::CHARGE) != 0
         {
+            let dam = dmg;
             if p.act.hud & crate::paction::hud::BLOCK != 0 {
                 dmg = 0.0;
             } else {
                 dmg *= 0.5;
+            }
+            // StartBlockFX when the block took more than 2 off.
+            if dam - dmg > 2.0 {
+                clank = Some(dmg);
             }
             if flags & 0x10160 != 0 {
                 flags = (flags & !0x10160) | DmgType::KNOCKBACK;
@@ -5047,6 +5093,9 @@ impl Game {
         p.health -= dmg;
         if dmg > 0.0 {
             p.hurt_flash = 1.0;
+        }
+        if let Some(reduced) = clank {
+            self.start_block_fx(pi, reduced);
         }
         self.damage_sounds(pi, mode, dmg, flags, old);
     }
@@ -5319,6 +5368,11 @@ impl Game {
         let mut shots: Vec<Shot> = Vec::new();
         let mut blasts: Vec<(Vec3, f32)> = Vec::new();
         let mut drains: Vec<(usize, f32)> = Vec::new();
+        // Garm's swings (StartEnemyAtkFX) and deaths (fn_8004F1DC).
+        let mut garm_atk: Vec<(u64, usize)> = Vec::new();
+        let mut garm_dead: Vec<Vec3> = Vec::new();
+        // Death and whom it drains (StartDeathFX on both).
+        let mut drain_fx: Vec<(u64, usize)> = Vec::new();
         let mut death_done: Vec<usize> = Vec::new();
         let mut tagged: Option<usize> = None;
         let halo: Vec<bool> = self
@@ -5342,6 +5396,8 @@ impl Game {
         let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut chests_opened: Vec<(Vec3, Option<usize>)> = Vec::new();
         let mut proj_hits: Vec<(usize, usize, f32, Vec2, f32)> = Vec::new();
+        // Hero missiles that burst on the world: (id, where, yaw, scale).
+        let mut missile_walls: Vec<(u64, Vec3, f32, f32)> = Vec::new();
 
         // do_enemies: what the monsters' routines share this frame.
         self.ai_paths.update_players(&player_pos);
@@ -5633,6 +5689,10 @@ impl Game {
                             *timer -= dt;
                             if *timer <= 0.0 {
                                 e.alive = false;
+                                // kill_enemy: Garm's pup leaves its death shot.
+                                if *etype == 27 {
+                                    garm_dead.push(e.pos);
+                                }
                             }
                             e.animator.update(skel, dt);
                             continue;
@@ -5675,6 +5735,7 @@ impl Game {
                                 // time, until it has taken 100, then leaves.
                                 if let Some(pi) = contact.filter(|&pi| !halo[pi]) {
                                     walk = false;
+                                    drain_fx.push((e.id, pi));
                                     if *reload <= 0.0 {
                                         *reload = 3.0 / 60.0;
                                         let f = self.tuning.damage;
@@ -5694,7 +5755,7 @@ impl Game {
                             } else if o.explode {
                                 // move_logic18: the suicide grunt's run ends in a
                                 // blast.
-                                blasts.push((e.pos, 50.0 * self.tuning.damage));
+                                blasts.push((e.pos + Vec3::Y * 3.0, 50.0 * self.tuning.damage));
                                 *state = EnemyState::Dying { timer: 0.1 };
                                 walk = false;
                             } else if let (Some(pi), Some((swing, _)), false) =
@@ -5704,6 +5765,10 @@ impl Game {
                                 let power = *attacks & 7 == 7 && seqs.power.is_some();
                                 let a = if power { seqs.power.unwrap().0 } else { swing };
                                 *state = EnemyState::Attack { hit_done: false };
+                                // action.c: Garm's swings carry ATK1FX / ATK2FX.
+                                if *etype == 27 {
+                                    garm_atk.push((e.id, power as usize));
+                                }
                                 *target = Some((pi, power));
                                 e.animator.restart(a);
                                 e.animator.force_loop = false;
@@ -5738,6 +5803,10 @@ impl Game {
                                                 *state = EnemyState::Attack { hit_done: false };
                                                 *target = (brain.actual_dist <= 7.5)
                                                     .then_some((pi, false));
+                                                if *etype == 27 {
+                                                    let n = (o.daction == act::ATTACK_PWR) as usize;
+                                                    garm_atk.push((e.id, n));
+                                                }
                                             }
                                             e.animator.restart(a);
                                             e.animator.force_loop = false;
@@ -6145,6 +6214,7 @@ impl Game {
                         } else {
                             gone = true;
                             wall_sounds.push(wall_sound.clone());
+                            missile_walls.push((e.id, at, e.yaw, e.scale));
                         }
                     }
                     if gone {
@@ -6284,6 +6354,10 @@ impl Game {
                 }
             }
         }
+        // ProcessEffects: a missile that hit the world becomes its hit row.
+        for (id, at, yaw, scale) in missile_walls {
+            self.missile_burst(id, at, yaw, scale, true);
+        }
         // fn_8009DB24: missiles bursting on walls.
         for snd in wall_sounds {
             match snd {
@@ -6388,7 +6462,12 @@ impl Game {
                     Kind::Projectile {
                         pierced: Some(p), ..
                     } => p.push(id),
-                    _ => self.entities[pidx].alive = false,
+                    _ => {
+                        let e = &mut self.entities[pidx];
+                        e.alive = false;
+                        let (mid, yaw, scale) = (e.id, e.yaw, e.scale);
+                        self.missile_burst(mid, ppos, yaw, scale, false);
+                    }
                 }
             } else if self.friendly_fire > 0 {
                 // The Multiplayer option: a hero's shot stuns (1) or hurts (2)
@@ -6743,16 +6822,10 @@ impl Game {
                 dir.x.atan2(dir.z),
             );
         }
-        // The suicide grunt's blast hurts everyone near it.
+        // The suicide grunt's blast (enemy_dies: SuicideExplosion at its
+        // collision point).
         for (pos, dmg) in blasts {
-            self.sfx.push("S_EXPLODE1|S_SUICIDEEXP".into());
-            for pi in 0..self.players.len() {
-                if (self.players[pi].pos - pos).length() < 8.0 {
-                    self.damage_from = Some(pos);
-                    self.damage_player(pi, dmg, 0);
-                    self.damage_from = None;
-                }
-            }
+            self.suicide_explosion(pos, dmg);
         }
         // Death's drain goes round armour; once it has had 100 it leaves.
         // AudioPlayEvt102Follow: S_DEATHSUCK while Death drains;
@@ -6762,6 +6835,15 @@ impl Game {
         }
         for (pi, f) in drains {
             self.damage_player(pi, f, DmgType::NO_ARMOR);
+        }
+        for (id, pi) in drain_fx {
+            self.note_drain(id, pi);
+        }
+        for (id, n) in garm_atk {
+            self.start_enemy_atk_fx(n, id);
+        }
+        for at in garm_dead {
+            self.garm_death_fx(at);
         }
         for pi in death_done {
             self.sfx_id(0x68);
@@ -8148,6 +8230,9 @@ mod tests {
         let (mut g, _) = missile_game(&fs, "WIZ");
         let row = g.pdata[0].damage[g.pdata[0].rows.turbo_b as usize].clone();
         g.sfx.clear();
+        // (Not the level's STARTFX.)
+        g.entities
+            .retain(|e| !matches!(e.kind, Kind::Effect { .. }));
         g.fire_damage_row(0, &row, -1.0, 0.0, None);
         // WIZ_POWERB (flags 6: shake) chains to the wrist particles (sound
         // field = node, not played).

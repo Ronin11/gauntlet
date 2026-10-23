@@ -9,10 +9,11 @@
 //! events (damage), translation and rotation as `ProcessCritter`,
 //! `CritterBossAI` and `CritterGolemAI` do.
 //!
-//! What critter.c hands to the effect system (sfx.c, not decompiled here) is
-//! approximated, and marked [CHOICE] where it is: projectiles become enemy
-//! shots, ground waves expand at a fixed speed, and visual effects are the
-//! effect atrees of the monster directory played once.
+//! What critter.c hands to the effect system (sfx.c) is run as
+//! ProcessEffects runs it: projectiles become enemy shots living their
+//! effect's time, ground waves (expanding effects) grow and weaken over
+//! theirs, and visual effects are the effect atrees of the monster directory
+//! played once.
 
 use crate::character::{Animator, Model};
 use crate::game::{Game, Kind};
@@ -72,11 +73,6 @@ pub const ROAR_SCALE: [f32; 5] = [1.0, 1.0, 1.5, 2.0, 2.0];
 pub const BOSS_PLAYER_SCALE: [f32; 5] = [1.0, 1.0, 0.5, 0.3, 0.2];
 /// NODE/CONE hits skip a player hit in the last 0.25 s (player.fxhittime).
 const PLAYER_REHIT: f32 = 0.25;
-/// [CHOICE] Ground waves (STOMP/ARC/SPOUT/FOUNTAIN effects, sfx flag 0x20)
-/// spread out at this speed; the effect code that moves them is not decoded.
-const WAVE_SPEED: f32 = 90.0;
-/// [CHOICE] A projectile effect lives this long when its SFXX gives no maxlen.
-const SHOT_LIFE: f32 = 5.0;
 /// An enemy shot that brings Garm's escorts where it lands.
 pub const SHOT_ADDS: u32 = 0x8000_0000;
 
@@ -1760,14 +1756,8 @@ impl Game {
                     if d.fx >= 0 {
                         self.critter_sfx(c, d.fx as usize, at);
                     }
-                    self.crit_waves.push(Wave {
-                        pos: at,
-                        radius: 0.0,
-                        max_radius: d.radius.max(1.0),
-                        damage: amount,
-                        flags: d.dmgtype,
-                        hit: [false; 4],
-                    });
+                    let w = self.critter_wave(c, d, at, amount, yaw);
+                    self.crit_waves.push(w);
                 }
             }
             6 if active => {
@@ -1780,25 +1770,13 @@ impl Game {
                     if d.fx >= 0 {
                         self.critter_sfx(c, d.fx as usize, at);
                     }
-                    self.crit_waves.push(Wave {
-                        pos: at,
-                        radius: 0.0,
-                        max_radius: d.radius.max(1.0),
-                        damage: amount,
-                        flags: d.dmgtype,
-                        hit: [false; 4],
-                    });
+                    let w = self.critter_wave(c, d, at, amount, yaw);
+                    self.crit_waves.push(w);
                 }
             }
             2 | 3 | 8 if active => {
-                self.crit_waves.push(Wave {
-                    pos: at,
-                    radius: 0.0,
-                    max_radius: d.radius.max(1.0),
-                    damage: amount,
-                    flags: d.dmgtype,
-                    hit: [false; 4],
-                });
+                let w = self.critter_wave(c, d, at, amount, yaw);
+                self.crit_waves.push(w);
             }
             _ => {}
         }
@@ -1941,14 +1919,7 @@ impl Game {
         }
         let life = match c.parts[pi].fball_cap {
             cap if cap > 0.0 && d.flags & 0x4000 != 0 => cap,
-            _ => {
-                d.fx.try_into()
-                    .ok()
-                    .and_then(|i: usize| c.wad.sfx.get(i))
-                    .map(|s| s.maxlen)
-                    .filter(|&l| l > 0.0)
-                    .unwrap_or(SHOT_LIFE)
-            }
+            _ => self.critter_fx_time(c, d.fx),
         };
         let model = usize::try_from(d.fx)
             .ok()
@@ -2509,15 +2480,26 @@ fn seg_seg_dist(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> f32 {
     ((a + u * s) - (c + v * t)).length()
 }
 
-/// A ground wave spreading from a stomp or eruption.
+/// A critter's damaging effect on the ground (CritterDoTexmodNode with
+/// flags 0x20): STOMP, SPOUT and FOUNTAIN expand (mode 1), ARC holds its
+/// whole radius (flags 0x30, mode 2), each over its effect's time.
 #[derive(Clone, Debug)]
 pub struct Wave {
     pub pos: Vec3,
-    pub radius: f32,
+    /// damageradius, damage and damagetype.
     pub max_radius: f32,
     pub damage: f32,
     pub flags: u32,
-    pub hit: [bool; 4],
+    /// Mode 2: the whole radius at full damage, again each second.
+    pub hold: bool,
+    /// endtime - now, and maxtime.
+    pub left: f32,
+    pub maxtime: f32,
+    /// mindp (-1: all round) and the effect's facing.
+    pub mindp: f32,
+    pub dir: Vec2,
+    /// The radius this frame (for tests and debugging).
+    pub radius: f32,
 }
 
 impl Game {
@@ -2544,29 +2526,132 @@ impl Game {
         best
     }
 
-    /// Spread the ground waves; each player it passes over (on the ground,
-    /// not levitating) takes its damage once.
+    /// The wave of damage `d` at `at`: its time is the effect's.
+    fn critter_wave(&self, c: &Critter, d: &Damage, at: Vec3, amount: f32, yaw: f32) -> Wave {
+        let maxtime = self.critter_fx_time(c, d.fx);
+        let dir = turn(yaw_dir(yaw), d.angle);
+        Wave {
+            pos: at,
+            max_radius: d.radius,
+            damage: amount,
+            flags: d.dmgtype,
+            hold: d.kind == 2,
+            left: maxtime,
+            maxtime,
+            mindp: d.arc,
+            dir: Vec2::new(dir.x, dir.z).normalize_or_zero(),
+            radius: 0.0,
+        }
+    }
+
+    /// An SFXX effect's time (StartFXSub's time: its maxlen, else its
+    /// tree's animation, nframes x rate / 900).
+    pub(crate) fn critter_fx_time(&self, c: &Critter, fx: i16) -> f32 {
+        let Some(i) = usize::try_from(fx).ok() else {
+            return 1.0;
+        };
+        if let Some(l) = c.wad.sfx.get(i).map(|s| s.maxlen).filter(|&l| l > 0.0) {
+            return l;
+        }
+        c.fx_models
+            .get(i)
+            .copied()
+            .flatten()
+            .and_then(|m| self.models[m].skeleton.sequences.first())
+            .map_or(1.0, |s| {
+                let n = if s.frame_count == 0 {
+                    30.0
+                } else {
+                    s.frame_count as f32
+                };
+                let rate = if s.frame_rate > 0 {
+                    s.frame_rate as f32
+                } else {
+                    30.0
+                };
+                n * rate * 0.001_111_11
+            })
+    }
+
+    /// ProcessEffects' players part for the ground waves. Mode 1: over the
+    /// first two thirds of its time the radius grows from a third of
+    /// damageradius to all of it as the damage falls from 1.5x to nothing;
+    /// mode 2: all of it at full damage. A hero within it (height within
+    /// half theirs plus it, a wall in the way past 10, inside its mindp
+    /// arc) is hit, then not until their fxhittime (the rest of the effect
+    /// in mode 1, a second at most in mode 2; half a second for gas).
     pub(crate) fn update_waves(&mut self, dt: f32) {
         let mut hits = Vec::new();
         for w in &mut self.crit_waves {
-            let r0 = w.radius;
-            w.radius = (w.radius + WAVE_SPEED * dt).min(w.max_radius);
+            w.left -= dt;
+            let remaining = w.left;
+            let (radius, scale, age) = if w.hold {
+                (w.max_radius, 1.0, remaining.min(1.0))
+            } else {
+                let phase = if remaining > w.maxtime {
+                    0.0
+                } else if w.maxtime <= 0.033_333_3 {
+                    1.0
+                } else {
+                    remaining / w.maxtime
+                };
+                let (r, k) = if phase > 0.33 {
+                    (w.max_radius * (0.33 + (1.0 - phase)), 1.5 * (phase - 0.33))
+                } else {
+                    (0.0, 0.0)
+                };
+                (r, k, remaining + 0.066_667)
+            };
+            w.radius = radius;
+            if radius <= 0.0 {
+                continue;
+            }
+            let dmg = w.damage * scale;
+            let flags = if dmg < 5.0 {
+                (w.flags & !0x170) | DMG_NOHITFX
+            } else {
+                w.flags
+            };
             for (i, p) in self.players.iter().enumerate().take(4) {
-                if w.hit[i] || !p.state.active() {
+                if !p.state.active() || self.time < self.crit_hit_until[i] {
                     continue;
                 }
-                if p.fx.special & crate::powerups::S_LEVITATE != 0 {
+                let at = p.pos + Vec3::Y * (crate::game::PLAYER_HEIGHT * 0.5);
+                let d = at - w.pos;
+                if d.y.abs() > crate::game::PLAYER_HEIGHT * 0.5 + radius {
                     continue;
                 }
-                let d = Vec2::new(p.pos.x - w.pos.x, p.pos.z - w.pos.z).length();
-                if d <= w.radius + 1.5 && d + 1.5 >= r0 - 1.0 && (p.pos.y - w.pos.y).abs() < 12.0 {
-                    w.hit[i] = true;
-                    hits.push((i, w.damage, w.flags));
+                let flat = Vec2::new(d.x, d.z);
+                let dist = flat.length();
+                let sumr = radius + crate::game::PLAYER_RADIUS;
+                if dist > sumr {
+                    continue;
                 }
+                if dist > 10.0 && self.collision.raycast(w.pos + Vec3::Y * 0.1, at).is_some() {
+                    continue;
+                }
+                if w.mindp > -1.0 {
+                    let mut mindp = w.mindp;
+                    if dist < 0.3 * sumr {
+                        mindp *= 0.85;
+                    }
+                    if flat.normalize_or_zero().dot(w.dir) < mindp {
+                        continue;
+                    }
+                }
+                let until = if w.flags & DMG_POISONGAS != 0 {
+                    Some(0.5)
+                } else {
+                    (dmg > 2.0).then_some(age)
+                };
+                hits.push((i, dmg, flags, until));
             }
         }
-        self.crit_waves.retain(|w| w.radius < w.max_radius);
-        for (i, d, f) in hits {
+        self.crit_waves.retain(|w| w.left > 0.033_32);
+        for (i, d, f, until) in hits {
+            if let Some(t) = until {
+                self.crit_hit_until[i] = self.time + t;
+            }
             self.damage_player(i, d, f & !0x1000);
         }
     }

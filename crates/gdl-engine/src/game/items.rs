@@ -25,7 +25,7 @@ pub(crate) const DEFAULT_AI: [i32; 34] = [
 const DMG_EXPLODE: u32 = 0x400;
 const DMG_NOHITFX: u32 = 0x100_0000;
 
-/// Effect types (fx_type) and their trees in WEAPONS (EffectInfo's names).
+/// Effect types (fx_type) of the EffectInfo rows used here (effect.rs).
 const FX_EXPLODE: usize = 22;
 const FX_EXPBARREL: usize = 24;
 const FX_EXPPOISON: usize = 25;
@@ -37,19 +37,6 @@ const FX_CHESTDEST: usize = 32;
 const FX_DESTSMOKE: usize = 33;
 const FX_BAG_THROW: usize = 68;
 const FX_BAG_HIT: usize = 69;
-const FX_NAMES: [(usize, &str); 11] = [
-    (FX_CHESTDEST1, "CHESTDEST"),
-    (FX_EXPLODE, "EXPLOSION"),
-    (FX_EXPBARREL, "EXPLOSION"),
-    (FX_EXPPOISON, "POISONEXP1"),
-    (FX_EXPPOISON2, "POISONEXP2"),
-    (FX_EXPPOISON3, "POISONEXP3"),
-    (FX_EXPCHEST, "EXPCHEST"),
-    (FX_CHESTDEST, "CHESTDEST"),
-    (FX_DESTSMOKE, "DESTSMOKE"),
-    (FX_BAG_THROW, "BAG_THROW"),
-    (FX_BAG_HIT, "BAG_HIT"),
-];
 
 /// The debris objects left by a blast (MBOX_NewObject) and the models food
 /// and gold turn into.
@@ -118,8 +105,38 @@ pub struct Blast {
     hit: Vec<u64>,
 }
 
-/// A bag thrown out of a dying monster (StartBagFX): up at 20, falling at
-/// 50, its item placed where the BAG_HIT effect it becomes ends.
+impl Blast {
+    /// An owner-less expanding effect (flags 0x20) over `maxtime`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        pos: Vec3,
+        damage: f32,
+        dtype: u32,
+        radius: f32,
+        flags: u32,
+        maxtime: f32,
+        morph: Vec<(usize, f32)>,
+        fx: Option<u64>,
+    ) -> Blast {
+        Blast {
+            pos,
+            damage,
+            dtype,
+            radius,
+            flags,
+            owner: None,
+            remaining: maxtime,
+            maxtime,
+            morph,
+            fx,
+            hit: Vec::new(),
+        }
+    }
+}
+
+/// A bag thrown out of a dying monster (StartBagFX): up at 20, pitching
+/// over, falling at 50 for at most 3 s; whatever it hits it becomes BAG_HIT
+/// (fxhit, placed on the floor), and its item is placed where that ends.
 #[derive(Clone, Debug)]
 pub struct Bag {
     pub pos: Vec3,
@@ -128,6 +145,10 @@ pub struct Bag {
     /// Seconds of BAG_HIT left once it has landed.
     pub landed: Option<f32>,
     pub fx: Option<u64>,
+    /// pyrvel[0]: pi/12 + Random(pi/3) rad/s.
+    pub pitch_rate: f32,
+    /// endtime - now while it flies.
+    pub left: f32,
 }
 
 /// The item state that rides along with the game.
@@ -144,8 +165,7 @@ pub struct ItemsState {
     pub(crate) carried: HashMap<u64, (Carry, Option<Vec3>)>,
     /// fxhittime of monsters and items against owner-less effects.
     fxhit: HashMap<u64, f32>,
-    /// Effect models by fx_type, and the named models above.
-    fx_models: HashMap<usize, Option<usize>>,
+    /// The debris models above.
     models: HashMap<&'static str, Option<usize>>,
 }
 
@@ -238,22 +258,10 @@ pub(crate) fn gen_dirs(etype: usize, spew: i32) -> (usize, u32) {
     }
 }
 
-/// An effect model's life: its first sequence (a frame lasts rate/900 s).
-fn model_time(m: &Model) -> f32 {
-    m.skeleton.sequences.first().map_or(1.0, |s| {
-        let rate = if s.frame_rate > 0 {
-            s.frame_rate as f32
-        } else {
-            30.0
-        };
-        (s.frame_count.max(1) as f32 * rate / 900.0).clamp(0.2, 10.0)
-    })
-}
-
 impl Game {
-    /// Load the effect trees (WEAPONS) and debris objects the level's items
-    /// may need: only levels with blasting barrels, trap chests or carried
-    /// items.
+    /// Load the debris objects the level's items may need (the effect rows
+    /// are InitEffects', effect.rs): only levels with blasting barrels, trap
+    /// chests or carried items.
     pub(super) fn load_item_fx(
         &mut self,
         fs: &GameFs,
@@ -277,11 +285,6 @@ impl Game {
             });
         if !needed {
             return;
-        }
-        let weapons = ["WEAPONS".to_string()];
-        for (fx, name) in FX_NAMES {
-            let m = self.item_model(fs, cache, known, &weapons, name);
-            self.items.fx_models.insert(fx, m);
         }
         let mut all = dirs.to_vec();
         all.push("WEAPONS".into());
@@ -325,15 +328,19 @@ impl Game {
         self.items.carried.remove(&id).map(|(c, _)| c)
     }
 
-    /// StartBagFX: throw `item` out of a bag from `pos`.
+    /// StartBagFX: throw `item` out of a bag from `pos` (scale 0: 20).
     pub(crate) fn start_bag(&mut self, pos: Vec3, item: Carry) {
-        let fx = self.start_fx(FX_BAG_THROW, pos, 0.0, 99.0);
+        use super::effect::{BAG_SPEED, BAG_TIME};
+        let fx = self.start_fx(FX_BAG_THROW, pos, 0.0, BAG_TIME);
+        let pitch_rate = 0.261_799_4 + self.rng.f32() * std::f32::consts::FRAC_PI_3;
         self.items.bags.push(Bag {
             pos,
-            vel: Vec3::Y * 20.0,
+            vel: Vec3::Y * BAG_SPEED,
             item,
             landed: None,
             fx,
+            pitch_rate,
+            left: BAG_TIME,
         });
     }
 
@@ -380,26 +387,6 @@ impl Game {
         if let Some(i) = c.info {
             self.items.info.insert(id, i);
         }
-    }
-
-    /// StartFXSub: show effect `fx` at `pos`; None when it has no tree.
-    fn start_fx(&mut self, fx: usize, pos: Vec3, yaw: f32, life: f32) -> Option<u64> {
-        let m = self.items.fx_models.get(&fx).copied().flatten()?;
-        let life = if life > 0.0 {
-            life
-        } else {
-            model_time(&self.models[m])
-        };
-        Some(self.spawn(Kind::Effect { life }, Some(m), pos, yaw))
-    }
-
-    fn fx_time(&self, fx: usize) -> f32 {
-        self.items
-            .fx_models
-            .get(&fx)
-            .copied()
-            .flatten()
-            .map_or(1.0, |m| model_time(&self.models[m]))
     }
 
     /// MBOX_NewObject: leave a debris object where an item was.
@@ -731,7 +718,11 @@ impl Game {
             (Kind::Pickup { .. } | Kind::Container { .. }, _) => {
                 self.damage_item(t, dmg, dtype, owner);
             }
-            (_, Some(pi)) if pi < self.players.len() => self.hit_entity(pi, t, dmg, push, false),
+            (_, Some(pi)) if pi < self.players.len() => {
+                self.effects.hit_dtype = Some(dtype);
+                self.hit_entity(pi, t, dmg, push, false);
+                self.effects.hit_dtype = None;
+            }
             (Kind::Critter(_), _) => {
                 let (pos, yaw) = (self.entities[t].pos, self.entities[t].yaw);
                 let Kind::Critter(mut c) =
@@ -759,6 +750,7 @@ impl Game {
                 if !r.hit {
                     return;
                 }
+                self.enemy_hit_fx(t, dtype, r.killed);
                 let e = &mut self.entities[t];
                 let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
                 if let (Some(seqs), Kind::Enemy { state, etype, .. }) = (seqs, &mut e.kind) {
@@ -785,6 +777,7 @@ impl Game {
             }
             (Kind::Generator { .. }, _) => {
                 let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+                let mut dropped = r.killed;
                 if !r.killed {
                     let thr = 10.0 * self.tuning.gen_health;
                     let e = &mut self.entities[t];
@@ -809,8 +802,12 @@ impl Game {
                             if let Some(m) = self.classes[*class].gen_model(tier) {
                                 e.model = Some(m);
                             }
+                            dropped = true;
                         }
                     }
+                }
+                if dropped {
+                    self.generator_fx(t, r.killed);
                 }
                 let e = &self.entities[t];
                 if let Some(snd) = self.hit_sound(e, Self::is_destroyed(e)) {
@@ -935,7 +932,7 @@ impl Game {
                     if b.morph.is_empty() {
                         b.radius = 0.0;
                     }
-                    let m = self.items.fx_models.get(&ty).copied().flatten();
+                    let m = self.fx_def(ty).and_then(|d| d.model);
                     if let Some(e) =
                         b.fx.and_then(|fx| self.entities.iter_mut().find(|e| e.id == fx))
                     {
@@ -1110,9 +1107,12 @@ impl Game {
         }
     }
 
-    /// Bags rise and fall; on the floor they burst (BAG_HIT) and leave their
-    /// item where it ends.
+    /// Bags rise, pitch and fall (ProcessEffects with flags 4): hitting the
+    /// world (WeaponWallCollide, half the colrad of 1) they become BAG_HIT
+    /// on the floor below (0x200000); their item is placed where that ends,
+    /// or where the bag is after its 3 s.
     fn update_bags(&mut self, dt: f32) {
+        use super::effect::BAG_WEIGHT;
         let mut bags = std::mem::take(&mut self.items.bags);
         let mut place = Vec::new();
         for b in &mut bags {
@@ -1125,28 +1125,43 @@ impl Game {
                 }
                 None => {
                     let from = b.pos;
-                    b.vel.y -= 50.0 * dt;
-                    b.pos += b.vel * dt;
-                    let floor = self
-                        .collision
-                        .ground_height(b.pos, from.y.max(b.pos.y) + 0.5);
-                    if b.vel.y < 0.0 && floor.is_some_and(|g| b.pos.y <= g) {
-                        b.pos.y = floor.unwrap_or(b.pos.y);
-                        if let Some(e) =
-                            b.fx.and_then(|fx| self.entities.iter_mut().find(|e| e.id == fx))
-                        {
-                            e.alive = false;
+                    let to = from + b.vel * dt;
+                    b.vel.y -= BAG_WEIGHT * dt;
+                    b.left -= dt;
+                    let fx =
+                        b.fx.and_then(|fx| self.entities.iter().position(|e| e.id == fx));
+                    if let Some((at, _)) = self.collision.sweep(from, to, 0.5) {
+                        // fxhit: BAG_HIT, PlaceEffectOnFloor.
+                        let y = self
+                            .collision
+                            .ground_height(at, at.y + 1.0)
+                            .map_or(at.y, |g| g + 0.1);
+                        b.pos = Vec3::new(at.x, y, at.z);
+                        if let Some(i) = fx {
+                            self.entities[i].alive = false;
                         }
                         let t = self.fx_time(FX_BAG_HIT);
                         self.start_fx(FX_BAG_HIT, b.pos, 0.0, t);
                         b.landed = Some(t);
-                    } else if b.pos.y < self.level.worlds.min_bounds[1] - 50.0 {
-                        place.push((from, b.item.clone()));
+                    } else if b.left <= 0.033_32 || to.y < self.level.worlds.min_bounds[1] - 25.0 {
+                        // Its time is up (or it fell out of the world): the
+                        // item comes out where it is.
+                        if let Some(i) = fx {
+                            self.entities[i].alive = false;
+                        }
+                        b.pos = to;
+                        place.push((to, b.item.clone()));
                         b.landed = Some(-1.0);
-                    } else if let Some(e) =
-                        b.fx.and_then(|fx| self.entities.iter_mut().find(|e| e.id == fx))
-                    {
-                        e.pos = b.pos;
+                    } else {
+                        b.pos = to;
+                        if let Some(i) = fx {
+                            let e = &mut self.entities[i];
+                            e.pos = to;
+                            e.pitch += b.pitch_rate * dt;
+                            if let Kind::Effect { life } = &mut e.kind {
+                                *life = b.left + 1.0;
+                            }
+                        }
                     }
                 }
             }

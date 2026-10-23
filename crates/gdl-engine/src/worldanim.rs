@@ -553,12 +553,6 @@ const EXPLOSION_SFX: [i32; 16] = [
     -1, -1, -1, -1, -1, -1, -1, -1, -1, 0x2B0047, -1, -1, -1, 0, -1, -1,
 ];
 
-/// WorldExplosion's damage (SfxSetDamage: lbl_80346BF4, radius lbl_80346BE8,
-/// type 33).
-const EXPLOSION_DAMAGE: f32 = 50.0;
-const EXPLOSION_RADIUS: f32 = 5.0;
-const EXPLOSION_TYPE: u32 = 33;
-
 impl crate::game::Game {
     /// RegisterItemWobj: a trigger's target joins the movers. An animated
     /// target is steered through its animation; one that also turns slides
@@ -634,18 +628,11 @@ impl crate::game::Game {
             };
             self.sfx_id(id);
         }
-        // WorldExplosion: a blast that hurts heroes near it, and its sound.
+        // WorldExplosion: its expanding blast (effect.rs), and its sound.
         for at in std::mem::take(&mut self.world_anim.explosions) {
             let id = self.realm_sound(&EXPLOSION_SFX);
             self.sfx_id(id);
-            for pi in 0..self.players.len() {
-                let p = &self.players[pi];
-                if p.state.active() && (p.pos - at).length() < EXPLOSION_RADIUS + PLAYER_RADIUS {
-                    self.damage_from = Some(at);
-                    self.damage_player(pi, EXPLOSION_DAMAGE, EXPLOSION_TYPE);
-                    self.damage_from = None;
-                }
-            }
+            self.world_explosion(at);
         }
     }
 }
