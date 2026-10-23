@@ -30,13 +30,13 @@ pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
 pub const PLAYER_COLORS: [&str; 4] = ["RED", "BLU", "YEL", "GRE"];
 
 const GRAVITY: f32 = 60.0;
-pub(crate) const STEP_HEIGHT: f32 = 1.2;
+pub const STEP_HEIGHT: f32 = 1.2;
 /// PlayerCollideFloor's limit on a floor change in one move (lbl_80347BF8):
 /// how high a stairs (or ramp) object's wall a player walks up.
-pub(crate) const STAIR_RISE: f32 = 3.0;
+pub const STAIR_RISE: f32 = 3.0;
 /// PDATA width and height (col_radius 1.5, height 5).
-pub(crate) const PLAYER_RADIUS: f32 = 1.5;
-pub(crate) const PLAYER_HEIGHT: f32 = 5.0;
+pub const PLAYER_RADIUS: f32 = 1.5;
+pub const PLAYER_HEIGHT: f32 = 5.0;
 /// PlayerGetTarget: the farthest a target is looked for, and the melee reach
 /// (2 plus the player's radius, from the target's surface).
 const TARGET_RANGE: f32 = 30.0;
@@ -1200,7 +1200,7 @@ pub struct Game {
     /// 2 Shots Hurt.
     pub friendly_fire: usize,
     /// The party's progress out of the level (lbl_803447D0 / lbl_803447B4).
-    pub(crate) exit_state: exits::ExitState,
+    pub exit_state: exits::ExitState,
     /// Each player model's action slots (InitActions) and class PDATA.
     action_seqs: Vec<crate::paction::ActionSeqs>,
     pdata: Vec<gdl_formats::pdata::PlayerData>,
@@ -3664,7 +3664,7 @@ impl Game {
 
     /// WorldObjGetAllFlags of a collision triangle's owner when it hurts: a
     /// 0xF0000 material, and for 0x2000000 objects only while they move.
-    pub(crate) fn hurting_surface(&self, owner: i32) -> Option<u32> {
+    pub fn hurting_surface(&self, owner: i32) -> Option<u32> {
         let o = usize::try_from(owner).ok()?;
         let live = self
             .world_anim
@@ -4945,7 +4945,7 @@ impl Game {
 
     /// Where an attack from `from` aims at entity `e`: the point and its
     /// radius (a critter's nearest colnode, else the entity itself).
-    fn aim_point(e: &Entity, from: Vec3) -> Option<(Vec3, f32)> {
+    pub fn aim_point(e: &Entity, from: Vec3) -> Option<(Vec3, f32)> {
         let r = match &e.kind {
             Kind::Critter(c) => c.wad.types[c.parts[0].ty].rad,
             _ => Self::target_radius(e)?,

@@ -22,6 +22,7 @@ pub mod menu;
 pub mod movie;
 pub mod options;
 pub mod optmenu;
+pub mod runner;
 pub mod scene;
 pub mod screen;
 pub mod screensaver;

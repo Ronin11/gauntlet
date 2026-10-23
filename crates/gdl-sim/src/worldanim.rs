@@ -356,6 +356,16 @@ impl WorldAnims {
         self.world[o] * Mat4::from_translation(-self.rest[o])
     }
 
+    /// For the level runner (read only): the subtype-2 rotators a touch
+    /// still sets off: (place, touch radius, target object).
+    pub fn untouched_rotators(&self) -> Vec<(Vec3, f32, usize)> {
+        self.rotators
+            .iter()
+            .filter(|r| r.sub == 2 && !r.on)
+            .map(|r| (r.pos, r.radius, r.target))
+            .collect()
+    }
+
     /// RotatorTouched (fn_8005D730 case 12): a hero touching a subtype-2
     /// rotator sets it off.
     pub fn touch_rotators(&mut self, at: Vec3, radius: f32) {

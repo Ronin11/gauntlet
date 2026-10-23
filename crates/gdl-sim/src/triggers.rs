@@ -493,6 +493,29 @@ impl Mover {
         }
     }
 
+    /// For the level runner's lookahead (runner/bot.rs), read only: the
+    /// collision this target would have once triggered (`active`) or not
+    /// and settled — the moved triangles and how far it rises — or, for a
+    /// fading target, its triangles and whether they would be solid. None
+    /// for animated targets.
+    pub fn end_state(&self, active: bool) -> Option<(Vec<(usize, [Vec3; 3])>, f32, Option<bool>)> {
+        if self.fades() {
+            let shown = if self.flags8 & 0x20 != 0 { !active } else { active };
+            let tris = self.owned.iter().map(|&i| (i, [Vec3::ZERO; 3])).collect();
+            return Some((tris, 0.0, Some(shown)));
+        }
+        if self.animated || self.node {
+            return None;
+        }
+        let target = if active { self.on } else { self.off };
+        let tris = self
+            .tris
+            .iter()
+            .map(|&(i, rest)| (i, rest.map(|v| v + Vec3::Y * target)))
+            .collect();
+        Some((tris, target - self.offset, None))
+    }
+
     /// Put the collision at the starting offset.
     pub fn place(&self, collision: &mut Collision) {
         for &(i, rest) in &self.tris {
