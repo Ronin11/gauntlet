@@ -1123,6 +1123,11 @@ fn main() -> Result<()> {
     .build();
     let max = logger.filter();
     gdl_engine::bugreport::install_logger(Box::new(logger), max);
+    // The level runner (runner/mod.rs) takes its own arguments.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(r) = gdl_engine::runner::main_from_args(&argv) {
+        return r;
+    }
     let args = parse_args()?;
     if args.snapshot.is_some() {
         return match &args.character {

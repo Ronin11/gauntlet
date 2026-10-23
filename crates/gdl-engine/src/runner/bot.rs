@@ -1,0 +1,1731 @@
+//! The level runner's player: picks objectives the way a player would (the
+//! exit; else keys, doors, levers and pads, breakables, then anything left
+//! to pick up), walks there over the nav graph, fights what comes near, and
+//! notices when it gets nowhere.
+
+use super::nav::{xz, Goal, Nav};
+use crate::game::{EnemyState, Game, Kind, LevelEnd, PickupKind, PlayerState, PLAYER_RADIUS};
+use crate::input::PlayerInput;
+use glam::{Vec2, Vec3};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// What a hero is after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Obj {
+    Exit(u64),
+    Key(u64),
+    Door(u64),
+    Trigger(u64),
+    Smash(u64),
+    Pickup(u64),
+    Food(u64),
+    Boss,
+    Lectern,
+    Portal(u64),
+    Follow,
+    /// Nothing to do: stand (and fight).
+    Idle,
+}
+
+impl Obj {
+    pub fn name(&self) -> String {
+        match self {
+            Obj::Exit(i) => format!("exit#{i}"),
+            Obj::Key(i) => format!("key#{i}"),
+            Obj::Door(i) => format!("door#{i}"),
+            Obj::Trigger(i) => format!("trigger#{i}"),
+            Obj::Smash(i) => format!("smash#{i}"),
+            Obj::Pickup(i) => format!("pickup#{i}"),
+            Obj::Food(i) => format!("food#{i}"),
+            Obj::Boss => "boss".into(),
+            Obj::Lectern => "lectern".into(),
+            Obj::Portal(i) => format!("portal#{i}"),
+            Obj::Follow => "follow".into(),
+            Obj::Idle => "idle".into(),
+        }
+    }
+    fn entity(&self) -> Option<u64> {
+        match *self {
+            Obj::Exit(i)
+            | Obj::Key(i)
+            | Obj::Door(i)
+            | Obj::Trigger(i)
+            | Obj::Smash(i)
+            | Obj::Pickup(i)
+            | Obj::Food(i)
+            | Obj::Portal(i) => Some(i),
+            _ => None,
+        }
+    }
+}
+
+/// How a level run ended.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    Completed,
+    Stuck(String),
+    Unreachable(String),
+    Timeout(String),
+    Died(String),
+    ExitNoEnd(String),
+    Nan(String),
+    /// Left through a secret icon (not a failure of the level).
+    Secret(u32),
+}
+
+impl Outcome {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Outcome::Completed => "completed",
+            Outcome::Stuck(_) => "stuck",
+            Outcome::Unreachable(_) => "unreachable",
+            Outcome::Timeout(_) => "timeout",
+            Outcome::Died(_) => "died",
+            Outcome::ExitNoEnd(_) => "exit_no_end",
+            Outcome::Nan(_) => "nan",
+            Outcome::Secret(_) => "secret",
+        }
+    }
+    pub fn detail(&self) -> String {
+        match self {
+            Outcome::Completed => String::new(),
+            Outcome::Secret(w) => format!("secret level {w:#x}"),
+            Outcome::Stuck(s)
+            | Outcome::Unreachable(s)
+            | Outcome::Timeout(s)
+            | Outcome::Died(s)
+            | Outcome::ExitNoEnd(s)
+            | Outcome::Nan(s) => s.clone(),
+        }
+    }
+}
+
+/// One hero's plan.
+#[derive(Default)]
+pub struct Agent {
+    pub obj: Option<Obj>,
+    pub obj_t: f32,
+    /// Where the objective is (followed directly once the path is done).
+    pub target: Option<Vec3>,
+    pub goals: Vec<Goal>,
+    pub path: Vec<u32>,
+    pub wp: usize,
+    pub last_adv: f32,
+    pub best_d: f32,
+    pub stucks: u32,
+    /// Arrived at a trigger / door / exit: since when.
+    pub arrived: Option<f32>,
+    pub fight_t: f32,
+    pub calm_until: f32,
+    pub potion_t: f32,
+    pub replan: bool,
+    pub on_pad_t: Option<f32>,
+    pub hunt_t: f32,
+    pub stuck_wp: usize,
+}
+
+/// Something worth a bug report found on the way (not necessarily the end).
+pub struct Anomaly {
+    pub what: String,
+    pub tags: Vec<&'static str>,
+    /// Capture now (the runner files the report with the game as it is).
+    pub capture: bool,
+}
+
+pub struct Bot {
+    pub agents: Vec<Agent>,
+    pub nav: Nav,
+    /// The graph with doors open and breakables gone.
+    pub opt: Option<Nav>,
+    pub tried: HashMap<Obj, u32>,
+    pub failed: HashSet<Obj>,
+    pub history: Vec<String>,
+    pub trail: VecDeque<(f32, Vec3)>,
+    pub god_at: Option<(f32, String)>,
+    pub boss_killed_debug: bool,
+    pub boss_fight_t: f32,
+    pub anomalies: Vec<Anomaly>,
+    pub reach_mark: usize,
+    pub lectern_ok: Option<bool>,
+    pub portals_reachable: Vec<String>,
+    pub tower: bool,
+    pub timeout: f32,
+    pub exit_since: Option<f32>,
+    pub used: Vec<String>,
+    last_pos: Vec<Vec3>,
+    falls: u32,
+    pub verbose: bool,
+}
+
+const MAX_EXPAND: usize = 300_000;
+const STUCK_SECS: f32 = 3.0;
+const STUCKS_PER_OBJ: u32 = 6;
+
+impl Bot {
+    pub fn new(g: &Game, timeout: f32, tower: bool, verbose: bool) -> Bot {
+        let t0 = std::time::Instant::now();
+        let nav = Nav::new(g);
+        if verbose {
+            println!(
+                "nav: {} nodes ({}x{} cells) in {:.0} ms",
+                nav.live_nodes(),
+                nav.nx,
+                nav.nz,
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        if verbose {
+            for e in &g.entities {
+                match &e.kind {
+                    Kind::Exit { open, dest, radius, .. } => println!(
+                        "exit #{} at {:?} r {radius:.1} open {open} dest {dest:?}",
+                        e.id, e.pos
+                    ),
+                    Kind::Trigger { mover, mode, radius, shoot, flags, id, .. } => println!(
+                        "trigger #{} id {id} at {:?} r {radius:.1} mover {mover:?} {mode:?} shoot {shoot} flags {flags:#x}",
+                        e.id, e.pos
+                    ),
+                    Kind::Door { radius, .. } => println!("door #{} at {:?} r {radius:.1}", e.id, e.pos),
+                    _ => {}
+                }
+            }
+            for (i, m) in g.movers.iter().enumerate() {
+                println!(
+                    "mover {i} root {} at {:?} active {} offset {:.1} shown {}",
+                    m.root, m.pos, m.active, m.offset, m.shown
+                );
+            }
+            for (i, p) in g.transport.pads.iter().enumerate() {
+                let to = p.dest.map(|d| g.transport.pads[d].pos);
+                let ground = to.map(|to| g.collision.ground_height(to, to.y + 4.0));
+                println!(
+                    "pad {i} id {} at {:?} r {:.1} -> {:?} {:?} ground there {:?}",
+                    p.id, p.pos, p.radius, p.dest, to, ground
+                );
+            }
+        }
+        Bot {
+            agents: (0..g.players.len()).map(|_| Agent::default()).collect(),
+            nav,
+            opt: None,
+            tried: HashMap::new(),
+            failed: HashSet::new(),
+            history: Vec::new(),
+            trail: VecDeque::new(),
+            god_at: None,
+            boss_killed_debug: false,
+            boss_fight_t: 0.0,
+            anomalies: Vec::new(),
+            reach_mark: 0,
+            lectern_ok: None,
+            portals_reachable: Vec::new(),
+            tower,
+            timeout,
+            exit_since: None,
+            used: Vec::new(),
+            last_pos: g.players.iter().map(|p| p.pos).collect(),
+            falls: 0,
+            verbose,
+        }
+    }
+
+    fn log(&mut self, g: &Game, s: String) {
+        log_to(&mut self.history, self.verbose, g, s);
+    }
+
+    // ---- the world, as the runner reads it ---------------------------------
+
+    fn ent<'a>(g: &'a Game, id: u64) -> Option<&'a crate::game::Entity> {
+        g.entities.iter().find(|e| e.id == id && e.alive)
+    }
+
+    fn boss_level(g: &Game) -> bool {
+        g.boss.is_some()
+    }
+
+    fn leader(g: &Game) -> Option<usize> {
+        g.players.iter().position(|p| p.state.active())
+    }
+
+    /// The goals of an objective, and the spot to steer to at the end.
+    fn goals_of(&self, g: &Game, o: Obj) -> Option<(Vec<Goal>, Vec3)> {
+        let e = o.entity().and_then(|id| Self::ent(g, id));
+        Some(match (o, e) {
+            (Obj::Exit(_) | Obj::Portal(_), Some(e)) => match e.kind {
+                Kind::Exit { radius, height, .. } => (
+                    vec![Goal::new(e.pos, (radius * 0.7).max(0.8), height.max(2.0))],
+                    e.pos,
+                ),
+                _ => return None,
+            },
+            (Obj::Key(_) | Obj::Pickup(_) | Obj::Food(_), Some(e)) => match e.kind {
+                Kind::Pickup { radius, .. } => {
+                    (vec![Goal::new(e.pos, (radius + 0.3).max(1.0), 3.0)], e.pos)
+                }
+                _ => return None,
+            },
+            (Obj::Door(_), Some(e)) => match e.kind {
+                Kind::Door { radius, .. } => {
+                    (vec![Goal::new(e.pos, (radius - 0.6).max(1.5), 2.5)], e.pos)
+                }
+                _ => return None,
+            },
+            (Obj::Trigger(_), Some(e)) => match e.kind {
+                Kind::Trigger { radius, shoot, .. } => {
+                    let r = if shoot {
+                        7.0
+                    } else {
+                        (radius + PLAYER_RADIUS + 0.45).max(1.0)
+                    };
+                    (vec![Goal::new(e.pos, r, 3.5)], e.pos)
+                }
+                _ => return None,
+            },
+            (Obj::Smash(_), Some(e)) => {
+                let r = solid_radius(e) + PLAYER_RADIUS + 1.2;
+                (vec![Goal::new(e.pos, r, 3.0)], e.pos)
+            }
+            (Obj::Lectern, _) => {
+                let e = g.entities.iter().find(|e| {
+                    matches!(e.kind, Kind::Trigger { id, .. } if id == crate::tower::LECTERN)
+                })?;
+                let r = match e.kind {
+                    Kind::Trigger { radius, .. } => radius + 1.0,
+                    _ => 2.0,
+                };
+                (vec![Goal::new(e.pos, r, 3.5)], e.pos)
+            }
+            (Obj::Boss, _) => {
+                let (at, r) = boss_point(g, g.players[0].pos)?;
+                (vec![Goal::new(at, r + 4.0, 12.0)], at)
+            }
+            _ => return None,
+        })
+    }
+
+    // ---- choosing what to do ------------------------------------------------
+
+    /// A path for hero `i` to the nearest of `cands` (objective, goals).
+    fn plan_any(
+        &mut self,
+        g: &Game,
+        i: usize,
+        cands: &[(Obj, Vec<Goal>, Vec3)],
+    ) -> Option<(Obj, Vec<u32>, f32)> {
+        if cands.is_empty() {
+            return None;
+        }
+        let p = g.players[i].pos;
+        let start = self.nav.start_node(g, p)?;
+        let goals: Vec<Goal> = cands.iter().flat_map(|c| c.1.iter().copied()).collect();
+        let (path, cost) = self.nav.path(g, start, &goals, g.time, MAX_EXPAND)?;
+        let end = self.nav.nodes[*path.last()? as usize].pos;
+        let (o, ..) = cands
+            .iter()
+            .filter(|c| c.1.iter().any(|gl| gl.holds(end)))
+            .min_by(|a, b| xz(a.2 - end).length().total_cmp(&xz(b.2 - end).length()))?;
+        Some((*o, path, cost))
+    }
+
+    fn cands(&self, g: &Game, f: impl Fn(&crate::game::Entity) -> Option<Obj>) -> Vec<(Obj, Vec<Goal>, Vec3)> {
+        g.entities
+            .iter()
+            .filter(|e| e.alive)
+            .filter_map(&f)
+            .filter(|o| !self.failed.contains(o))
+            .filter_map(|o| self.goals_of(g, o).map(|(gl, at)| (o, gl, at)))
+            .collect()
+    }
+
+    fn set_obj(&mut self, g: &Game, i: usize, o: Obj, path: Vec<u32>, cost: f32) {
+        let (goals, target) = self.goals_of(g, o).unwrap_or((Vec::new(), g.players[i].pos));
+        let a = &mut self.agents[i];
+        let same = a.obj == Some(o);
+        a.obj = Some(o);
+        a.goals = goals;
+        a.target = Some(target);
+        a.path = path;
+        a.wp = 0;
+        a.last_adv = g.time;
+        a.best_d = f32::MAX;
+        a.replan = false;
+        if !same {
+            a.obj_t = g.time;
+            a.stucks = 0;
+            a.arrived = None;
+            a.fight_t = 0.0;
+            if i == 0 {
+                let line = format!(
+                    "hero {i} -> {} at ({:.1},{:.1},{:.1}) path {} nodes cost {:.0}",
+                    o.name(),
+                    target.x,
+                    target.y,
+                    target.z,
+                    self.agents[i].path.len(),
+                    cost
+                );
+                self.log(g, line);
+            }
+        }
+    }
+
+    /// The leader's next objective.
+    fn decide_leader(&mut self, g: &mut Game, i: usize) -> Result<(), Outcome> {
+        let health = g.players[i].health / crate::game::max_health(g.players[i].level);
+        // Boss levels: the boss, then wait for the good wizard.
+        if Self::boss_level(g) {
+            let dead = g.boss.as_ref().is_some_and(|b| b.dead || b.dying);
+            if !dead {
+                let c = self.goals_of(g, Obj::Boss);
+                if let Some((gl, at)) = c {
+                    let cands = vec![(Obj::Boss, gl, at)];
+                    match self.plan_any(g, i, &cands) {
+                        Some((o, path, cost)) => self.set_obj(g, i, o, path, cost),
+                        None => self.set_obj(g, i, Obj::Boss, Vec::new(), 0.0),
+                    }
+                    return Ok(());
+                }
+            }
+            // Coins and items the boss spewed, then stand for the wizard.
+            let cands = self.cands(g, |e| match e.kind {
+                Kind::Pickup { .. } if xz(e.pos - g.players[i].pos).length() < 30.0 => {
+                    Some(Obj::Pickup(e.id))
+                }
+                _ => None,
+            });
+            if let Some((o, path, cost)) = self.plan_any(g, i, &cands) {
+                if cost < 40.0 {
+                    self.set_obj(g, i, o, path, cost);
+                    return Ok(());
+                }
+            }
+            self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
+            return Ok(());
+        }
+        // The tower: the lectern first, then the nearest open portal.
+        if self.tower {
+            if self.lectern_ok.is_none() && !self.failed.contains(&Obj::Lectern) {
+                if let Some((gl, at)) = self.goals_of(g, Obj::Lectern) {
+                    if let Some((o, path, cost)) = self.plan_any(g, i, &[(Obj::Lectern, gl, at)]) {
+                        self.set_obj(g, i, o, path, cost);
+                        return Ok(());
+                    }
+                    self.log(g, "lectern unreachable".into());
+                    self.failed.insert(Obj::Lectern);
+                    self.lectern_ok = Some(false);
+                }
+            }
+            if self.portals_reachable.is_empty() {
+                // Which open portals can be walked to at all.
+                let portals = self.cands(g, |e| match e.kind {
+                    Kind::Exit { open: true, dest: Some(_), .. } => Some(Obj::Portal(e.id)),
+                    _ => None,
+                });
+                for c in &portals {
+                    let dest = match Self::ent(g, c.0.entity().unwrap()).map(|e| &e.kind) {
+                        Some(Kind::Exit { dest: Some(w), .. }) => *w,
+                        _ => 0,
+                    };
+                    let ok = self.plan_any(g, i, std::slice::from_ref(c)).is_some();
+                    self.portals_reachable.push(format!(
+                        "{}:{}",
+                        g.worlds.level(dest).map_or(format!("{dest:#x}"), |l| l.name.clone()),
+                        if ok { "reachable" } else { "UNREACHABLE" }
+                    ));
+                }
+            }
+            let portals = self.cands(g, |e| match e.kind {
+                Kind::Exit { open: true, dest: Some(_), .. } => Some(Obj::Portal(e.id)),
+                _ => None,
+            });
+            if let Some((o, path, cost)) = self.plan_any(g, i, &portals) {
+                self.set_obj(g, i, o, path, cost);
+                return Ok(());
+            }
+            return Err(Outcome::Unreachable("no open tower portal is reachable".into()));
+        }
+        // Low on health: food close by first.
+        if health < 0.5 {
+            let cands = self.cands(g, |e| match e.kind {
+                Kind::Pickup { kind: PickupKind::Food(v), .. } if v > 0.0 => Some(Obj::Food(e.id)),
+                _ => None,
+            });
+            if let Some((o, path, cost)) = self.plan_any(g, i, &cands) {
+                if cost < 50.0 {
+                    self.set_obj(g, i, o, path, cost);
+                    return Ok(());
+                }
+            }
+        }
+        // The exit.
+        let exits = self.cands(g, |e| match e.kind {
+            Kind::Exit { open: true, .. } => Some(Obj::Exit(e.id)),
+            _ => None,
+        });
+        if exits.is_empty() && !self.failed.iter().any(|o| matches!(o, Obj::Exit(_))) {
+            return Err(Outcome::Unreachable("the level has no open exit".into()));
+        }
+        if let Some((o, path, cost)) = self.plan_any(g, i, &exits) {
+            self.set_obj(g, i, o, path, cost);
+            return Ok(());
+        }
+        // What stands between the hero and the exit: plan as if doors were
+        // open and breakables broken; the first one on that path is next.
+        if let Some(b) = self.first_blocker(g, i, &exits) {
+            let keys: u32 = g.players.iter().map(|p| p.keys).sum();
+            let is_door = matches!(Self::ent(g, b).map(|e| &e.kind), Some(Kind::Door { .. }));
+            let o = if is_door { Obj::Door(b) } else { Obj::Smash(b) };
+            if !self.failed.contains(&o) {
+                if is_door && keys == 0 {
+                    let ks = self.cands(g, |e| match e.kind {
+                        Kind::Pickup { kind: PickupKind::Key(_), .. } => Some(Obj::Key(e.id)),
+                        _ => None,
+                    });
+                    if let Some((o, path, cost)) = self.plan_any(g, i, &ks) {
+                        let line = format!("{} blocks the way to the exit: fetching a key", Obj::Door(b).name());
+                        self.log(g, line);
+                        self.set_obj(g, i, o, path, cost);
+                        return Ok(());
+                    }
+                } else if let Some((gl, at)) = self.goals_of(g, o) {
+                    if let Some((o, path, cost)) = self.plan_any(g, i, &[(o, gl, at)]) {
+                        let line = format!("{} blocks the way to the exit", o.name());
+                        self.log(g, line);
+                        self.set_obj(g, i, o, path, cost);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        // Enablers. When the reachable area has grown since the last round,
+        // everything may be worth another try.
+        let reach = self
+            .nav
+            .start_node(g, g.players[i].pos)
+            .map(|s| self.nav.reachable(g, s, 400_000))
+            .unwrap_or_default();
+        if self.verbose {
+            // Where each lever and pad stands relative to what can be reached.
+            for e in g.entities.iter().filter(|e| e.alive) {
+                if let Kind::Trigger { gate: None, pressed, mode, .. } = e.kind {
+                    let near = reach
+                        .iter()
+                        .map(|&n| self.nav.nodes[n as usize].pos)
+                        .min_by(|a, b| (*a - e.pos).length().total_cmp(&(*b - e.pos).length()));
+                    println!(
+                        "  trigger#{} at {:?} {mode:?} pressed {pressed}: nearest reachable node {:?}",
+                        e.id, e.pos, near
+                    );
+                }
+            }
+        }
+        // What each reachable lever or pad would open up.
+        let exit_goals: Vec<Goal> = exits.iter().flat_map(|c| c.1.iter().copied()).collect();
+        let mut looks: Vec<(Obj, bool, i64)> = Vec::new();
+        let trig_ids: Vec<u64> = g
+            .entities
+            .iter()
+            .filter(|e| e.alive)
+            .filter_map(|e| match e.kind {
+                Kind::Trigger { gate: None, id, mover: Some(m), mode, pressed, .. }
+                    if id != crate::tower::LECTERN
+                        && !(mode == crate::triggers::TriggerMode::Latch
+                            && (pressed || g.movers.get(m).is_some_and(|m| m.active))) =>
+                {
+                    Some(e.id)
+                }
+                _ => None,
+            })
+            .collect();
+        for tid in trig_ids {
+            let o = Obj::Trigger(tid);
+            if self.failed.contains(&o) {
+                continue;
+            }
+            let Some((gl, _)) = self.goals_of(g, o) else { continue };
+            let at_hand = reach
+                .iter()
+                .any(|&n| gl.iter().any(|x| x.holds(self.nav.nodes[n as usize].pos)));
+            if !at_hand {
+                continue;
+            }
+            let la = self.lookahead(g, tid, &exit_goals, reach.len());
+            if self.verbose {
+                println!("  lookahead {}: {la:?}", o.name());
+            }
+            if let Some((exit_ok, gain)) = la {
+                looks.push((o, exit_ok, gain));
+            }
+        }
+        let reach = reach.len();
+        // A lever that opens the way to the exit comes first.
+        let best_exit: Vec<_> = looks
+            .iter()
+            .filter(|l| l.1)
+            .filter_map(|l| self.goals_of(g, l.0).map(|(gl, at)| (l.0, gl, at)))
+            .collect();
+        if let Some((o, path, cost)) = self.plan_any(g, i, &best_exit) {
+            let line = format!("{} should open the way to the exit", o.name());
+            self.log(g, line);
+            self.set_obj(g, i, o, path, cost);
+            return Ok(());
+        }
+        if reach > self.reach_mark + self.reach_mark / 20 + 5 {
+            if self.reach_mark > 0 {
+                let line = format!("reachable area grew {} -> {reach} nodes", self.reach_mark);
+                self.log(g, line);
+            }
+            self.reach_mark = reach;
+            self.tried.retain(|o, _| !matches!(o, Obj::Trigger(_) | Obj::Smash(_)));
+            self.failed
+                .retain(|o| !matches!(o, Obj::Trigger(_) | Obj::Smash(_) | Obj::Door(_) | Obj::Exit(_)));
+        }
+        let keys: u32 = g.players.iter().map(|p| p.keys).sum();
+        let tried_map = self.tried.clone();
+        let tried = |o: &Obj| tried_map.get(o).copied().unwrap_or(0);
+        // 1. A locked door, with a key.
+        if keys > 0 {
+            let doors: Vec<_> = self
+                .cands(g, |e| matches!(e.kind, Kind::Door { .. }).then_some(Obj::Door(e.id)))
+                .into_iter()
+                .filter(|c| tried(&c.0) < 2)
+                .collect();
+            if let Some((o, path, cost)) = self.plan_any(g, i, &doors) {
+                self.set_obj(g, i, o, path, cost);
+                return Ok(());
+            }
+        }
+        // 2. Keys.
+        if keys < crate::game::MAX_KEYS {
+            let ks = self.cands(g, |e| match e.kind {
+                Kind::Pickup { kind: PickupKind::Key(_), .. } => Some(Obj::Key(e.id)),
+                _ => None,
+            });
+            if let Some((o, path, cost)) = self.plan_any(g, i, &ks) {
+                self.set_obj(g, i, o, path, cost);
+                return Ok(());
+            }
+        }
+        // 3. Levers and pads that open up more of the level (most first).
+        let min_gain = (reach as i64 / 30).max(30);
+        let mut gains: Vec<_> = looks.iter().filter(|l| l.2 >= min_gain && tried(&l.0) < 2).collect();
+        gains.sort_by_key(|l| -l.2);
+        if let Some(best) = gains.first() {
+            let top = best.2;
+            let cands: Vec<_> = gains
+                .iter()
+                .filter(|l| l.2 * 2 >= top)
+                .filter_map(|l| self.goals_of(g, l.0).map(|(gl, at)| (l.0, gl, at)))
+                .collect();
+            if let Some((o, path, cost)) = self.plan_any(g, i, &cands) {
+                let line = format!("{} should open up the level (+{} nodes)", o.name(), top);
+                self.log(g, line);
+                self.set_obj(g, i, o, path, cost);
+                return Ok(());
+            }
+        }
+        // Levers and pads not tried since the area last grew.
+        let trigs: Vec<_> = self
+            .cands(g, |e| match e.kind {
+                Kind::Trigger { gate: None, id, mode, pressed, mover, .. }
+                    if id != crate::tower::LECTERN
+                        && !(mode == crate::triggers::TriggerMode::Latch && pressed)
+                        && !(mode == crate::triggers::TriggerMode::Latch
+                            && mover.and_then(|m| g.movers.get(m)).is_some_and(|m| m.active)) =>
+                {
+                    Some(Obj::Trigger(e.id))
+                }
+                _ => None,
+            })
+            .into_iter()
+            .filter(|c| tried(&c.0) == 0)
+            .collect();
+        if let Some((o, path, cost)) = self.plan_any(g, i, &trigs) {
+            self.set_obj(g, i, o, path, cost);
+            return Ok(());
+        }
+        // 4. Breakables: generators, barrels, secret walls.
+        let smash: Vec<_> = self
+            .cands(g, |e| match &e.kind {
+                Kind::Generator { .. } => Some(Obj::Smash(e.id)),
+                Kind::Wall(w) if w.health > 0 => Some(Obj::Smash(e.id)),
+                _ => None,
+            })
+            .into_iter()
+            .filter(|c| tried(&c.0) == 0)
+            .collect();
+        if let Some((o, path, cost)) = self.plan_any(g, i, &smash) {
+            self.set_obj(g, i, o, path, cost);
+            return Ok(());
+        }
+        // 5. Whatever can still be picked up (it may be what opens the way).
+        let picks: Vec<_> = self
+            .cands(g, |e| match e.kind {
+                Kind::Pickup { kind, .. } => match kind {
+                    PickupKind::Food(_) => None,
+                    PickupKind::Potion(_) if g.players[i].potions >= crate::game::MAX_POTIONS => None,
+                    PickupKind::Key(_) => None,
+                    _ => Some(Obj::Pickup(e.id)),
+                },
+                _ => None,
+            })
+            .into_iter()
+            .filter(|c| tried(&c.0) == 0)
+            .collect();
+        if let Some((o, path, cost)) = self.plan_any(g, i, &picks) {
+            self.set_obj(g, i, o, path, cost);
+            return Ok(());
+        }
+        // 6. Barrels and other breakables.
+        let smash: Vec<_> = self
+            .cands(g, |e| match &e.kind {
+                Kind::Container { chest: false, armor, .. } if *armor >= 0.0 && e.solid.is_some() => {
+                    Some(Obj::Smash(e.id))
+                }
+                _ => None,
+            })
+            .into_iter()
+            .filter(|c| tried(&c.0) == 0)
+            .collect();
+        if let Some((o, path, cost)) = self.plan_any(g, i, &smash) {
+            self.set_obj(g, i, o, path, cost);
+            return Ok(());
+        }
+        // Movers may still be on their way: wait for them before giving up.
+        if g.movers.iter().any(|m| m.moving) {
+            self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
+            return Ok(());
+        }
+        let exits_failed: Vec<String> = self
+            .failed
+            .iter()
+            .filter(|o| matches!(o, Obj::Exit(_)))
+            .map(|o| o.name())
+            .collect();
+        Err(if exits_failed.is_empty() {
+            Outcome::Unreachable(format!(
+                "no path to any exit; enablers exhausted (reachable {reach} nodes, keys {keys}, tried {})",
+                self.tried.len()
+            ))
+        } else {
+            Outcome::Stuck(format!(
+                "exit path found but kept getting stuck on the way ({})",
+                exits_failed.join(", ")
+            ))
+        })
+    }
+
+    /// A follower: the leader's exit once the leader stands on it, the
+    /// leader's trigger while the leader holds it, else the leader.
+    fn decide_follower(&mut self, g: &Game, i: usize, lead: usize) {
+        let lo = self.agents[lead].obj;
+        let on = g.players[lead].exit.touch.is_some() || self.agents[lead].arrived.is_some();
+        if let (Some(o @ (Obj::Exit(_) | Obj::Portal(_) | Obj::Trigger(_))), true) = (lo, on) {
+            if let Some((gl, at)) = self.goals_of(g, o) {
+                if let Some((o, path, cost)) = self.plan_any(g, i, &[(o, gl, at)]) {
+                    self.set_obj(g, i, o, path, cost);
+                    return;
+                }
+            }
+        }
+        let lp = g.players[lead].pos;
+        let a = &mut self.agents[i];
+        if xz(g.players[i].pos - lp).length() < 5.0 && (g.players[i].pos.y - lp.y).abs() < 3.0 {
+            a.obj = Some(Obj::Follow);
+            a.path.clear();
+            a.target = None;
+            a.goals.clear();
+            a.last_adv = g.time;
+            return;
+        }
+        let goals = vec![Goal::new(lp, 4.0, 3.0)];
+        let start = self.nav.start_node(g, g.players[i].pos);
+        let path = start
+            .and_then(|s| self.nav.path(g, s, &goals, g.time, MAX_EXPAND / 4))
+            .map(|p| p.0)
+            .unwrap_or_default();
+        let a = &mut self.agents[i];
+        a.obj = Some(Obj::Follow);
+        a.goals = goals;
+        a.target = Some(lp);
+        a.path = path;
+        a.wp = 0;
+        a.last_adv = g.time;
+    }
+
+    // ---- the optimistic graph ---------------------------------------------
+
+    /// Doors, breakable walls, breakable containers and generators: what
+    /// the optimistic graph walks through. With the collision triangles of
+    /// doors and walls.
+    fn removable(g: &Game) -> (std::collections::HashSet<u64>, Vec<usize>) {
+        let mut ids = std::collections::HashSet::new();
+        let mut tris = Vec::new();
+        for e in g.entities.iter().filter(|e| e.alive) {
+            match &e.kind {
+                Kind::Door { coll, .. } => {
+                    ids.insert(e.id);
+                    if let Some((a, n)) = coll {
+                        tris.extend(*a..*a + *n);
+                    }
+                }
+                Kind::Wall(w) if w.health > 0 => {
+                    ids.insert(e.id);
+                    if let Some((a, n)) = w.tris {
+                        tris.extend(a..a + n);
+                    }
+                }
+                Kind::Generator { .. } => {
+                    ids.insert(e.id);
+                }
+                Kind::Container { chest: false, armor, .. } if *armor >= 0.0 => {
+                    ids.insert(e.id);
+                }
+                _ => {}
+            }
+        }
+        tris.retain(|&t| t < g.collision.tris.len());
+        (ids, tris)
+    }
+
+    /// The first removable thing on an optimistic path from hero i to one
+    /// of `cands`.
+    fn first_blocker(
+        &mut self,
+        g: &mut Game,
+        i: usize,
+        cands: &[(Obj, Vec<Goal>, Vec3)],
+    ) -> Option<u64> {
+        if cands.is_empty() {
+            return None;
+        }
+        let (ids, tris) = Self::removable(g);
+        let saved: Vec<bool> = tris.iter().map(|&t| g.collision.enabled[t]).collect();
+        for &t in &tris {
+            g.collision.enabled[t] = false;
+        }
+        let gr: &Game = g;
+        let opt = self.opt.get_or_insert_with(|| {
+            let mut n = Nav::new(gr);
+            n.ignore = ids.clone();
+            n.reset_edges();
+            n
+        });
+        if opt.ignore != ids {
+            let grew = ids.iter().any(|id| !opt.ignore.contains(id));
+            opt.ignore = ids.clone();
+            if grew {
+                opt.reset_edges();
+            }
+        }
+        opt.refresh(gr);
+        let goals: Vec<Goal> = cands.iter().flat_map(|c| c.1.iter().copied()).collect();
+        let pos = gr.players[i].pos;
+        let path = opt
+            .start_node(gr, pos)
+            .and_then(|s| opt.path(gr, s, &goals, gr.time, MAX_EXPAND));
+        let pts: Vec<Vec3> = path
+            .map(|(p, _)| {
+                std::iter::once(pos)
+                    .chain(p.iter().map(|&n| opt.nodes[n as usize].pos))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (k, &t) in tris.iter().enumerate() {
+            g.collision.enabled[t] = saved[k];
+        }
+        if self.verbose {
+            println!("optimistic path to the exit: {} points", pts.len());
+        }
+        if pts.is_empty() {
+            return None;
+        }
+        let ents: Vec<(u64, Vec3, f32)> = g
+            .entities
+            .iter()
+            .filter(|e| ids.contains(&e.id))
+            .map(|e| {
+                let at = match &e.kind {
+                    Kind::Wall(w) => e.pos + w.coll,
+                    _ => e.pos,
+                };
+                (e.id, at, solid_radius(e))
+            })
+            .collect();
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mut best: Option<(f32, u64)> = None;
+            for &(id, at, r) in &ents {
+                if (at.y - a.y).abs() > 4.0 {
+                    continue;
+                }
+                let d = seg_dist(xz(a), xz(b), xz(at));
+                if d < r + PLAYER_RADIUS + 0.3 {
+                    let along = xz(at - a).length();
+                    if best.is_none_or(|x| along < x.0) {
+                        best = Some((along, id));
+                    }
+                }
+            }
+            if let Some((_, id)) = best {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Pressing trigger `tid`: would the exit become reachable from where
+    /// the hero then stands (riding the target if it stands on it), and how
+    /// many more nodes could be reached than `base`.
+    fn lookahead(&mut self, g: &mut Game, tid: u64, exits: &[Goal], base: usize) -> Option<(bool, i64)> {
+        use crate::worldanim::wflags;
+        let e = Self::ent(g, tid)?;
+        let (mi, tpos, radius) = match e.kind {
+            Kind::Trigger { mover: Some(m), radius, .. } => (m, e.pos, radius),
+            _ => return None,
+        };
+        let reach_r = radius + PLAYER_RADIUS + 0.45;
+        let stand = self.nav.node_near(tpos, reach_r, 3.5)?;
+        let stand_pos = self.nav.nodes[stand as usize].pos;
+        let under = g.collision.ground_tri(stand_pos, stand_pos.y + 0.5).map(|(_, t)| t);
+        // The whole collision as it is, to put back.
+        let saved: Vec<([Vec3; 3], Vec3)> = g.collision.tris.iter().map(|t| (t.v, t.n)).collect();
+        let saved_on = g.collision.enabled.clone();
+        let m = g.movers.get(mi)?;
+        if m.animated && !m.fades() {
+            // Its world animation at the other end.
+            let mut wa = g.world_anim.clone();
+            let to_end = !m.active;
+            let mut any = false;
+            for &o in &m.objects {
+                if wa.has_anim(o) {
+                    any = true;
+                    wa.restore_anim(o, 1, if to_end { 1e9 } else { 0.0 });
+                    if let Some(f) = wa.flags.get_mut(o) {
+                        *f = (*f & !(wflags::REVERSE | wflags::FORWARD))
+                            | if to_end { wflags::FORWARD } else { wflags::REVERSE };
+                    }
+                }
+            }
+            if !any {
+                return None;
+            }
+            wa.update(&mut g.collision, 0.0);
+        } else {
+            let (tris, _, solid) = m.other_end()?;
+            for (i, v) in tris {
+                match solid {
+                    Some(on) => g.collision.enabled[i] = on,
+                    None => g.collision.tris[i].v = v,
+                }
+            }
+            g.collision.refit_dynamic();
+        }
+        // What changed, and how far the floor under the trigger moved.
+        let mut lo = Vec2::splat(f32::MAX);
+        let mut hi = Vec2::splat(f32::MIN);
+        let mut changed = 0;
+        for (i, t) in g.collision.tris.iter().enumerate() {
+            if t.v != saved[i].0 || g.collision.enabled[i] != saved_on[i] {
+                changed += 1;
+                for p in t.v.iter().chain(saved[i].0.iter()) {
+                    lo = lo.min(xz(*p));
+                    hi = hi.max(xz(*p));
+                }
+            }
+        }
+        let dy = under
+            .filter(|&t| g.collision.tris[t].v != saved[t].0)
+            .map(|t| {
+                let y = |v: &[Vec3; 3]| (v[0].y + v[1].y + v[2].y) / 3.0;
+                y(&g.collision.tris[t].v) - y(&saved[t].0)
+            });
+        let result = if changed == 0 {
+            None
+        } else {
+            let gr: &Game = g;
+            self.nav.invalidate(gr, lo, hi);
+            let seed_pos = stand_pos + Vec3::Y * dy.unwrap_or(0.0);
+            let seed = self.nav.node_near(seed_pos, 2.0, 2.0);
+            let r = seed.map(|s| self.nav.reachable(gr, s, 400_000)).unwrap_or_default();
+            let exit_ok = r
+                .iter()
+                .any(|&n| exits.iter().any(|gl| gl.holds(self.nav.nodes[n as usize].pos)));
+            Some((exit_ok, r.len() as i64 - base as i64))
+        };
+        for (i, t) in g.collision.tris.iter_mut().enumerate() {
+            t.v = saved[i].0;
+            t.n = saved[i].1;
+        }
+        g.collision.enabled = saved_on;
+        g.collision.refit_dynamic();
+        if changed > 0 {
+            let gr: &Game = g;
+            self.nav.invalidate(gr, lo, hi);
+        }
+        result
+    }
+
+    // ---- objective state ----------------------------------------------------
+
+    /// Whether hero i's objective is over: Some(true) done, Some(false) given up.
+    fn obj_over(&mut self, g: &mut Game, i: usize) -> Option<bool> {
+        let a = &self.agents[i];
+        let o = a.obj?;
+        let now = g.time;
+        let gone = |id: u64| Self::ent(g, id).is_none();
+        // Nothing takes forever.
+        let cap = match o {
+            Obj::Exit(_) | Obj::Portal(_) => 300.0,
+            Obj::Boss | Obj::Idle | Obj::Follow => f32::MAX,
+            Obj::Key(_) | Obj::Pickup(_) | Obj::Food(_) => 60.0,
+            _ => 120.0,
+        };
+        if now - a.obj_t > cap && !o.entity().is_some_and(gone) {
+            return Some(false);
+        }
+        match o {
+            Obj::Key(id) | Obj::Pickup(id) | Obj::Food(id) => {
+                if gone(id) {
+                    return Some(true);
+                }
+                (now - a.obj_t > 40.0).then_some(false)
+            }
+            Obj::Door(id) => {
+                if gone(id) {
+                    return Some(true);
+                }
+                let keys: u32 = g.players.iter().map(|p| p.keys).sum();
+                (keys == 0 || a.arrived.is_some_and(|t| now - t > 4.0)).then_some(false)
+            }
+            Obj::Trigger(_) => {
+                let t = a.arrived?;
+                let moving = g.movers.iter().any(|m| m.moving);
+                ((now - t > 1.5 && !moving) || now - t > 15.0).then_some(true)
+            }
+            Obj::Smash(id) => {
+                if gone(id) {
+                    return Some(true);
+                }
+                (a.arrived.is_some_and(|t| now - t > 25.0)).then_some(false)
+            }
+            Obj::Boss => {
+                let dead = g.boss.as_ref().is_some_and(|b| b.dead || b.dying);
+                dead.then_some(true)
+            }
+            Obj::Lectern => {
+                let got = g
+                    .sumner
+                    .as_mut()
+                    .and_then(|s| s.hint_request.take())
+                    .is_some();
+                if got {
+                    if let Some(mut s) = g.sumner.take() {
+                        s.hints_closed(g);
+                        g.sumner = Some(s);
+                    }
+                    self.lectern_ok = Some(true);
+                    self.log(g, "lectern: Sumner's hint menu opened".into());
+                    return Some(true);
+                }
+                if a.arrived.is_some_and(|t| now - t > 12.0) {
+                    self.lectern_ok = Some(false);
+                    self.log(g, "lectern: stood there 12 s, no hint menu".into());
+                    return Some(false);
+                }
+                None
+            }
+            Obj::Follow => (now - a.obj_t > 1.0 || a.path.is_empty()).then_some(true),
+            Obj::Idle => (now - a.obj_t > 2.0).then_some(true),
+            Obj::Exit(id) | Obj::Portal(id) => gone(id).then_some(false),
+        }
+    }
+
+    // ---- driving ------------------------------------------------------------
+
+    /// One tick: decide, steer, fight. The inputs for every hero.
+    pub fn inputs(&mut self, g: &mut Game) -> Result<Vec<PlayerInput>, Outcome> {
+        let n = g.players.len();
+        let mut out = vec![PlayerInput::default(); n];
+        if g.frame % 30 == 0 && self.nav.refresh(g) {
+            for a in &mut self.agents {
+                a.replan = true;
+            }
+        }
+        let Some(lead) = Self::leader(g) else {
+            return Ok(out);
+        };
+        for i in 0..n {
+            if !g.players[i].state.active() {
+                continue;
+            }
+            if let Some(done) = self.obj_over(g, i) {
+                let o = self.agents[i].obj.unwrap();
+                if i == lead && !matches!(o, Obj::Follow | Obj::Idle) {
+                    let line = format!(
+                        "hero {i} {} {} after {:.1}s",
+                        o.name(),
+                        if done { "done" } else { "given up" },
+                        g.time - self.agents[i].obj_t
+                    );
+                    self.log(g, line);
+                    if done {
+                        self.used.push(o.name());
+                    }
+                }
+                *self.tried.entry(o).or_default() += 1;
+                if !done {
+                    self.failed.insert(o);
+                }
+                self.agents[i].obj = None;
+            }
+            if self.agents[i].obj.is_none() || self.agents[i].replan {
+                let keep = self.agents[i].obj;
+                if i == lead {
+                    // A replan keeps the objective when it still has a path.
+                    let mut kept = false;
+                    if let Some(o) = keep.filter(|o| !matches!(o, Obj::Idle | Obj::Follow)) {
+                        if let Some((gl, at)) = self.goals_of(g, o) {
+                            if let Some((o2, path, cost)) = self.plan_any(g, i, &[(o, gl, at)]) {
+                                self.set_obj(g, i, o2, path, cost);
+                                kept = true;
+                            }
+                        }
+                    }
+                    if !kept {
+                        self.agents[i].obj = None;
+                        self.decide_leader(g, i)?;
+                    }
+                } else {
+                    self.decide_follower(g, i, lead);
+                }
+            }
+            out[i] = self.drive(g, i);
+        }
+        self.watch(g)?;
+        Ok(out)
+    }
+
+    fn drive(&mut self, g: &mut Game, i: usize) -> PlayerInput {
+        let now = g.time;
+        let p = &g.players[i];
+        let pos = p.pos;
+        let maxh = crate::game::max_health(p.level);
+        // Low health: god mode (recorded), so the level can still be checked.
+        if p.health < maxh * 0.2 && !g.debug_god {
+            let why = format!(
+                "hero {i} health {:.0}/{maxh:.0} at ({:.1},{:.1},{:.1}) during {}",
+                p.health,
+                pos.x,
+                pos.y,
+                pos.z,
+                self.agents[i].obj.map_or("-".into(), |o| o.name())
+            );
+            self.log(g, format!("GOD MODE switched on: {why}"));
+            self.god_at = Some((now, why));
+            g.debug_god = true;
+        }
+        let p = &g.players[i];
+        let a = &self.agents[i];
+        let obj = a.obj.unwrap_or(Obj::Idle);
+        // Standing on the exit: stand still (DoExit counts still ticks).
+        if matches!(obj, Obj::Exit(_) | Obj::Portal(_)) && p.exit.touch.is_some() {
+            return PlayerInput::default();
+        }
+        let mut fight = self.combat(g, i);
+        // A transporter in progress: hands off.
+        if g.transport.heroes.get(i).is_some_and(|h| h.timer > 0.0) {
+            self.agents[i].last_adv = now;
+            return PlayerInput::default();
+        }
+        // Boss: attack it in reach.
+        if obj == Obj::Boss {
+            if let Some((at, r)) = boss_point(g, pos) {
+                let d = xz(at - pos).length() - r;
+                if d < 4.0 {
+                    self.boss_fight_t += 1.0 / 60.0;
+                    self.agents[i].last_adv = now;
+                    return self.attack_toward(g, i, at, true);
+                }
+            }
+        }
+        let a = &mut self.agents[i];
+        // Arrival: where the objective acts.
+        let target = a.target;
+        let in_goal = a.goals.iter().any(|gl| gl.holds(pos));
+        match obj {
+            Obj::Trigger(id) if in_goal || a.arrived.is_some() => {
+                let shoot = matches!(
+                    Self::ent(g, id).map(|e| &e.kind),
+                    Some(Kind::Trigger { shoot: true, .. })
+                );
+                if a.arrived.is_none() {
+                    a.arrived = Some(now);
+                }
+                a.last_adv = now;
+                if shoot {
+                    if let Some(t) = target {
+                        return self.attack_toward(g, i, t, false);
+                    }
+                }
+                // Step onto it fully, then hold still (fights still happen).
+                if let Some(t) = target {
+                    let d = xz(t - pos);
+                    let close = d.length() < 0.6 || !in_goal;
+                    if !close && now - a.arrived.unwrap() < 0.6 {
+                        return PlayerInput {
+                            stick: g.stick_toward(d.normalize_or_zero()) * 0.5,
+                            ..Default::default()
+                        };
+                    }
+                }
+                return fight.take().unwrap_or_default();
+            }
+            Obj::Door(_) if in_goal => {
+                a.arrived.get_or_insert(now);
+                a.last_adv = now;
+                if let Some(t) = target {
+                    let d = xz(t - pos).normalize_or_zero();
+                    return PlayerInput {
+                        stick: g.stick_toward(d),
+                        ..Default::default()
+                    };
+                }
+            }
+            Obj::Smash(_) if in_goal => {
+                a.arrived.get_or_insert(now);
+                a.last_adv = now;
+                if let Some(t) = target {
+                    return self.attack_toward(g, i, t, true);
+                }
+            }
+            Obj::Lectern if in_goal => {
+                a.arrived.get_or_insert(now);
+                a.last_adv = now;
+                if let Some(t) = target {
+                    let d = xz(t - pos);
+                    if d.length() > 0.8 {
+                        return PlayerInput {
+                            stick: g.stick_toward(d.normalize_or_zero()) * 0.5,
+                            ..Default::default()
+                        };
+                    }
+                }
+                return PlayerInput::default();
+            }
+            Obj::Idle => {
+                a.last_adv = now;
+                return fight.take().unwrap_or_default();
+            }
+            Obj::Follow if a.path.is_empty() => {
+                a.last_adv = now;
+                return fight.take().unwrap_or_default();
+            }
+            _ => {}
+        }
+        // Fight what is in reach (within limits).
+        if let Some(f) = fight {
+            // Monsters keep coming: go for the generators making them.
+            let a = &self.agents[i];
+            if a.fight_t > 5.0
+                && now - a.hunt_t > 10.0
+                && !matches!(obj, Obj::Smash(_) | Obj::Boss)
+                && (i == 0 || !matches!(obj, Obj::Follow))
+            {
+                self.agents[i].hunt_t = now;
+                let gens = self.cands(g, |e| match e.kind {
+                    Kind::Generator { .. }
+                        if xz(e.pos - pos).length() < 18.0 && (e.pos.y - pos.y).abs() < 4.0 =>
+                    {
+                        Some(Obj::Smash(e.id))
+                    }
+                    _ => None,
+                });
+                if let Some((o, path, cost)) = self.plan_any(g, i, &gens) {
+                    if cost < 40.0 {
+                        let line = format!("hero {i}: monsters keep coming; detour to {}", o.name());
+                        self.log(g, line);
+                        self.set_obj(g, i, o, path, cost);
+                        return f;
+                    }
+                }
+            }
+            let a = &mut self.agents[i];
+            a.fight_t += 1.0 / 60.0;
+            a.last_adv = now;
+            if a.fight_t > 45.0 && now > a.calm_until {
+                // Fought long enough here: push on for a while.
+                a.calm_until = now + 6.0;
+                a.fight_t = 0.0;
+            }
+            if now >= a.calm_until {
+                return f;
+            }
+        }
+        self.follow_path(g, i)
+    }
+
+    fn follow_path(&mut self, g: &Game, i: usize) -> PlayerInput {
+        let now = g.time;
+        let pos = g.players[i].pos;
+        let a = &mut self.agents[i];
+        // Waypoints reached.
+        while a.wp < a.path.len() {
+            let n = self.nav.nodes[a.path[a.wp] as usize];
+            let last = a.wp + 1 == a.path.len();
+            let d = xz(n.pos - pos).length();
+            let reach = if last { 0.6 } else { 1.0 };
+            // Passed it: nearer the next waypoint than it is.
+            let passed = !last && d < 2.5 && {
+                let nx = self.nav.nodes[a.path[a.wp + 1] as usize].pos;
+                xz(nx - pos).length() + 0.3 < xz(nx - n.pos).length()
+            };
+            if (d < reach || passed) && (n.pos.y - pos.y).abs() < 2.0 {
+                a.wp += 1;
+                a.last_adv = now;
+                a.best_d = f32::MAX;
+                if a.wp >= a.stuck_wp + 4 {
+                    a.stucks = 0;
+                }
+            } else {
+                break;
+            }
+        }
+        // Skip ahead when a later waypoint is straight ahead and walkable.
+        if a.wp + 1 < a.path.len() && g.frame % 6 == 0 {
+            let w = super::nav::WalkWorld {
+                col: &g.collision,
+                ents: &g.entities,
+                ignore: &self.nav.ignore,
+                min_y: g.level.worlds.min_bounds[1],
+            };
+            let far = (a.wp + 4).min(a.path.len() - 1);
+            for k in (a.wp + 1..=far).rev() {
+                let n = self.nav.nodes[a.path[k] as usize];
+                // Not across a transporter trip.
+                if (a.wp.max(1)..=k).any(|j| self.nav.pad_edge(a.path[j - 1], a.path[j]).is_some()) {
+                    continue;
+                }
+                if !n.hurts && w.walks(pos, n.pos) {
+                    a.wp = k;
+                    a.best_d = f32::MAX;
+                    a.last_adv = now;
+                    break;
+                }
+            }
+        }
+        let goal = if a.wp < a.path.len() {
+            // A transporter edge: touch the pad and stand there.
+            let mut pad_goal = None;
+            if a.wp > 0 {
+                if let Some(pad) = self.nav.pad_edge(a.path[a.wp - 1], a.path[a.wp]) {
+                    let dest = self.nav.nodes[a.path[a.wp] as usize].pos;
+                    if xz(dest - pos).length() < super::nav::CELL * 1.5 + 0.5
+                        && (dest.y - pos.y).abs() < 2.5
+                    {
+                        // Sent across.
+                        a.wp += 1;
+                        a.last_adv = now;
+                        a.on_pad_t = None;
+                        return self.follow_path(g, i);
+                    }
+                    let pp = g.transport.pads[pad].pos;
+                    let reach = g.transport.pads[pad].radius + PLAYER_RADIUS - 0.4;
+                    if xz(pp - pos).length() < reach {
+                        let t0 = *a.on_pad_t.get_or_insert(now);
+                        a.last_adv = now;
+                        if now - t0 > 6.0 {
+                            // Not taken: treat as blocked.
+                            self.nav
+                                .blocked
+                                .insert((a.path[a.wp - 1], a.path[a.wp]), now + 120.0);
+                            a.replan = true;
+                            a.on_pad_t = None;
+                        }
+                        return PlayerInput::default();
+                    }
+                    pad_goal = Some(pp);
+                }
+            }
+            if let Some(pp) = pad_goal {
+                pp
+            } else {
+            a.on_pad_t = None;
+            self.nav.nodes[a.path[a.wp] as usize].pos
+            }
+        } else {
+            match a.target {
+                Some(t) => t,
+                None => return PlayerInput::default(),
+            }
+        };
+        let d = xz(goal - pos);
+        let dist = d.length();
+        if dist + 0.3 < a.best_d {
+            a.best_d = dist;
+            a.last_adv = now;
+        }
+        // Stuck: no waypoint reached for a while.
+        if now - a.last_adv > STUCK_SECS {
+            a.stucks += 1;
+            a.stuck_wp = a.wp;
+            let (from, to) = if a.wp > 0 && a.wp < a.path.len() {
+                (Some(a.path[a.wp - 1]), Some(a.path[a.wp]))
+            } else {
+                (None, None)
+            };
+            if let (Some(f), Some(t)) = (from, to) {
+                self.nav.blocked.insert((f, t), now + 90.0);
+            }
+            if self.verbose {
+                let fp = from.map(|f| self.nav.nodes[f as usize].pos);
+                println!(
+                    "  stuck #{} t={now:.1} at {pos:?} goal {goal:?} (from node {fp:?}) wp {}/{} act {}",
+                    a.stucks,
+                    a.wp,
+                    a.path.len(),
+                    g.players[i].act.cur
+                );
+                let pts: Vec<Vec3> = a.path.iter().map(|&n| self.nav.nodes[n as usize].pos).collect();
+                for (k, w) in pts.windows(2).enumerate() {
+                    if (w[1] - w[0]).length() > 4.0 {
+                        println!("    path gap at {k}: {:?} -> {:?}", w[0], w[1]);
+                    }
+                }
+            }
+            a.last_adv = now;
+            a.best_d = f32::MAX;
+            a.replan = true;
+            if a.stucks >= STUCKS_PER_OBJ {
+                if let Some(o) = a.obj {
+                    if !matches!(o, Obj::Follow | Obj::Idle | Obj::Boss) {
+                        self.failed.insert(o);
+                        let msg = format!(
+                            "hero {i} stuck {} times going for {} at ({:.1},{:.1},{:.1}); given up",
+                            a.stucks, o.name(), pos.x, pos.y, pos.z
+                        );
+                        a.obj = None;
+                        log_to(&mut self.history, self.verbose, g, msg.clone());
+                        {
+                            self.anomalies.push(Anomaly {
+                                what: msg,
+                                tags: vec!["stuck"],
+                                capture: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let mag = if a.wp >= a.path.len() && dist < 1.5 { 0.5 } else { 1.0 };
+        PlayerInput {
+            stick: g.stick_toward(d.normalize_or_zero()) * mag,
+            ..Default::default()
+        }
+    }
+
+    /// Face `at` and swing (or throw); turbo now and then.
+    fn attack_toward(&mut self, g: &Game, i: usize, at: Vec3, turbo_ok: bool) -> PlayerInput {
+        let p = &g.players[i];
+        let d = xz(at - p.pos).normalize_or_zero();
+        let f = g.frame;
+        let turbo = turbo_ok && p.power >= 60.0 && f % 120 < 12;
+        PlayerInput {
+            stick: g.stick_toward(d) * 0.06,
+            attack: true,
+            attack_pressed: f % 4 == 0 || (turbo && f % 120 == 11),
+            turbo,
+            ..Default::default()
+        }
+    }
+
+    /// Fight what is in reach: monsters, generators, critters (not a sleeping
+    /// boss). A potion when hard pressed.
+    fn combat(&mut self, g: &Game, i: usize) -> Option<PlayerInput> {
+        let p = &g.players[i];
+        let pos = p.pos;
+        let mut near = 0;
+        let mut best: Option<(f32, Vec3)> = None;
+        for e in &g.entities {
+            if !e.alive {
+                continue;
+            }
+            let (at, r) = match &e.kind {
+                Kind::Enemy { state, .. } if !matches!(state, EnemyState::Dying { .. }) => {
+                    (e.pos, 1.0)
+                }
+                Kind::Generator { .. } => (e.pos, solid_radius(e)),
+                Kind::Critter(c) if c.hittable() && !c.is_boss() => {
+                    match crate::game::Game::aim_point(e, pos + Vec3::Y * 2.5) {
+                        Some(x) => x,
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if (at.y - pos.y).abs() > 3.5 && !matches!(e.kind, Kind::Critter(_)) {
+                continue;
+            }
+            let d = xz(at - pos).length() - r;
+            if d < 6.0 {
+                near += 1;
+            }
+            if d < 4.0 && best.is_none_or(|b| d < b.0) {
+                best = Some((d, at));
+            }
+        }
+        let (_, at) = best?;
+        let maxh = crate::game::max_health(p.level);
+        let mut inp = self.attack_toward(g, i, at, near >= 3);
+        let a = &mut self.agents[i];
+        if p.potions > 0 && p.health < maxh * 0.4 && near >= 3 && g.time - a.potion_t > 5.0 {
+            a.potion_t = g.time;
+            inp.magic = true;
+            inp.magic_pressed = true;
+        }
+        Some(inp)
+    }
+
+    /// Per-tick sanity checks: NaN, falling out of the world, the trail.
+    fn watch(&mut self, g: &Game) -> Result<(), Outcome> {
+        for (i, p) in g.players.iter().enumerate() {
+            if !p.pos.is_finite() {
+                return Err(Outcome::Nan(format!("hero {i} position {:?}", p.pos)));
+            }
+            let last = self.last_pos.get(i).copied().unwrap_or(p.pos);
+            let jump = (p.pos - last).length();
+            let transporting = g.transport.heroes.get(i).is_some_and(|h| h.timer > 0.0 || h.counter > 0);
+            // Moved by the game (a transporter, put back on the floor): replan.
+            if jump > 3.0 {
+                if let Some(a) = self.agents.get_mut(i) {
+                    a.replan = true;
+                    a.on_pad_t = None;
+                }
+            }
+            if jump > 12.0 && !transporting && p.state.active() && self.falls < 5 {
+                self.falls += 1;
+                self.anomalies.push(Anomaly {
+                    what: format!(
+                        "hero {i} jumped {jump:.1} units in a tick from ({:.1},{:.1},{:.1}) to ({:.1},{:.1},{:.1}) (fell out of the world and was put back?)",
+                        last.x, last.y, last.z, p.pos.x, p.pos.y, p.pos.z
+                    ),
+                    tags: vec!["other"],
+                    capture: false,
+                });
+            }
+            if i < self.last_pos.len() {
+                self.last_pos[i] = p.pos;
+            }
+        }
+        if g.frame % 60 == 0 {
+            if let Some(p) = g.players.first() {
+                self.trail.push_back((g.time, p.pos));
+                if self.trail.len() > 40 {
+                    self.trail.pop_front();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The level ended (or the time ran out): the outcome, if over.
+    pub fn check_end(&mut self, g: &Game) -> Option<Outcome> {
+        if let Some(end) = g.level_end {
+            return Some(match end {
+                LevelEnd::Exit(_) => Outcome::Completed,
+                LevelEnd::AllDead => Outcome::Died("every hero died".into()),
+                LevelEnd::Secret(w) => Outcome::Secret(w),
+                LevelEnd::SecretOver => Outcome::Completed,
+            });
+        }
+        if g.players.iter().any(|p| matches!(p.state, PlayerState::Dead { .. })) && g.debug_god {
+            return Some(Outcome::Died("a hero died in god mode".into()));
+        }
+        // On the exit for long with nothing happening.
+        let on_exit = g.players.iter().filter(|p| p.state.active()).all(|p| p.exit.touch.is_some());
+        if on_exit && g.players.iter().any(|p| p.state.active()) {
+            let t = *self.exit_since.get_or_insert(g.time);
+            if g.time - t > 20.0 {
+                return Some(Outcome::ExitNoEnd(format!(
+                    "the whole party stood on an exit for {:.0} s; exit progress {:#x}, waiting {:?}",
+                    g.time - t,
+                    g.exit_state.progress,
+                    g.players.iter().map(|p| p.exit.waiting).collect::<Vec<_>>()
+                )));
+            }
+        } else {
+            self.exit_since = None;
+        }
+        if g.time > self.timeout {
+            let o = self.agents.first().and_then(|a| a.obj);
+            return Some(Outcome::Timeout(format!(
+                "{:.0} s of game time; last objective {}",
+                g.time,
+                o.map_or("-".into(), |o| o.name())
+            )));
+        }
+        None
+    }
+
+    /// The runner's view, for reports: objective, path, recent places.
+    pub fn note(&self, g: &Game) -> String {
+        let mut s = String::new();
+        for (i, a) in self.agents.iter().enumerate() {
+            let p = &g.players[i];
+            s += &format!(
+                "- hero {i}: pos ({:.2}, {:.2}, {:.2}) health {:.0} keys {} state {:?}\n  objective {} (since t={:.1}s, stucks {}), target {:?}\n",
+                p.pos.x, p.pos.y, p.pos.z, p.health, p.keys, p.state,
+                a.obj.map_or("-".into(), |o| o.name()), a.obj_t, a.stucks,
+                a.target.map(|t| (t.x, t.y, t.z))
+            );
+            let path: Vec<String> = a
+                .path
+                .iter()
+                .skip(a.wp.saturating_sub(1))
+                .take(25)
+                .map(|&n| {
+                    let p = self.nav.nodes[n as usize].pos;
+                    format!("({:.1},{:.1},{:.1})", p.x, p.y, p.z)
+                })
+                .collect();
+            s += &format!("  path from waypoint {} of {}: {}\n", a.wp, a.path.len(), path.join(" "));
+        }
+        s += "\nLast positions of hero 0 (one a second):\n";
+        for (t, p) in &self.trail {
+            s += &format!("  t={t:7.1}s ({:.2}, {:.2}, {:.2})\n", p.x, p.y, p.z);
+        }
+        s += "\nObjectives so far:\n";
+        for h in self.history.iter().rev().take(400).collect::<Vec<_>>().into_iter().rev() {
+            s += &format!("  {h}\n");
+        }
+        s += &format!(
+            "\nFailed objectives: {}\nBlocked edges: {}\nNav: {} live nodes, {} edge walks\n",
+            self.failed.iter().map(|o| o.name()).collect::<Vec<_>>().join(", "),
+            self.nav.blocked.len(),
+            self.nav.live_nodes(),
+            self.nav.walks
+        );
+        s
+    }
+}
+
+/// The radius an entity takes up (its solid shape).
+pub fn solid_radius(e: &crate::game::Entity) -> f32 {
+    match e.solid {
+        Some(crate::game::Shape::Cylinder { radius }) => radius,
+        Some(crate::game::Shape::Box { half }) => half.max_element(),
+        None => match &e.kind {
+            Kind::Wall(w) => w.radius,
+            _ => 1.0,
+        },
+    }
+}
+
+/// The boss's aim point and radius.
+pub fn boss_point(g: &Game, from: Vec3) -> Option<(Vec3, f32)> {
+    let e = g.entities.iter().find(|e| match &e.kind {
+        Kind::Critter(c) => c.is_boss() && !c.deleted,
+        _ => false,
+    })?;
+    let _ = Vec2::ZERO;
+    crate::game::Game::aim_point(e, from + Vec3::Y * 2.5)
+}
+
+fn log_to(history: &mut Vec<String>, verbose: bool, g: &Game, s: String) {
+    let line = format!("t={:7.2}s {s}", g.time);
+    if verbose {
+        println!("{line}");
+    }
+    crate::bugreport::event("runner", s);
+    history.push(line);
+}
+
+/// Distance from p to the segment a-b.
+fn seg_dist(a: Vec2, b: Vec2, p: Vec2) -> f32 {
+    let ab = b - a;
+    let t = if ab.length_squared() > 1e-6 {
+        ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (a + ab * t - p).length()
+}
+
+impl Bot {
+    /// A top-down map of the nav graph: floors reachable from hero 0 in
+    /// green (brighter = higher), the rest grey, hero 0 red, its path white,
+    /// exits yellow, levers and pads blue (cyan once pressed), doors brown,
+    /// keys magenta, generators orange, transporter pads purple.
+    pub fn nav_map(&mut self, g: &Game) -> gdl_formats::Image {
+        const PX: i32 = 6;
+        let (nx, nz) = (self.nav.nx, self.nav.nz);
+        let (w, h) = ((nx * PX) as u32, (nz * PX) as u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        let reach = self
+            .nav
+            .start_node(g, g.players[0].pos)
+            .map(|s| self.nav.reachable(g, s, 400_000))
+            .unwrap_or_default();
+        let (lo, hi) = (g.level.worlds.min_bounds[1], g.level.worlds.max_bounds[1]);
+        let span = (hi - lo).max(1.0);
+        let put = |rgba: &mut Vec<u8>, c: (i32, i32), col: [u8; 3], size: i32| {
+            for dz in 0..size {
+                for dx in 0..size {
+                    let x = c.0 * PX + dx - (size - PX) / 2;
+                    // North (+z) up.
+                    let z = (nz - 1 - c.1) * PX + dz - (size - PX) / 2;
+                    if x < 0 || z < 0 || x >= w as i32 || z >= h as i32 {
+                        continue;
+                    }
+                    let k = ((z as u32 * w + x as u32) * 4) as usize;
+                    rgba[k..k + 4].copy_from_slice(&[col[0], col[1], col[2], 255]);
+                }
+            }
+        };
+        // Highest node per cell drawn last.
+        let mut order: Vec<u32> = (0..self.nav.nodes.len() as u32)
+            .filter(|&n| self.nav.nodes[n as usize].alive)
+            .collect();
+        order.sort_by(|a, b| {
+            self.nav.nodes[*a as usize].pos.y.total_cmp(&self.nav.nodes[*b as usize].pos.y)
+        });
+        for n in order {
+            let node = self.nav.nodes[n as usize];
+            let t = ((node.pos.y - lo) / span).clamp(0.0, 1.0);
+            let v = (60.0 + 160.0 * t) as u8;
+            let col = if reach.contains(&n) {
+                [0, v, 0]
+            } else if node.hurts {
+                [v, 0, 0]
+            } else {
+                [v / 2, v / 2, v / 2]
+            };
+            put(&mut rgba, node.cell, col, PX);
+        }
+        if let Some(a) = self.agents.first() {
+            for &n in &a.path {
+                let c = self.nav.nodes[n as usize].cell;
+                put(&mut rgba, c, [255, 255, 255], 3);
+            }
+        }
+        for e in g.entities.iter().filter(|e| e.alive) {
+            let col = match &e.kind {
+                Kind::Exit { open: true, .. } => [255, 255, 0],
+                Kind::Trigger { pressed: false, .. } => [40, 80, 255],
+                Kind::Trigger { pressed: true, .. } => [0, 255, 255],
+                Kind::Door { .. } => [160, 90, 30],
+                Kind::Pickup { kind: PickupKind::Key(_), .. } => [255, 0, 255],
+                Kind::Generator { .. } => [255, 140, 0],
+                _ => continue,
+            };
+            put(&mut rgba, self.nav.cell_of(e.pos), col, 10);
+        }
+        for p in &g.transport.pads {
+            put(&mut rgba, self.nav.cell_of(p.pos), [150, 0, 200], 10);
+        }
+        for p in &g.players {
+            put(&mut rgba, self.nav.cell_of(p.pos), [255, 0, 0], 14);
+        }
+        gdl_formats::Image { width: w, height: h, rgba }
+    }
+}

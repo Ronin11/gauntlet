@@ -4923,7 +4923,7 @@ impl Game {
 
     /// Where an attack from `from` aims at entity `e`: the point and its
     /// radius (a critter's nearest colnode, else the entity itself).
-    fn aim_point(e: &Entity, from: Vec3) -> Option<(Vec3, f32)> {
+    pub(crate) fn aim_point(e: &Entity, from: Vec3) -> Option<(Vec3, f32)> {
         let r = match &e.kind {
             Kind::Critter(c) => c.wad.types[c.parts[0].ty].rad,
             _ => Self::target_radius(e)?,

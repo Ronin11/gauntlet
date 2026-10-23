@@ -43,6 +43,7 @@ pub mod wflags {
 use wflags::*;
 
 /// One `struct worldanim` and its run state.
+#[derive(Clone)]
 struct Anim {
     obj: usize,
     nframes: i16,
@@ -53,6 +54,7 @@ struct Anim {
 }
 
 /// A rotator item (items.c rotdata): turns its target's node about Y.
+#[derive(Clone)]
 struct Rotator {
     target: usize,
     /// Radians per 60 Hz tick.
@@ -71,6 +73,7 @@ struct Rotator {
     radius: f32,
 }
 
+#[derive(Clone)]
 pub struct WorldAnims {
     /// Live WorldObj.flags.
     pub flags: Vec<u32>,
