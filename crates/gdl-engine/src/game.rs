@@ -1,8 +1,5 @@
 //! Game state and simulation (independent of rendering).
 
-#[path = "sounds.rs"]
-pub mod sounds;
-
 use crate::character::{Animator, Model};
 use crate::collision::{Collision, Tri};
 use crate::fs::GameFs;
@@ -15,6 +12,10 @@ use gdl_formats::worlds::ItemType;
 use gdl_formats::Objects;
 use glam::{Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
+
+pub(crate) mod items;
+mod magic;
+pub mod sounds;
 
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
 pub const PLAYER_COLORS: [&str; 4] = ["RED", "BLU", "YEL", "GRE"];
@@ -30,9 +31,6 @@ const TARGET_RANGE: f32 = 30.0;
 const MELEE_REACH: f32 = 2.0 + PLAYER_RADIUS;
 /// The aim cone: dot >= 0.707 (0.5 on Easy).
 const AIM_CONE: f32 = 0.707;
-/// The potion ring's damage at full strength, and how long it spreads (s).
-const MAGIC_DAMAGE: f32 = 40.0;
-const MAGIC_TIME: f32 = 1.0;
 /// Turbo meter: fill per second, and the costs of the PWRB / PWRC moves.
 const TURBO_FILL: f32 = 2.0;
 /// player_max_health: 100 per level above 1 plus 500, at most 9999. A new
@@ -227,19 +225,6 @@ impl DmgType {
 /// potion, turbo move and amulet hit has an element; monsters here are neutral.
 const ELEMENT_BONUS: f32 = 1.5;
 
-/// A spreading potion blast.
-#[derive(Clone, Debug)]
-pub struct Ring {
-    pub owner: usize,
-    pub pos: Vec3,
-    pub radius: f32,
-    pub damage: f32,
-    pub colour: u8,
-    pub time: f32,
-    /// Entities already hit.
-    hit: Vec<u64>,
-}
-
 /// A monster's missile to launch.
 #[derive(Clone, Copy, Debug)]
 /// A missile launch this tick (pmotion.c's missile block).
@@ -281,11 +266,6 @@ fn missile(etype: usize, slot: usize) -> (f32, f32, f32, f32) {
     }
 }
 
-/// Level-3 demons, sorcerers, plague, worms and warlocks cast fireballs.
-fn caster(etype: usize, strength: usize) -> bool {
-    strength == 3 && matches!(etype, 2 | 7 | 14 | 17 | 24)
-}
-
 /// A generator's request for a monster.
 #[derive(Clone, Copy, Debug)]
 struct Spawn {
@@ -296,11 +276,15 @@ struct Spawn {
     generator: u64,
     /// Every slot is taken: recycle the farthest monster off screen.
     recycle: bool,
+    /// The generator's ai and height (generate_enemy's spew and ang).
+    ai: i32,
+    height: f32,
 }
 
 thread_local! {
-    /// Set while a potion's ring is dealing its damage (DMG_MAGIC).
-    static MAGIC_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while a potion's effect is dealing its damage (DMG_MAGIC): its
+    /// element (1-4), else 0.
+    static MAGIC_HIT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// What one hit did.
@@ -749,6 +733,16 @@ pub enum Kind {
         drained: f32,
         /// The Warlock's blink: seconds left seen (> 0) or unseen (< 0).
         blink: f32,
+        /// do_ai's state: its move_logic routine and what that keeps.
+        brain: Box<crate::ai::Brain>,
+        /// Enemy.algorithm: the AI routine (init_enemy, after fn_8004F87C):
+        /// a placed monster's or generator's params[2] override, else
+        /// sEnemyDefaultAlgorithm by type. Set by the item code; the movement
+        /// AI reads it (items::algorithm).
+        ai: i32,
+        /// Enemy.dest: where a logic-12 generator sent it (place_logic12),
+        /// for the AI to walk to; None otherwise.
+        dest: Option<Vec3>,
     },
     Generator {
         class: usize,
@@ -768,6 +762,15 @@ pub enum Kind {
         always: bool,
         /// Temple / Hell SPECIAL generators: which list they cycle through.
         special: Option<&'static [usize; 4]>,
+        /// gendata ai (params[2], else sEnemyDefaultAlgorithm): handed to
+        /// generate_enemy; 12 sends spawns to either side (place_logic12).
+        ai: i32,
+        /// The item's height: how far in front monsters appear (+ their radius).
+        height: f32,
+        /// place_logic12's side (data[4]): 0 left, 1 right, then in place.
+        side: u8,
+        /// gendata's spawn bookkeeping for ai 13 / 14 (the zombie line's tail).
+        chain: crate::ai::GenAi,
     },
     Pickup {
         kind: PickupKind,
@@ -778,7 +781,11 @@ pub enum Kind {
         hp: f32,
         drop: Option<usize>,
         chest: bool,
+        /// The item's armour; -1 (walls, signs, chests) turns hits away.
         armor: f32,
+        /// The item-info subtype (0x2B barrel, 0x2C explosive barrel or trap
+        /// chest, 0x2D poison barrel; 0 for the boss's spouts).
+        sub: i32,
     },
     Door {
         radius: f32,
@@ -1031,10 +1038,17 @@ pub struct Game {
     pub max_enemies: usize,
     /// The player who is IT: every monster goes after them.
     pub it_holder: Option<usize>,
+    /// The milestone network and the players' trails through it (do_ai).
+    pub ai_paths: crate::ai::Paths,
     /// Round-robin counter for the Temple / Hell SPECIAL generators.
     special_counter: u32,
-    /// Potion blasts spreading out.
-    pub rings: Vec<Ring>,
+    /// Potion effects in flight or spreading (start_magic).
+    pub(crate) magic: Vec<magic::MagicFx>,
+    pub(crate) magic_models: magic::MagicModels,
+    /// Item damage state: blasts, bags, carried items (items.rs).
+    pub(crate) items: items::ItemsState,
+    /// randpottype: the colour a colourless potion takes next.
+    randpottype: u32,
     /// Lightning-shield strikes waiting out their second, by (player, monster).
     shield_cooldown: HashMap<(usize, u64), f32>,
     /// Damage-row re-hits waiting out their delay, by (player, target).
@@ -1066,6 +1080,10 @@ pub struct Game {
     pub crystal_shown: Option<(usize, f32)>,
     /// World objects hidden for good (closed tower portals).
     pub hidden: HashSet<usize>,
+    /// World-object animations, rotators and the floors they carry (worldanim.rs).
+    pub world_anim: crate::worldanim::WorldAnims,
+    /// Transporter pads and each hero's trip (transport.rs).
+    pub transport: crate::transport::Transport,
     /// Set once every player has left or died.
     pub level_end: Option<LevelEnd>,
     /// Help messages and announcements (msgPost).
@@ -1536,7 +1554,8 @@ impl Game {
         difficulty: usize,
     ) -> Result<Game> {
         let level = Level::load(fs, level_name)?;
-        let collision = Collision::new(build_collision(&level));
+        let mut collision = Collision::new(build_collision(&level));
+        let world_anim = crate::worldanim::WorldAnims::new(&level, &mut collision);
 
         let mut game = Game {
             obj_flags: level.worlds.all_flags(),
@@ -1581,7 +1600,11 @@ impl Game {
             max_enemies: 25,
             special_counter: 0,
             it_holder: None,
-            rings: Vec::new(),
+            ai_paths: Default::default(),
+            magic: Vec::new(),
+            items: Default::default(),
+            magic_models: Default::default(),
+            randpottype: 0,
             shield_cooldown: HashMap::new(),
             damg_cooldown: HashMap::new(),
             difficulty,
@@ -1598,6 +1621,8 @@ impl Game {
             crystals: [0; 9],
             crystal_shown: None,
             hidden: HashSet::new(),
+            world_anim,
+            transport: Default::default(),
             level_end: None,
             msgs: Default::default(),
             sfx: vec!["S_ENTRANCE".into()],
@@ -1612,6 +1637,8 @@ impl Game {
             wizard_model: None,
             hit_from: None,
         };
+        game.ai_paths =
+            crate::ai::Paths::new(&game.level.worlds.locators, game.level.start_positions()[0]);
         if let Ok(rom) = fs.read("TEXT/ENGLISH.ROM") {
             if let Ok(rom) = gdl_formats::text::TextRom::parse(&rom) {
                 game.msgs = crate::messages::Messages::new(
@@ -1788,6 +1815,7 @@ impl Game {
                 .collect();
             game.psfx.push(res);
         }
+        game.load_magic_models(fs, &mut cache);
         game.cam_focus = game.players.first().map(|p| p.pos).unwrap_or(Vec3::ZERO);
         for p in &mut game.players {
             p.refresh_stats();
@@ -1924,7 +1952,7 @@ impl Game {
     }
 
     /// Whether a point is on the 4:3 screen, give or take `margin` units.
-    fn on_screen(&self, pos: Vec3, margin: f32) -> bool {
+    pub(crate) fn on_screen(&self, pos: Vec3, margin: f32) -> bool {
         match crate::scene::project(self, pos) {
             Some((x, y)) => {
                 let m = margin * 4.0;
@@ -2045,17 +2073,25 @@ impl Game {
                 None => return,
             }
         }
-        // Medium and large monsters only use front and +-45 degrees.
+        // fn_8004F87C: the spew the monster's algorithm comes from; logic 12
+        // spawns straight ahead only.
+        let spew = crate::items::resolve_spew(etype, sp.strength as i32, sp.ai);
+        let (ndirs, mask) = crate::items::gen_dirs(etype, spew);
+        // gendir_8004FBC8's eight directions, from a random one round, the
+        // masked ones skipped; the item's height + the monster's radius out.
         const OCTANTS: [f32; 8] = [0.0, 180.0, -90.0, 90.0, 45.0, -45.0, 135.0, -135.0];
-        let dirs: &[usize] = if crate::enemies::is_small(etype) {
-            &[0, 1, 2, 3, 4, 5, 6, 7]
+        let dist = if etype == 17 {
+            0.0
         } else {
-            &[0, 4, 5]
+            sp.height + t.radius
         };
-        let dist = if etype == 17 { 0.0 } else { 5.0 + t.radius };
-        let start = self.rng.next_u32() as usize % dirs.len();
-        for k in 0..dirs.len() {
-            let a = sp.yaw + OCTANTS[dirs[(start + k) % dirs.len()]].to_radians();
+        let start = self.rng.next_u32() as usize % ndirs;
+        for k in 0..ndirs {
+            let d = (start + k) % ndirs;
+            if mask & (1 << d) != 0 {
+                continue;
+            }
+            let a = sp.yaw + OCTANTS[d].to_radians();
             let p = sp.pos + Vec3::new(a.sin(), 0.0, a.cos()) * dist;
             let from = sp.pos + Vec3::Y * 2.0;
             if dist > 0.0 && self.collision.raycast(from, p + Vec3::Y * 2.0).is_some() {
@@ -2068,8 +2104,47 @@ impl Game {
                 continue;
             }
             let model = self.classes[sp.class].model(sp.strength);
-            let kind = self.new_enemy(sp.class, sp.strength, EnemyState::Spawning);
+            let mut kind = self.new_enemy(sp.class, sp.strength, EnemyState::Spawning);
+            // fn_800606FC: ai 13 chains each spawn behind the last (zombie
+            // lines); ai 14 sends them off 45 degrees either way in turn.
+            let chain = self
+                .entities
+                .iter()
+                .find(|e| e.id == sp.generator)
+                .and_then(|e| match &e.kind {
+                    Kind::Generator { chain, .. } => Some(*chain),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Kind::Enemy { ai, brain, .. } = &mut kind {
+                *ai = crate::items::algorithm(etype, spew);
+                brain.generator = Some(sp.generator);
+                if spew == 13 {
+                    brain.prev = chain.tail;
+                }
+            }
             let id = self.spawn(kind, model, Vec3::new(p.x, g, p.z), a);
+            if spew == 12 {
+                self.place_logic12(sp.generator, id);
+            }
+            if spew == 14 {
+                if let Some(Kind::Enemy { brain, .. }) =
+                    self.entities.last_mut().map(|e| &mut e.kind)
+                {
+                    brain.zigzag(chain.generated & 1 != 0);
+                }
+            }
+            if let Some(Kind::Generator { chain, .. }) = self
+                .entities
+                .iter_mut()
+                .find(|e| e.id == sp.generator)
+                .map(|e| &mut e.kind)
+            {
+                chain.generated += 1;
+                if spew == 13 {
+                    chain.tail = Some(id);
+                }
+            }
             if let Some(start) = model
                 .and_then(|m| self.monster_seqs.get(&m))
                 .and_then(|s| s.start)
@@ -2093,8 +2168,21 @@ impl Game {
 
     /// A new monster of `class` at a tier, as init_enemy sets it up.
     pub(crate) fn new_enemy(&self, class: usize, strength: usize, state: EnemyState) -> Kind {
+        self.new_enemy_ai(class, strength, state, -1)
+    }
+
+    /// new_enemy with generate_enemy's spew: the generator's or placement's
+    /// ai (-1 for the type's default routine).
+    pub(crate) fn new_enemy_ai(
+        &self,
+        class: usize,
+        strength: usize,
+        state: EnemyState,
+        ai: i32,
+    ) -> Kind {
         let etype = self.classes[class].etype;
         let t = &crate::enemies::TYPES[etype.min(33)];
+        let sight = 30.0 * self.tuning.visrad;
         Kind::Enemy {
             class,
             strength,
@@ -2109,10 +2197,25 @@ impl Game {
             reload: 0.0,
             drained: 0.0,
             blink: 0.0,
+            brain: Box::new(crate::ai::Brain::new(strength as i32, ai, 0.0, sight)),
+            ai: crate::items::algorithm(
+                etype,
+                crate::items::resolve_spew(etype, strength as i32, ai),
+            ),
+            dest: None,
         }
     }
 
-    pub(crate) fn spawn(&mut self, kind: Kind, model: Option<usize>, pos: Vec3, yaw: f32) -> u64 {
+    pub(crate) fn spawn(
+        &mut self,
+        mut kind: Kind,
+        model: Option<usize>,
+        pos: Vec3,
+        yaw: f32,
+    ) -> u64 {
+        if let Kind::Enemy { brain, .. } = &mut kind {
+            brain.set_heading(yaw);
+        }
         let id = self.next_id;
         self.next_id += 1;
         let seq = match (&kind, model) {
@@ -2276,11 +2379,16 @@ impl Game {
 
         let instances = self.level.worlds.item_instances.clone();
         let infos = self.level.worlds.item_infos.clone();
+        let items_option = items::items_option();
+        // Golems, gargoyles and generals placed, for what they carry.
+        let mut carriers: Vec<(u64, Vec3)> = Vec::new();
         for inst in &instances {
-            if inst.min_players as usize > num_players.max(1) {
+            // ItemVisible: placed for this many players.
+            if !items::item_visible(inst.min_players, num_players.max(1), items_option) {
                 continue;
             }
-            let Some(mut info) = infos.get(inst.item_index as usize).cloned() else {
+            let mut info_idx = inst.item_index as usize;
+            let Some(mut info) = infos.get(info_idx).cloned() else {
                 continue;
             };
             // Random items pick one of their candidates.
@@ -2288,10 +2396,14 @@ impl Game {
                 let pick =
                     info.random_indices[self.rng.next_u32() as usize % info.random_indices.len()];
                 match infos.get(pick as usize) {
-                    Some(i) => info = i.clone(),
+                    Some(i) => {
+                        info = i.clone();
+                        info_idx = pick as usize;
+                    }
                     None => continue,
                 }
             }
+            let first_id = self.next_id;
             let pos = Vec3::from(inst.pos);
             // Placement rotations use the game's pitch/yaw/roll convention; items stand
             // upright, so reduce to the yaw that the rotation turns +z towards.
@@ -2334,21 +2446,62 @@ impl Game {
                             let name = format!("GARG{}", kind.to_ascii_uppercase());
                             self.item_model(fs, &mut cache, &mut known, &dirs, &name);
                         }
-                        self.spawn_critter(fs, &wad, variant.as_deref(), pos, yaw, num_players);
+                        if let Some(id) =
+                            self.spawn_critter(fs, &wad, variant.as_deref(), pos, yaw, num_players)
+                        {
+                            carriers.push((id, pos));
+                        }
                         continue;
                     }
+                    // SetItem case 4: the placement's ai (its name's default
+                    // routine when negative), sight radius and throw interval.
+                    let ai = match p16(2) {
+                        a if a < 0 => crate::ai::DEFAULT_ALG[ty.min(33)],
+                        a => a as i32,
+                    };
+                    let rad = f32::from_le_bytes(inst.params[4..8].try_into().unwrap());
+                    let interval = p16(8);
                     let ty = self.roster.resolve(ty, strength as i32);
                     if let Some(c) = self.monster_class(fs, &mut cache, ty) {
                         let model = self.classes[c].model(strength.max(1));
-                        let state = if strength == 0 && ty != crate::enemies::DEATH {
+                        // fn_80060114: strength 0 lies dormant (not Death or IT);
+                        // otherwise below 4 it starts stunned for 30 ticks.
+                        let asleep = strength == 0
+                            && ty != crate::enemies::DEATH
+                            && ty != crate::enemies::IT;
+                        let state = if asleep {
                             EnemyState::Asleep
                         } else {
                             EnemyState::Idle
                         };
                         let mut kind = self.new_enemy(c, strength.max(1), state);
-                        if let Kind::Enemy { cooldown, .. } = &mut kind {
-                            // A half-second freeze as it appears.
-                            *cooldown = if strength < 4 { 0.5 } else { 0.0 };
+                        if let Kind::Enemy {
+                            cooldown,
+                            ai: alg,
+                            brain,
+                            ..
+                        } = &mut kind
+                        {
+                            *cooldown = if !asleep && strength < 4 { 0.5 } else { 0.0 };
+                            // SetItem case 4: params[2] picks the AI (-1: the
+                            // name's own), through generate_enemy's fn_8004F87C.
+                            *alg =
+                                items::algorithm(ty, items::resolve_spew(ty, strength as i32, ai));
+                            // fn_80060114: placed monsters never flee the suicide
+                            // grunt; Death sees 1000 off.
+                            brain.birth_style = 1;
+                            if ty == crate::enemies::DEATH {
+                                brain.sight = 1000.0;
+                            } else if rad > 0.0 {
+                                brain.sight = rad * self.tuning.visrad;
+                            }
+                            if interval > 0 {
+                                brain.idle_time = if interval == 1 {
+                                    0.0
+                                } else {
+                                    0.1 * interval as f32
+                                };
+                            }
                         }
                         // fn_80060114: it appears once it comes into view.
                         self.pending_enemies.push(PendingEnemy {
@@ -2412,6 +2565,13 @@ impl Game {
                                 genratio: 0.0,
                                 always: inst.flags & 1 != 0,
                                 special,
+                                ai: match p16(2) {
+                                    a if a < 0 => crate::items::DEFAULT_AI[ty.min(33)],
+                                    a => a as i32,
+                                },
+                                height: info.height,
+                                side: 0,
+                                chain: Default::default(),
                             },
                             model,
                             pos,
@@ -2494,12 +2654,18 @@ impl Game {
                         .then(|| i32::from_le_bytes(inst.params[0..4].try_into().unwrap()))
                         .filter(|&i| i >= 0)
                         .map(|i| i as usize);
+                    // fn_8005C1DC goes by the info's subtype (not SetItem case
+                    // 10's params[0], which barrels set to 0x2B). A type-2
+                    // barrel breaks rather than opening.
+                    let sub = info.subtype;
                     let id = self.spawn(
                         Kind::Container {
                             hp: info.hit_points.max(1) as f32,
                             drop,
-                            chest: info.item_type == ItemType::Container,
-                            armor: info.armor.max(0) as f32,
+                            chest: info.item_type == ItemType::Container
+                                && sub != crate::items::SUB_BARREL,
+                            armor: info.armor as f32,
+                            sub,
                         },
                         model,
                         pos,
@@ -2637,9 +2803,7 @@ impl Game {
                                     p16(8) as f32 * 0.1,
                                     p16(10) as f32 * 0.1,
                                 );
-                                m.place(&mut self.collision);
-                                self.movers.push(m);
-                                self.movers.len() - 1
+                                self.add_mover(m)
                             })
                     });
                     self.spawn(
@@ -2679,6 +2843,19 @@ impl Game {
                     }
                 }
                 ItemType::Transporter | ItemType::Rotator => {
+                    // SetItem case 11: the pad's id and its destination's.
+                    if info.item_type == ItemType::Transporter {
+                        let w = |k: usize| {
+                            i32::from_le_bytes(inst.params[k..k + 4].try_into().unwrap())
+                        };
+                        self.transport.pads.push(crate::transport::Pad {
+                            pos,
+                            radius: info.radius.max(0.5),
+                            id: w(0),
+                            dest_id: w(4),
+                            dest: None,
+                        });
+                    }
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     if model.is_some() {
                         self.spawn(Kind::Prop, model, pos, yaw);
@@ -2686,7 +2863,19 @@ impl Game {
                 }
                 _ => {}
             }
+            // Remember which info each power-up, container and generator is.
+            for e in self.entities.iter().filter(|e| e.id >= first_id) {
+                if matches!(
+                    e.kind,
+                    Kind::Pickup { .. } | Kind::Container { .. } | Kind::Generator { .. }
+                ) {
+                    self.items.info.insert(e.id, info_idx);
+                }
+            }
         }
+        self.link_carried(&carriers);
+        self.load_item_fx(fs, &mut cache, &mut known, &dirs);
+        self.transport.match_pads();
         // The boss, its coins and key, and the good wizard (boss levels).
         self.merge_item_models(std::mem::take(&mut known));
         self.spawn_boss(fs, num_players);
@@ -2812,7 +3001,7 @@ impl Game {
     }
 
     /// A realm sound table's entry for this level (sMusicTrackHi = realm).
-    fn realm_sound(&self, table: &[i32; 16]) -> i32 {
+    pub(crate) fn realm_sound(&self, table: &[i32; 16]) -> i32 {
         self.wave
             .and_then(|w| table.get((w >> 8) as usize))
             .copied()
@@ -2899,16 +3088,16 @@ impl Game {
     /// 0xF0000 material, and for 0x2000000 objects only while they move.
     pub(crate) fn hurting_surface(&self, owner: i32) -> Option<u32> {
         let o = usize::try_from(owner).ok()?;
-        let flags = *self.obj_flags.get(o)?;
+        let live = self
+            .world_anim
+            .flags
+            .get(o)
+            .map_or(0, |f| f & crate::worldanim::wflags::HAS_ANIM);
+        let flags = *self.obj_flags.get(o)? | live;
         if flags & 0xF0000 == 0 {
             return None;
         }
-        if flags & 0x2000000 != 0
-            && !self
-                .movers
-                .iter()
-                .any(|m| m.moving && m.objects.contains(&o))
-        {
+        if flags & 0x2000000 != 0 && !self.world_anim.animating(o) {
             return None;
         }
         Some(flags)
@@ -3016,12 +3205,16 @@ impl Game {
             self.sumner = Some(s);
         }
         let inputs = self.legend_freeze_inputs(inputs);
+        self.update_world_motion(dt);
+        let held = self.update_transporters(dt);
         self.update_players(dt, &inputs);
+        self.hold_transporting(held);
         self.update_music_area();
         self.legend_face_boss();
-        self.update_rings(dt);
+        self.update_magic(dt);
         self.spawn_placed_enemies();
         self.update_entities(dt);
+        self.update_items(dt);
         self.update_critters(dt);
         self.update_waves(dt);
         self.update_spews(dt);
@@ -3037,7 +3230,16 @@ impl Game {
         // potion blasts, breath and hammer power-ups, damage rows firing.
         let mut swings: Vec<(usize, f32, bool)> = Vec::new();
         let mut throws: Vec<Throw> = Vec::new();
-        let mut rings: Vec<(usize, Vec3, u8)> = Vec::new();
+        // Potions released: (player, where, colour, start_magic mode), and
+        // the heroes starting the MAGICFX.
+        let mut rings: Vec<(usize, Vec3, u8, u8)> = Vec::new();
+        let mut magic_fx: Vec<usize> = Vec::new();
+        // pmotion.c:2800: no magic while the legend sequence (lbl_8034489C
+        // 1..4) runs; the holder's own bits go to the legend weapon.
+        let magic_ok = self
+            .boss
+            .as_ref()
+            .is_none_or(|b| b.legend_state == 0 || b.legend_state >= 5);
         let mut breaths: Vec<usize> = Vec::new();
         let mut hammers: Vec<usize> = Vec::new();
         let mut damg: Vec<DamgFire> = Vec::new();
@@ -3413,13 +3615,21 @@ impl Game {
                     since_swing: self.time - p.combo_fade,
                 });
             }
-            if bits_now & act::USE_MAGIC != 0 && p.potions > 0 {
-                p.potions -= 1;
-                self.sfx.push("S_POTION1".into());
+            // USE_MAGIC and THROW_MAGIC each start a MAGICFX on the hero.
+            if bits_now & act::USE_MAGIC != 0 {
+                magic_fx.push(i);
             }
-            if bits_now & (act::MAGIC_RELEASE | act::THROW_MAGIC_RELEASE) != 0 {
-                let colour = p.potion_colours.pop().unwrap_or(0);
-                rings.push((i, p.pos, colour));
+            // The release uses the last potion picked up (none: a random
+            // colour) in the mode the release chose.
+            if bits_now & (act::MAGIC_RELEASE | act::THROW_MAGIC_RELEASE) != 0 && magic_ok {
+                let mode = magic::magic_mode(bits_now, levels, false);
+                let colour = if p.potions > 0 {
+                    p.potions -= 1;
+                    p.potion_colours.pop().unwrap_or(0)
+                } else {
+                    0
+                };
+                rings.push((i, p.pos, colour, mode));
             }
             if bits_now & act::BREATHE != 0 {
                 breaths.push(i);
@@ -3628,18 +3838,11 @@ impl Game {
         }
         self.update_fx_follow();
         self.shield_contact(dt);
-        // start_magic: the potion's ring spreads out from where it was used.
-        for (pi, pos, colour) in rings {
-            let power = self.players[pi].derived.magic_power;
-            self.rings.push(Ring {
-                owner: pi,
-                pos,
-                radius: power,
-                damage: MAGIC_DAMAGE,
-                colour,
-                time: 0.0,
-                hit: Vec::new(),
-            });
+        for pi in magic_fx {
+            self.start_magic_player_fx(pi);
+        }
+        for (pi, pos, colour, mode) in rings {
+            self.start_magic(Some(pi), pos, colour as u32, mode, 1.0);
         }
         for t in throws {
             self.player_start_missile(t);
@@ -3750,9 +3953,17 @@ impl Game {
             }
             pt1 = pt0;
         }
-        // fn_8005ED44: a barrel or generator in the sweep is hit at once.
+        // fn_8005ED44: a barrel, generator or potion in the sweep is hit at once.
         let item = (0..self.entities.len()).find(|&i| {
             let e = &self.entities[i];
+            if matches!(e.kind, Kind::Pickup { .. }) {
+                let (a, b) = (Vec2::new(pt0.x, pt0.z), Vec2::new(pt1.x, pt1.z));
+                let q = Vec2::new(e.pos.x, e.pos.z);
+                let ab = b - a;
+                let k = ((q - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                let at = pt0 + (pt1 - pt0) * k;
+                return self.missile_hits_potion(e, at, r);
+            }
             if !e.alive
                 || !matches!(
                     e.kind,
@@ -3771,9 +3982,13 @@ impl Game {
             (a + ab * k).distance(q) < reach + r && (e.pos.y + 2.0 - hand.y).abs() < 3.5
         });
         if let Some(i) = item {
-            self.hit_from = Some(pt1);
-            self.hit_entity(pi, i, damage, push, false);
-            self.hit_from = None;
+            if matches!(self.entities[i].kind, Kind::Pickup { .. }) {
+                self.damage_item(i, damage, flags, Some(pi));
+            } else {
+                self.hit_from = Some(pt1);
+                self.hit_entity(pi, i, damage, push, false);
+                self.hit_from = None;
+            }
             if flags & m::DMG_SUPER == 0 {
                 return 0;
             }
@@ -4594,7 +4809,7 @@ impl Game {
         }
         // The monster staggers (HIT1) or dies (DEATH / HIT2).
         if r.hit
-            && !MAGIC_HIT.with(|m| m.get())
+            && MAGIC_HIT.with(|m| m.get()) == 0
             && matches!(
                 self.entities[t].kind,
                 Kind::Enemy {
@@ -4677,6 +4892,8 @@ impl Game {
             };
             self.add_exp(pi, amount, melee);
         }
+        // A barrel knocks, breaks, explodes or gasses.
+        self.barrel_hit(t);
         if let Some((pos, item)) = r.drop {
             self.spawn_content(pos, item);
         }
@@ -4701,9 +4918,15 @@ impl Game {
         }
         let (_, node) = c.surface(from, pos, yaw);
         let (part, colnode) = node.unwrap_or((0, usize::MAX));
-        let magic = MAGIC_HIT.with(|m| m.get());
-        let mut flags = if magic { crate::critter::DMG_MAGIC } else { 0 };
-        let mut dmg = dmg;
+        let element = MAGIC_HIT.with(|m| m.get());
+        let magic = element != 0;
+        let mut flags = if magic {
+            // The potion's element, for this critter's own affinity.
+            crate::critter::DMG_MAGIC | element
+        } else {
+            0
+        };
+        let mut dmg = if magic { dmg / ELEMENT_BONUS } else { dmg };
         let elem = self
             .players
             .get(pi)
@@ -4828,52 +5051,6 @@ impl Game {
         self.damage_sounds(pi, mode, dmg, flags, old);
     }
 
-    /// Advance the potion rings: each grows from a third of its radius to the
-    /// whole of it, hitting each monster once as it passes, harder near the start.
-    fn update_rings(&mut self, dt: f32) {
-        let mut hits = Vec::new();
-        for ring in &mut self.rings {
-            ring.time += dt;
-            let phase = 1.0 - ring.time / MAGIC_TIME;
-            if phase <= 0.33 {
-                continue;
-            }
-            let radius = ring.radius * (0.33 + (1.0 - phase));
-            let dmg = ring.damage * 1.5 * (phase - 0.33) * ELEMENT_BONUS;
-            for (i, e) in self.entities.iter().enumerate() {
-                if !e.alive || ring.hit.contains(&e.id) {
-                    continue;
-                }
-                if !matches!(
-                    e.kind,
-                    Kind::Enemy { .. } | Kind::Generator { .. } | Kind::Critter(_)
-                ) {
-                    continue;
-                }
-                let (at, r) = match &e.kind {
-                    Kind::Critter(_) => match Self::aim_point(e, ring.pos) {
-                        Some(a) => a,
-                        None => continue,
-                    },
-                    _ => (e.pos, 0.0),
-                };
-                let d = Vec2::new(at.x - ring.pos.x, at.z - ring.pos.z);
-                if d.length() - r < radius {
-                    ring.hit.push(e.id);
-                    hits.push((ring.owner, i, dmg, d.normalize_or_zero()));
-                }
-            }
-        }
-        self.rings.retain(|r| r.time < MAGIC_TIME);
-        MAGIC_HIT.with(|m| m.set(true));
-        for (pi, i, dmg, push) in hits {
-            if self.entities.get(i).is_some_and(|e| e.alive) {
-                self.hit_entity(pi, i, dmg, push, false);
-            }
-        }
-        MAGIC_HIT.with(|m| m.set(false));
-    }
-
     pub(crate) fn world_letter(&self) -> char {
         self.level
             .name
@@ -4916,6 +5093,8 @@ impl Game {
                 let etype = self.classes.get(*class).map_or(0, |c| c.etype);
                 return self.generator_sound(etype, destroyed);
             }
+            // Barrels and walls sound in barrel_hit.
+            Kind::Container { sub, .. } if *sub != 0 => return None,
             Kind::Container { .. } if destroyed => "S_CHEST".into(),
             Kind::Container { .. } => "S_WEAPONHITWOOD".into(),
             _ => return None,
@@ -4947,7 +5126,7 @@ impl Game {
                 if *etype == crate::enemies::IT {
                     return r;
                 }
-                let dmg = if *etype == crate::enemies::DEATH && !MAGIC_HIT.with(|m| m.get()) {
+                let dmg = if *etype == crate::enemies::DEATH && MAGIC_HIT.with(|m| m.get()) == 0 {
                     1.0
                 } else if *etype == crate::enemies::DEATH {
                     999.0
@@ -4975,13 +5154,18 @@ impl Game {
                     r.killed = true;
                 }
             }
-            // Breakables lose the damage less their armour, at least 1 a hit.
+            // Breakables lose the damage less their armour, at least 1 a hit
+            // (fn_8005C1DC); armour -1 turns it away.
             Kind::Container {
                 hp,
                 drop,
                 chest: false,
                 armor,
+                ..
             } => {
+                if *armor < 0.0 || !e.alive {
+                    return r;
+                }
                 *hp -= (dmg - *armor).round().max(1.0);
                 if *hp <= 0.0 {
                     e.alive = false;
@@ -5036,7 +5220,7 @@ impl Game {
             .copied()
             .flatten()
             .or_else(|| self.pickup_model(&kind));
-        self.spawn(
+        let id = self.spawn(
             Kind::Pickup {
                 kind,
                 radius: info.radius.max(1.0) + 1.0,
@@ -5045,6 +5229,9 @@ impl Game {
             pos + Vec3::Y * 0.5,
             0.0,
         );
+        if let Some(i) = item {
+            self.items.info.insert(id, i);
+        }
     }
 
     fn update_entities(&mut self, dt: f32) {
@@ -5127,7 +5314,6 @@ impl Game {
             .enumerate()
             .map(|(i, c)| (c.etype, i))
             .collect();
-        let sight = 30.0 * self.tuning.visrad;
         let boss_dying = self.boss.as_ref().is_some_and(|b| b.dying);
         let mut spawns: Vec<Spawn> = Vec::new();
         let mut shots: Vec<Shot> = Vec::new();
@@ -5157,6 +5343,73 @@ impl Game {
         let mut chests_opened: Vec<(Vec3, Option<usize>)> = Vec::new();
         let mut proj_hits: Vec<(usize, usize, f32, Vec2, f32)> = Vec::new();
 
+        // do_enemies: what the monsters' routines share this frame.
+        self.ai_paths.update_players(&player_pos);
+        let seen: Vec<crate::ai::Seen> = self
+            .players
+            .iter()
+            .enumerate()
+            .map(|(i, p)| crate::ai::Seen {
+                pos: p.pos,
+                active: p.state.active(),
+                hidden: hidden[i],
+                halo: halo[i],
+            })
+            .collect();
+        let ticks = (dt * 60.0).round().max(1.0) as i32;
+        let ai_enemies: Vec<(usize, u64, Vec3, f32, f32)> = self
+            .entities
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match &e.kind {
+                Kind::Enemy { etype, state, .. }
+                    if e.alive && !matches!(state, EnemyState::Dying { .. }) =>
+                {
+                    let t = &crate::enemies::TYPES[(*etype).min(33)];
+                    Some((i, e.id, e.pos, t.radius, t.height * 0.5))
+                }
+                _ => None,
+            })
+            .collect();
+        let ai_solids: Vec<(Vec3, f32)> = self
+            .entities
+            .iter()
+            .filter(|e| e.alive)
+            .filter_map(|e| match e.solid? {
+                Shape::Cylinder { radius } => Some((e.pos, radius)),
+                Shape::Box { half } => Some((e.pos, half.x.max(half.y))),
+            })
+            .collect();
+        // lbl_80344748: the suicide grunt running at the party.
+        let bomber = self
+            .entities
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| match &e.kind {
+                Kind::Enemy { brain, .. } if e.alive && visible[i] && brain.bombing() => {
+                    Some(crate::ai::Bomber {
+                        slot: i,
+                        pos: e.pos,
+                        actual_dist: brain.actual_dist,
+                    })
+                }
+                _ => None,
+            });
+        let generators: HashMap<u64, u32> = self
+            .entities
+            .iter()
+            .filter(|e| e.alive)
+            .filter_map(|e| match &e.kind {
+                Kind::Generator { chain, .. } => Some((e.id, chain.generated)),
+                _ => None,
+            })
+            .collect();
+        let mut offsets = vec![0.0f32; self.players.len()];
+        let mut releases: Vec<u64> = Vec::new();
+        // Each monster's move for do_enemy_move's report: (from, tried, walls
+        // stopped it, touching this player).
+        let mut ai_moves: HashMap<u64, (Vec3, bool, bool, Option<Vec3>)> = HashMap::new();
+
         for ei in 0..self.entities.len() {
             if !self.entities[ei].alive {
                 continue;
@@ -5175,8 +5428,11 @@ impl Game {
                     genratio,
                     always,
                     special,
+                    ai,
+                    height,
                     ..
                 } => {
+                    let (ai, height) = (*ai, *height);
                     let on = visible[ei];
                     // generate_enemy refuses everything once the boss is dying.
                     if (*always || on) && spawned.len() < *max && !boss_dying {
@@ -5187,24 +5443,35 @@ impl Game {
                             // screen may spawn, by recycling one off screen.
                             let full = enemy_count + spawns.len() >= self.max_enemies;
                             if !full || on {
-                                let class = match special {
+                                // generate_enemy -2 / -3: the Temple's and Hell's
+                                // lists bring their own routines.
+                                let (class, spew) = match special {
                                     Some(list) => {
-                                        let t = list[(self.special_counter as usize) & 3];
+                                        let k = (self.special_counter as usize) & 3;
+                                        let t = list[k];
                                         self.special_counter += 1;
-                                        class_of
+                                        let spew = if list[0] == crate::enemies::HELL_SPECIAL[0] {
+                                            [30, 30, 7, 7][k]
+                                        } else {
+                                            7
+                                        };
+                                        let c = class_of
                                             .iter()
                                             .find(|(ty, _)| *ty == t)
-                                            .map_or(*class, |c| c.1)
+                                            .map_or(*class, |c| c.1);
+                                        (c, spew)
                                     }
-                                    None => *class,
+                                    None => (*class, ai),
                                 };
                                 spawns.push(Spawn {
                                     class,
+                                    ai: spew,
                                     strength: *strength,
                                     pos,
                                     yaw: e.yaw,
                                     generator: e.id,
                                     recycle: full,
+                                    height,
                                 });
                                 // 0.1 s x interval x (1..2), growing over 2 x max
                                 // spawns and starting again.
@@ -5231,6 +5498,9 @@ impl Game {
                     reload,
                     drained,
                     blink,
+                    brain,
+                    ai,
+                    dest,
                     ..
                 } => {
                     let Some(model) = e.model else { continue };
@@ -5268,26 +5538,20 @@ impl Game {
                             (e.fade + step).min(1.0)
                         };
                     }
-                    // Recognize a player within sight; chase from then on.
-                    if !*recognized && near.is_some_and(|(_, d)| d <= sight) {
-                        *recognized = true;
-                    }
-                    // fn_8004D958: out of sight and off screen, nothing moves.
-                    let in_sight = near.is_some_and(|(_, d)| d <= sight);
-                    if !in_sight && !visible[ei] && !matches!(state, EnemyState::Dying { .. }) {
-                        continue;
-                    }
                     if *cooldown > 0.0 && !matches!(state, EnemyState::Dying { .. }) {
                         *cooldown -= dt;
                         e.animator.update(skel, dt);
                         continue;
                     }
-                    // do_enemy_move: touching the player (radius + 0.5 + the
-                    // player's 1.5) requests a swing.
+                    // do_enemy_move: a step that would touch the player (radius
+                    // + 0.5 + the player's 1.5; fn_80046680's sweep) requests a
+                    // swing.
+                    let step = *speed * dt * 2.0 + 0.01;
                     let contact = near.and_then(|(pi, _)| {
                         let pp = player_pos[pi].0;
                         let d = Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length();
-                        (d < ty.radius + 0.5 + PLAYER_RADIUS && (pp.y - e.pos.y).abs() < ty.height)
+                        (d < ty.radius + 0.5 + PLAYER_RADIUS + step
+                            && (pp.y - e.pos.y).abs() < ty.height)
                             .then_some(pi)
                     });
                     let play_loop = |a: &mut Animator, s: Option<usize>| {
@@ -5295,6 +5559,72 @@ impl Game {
                             a.play(s);
                             a.force_loop = true;
                         }
+                    };
+                    // do_ai: the monster's routine for this frame; busy with
+                    // a swing, throw, hit or its appearance it only turns.
+                    let start = e.pos;
+                    let mut ai_moved = false;
+                    let busy = match state {
+                        EnemyState::Attack { .. } | EnemyState::Recover => {
+                            Some(crate::ai::act::ATTACK)
+                        }
+                        EnemyState::Throw { .. } => Some(crate::ai::act::THROW),
+                        EnemyState::Hurt { .. } => Some(crate::ai::act::HIT_REACT1),
+                        EnemyState::Spawning => Some(crate::ai::act::START),
+                        _ => None,
+                    };
+                    let out = if matches!(state, EnemyState::Dying { .. } | EnemyState::Asleep) {
+                        None
+                    } else {
+                        brain.recognized |= *recognized;
+                        brain.adopt(*ai);
+                        // place_logic12's spot: the egg is put there.
+                        if let Some(d) = dest.take() {
+                            e.pos = d;
+                        }
+                        let me = crate::ai::Me {
+                            slot: ei,
+                            etype: *etype,
+                            pos: e.pos,
+                            yaw: e.yaw,
+                            rad: ty.radius,
+                            hht: ty.height * 0.5,
+                            spd: *speed * dt,
+                            visactive: visible[ei],
+                            busy,
+                            reloading: *reload > 0.0 && seqs.throw.is_some(),
+                            has_generator: brain
+                                .generator
+                                .is_some_and(|g| generators.contains_key(&g)),
+                            generated: brain
+                                .generator
+                                .and_then(|g| generators.get(&g).copied())
+                                .unwrap_or(0),
+                        };
+                        let probe = crate::ai::WorldProbe {
+                            coll: &self.collision,
+                            enemies: &ai_enemies,
+                            solids: &ai_solids,
+                        };
+                        let frame = crate::ai::Frame {
+                            players: &seen,
+                            it,
+                            bomber,
+                            paths: &self.ai_paths,
+                            frame: self.frame,
+                            ticks,
+                            mrate: self.tuning.mrate,
+                        };
+                        let o =
+                            brain.think(&me, &frame, &mut offsets, &probe, &mut self.rng, contact);
+                        *recognized = brain.recognized;
+                        // fn_8004D958: out of sight and off screen, nothing moves.
+                        if o.frozen {
+                            continue;
+                        }
+                        e.yaw = o.yaw;
+                        releases.extend(o.release);
+                        Some(o)
                     };
                     match state {
                         EnemyState::Dying { timer } => {
@@ -5321,125 +5651,155 @@ impl Game {
                                 *state = EnemyState::Chase;
                             }
                         }
-                        EnemyState::Idle => {
-                            if *recognized {
-                                *state = EnemyState::Chase;
+                        EnemyState::Idle | EnemyState::Chase => {
+                            // do_ai's routine moves it and asks for its throws,
+                            // casts and runs; touching a player swings at them
+                            // (fn_80046140).
+                            *state = EnemyState::Chase;
+                            let o = out.unwrap_or_default();
+                            *reload -= dt;
+                            let aim = brain.closest.or(near.map(|n| n.0));
+                            use crate::ai::act;
+                            use crate::enemies::{DEATH, IT};
+                            let alg = brain.alg();
+                            let mut walk = true;
+                            if *etype == IT {
+                                // Tag: the touched player becomes IT.
+                                if let Some(pi) = contact {
+                                    tagged = Some(pi);
+                                    e.alive = false;
+                                    continue;
+                                }
+                            } else if *etype == DEATH {
+                                // Death drains whoever it touches, 3 ticks at a
+                                // time, until it has taken 100, then leaves.
+                                if let Some(pi) = contact.filter(|&pi| !halo[pi]) {
+                                    walk = false;
+                                    if *reload <= 0.0 {
+                                        *reload = 3.0 / 60.0;
+                                        let f = self.tuning.damage;
+                                        drains.push((pi, f));
+                                        *drained += f;
+                                        if *drained >= 100.0 {
+                                            *state = EnemyState::Dying { timer: 1.0 };
+                                            death_done.push(pi);
+                                        }
+                                    }
+                                    if let Some((a, _)) = seqs.attack {
+                                        if e.animator.seq != a {
+                                            e.animator.restart(a);
+                                        }
+                                    }
+                                }
+                            } else if o.explode {
+                                // move_logic18: the suicide grunt's run ends in a
+                                // blast.
+                                blasts.push((e.pos, 50.0 * self.tuning.damage));
+                                *state = EnemyState::Dying { timer: 0.1 };
+                                walk = false;
+                            } else if let (Some(pi), Some((swing, _)), false) =
+                                (contact, seqs.attack, matches!(alg, 18 | 31))
+                            {
+                                // Every 8th swing is the power attack.
+                                let power = *attacks & 7 == 7 && seqs.power.is_some();
+                                let a = if power { seqs.power.unwrap().0 } else { swing };
+                                *state = EnemyState::Attack { hit_done: false };
+                                *target = Some((pi, power));
+                                e.animator.restart(a);
+                                e.animator.force_loop = false;
+                                walk = false;
                             } else {
-                                play_loop(&mut e.animator, seqs.ready);
+                                match o.daction {
+                                    act::THROW => {
+                                        if let (Some(pi), Some((t, _))) = (aim, seqs.throw) {
+                                            *state = EnemyState::Throw { fired: false };
+                                            *target = Some((pi, false));
+                                            e.animator.restart(t);
+                                            e.animator.force_loop = false;
+                                            walk = false;
+                                        }
+                                    }
+                                    act::ATTACK | act::ATTACK2 | act::ATTACK_PWR => {
+                                        // fn_8004DF58: 28-31 cast at whoever they
+                                        // face when touching no one (31 swipes when
+                                        // near).
+                                        let cast = brain.casts()
+                                            && !(alg == 31 && o.daction != act::ATTACK_PWR);
+                                        let anim = if o.daction == act::ATTACK_PWR {
+                                            seqs.power.or(seqs.attack)
+                                        } else {
+                                            seqs.attack.or(seqs.power)
+                                        };
+                                        if let (Some(pi), Some((a, _))) = (aim, anim) {
+                                            if cast {
+                                                *state = EnemyState::Throw { fired: false };
+                                                *target = Some((pi, true));
+                                            } else {
+                                                *state = EnemyState::Attack { hit_done: false };
+                                                *target = (brain.actual_dist <= 7.5)
+                                                    .then_some((pi, false));
+                                            }
+                                            e.animator.restart(a);
+                                            e.animator.force_loop = false;
+                                            walk = false;
+                                        }
+                                    }
+                                    act::RUNATTACK if *reload <= 0.0 && seqs.throw.is_some() => {
+                                        // Backing off it shoots as it goes.
+                                        if let Some(pi) = aim {
+                                            shots.push(Shot {
+                                                from: e.pos,
+                                                to: player_pos[pi].0 + Vec3::Y * 2.5,
+                                                etype: *etype,
+                                                slot: brain.missile_kind(),
+                                                class: self
+                                                    .classes
+                                                    .iter()
+                                                    .position(|c| Some(model) == c.model(*strength))
+                                                    .unwrap_or(0),
+                                            });
+                                            *reload = brain.idle_time * self.tuning.mrate;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if walk {
+                                let mut tr = o.trans;
+                                // fn_80045C30: no stepping off a ledge (or into a
+                                // pit) higher than the step allows.
+                                let len = Vec2::new(tr.x, tr.z).length();
+                                if len > 0.0 {
+                                    let dir = Vec3::new(tr.x, 0.0, tr.z) / len;
+                                    let tol = 2.0 * (0.1 + len + ty.radius);
+                                    let here = self
+                                        .collision
+                                        .ground_height(e.pos, e.pos.y + STEP_HEIGHT)
+                                        .is_some();
+                                    let ahead = e.pos + dir * (ty.radius + len);
+                                    let ok = self
+                                        .collision
+                                        .ground_height(ahead, e.pos.y + tol)
+                                        .is_some_and(|g| (g - e.pos.y).abs() <= tol);
+                                    if here && !ok {
+                                        tr = Vec3::ZERO;
+                                    }
+                                }
+                                e.pos += tr;
+                                let moving = o.trans.length_squared() > 1e-8;
+                                let running = matches!(
+                                    o.daction,
+                                    act::RUN | act::READYTORUN | act::RUNATTACK
+                                );
+                                let anim = match (moving || running, running) {
+                                    (true, true) => seqs.run.or(seqs.walk),
+                                    (true, false) => seqs.walk,
+                                    _ => seqs.ready,
+                                };
+                                play_loop(&mut e.animator, anim);
+                                ai_moved = o.trans.length() > 0.001;
                             }
                         }
-                        EnemyState::Chase => match near {
-                            Some((pi, _)) => {
-                                // turn_enemy_ang: 0.049 rad a tick toward the target.
-                                let to = player_pos[pi].0 - e.pos;
-                                let want = to.x.atan2(to.z);
-                                let mut d = want - e.yaw;
-                                while d > std::f32::consts::PI {
-                                    d -= std::f32::consts::TAU;
-                                }
-                                while d < -std::f32::consts::PI {
-                                    d += std::f32::consts::TAU;
-                                }
-                                let turn = 0.0491 * 60.0 * dt;
-                                e.yaw += d.clamp(-turn, turn);
-                                let dist = (player_pos[pi].0 - e.pos).length();
-                                let on = visible[ei] && (player_pos[pi].0.y - e.pos.y).abs() < 10.0;
-                                *reload -= dt;
-                                use crate::enemies::{DEATH, IT};
-                                if *etype == IT {
-                                    // Tag: the touched player becomes IT.
-                                    if let Some(pi) = contact {
-                                        tagged = Some(pi);
-                                        e.alive = false;
-                                        continue;
-                                    }
-                                    let dir = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
-                                    e.pos += dir * *speed * dt;
-                                    play_loop(&mut e.animator, seqs.walk);
-                                } else if *etype == DEATH {
-                                    // Death drains whoever it touches, 3 ticks at a
-                                    // time, until it has taken 100, then leaves.
-                                    if let Some(pi) = contact.filter(|&pi| !halo[pi]) {
-                                        *reload -= 0.0;
-                                        if *reload <= 0.0 {
-                                            *reload = 3.0 / 60.0;
-                                            let f = self.tuning.damage;
-                                            drains.push((pi, f));
-                                            *drained += f;
-                                            if *drained >= 100.0 {
-                                                *state = EnemyState::Dying { timer: 1.0 };
-                                                death_done.push(pi);
-                                            }
-                                        }
-                                        if let Some((a, _)) = seqs.attack {
-                                            if e.animator.seq != a {
-                                                e.animator.restart(a);
-                                            }
-                                        }
-                                    } else {
-                                        let dir = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
-                                        e.pos += dir * *speed * dt;
-                                        play_loop(&mut e.animator, seqs.walk);
-                                    }
-                                } else if *strength == 6 {
-                                    // The suicide grunt: waits a second, then charges
-                                    // at 1.5x; on contact or after 4 s it explodes.
-                                    if *reload > -1.0 {
-                                        play_loop(&mut e.animator, seqs.ready);
-                                    } else {
-                                        let dir = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
-                                        e.pos += dir * *speed * 1.5 * dt;
-                                        play_loop(&mut e.animator, seqs.run.or(seqs.walk));
-                                        if contact.is_some() || *reload < -5.0 {
-                                            blasts.push((e.pos, 50.0 * self.tuning.damage));
-                                            *state = EnemyState::Dying { timer: 0.1 };
-                                        }
-                                    }
-                                } else if (*strength == 4 || *strength == 5) && seqs.throw.is_some()
-                                {
-                                    // Archers and bombers stand and shoot while the
-                                    // player is in sight and on screen.
-                                    play_loop(&mut e.animator, seqs.ready);
-                                    if on && dist <= sight && *reload <= 0.0 && d.abs() < 0.785 {
-                                        *state = EnemyState::Throw { fired: false };
-                                        *target = Some((pi, false));
-                                        e.animator.restart(seqs.throw.unwrap().0);
-                                        e.animator.force_loop = false;
-                                    }
-                                } else if caster(*etype, *strength)
-                                    && contact.is_none()
-                                    && dist > 6.0
-                                    && on
-                                    && *reload <= 0.0
-                                    && seqs.power.or(seqs.attack).is_some()
-                                {
-                                    // Level-3 casters roam and throw fireballs every
-                                    // so often (90 x mrate ticks, randomised).
-                                    let n = 90.0 * self.tuning.mrate;
-                                    *reload =
-                                        (20.0 + n + (ei as f32 * 7.3) % (n * 0.5 + 10.0)) / 60.0;
-                                    *state = EnemyState::Throw { fired: false };
-                                    *target = Some((pi, true));
-                                    let a = seqs.power.or(seqs.attack).unwrap().0;
-                                    e.animator.restart(a);
-                                    e.animator.force_loop = false;
-                                } else if let (Some(pi), Some((swing, _))) = (contact, seqs.attack)
-                                {
-                                    // Every 8th swing is the power attack.
-                                    let power = *attacks & 7 == 7 && seqs.power.is_some();
-                                    let a = if power { seqs.power.unwrap().0 } else { swing };
-                                    *state = EnemyState::Attack { hit_done: false };
-                                    *target = Some((pi, power));
-                                    e.animator.restart(a);
-                                    e.animator.force_loop = false;
-                                } else {
-                                    let dir = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
-                                    e.pos += dir * *speed * dt;
-                                    play_loop(&mut e.animator, seqs.walk);
-                                }
-                            }
-                            None => play_loop(&mut e.animator, seqs.ready),
-                        },
                         EnemyState::Attack { hit_done } => {
                             // The hit lands as the wind-up ends, wherever the
                             // player is now.
@@ -5481,13 +5841,7 @@ impl Game {
                             if !*fired && e.animator.finished {
                                 *fired = true;
                                 if let Some((pi, cast)) = target.take() {
-                                    let slot = if cast {
-                                        2
-                                    } else if *strength == 5 {
-                                        1
-                                    } else {
-                                        0
-                                    };
+                                    let slot = if cast { 2 } else { brain.missile_kind() };
                                     shots.push(Shot {
                                         from: e.pos,
                                         to: player_pos[pi].0 + Vec3::Y * 2.5,
@@ -5500,10 +5854,10 @@ impl Game {
                                             .unwrap_or(0),
                                     });
                                 }
-                                // The throw cooldown: 1 s x the missile rate, plus
-                                // the finish.
-                                if !matches!(target, Some((_, true))) && *strength != 6 {
-                                    *reload = self.tuning.mrate;
+                                // The throw cooldown (idle_secs): idle_time x the
+                                // missile rate, plus the finish.
+                                if !brain.casts() {
+                                    *reload = brain.idle_time * self.tuning.mrate;
                                 }
                                 match seqs.throw.and_then(|t| t.1) {
                                     Some(f) if *strength == 4 || *strength == 5 => {
@@ -5517,13 +5871,32 @@ impl Game {
                         }
                     }
                     let _ = strength;
-                    // Monsters collide with the world like players do.
+                    // Monsters collide with the world like players do; walls
+                    // slide them (SlideAlongWall) unless their routine stops
+                    // dead at walls instead.
+                    let want = e.pos;
                     e.pos = self.collision.resolve_walls(
                         e.pos,
                         ty.radius.min(1.5),
                         ty.height * 0.75,
                         STEP_HEIGHT,
                     );
+                    if ai_moved && !brain.slides() && (e.pos - want).length() > 1e-3 {
+                        e.pos = self.collision.resolve_walls(
+                            start,
+                            ty.radius.min(1.5),
+                            ty.height * 0.75,
+                            STEP_HEIGHT,
+                        );
+                    }
+                    if out.is_some() {
+                        let walled = ai_moved
+                            && Vec2::new(e.pos.x - start.x, e.pos.z - start.z).length() < 0.01;
+                        ai_moves.insert(
+                            e.id,
+                            (start, ai_moved, walled, contact.map(|pi| player_pos[pi].0)),
+                        );
+                    }
                     if let Some(g) = self.collision.ground_height(e.pos, e.pos.y + STEP_HEIGHT) {
                         if e.pos.y - g < 3.0 {
                             e.pos.y = g;
@@ -5981,6 +6354,10 @@ impl Game {
                     let cp = c.coll_pos(0, e.pos, e.yaw);
                     return surf < 0.4 && (node.is_some() || (ppos.y - cp.y).abs() < t0.hht + 2.0);
                 }
+                // fn_8005EE18: of the power-ups only potions stop missiles.
+                if matches!(e.kind, Kind::Pickup { .. }) {
+                    return self.missile_hits_potion(e, ppos, mr);
+                }
                 let flat = Vec2::new(e.pos.x - ppos.x, e.pos.z - ppos.z).length();
                 if let Kind::Enemy { state, etype, .. } = &e.kind {
                     let ty = &crate::enemies::TYPES[(*etype).min(33)];
@@ -5998,7 +6375,10 @@ impl Game {
                 e.alive && flat < r && (e.pos.y + 2.0 - ppos.y).abs() < 3.5
             });
             if let Some(t) = target {
-                if owner < self.players.len() {
+                if matches!(self.entities[t].kind, Kind::Pickup { .. }) {
+                    // fn_8005C1DC: a shot potion sets off its magic.
+                    self.damage_item(t, dmg, 0, Some(owner));
+                } else if owner < self.players.len() {
                     self.hit_from = Some(ppos);
                     self.hit_entity(owner, t, dmg, dir, false);
                     self.hit_from = None;
@@ -6052,8 +6432,15 @@ impl Game {
                 )
             })
             .collect();
+        // fn_8005D20C: what pushed it off a solid item stood there (coll_ip).
+        let mut item_hit: HashMap<u64, Vec3> = HashMap::new();
         for (i, p) in moved {
-            self.entities[i].pos = p;
+            let e = &mut self.entities[i];
+            if (p - e.pos).length_squared() > 1e-8 {
+                let push = Vec3::new(e.pos.x - p.x, 0.0, e.pos.z - p.z).normalize_or_zero();
+                item_hit.insert(e.id, p + push * 2.0);
+            }
+            e.pos = p;
         }
 
         // do_enemy_move: a monster's move is undone if it brings it into
@@ -6064,6 +6451,7 @@ impl Game {
                 self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. })
             })
             .collect();
+        let mut enemy_hit: HashMap<u64, Vec3> = HashMap::new();
         let size = |e: &Entity| match &e.kind {
             Kind::Enemy { etype, .. } => {
                 let t = &crate::enemies::TYPES[(*etype).min(33)];
@@ -6086,24 +6474,70 @@ impl Game {
                     && flat(new, other) < reach
                     && flat(new, other) < flat(old, other) - 1e-4
             };
-            let mut blocked = enemy_idx.iter().any(|&j| {
-                if j == i {
-                    return false;
-                }
-                let (rj, hj) = size(&self.entities[j]);
-                into(self.entities[j].pos, ri + rj, hi + hj)
-            });
-            blocked |= player_pos
+            let by_enemy = enemy_idx
                 .iter()
-                .any(|(pp, alive)| *alive && into(*pp, ri + 0.5 + PLAYER_RADIUS, hi + 2.5));
-            if blocked {
+                .find(|&&j| {
+                    let (rj, hj) = size(&self.entities[j]);
+                    j != i && into(self.entities[j].pos, ri + rj, hi + hj)
+                })
+                .map(|&j| self.entities[j].pos);
+            let by_player = player_pos
+                .iter()
+                .find(|(pp, alive)| *alive && into(*pp, ri + 0.5 + PLAYER_RADIUS, hi + 2.5))
+                .map(|p| p.0);
+            if by_enemy.is_some() || by_player.is_some() {
                 self.entities[i].pos = old;
+            }
+            if let Some(b) = by_enemy {
+                enemy_hit.insert(self.entities[i].id, b);
+            }
+        }
+        // do_enemy_move's blocked responses, which steer the routines' corner
+        // hugging next frame.
+        for e in self.entities.iter_mut() {
+            let Kind::Enemy { brain, etype, .. } = &mut e.kind else {
+                continue;
+            };
+            let Some(&(_, tried, wall, player)) = ai_moves.get(&e.id) else {
+                continue;
+            };
+            let report = crate::ai::Report {
+                tried,
+                wall,
+                player,
+                enemy: enemy_hit.get(&e.id).copied(),
+                item: item_hit.get(&e.id).copied(),
+            };
+            if let Some(yaw) = brain.after_move(*etype, e.pos, report) {
+                e.yaw = yaw;
+            }
+        }
+        // move_logic13: a zombie left behind lets the rest of its line go.
+        for mut id in releases {
+            for _ in 0..64 {
+                let Some(Kind::Enemy { brain, .. }) = self
+                    .entities
+                    .iter_mut()
+                    .find(|e| e.id == id)
+                    .map(|e| &mut e.kind)
+                else {
+                    break;
+                };
+                let prev = brain.prev;
+                brain.release();
+                match prev {
+                    Some(p) => id = p,
+                    None => break,
+                }
             }
         }
 
         let w = self.world_letter();
+        let floors = self.world_anim.floors.clone();
         for m in &mut self.movers {
-            let (started, stopped) = m.update(&mut self.collision, dt);
+            let ridden = floors.iter().any(|f| *f == Some(m.root as i32));
+            let (started, stopped) =
+                m.update(&mut self.collision, &mut self.world_anim, ridden, dt);
             if started {
                 self.sfx.push(format!("S_ELVSTONE{w}|S_STONEGATE"));
             }
@@ -6458,33 +6892,6 @@ impl Game {
         {
             self.spawn(Kind::Effect { life }, Some(model), pos, yaw);
         }
-    }
-
-    /// CritterDropItem for gargoyles: the level's GARG<kind> item.
-    pub(crate) fn spawn_garg_item(&mut self, kind: &str, pos: Vec3) {
-        let name = format!("GARG{}", kind.to_ascii_uppercase());
-        let info = self
-            .level
-            .worlds
-            .item_infos
-            .iter()
-            .find(|i| i.name.eq_ignore_ascii_case(&name))
-            .cloned();
-        let kind = match &info {
-            Some(i) => pickup_kind(i, &[0u8; 16]),
-            None => PickupKind::Gargoyle(match kind {
-                "serp" => 0,
-                "eagl" => 1,
-                _ => 2,
-            }),
-        };
-        let model = self.item_model_named(&name);
-        self.spawn(
-            Kind::Pickup { kind, radius: 2.0 },
-            model,
-            pos + Vec3::Y * 0.5,
-            0.0,
-        );
     }
 }
 
@@ -7493,6 +7900,146 @@ mod tests {
         // Big levels: the generators make the large monster.
         let b4 = names("levelB4");
         assert!(b4.contains(&"DEM".to_string()), "{b4:?}");
+    }
+
+    #[test]
+    fn monsters_run_their_routines() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let hp = g.players[0].health;
+        let mut algs: std::collections::BTreeMap<i32, usize> = Default::default();
+        let mut walked = HashSet::new();
+        let mut last: HashMap<u64, Vec3> = HashMap::new();
+        for _ in 0..900 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            for e in &g.entities {
+                if let Kind::Enemy { brain, .. } = &e.kind {
+                    *algs.entry(brain.alg()).or_default() += 1;
+                    if last
+                        .get(&e.id)
+                        .is_some_and(|p| (*p - e.pos).length() > 0.05)
+                    {
+                        walked.insert(e.id);
+                    }
+                    last.insert(e.id, e.pos);
+                }
+            }
+        }
+        eprintln!(
+            "algorithms {algs:?}, {} walked, hp {hp} -> {}",
+            walked.len(),
+            g.players[0].health
+        );
+        // Grunt generators chase (7); the rats drift (2 / 4).
+        assert!(algs.contains_key(&7), "{algs:?}");
+        assert!(algs.keys().any(|a| matches!(a, 2 | 4)), "{algs:?}");
+        assert!(walked.len() >= 3);
+        assert!(
+            g.players[0].health < hp,
+            "the monsters reached the idle hero"
+        );
+    }
+
+    #[test]
+    fn suicide_grunts_charge_and_blow_up() {
+        let Some(fs) = data() else { return };
+        for level in ["levelA3", "levelB4", "levelC4", "levelJ3", "levelT3"] {
+            let mut g = Game::new(&fs, level, &[("WAR", "RED")]).unwrap();
+            let Some((pos, yaw)) = g
+                .pending_enemies
+                .iter()
+                .find(|e| matches!(e.kind, Kind::Enemy { strength: 6, .. }))
+                .map(|e| (e.pos, e.yaw))
+            else {
+                continue;
+            };
+            g.players[0].pos = pos + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 15.0 + Vec3::Y;
+            let hp = g.players[0].health;
+            let mut ran = false;
+            let mut gone = false;
+            let mut seen = None;
+            for _ in 0..900 {
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                let grunt = g.entities.iter().find(|e| {
+                    e.alive && matches!(&e.kind, Kind::Enemy { strength: 6, brain, .. } if brain.alg() == 18)
+                });
+                match (grunt, seen) {
+                    (Some(e), _) => {
+                        seen = Some(e.id);
+                        let Kind::Enemy { brain, .. } = &e.kind else {
+                            unreachable!()
+                        };
+                        ran |= brain.bombing();
+                    }
+                    (None, Some(_)) => {
+                        gone = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(seen.is_some(), "{level}: no suicide grunt came into view");
+            assert!(ran, "{level}: it never ran");
+            assert!(gone, "{level}: it never blew up");
+            assert!(g.players[0].health < hp, "{level}: the blast missed");
+            eprintln!("{level}: hp {hp} -> {}", g.players[0].health);
+            return;
+        }
+        panic!("no suicide grunt found");
+    }
+
+    #[test]
+    fn tier_three_demons_cast_and_come_on() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelB4", &[("WAR", "RED")]).unwrap();
+        g.entities
+            .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
+        g.pending_enemies.clear();
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let class = g.classes.iter().position(|c| c.name == "DEM").unwrap();
+        // A level-3 generator's demon (gen ai 0): move_logic30.
+        let kind = g.new_enemy_ai(class, 3, EnemyState::Chase, 0);
+        let model = g.classes[class].model(3);
+        // Somewhere 16 off in the open.
+        let p = g.players[0].pos;
+        let (at, yaw) = (0..16)
+            .map(|k| k as f32 * std::f32::consts::TAU / 16.0)
+            .map(|a| (p + Vec3::new(a.sin(), 0.0, a.cos()) * 16.0, a))
+            .find(|(q, _)| {
+                (1..=16).all(|s| {
+                    let r = p + (*q - p) * (s as f32 / 16.0);
+                    g.collision
+                        .raycast(p + Vec3::Y * 2.0, r + Vec3::Y * 2.0)
+                        .is_none()
+                        && g.collision
+                            .ground_height(r, p.y + 2.0)
+                            .is_some_and(|y| (y - p.y).abs() < 1.0)
+                })
+            })
+            .expect("open ground near the start");
+        let id = g.spawn(kind, model, at, yaw + std::f32::consts::PI);
+        let mut shots = 0;
+        let mut closest = f32::MAX;
+        for _ in 0..600 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            shots += g
+                .entities
+                .iter()
+                .filter(|e| matches!(e.kind, Kind::EnemyShot { .. }))
+                .count();
+            if let Some(e) = g.entities.iter().find(|e| e.id == id) {
+                let Kind::Enemy { brain, .. } = &e.kind else {
+                    unreachable!()
+                };
+                assert_eq!(brain.alg(), 30);
+                closest = closest.min((e.pos - g.players[0].pos).length());
+            }
+        }
+        assert!(shots > 0, "the demon never cast");
+        // Between casts it comes on (move_logic00).
+        assert!(closest < 14.0, "the demon kept away ({closest})");
     }
 
     #[test]

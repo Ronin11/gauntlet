@@ -272,7 +272,7 @@ fn main() -> Result<()> {
             }
             for (i, it) in w.item_infos.iter().enumerate() {
                 println!(
-                    "info {i:3} {:?}/{}({}) {:16} rad {} h {} hp {} val {} coll {} rnd {:?}",
+                    "info {i:3} {:?}/{}({}) {:16} rad {} h {} hp {} armor {} val {} props {:#x} coll {} rnd {:?}",
                     it.item_type,
                     it.subtype_name(),
                     it.subtype,
@@ -280,15 +280,17 @@ fn main() -> Result<()> {
                     it.radius,
                     it.height,
                     it.hit_points,
+                    it.armor,
                     it.value,
+                    it.properties,
                     it.coll_type,
                     it.random_indices
                 );
             }
-            for it in w.item_instances.iter().take(40) {
+            for it in w.item_instances.iter() {
                 println!(
-                    "inst {:3} {:16} pos {:?} rot {:?} minp {} flags {}",
-                    it.item_index, it.name, it.pos, it.rot, it.min_players, it.flags
+                    "inst {:3} {:16} params {:?} pos {:?} rot {:?} minp {} flags {}",
+                    it.item_index, it.name, it.params, it.pos, it.rot, it.min_players, it.flags
                 );
             }
             for l in &w.locators {

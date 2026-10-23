@@ -1,6 +1,7 @@
 //! Gauntlet Dark Legacy engine: rendering, simulation, input and audio on top of the
 //! original game data. The desktop binary (`gauntlet`) and the Android app both use it.
 
+pub mod ai;
 pub mod app;
 pub mod attract;
 pub mod audio;
@@ -14,6 +15,7 @@ pub mod enemies;
 pub mod flyby;
 pub mod fs;
 pub mod game;
+pub(crate) use game::items;
 pub mod gpu;
 pub mod hints;
 pub mod hud;
@@ -38,5 +40,7 @@ pub mod shop;
 pub mod stats;
 pub mod texanim;
 pub mod tower;
+pub mod transport;
 pub mod triggers;
 pub mod ui;
+pub mod worldanim;

@@ -102,6 +102,29 @@ impl Level {
         (b.finish(), placed)
     }
 
+    /// The world objects in `objs`, each its own rigid part (its index in
+    /// `objs`), so moving objects can each be placed every frame.
+    pub fn parts_mesh(&self, objs: &[usize]) -> MeshData {
+        let banks: Vec<TexBank> = self
+            .weapons
+            .iter()
+            .map(|(objects, textures)| TexBank { objects, textures })
+            .collect();
+        let mut b = MeshBuilder::new(&self.objects, &self.textures_file)
+            .with_texmods(&self.texmods, &banks);
+        for (k, &i) in objs.iter().enumerate() {
+            let (Some(wo), Some(pos)) = (self.worlds.world_objects.get(i), self.world_pos.get(i))
+            else {
+                continue;
+            };
+            if let Some(obj) = self.objects.object_by_name(&wo.name) {
+                b.additive = wo.mb_flags & (1 << 23) != 0;
+                b.add_part(obj, Mat4::from_translation(Vec3::from(*pos)), k as u16);
+            }
+        }
+        b.finish()
+    }
+
     /// A world object and all of its descendants.
     pub fn subtree(&self, root: usize) -> Vec<usize> {
         let objs = &self.worlds.world_objects;
