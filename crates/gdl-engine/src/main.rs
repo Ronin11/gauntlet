@@ -751,13 +751,13 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     o.draw(&mut s);
                 }
             }
+            // credits[:scroll[:rz]]: rz as if R and Z were held (the version).
             Some(name) if name.starts_with("credits") => {
-                let scroll = name
-                    .strip_prefix("credits:")
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(300);
-                gdl_engine::attract::Attract::credits_demo(&fs, scroll)
-                    .draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100), None);
+                let mut parts = name.split(':').skip(1);
+                let scroll = parts.next().and_then(|n| n.parse().ok()).unwrap_or(300);
+                let mut a = gdl_engine::attract::Attract::credits_demo(&fs, scroll);
+                a.triggers = parts.next() == Some("rz");
+                a.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100), None);
             }
             // saver[:ticks]: the screen saver's weapons after that many ticks.
             Some(name) if name == "saver" || name.starts_with("saver:") => {

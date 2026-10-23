@@ -16,7 +16,8 @@ enum Entry {
     Title,
     /// A level flyby (MA_FLYBY).
     Flyby,
-    /// TODO: the credits roll (MA_CREDITS, every 16th loop) is not implemented.
+    /// The credits roll (MA_CREDITS): every 16th loop, or whenever R and Z
+    /// are held.
     Credits,
 }
 
@@ -43,6 +44,16 @@ const MOVIES: [[&str; 4]; 5] = [
     ["WAR_DWA", "VAL_KNI", "WIZ_SOR", "JES_ARC"],
     ["FAIL"; 4],
 ];
+
+/// sys/version.c Version, shown in the credits as "Version %s "
+/// (lbl_80111238) while R and Z are held.
+pub const VERSION: &str = "3.5";
+
+/// any_level(0x400000) && any_level(0x800000): some pad holds R1 (the GC R
+/// button) and some pad R2 (Z).
+fn r_and_z(inputs: &[PlayerInput]) -> bool {
+    inputs.iter().any(|i| i.strafe) && inputs.iter().any(|i| i.combo)
+}
 
 /// What the attract loop is showing.
 pub enum Show {
@@ -88,6 +99,9 @@ pub struct Attract {
     /// NextAttractWave's cursor and the realm tables it walks.
     waves: crate::flyby::WaveCursor,
     worlds: Option<gdl_formats::wdata::Worlds>,
+    /// R and Z held at the last update, and each input's R / Z then.
+    pub triggers: bool,
+    held_rz: Vec<(bool, bool)>,
 }
 
 impl Attract {
@@ -102,6 +116,8 @@ impl Attract {
             show: None,
             waves: Default::default(),
             worlds: None,
+            triggers: false,
+            held_rz: Vec::new(),
         }
     }
 
@@ -141,6 +157,24 @@ impl Attract {
     /// Step to the next entry that can be shown, applying the skip rules.
     /// Returns Title when the title screen is next.
     fn advance(&mut self, fs: &GameFs) -> Event {
+        // init_attract_mode: R and Z held force the credits (screen 0x8000),
+        // and the loop count starts over.
+        if self.triggers {
+            if let Some(blocks) = credit_lines(fs) {
+                self.index = SCREENS
+                    .iter()
+                    .position(|e| *e == Entry::Credits)
+                    .unwrap_or(0);
+                self.loops = 0;
+                self.column = 0;
+                self.show = Some(Show::Credits {
+                    blocks,
+                    scroll: 0,
+                    ticks: 0,
+                });
+                return Event::Credits;
+            }
+        }
         loop {
             self.index = self.index.wrapping_add(1);
             if self.index >= SCREENS.len() {
@@ -207,6 +241,13 @@ impl Attract {
 
     /// One 60 Hz tick.
     pub fn update(&mut self, fs: &GameFs, inputs: &[PlayerInput]) -> Event {
+        self.triggers = r_and_z(inputs);
+        // any(L1 | L2 | R1 | R2): a newly pressed shoulder button.
+        let shoulder = inputs.iter().enumerate().any(|(k, i)| {
+            let (r, z) = self.held_rz.get(k).copied().unwrap_or((false, false));
+            i.charge_pressed || (i.strafe && !r) || (i.combo && !z)
+        });
+        self.held_rz = inputs.iter().map(|i| (i.strafe, i.combo)).collect();
         let ended = match &mut self.show {
             None => true,
             Some(Show::Movie(m)) => m.update(1.0 / 60.0, inputs),
@@ -222,6 +263,14 @@ impl Attract {
                 {
                     self.show = None;
                     return Event::Title;
+                }
+                // attract_check_input: a shoulder button ends the roll.
+                if shoulder {
+                    self.show = None;
+                    return match self.advance(fs) {
+                        Event::None => Event::MovieEnded,
+                        e => e,
+                    };
                 }
                 *ticks += 1;
                 // scroll_credits: 1 a frame, 2 once the first block has passed.
@@ -281,6 +330,11 @@ impl Attract {
                     };
                     let font = crate::ui::FONT_CREDITS;
                     s.text(scale, x, 383.0 - y, font, 0xFFFFFF, a.clamp(0, 255), line);
+                }
+                // do_credits: the build's version while R and Z are held.
+                if self.triggers {
+                    let v = format!("Version {VERSION} ");
+                    s.text(1.0, 292.0, 340.0, crate::ui::FONT_8HI, 0xFFFF80, 0, &v);
                 }
             }
             None => s.rect(0.0, 0.0, 512.0, 384.0, [0.0, 0.0, 0.0, 1.0]),
@@ -342,4 +396,42 @@ fn credits_state(blocks: &[Vec<String>; 3], scroll: i32) -> (bool, bool) {
         !layout.is_empty() || scroll < 384,
         last_first > 192 || layout.is_empty(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data() -> Option<GameFs> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        GameFs::open(&root).ok()
+    }
+
+    /// init_attract_mode: R and Z held bring up the credits at the next
+    /// entry (and the loop count restarts); a newly pressed shoulder button
+    /// ends the roll.
+    #[test]
+    fn r_and_z_force_the_credits() {
+        let Some(fs) = data() else { return };
+        let mut a = Attract::new().after_title();
+        let rz = PlayerInput {
+            strafe: true,
+            combo: true,
+            ..Default::default()
+        };
+        assert!(matches!(a.update(&fs, &[rz]), Event::Credits));
+        assert!(matches!(a.show, Some(Show::Credits { .. })));
+        assert!(a.triggers && a.loops == 0);
+        // Still held: the roll goes on.
+        assert!(matches!(a.update(&fs, &[rz]), Event::None));
+        // Let go, then press L: the roll ends.
+        a.update(&fs, &[PlayerInput::default()]);
+        assert!(!a.triggers);
+        let l = PlayerInput {
+            charge_pressed: true,
+            ..Default::default()
+        };
+        a.update(&fs, &[l]);
+        assert!(!matches!(a.show, Some(Show::Credits { .. })));
+    }
 }
