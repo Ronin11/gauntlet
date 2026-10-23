@@ -152,7 +152,10 @@ const KIND_C: [usize; 5] = [4, 11, 14, 17, 20];
 const KIND_D: [usize; 5] = [5, 12, 15, 18, 21];
 const KIND_E: [usize; 5] = [84, 11, 14, 17, 20];
 const KIND_F: [usize; 5] = [85, 12, 15, 18, 21];
-/// lbl_8011A178: each player colour's tint (yellow, blue, red, green).
+/// lbl_8011A178 (0xFFFF00, 0xFF, 0xFF0000, 0xFF00 in main.dol): the tint
+/// by Player.class_id, which in the original (+0x4) is the costume colour
+/// (save.last_color; reset_players sets it to the slot) — yellow, blue,
+/// red, green — not this port's class_id (the character).
 pub(crate) const COLOUR_TINT: [u32; 4] = [0xFF_FF00, 0x00_00FF, 0xFF_0000, 0x00_FF00];
 
 /// ene_attn / ene_coll (0x8011B768 / 0x8011B7F0): each monster type's
@@ -186,6 +189,18 @@ const ENEDEATH_TYPE: u32 = 0x10_0020;
 pub(crate) const BAG_SPEED: f32 = 20.0;
 pub(crate) const BAG_WEIGHT: f32 = 50.0;
 pub(crate) const BAG_TIME: f32 = 3.0;
+
+/// PORT ADDITION, not in the original (which only shows FX_BLOCK as a
+/// clank on a blocked hit taking off more than 2): keep FX_BLOCK on a hero
+/// for as long as they hold a block (the DEFEND1 / DEFEND2 / directional
+/// defend poses: hud DEFEND1 or BLOCK). Tunable.
+pub(crate) const BLOCK_SHIELD_HELD: bool = true;
+/// The held shield's MBTreeSetAlpha (0 opaque .. 255 clear); StartBlockFX
+/// uses 0x40. Tunable.
+pub(crate) const BLOCK_SHIELD_ALPHA: i32 = 0x40;
+/// The held shield is kept at least this long ahead (s) each tick, so it
+/// lasts while the block does and goes within a few ticks if left behind.
+const BLOCK_SHIELD_KEEP: f32 = 0.1;
 
 /// A resolved EffectInfo row (EffectHeader): its tree's model (None when it
 /// has no geometry), z bias, alpha and animation length (nframes x rate /
@@ -254,6 +269,8 @@ pub(crate) struct Effects {
     pub looks: HashMap<u64, FxLook>,
     /// Player.timer_1FE: block sparks wait this long (s).
     block_timer: [f32; 4],
+    /// The held block shield on each hero (BLOCK_SHIELD_HELD; port addition).
+    pub block_shield: [Option<u64>; 4],
     /// lbl_803447B8 == 2: StartEnterFX has run.
     entered: bool,
     /// Enemy.specialfx / Player.death_effect: Death's drain arc.
@@ -283,6 +300,7 @@ impl Default for Effects {
             live: Vec::new(),
             looks: HashMap::new(),
             block_timer: [0.0; 4],
+            block_shield: [None; 4],
             entered: false,
             death_fx: HashMap::new(),
             player_death_fx: [None; 4],
@@ -804,19 +822,61 @@ impl Game {
 
     /// damage_player's block clank: StartBlockFX for `time` (0.333-1 s) on
     /// the hero, in their colour at alpha 0x40, then not again for 60 x
-    /// `time` ticks.
+    /// `time` ticks. Over a held shield it adds a second, brightening it.
     pub(crate) fn start_block_fx(&mut self, pi: usize, reduced: f32) -> Option<u64> {
         if self.effects.block_timer.get(pi).is_none_or(|&t| t > 0.0) {
             return None;
         }
         let time = (0.01 * reduced).clamp(0.333, 1.0);
         self.effects.block_timer[pi] = time;
+        self.block_fx_on(pi, time, 0x40)
+    }
+
+    /// StartBlockFX's body: FX_BLOCK riding hero `pi` for `time`, tinted
+    /// lbl_8011A178[class_id] (the costume colour), at `alpha`.
+    fn block_fx_on(&mut self, pi: usize, time: f32, alpha: i32) -> Option<u64> {
+        let colour = colour_index(&self.players.get(pi)?.color);
         let id = self.start_fx(FX_BLOCK, Vec3::ZERO, 0.0, time)?;
-        let colour = colour_index(&self.players[pi].color);
         self.tint_fx(id, COLOUR_TINT[colour]);
-        self.set_fx_alpha(id, 0x40);
+        self.set_fx_alpha(id, alpha);
         self.parent_fx(id, FX_BLOCK, time, FxParent::Player(pi));
         Some(id)
+    }
+
+    /// PORT ADDITION (BLOCK_SHIELD_HELD; not in the original): FX_BLOCK
+    /// shows on a hero while they hold a block — started when it begins,
+    /// kept alive while held, ended when released.
+    pub(crate) fn update_block_shield(&mut self) {
+        for pi in 0..self.effects.block_shield.len() {
+            let held = BLOCK_SHIELD_HELD
+                && self.players.get(pi).is_some_and(|p| {
+                    p.state.active()
+                        && p.act.hud & (crate::paction::hud::DEFEND1 | crate::paction::hud::BLOCK)
+                            != 0
+                });
+            let cur = self.effects.block_shield[pi].and_then(|id| {
+                self.effects
+                    .live
+                    .iter()
+                    .position(|l| l.id == id && l.left > 0.0)
+                    .map(|i| (id, i))
+            });
+            match (held, cur) {
+                (true, Some((_, i))) => {
+                    let l = &mut self.effects.live[i];
+                    l.left = l.left.max(BLOCK_SHIELD_KEEP);
+                }
+                (true, None) => {
+                    let time = self.fx_time(FX_BLOCK).max(BLOCK_SHIELD_KEEP);
+                    self.effects.block_shield[pi] = self.block_fx_on(pi, time, BLOCK_SHIELD_ALPHA);
+                }
+                (false, Some((id, _))) => {
+                    self.delete_fx(id, false);
+                    self.effects.block_shield[pi] = None;
+                }
+                (false, None) => self.effects.block_shield[pi] = None,
+            }
+        }
     }
 
     /// ProcessEffects' missile hit: a hero's missile that hit a wall (`wall`)
@@ -1015,6 +1075,7 @@ impl Game {
         for t in &mut self.effects.block_timer {
             *t -= dt;
         }
+        self.update_block_shield();
         self.update_death_fx();
         let mut live = std::mem::take(&mut self.effects.live);
         let mut hits: Vec<(usize, f32, u32, Vec3)> = Vec::new();
@@ -1323,6 +1384,70 @@ mod tests {
             g.update(1.0 / 60.0, &[PlayerInput::default()]);
         }
         assert!(!g.entities.iter().any(|e| e.id == id && e.alive), "gone");
+    }
+
+    #[test]
+    fn a_held_block_shows_the_shield_until_released() {
+        let Some(fs) = data() else { return };
+        let mut g = empty(&fs, "levelA1");
+        let blocking = |g: &Game| -> Vec<u64> {
+            effects(g)
+                .iter()
+                .filter(|e| Some(e.model) == Some(g.fx_def(FX_BLOCK).unwrap().model))
+                .map(|e| e.id)
+                .collect()
+        };
+        // Start: the block begins (DEFEND1, then BLOCK).
+        g.players[0].act.hud |= crate::paction::hud::DEFEND1;
+        g.update_block_shield();
+        let shown = blocking(&g);
+        assert_eq!(shown.len(), 1);
+        let id = shown[0];
+        assert_eq!(g.effects.block_shield[0], Some(id));
+        let look = g.fx_look(id).unwrap();
+        assert_eq!(look.tint, Some([1.0, 0.0, 0.0]), "RED's lbl_8011A178 tint");
+        let e = g.entities.iter().find(|e| e.id == id).unwrap();
+        let want = 1.0 - BLOCK_SHIELD_ALPHA as f32 / 255.0;
+        assert!((e.fade - want).abs() < 1e-4, "alpha 0x40");
+        // Keep: held well past the row's length, the same effect stays,
+        // riding the hero.
+        g.players[0].act.hud = crate::paction::hud::BLOCK;
+        for _ in 0..240 {
+            g.players[0].pos += Vec3::X * 0.01;
+            g.update_effects(1.0 / 60.0);
+        }
+        assert_eq!(blocking(&g), vec![id]);
+        let e = g.entities.iter().find(|e| e.id == id).unwrap();
+        assert!((e.pos - g.players[0].pos).length() < 0.2);
+        // The clank still comes on a blocked hit, as a second one on top.
+        g.damage_player(0, 20.0, 0);
+        assert_eq!(blocking(&g).len(), 2);
+        // Stop: released, the shield goes at once.
+        g.players[0].act.hud = 0;
+        g.update_effects(1.0 / 60.0);
+        assert!(!g.entities.iter().any(|e| e.id == id && e.alive), "gone");
+        assert_eq!(g.effects.block_shield[0], None);
+    }
+
+    #[test]
+    fn a_block_held_by_the_button_raises_the_shield() {
+        let Some(fs) = data() else { return };
+        let mut g = empty(&fs, "levelA1");
+        let hold = PlayerInput {
+            turbo: true,
+            ..Default::default()
+        };
+        let mut seen = false;
+        for f in 0..20 {
+            let b_pressed = f == 0;
+            g.update(1.0 / 60.0, &[PlayerInput { b_pressed, ..hold }]);
+            seen |= g.effects.block_shield[0].is_some();
+        }
+        assert!(seen, "the shield showed while blocking");
+        for _ in 0..240 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        assert_eq!(g.effects.block_shield[0], None, "and went after");
     }
 
     #[test]
