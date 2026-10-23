@@ -344,10 +344,12 @@ impl Audio {
 
     /// Play a named sound effect (`S_PICKUPKEY`, or by id: `#2b0048`); `A|B` tries alternatives in order. Names prefixed with `VOICE:` (or a
     /// `+`-joined list, e.g. `VOICE:S_REDWAR1+S_NEEDSFOOD+S_BADLY`) queue as announcements.
+    /// A trailing `@N` plays it at volume N of the game's 127 (`S_WARN@202`).
     pub fn play(&mut self, fs: &GameFs, name: &str) {
         let (Some(tx), Some(lib)) = (&self.tx, &mut self.lib) else {
             return;
         };
+        let (name, gain) = split_volume(name);
         // `A|B|C`: play the first alternative that exists.
         let name = name.split('|').find(|n| {
             let n = n.strip_prefix("VOICE:").unwrap_or(n);
@@ -369,10 +371,11 @@ impl Audio {
         if all.is_empty() {
             return;
         }
+        let vol = vol * gain;
         let _ = tx.send(if voice {
-            Cmd::Voice(all, vol)
+            Cmd::Voice(all, vol.min(1.0))
         } else {
-            Cmd::Sfx(all, vol * 0.8 * self.sfx_vol)
+            Cmd::Sfx(all, (vol * 0.8 * self.sfx_vol).min(1.0))
         });
     }
 
@@ -535,6 +538,17 @@ impl Audio {
     }
 }
 
+/// A request's `@N` volume suffix: (the request, N / 127), 1 without one.
+fn split_volume(req: &str) -> (&str, f32) {
+    match req.rsplit_once('@') {
+        Some((name, v)) => match v.parse::<u32>() {
+            Ok(v) => (name, v as f32 / 127.0),
+            Err(_) => (req, 1.0),
+        },
+        None => (req, 1.0),
+    }
+}
+
 /// For testing: which alternative (if any) each sound request resolves to, and its length.
 pub fn check_sounds(fs: &GameFs, requests: &[String]) -> Vec<(String, Option<(String, f32)>)> {
     let Some(mut lib) = SoundLib::load(fs) else {
@@ -543,7 +557,7 @@ pub fn check_sounds(fs: &GameFs, requests: &[String]) -> Vec<(String, Option<(St
     requests
         .iter()
         .map(|req| {
-            let found = req.split('|').find_map(|alt| {
+            let found = split_volume(req).0.split('|').find_map(|alt| {
                 let list = alt.strip_prefix("VOICE:").unwrap_or(alt);
                 let mut total = 0.0;
                 for n in list.split('+') {
@@ -563,13 +577,22 @@ pub fn check_sounds(fs: &GameFs, requests: &[String]) -> Vec<(String, Option<(St
 #[cfg(test)]
 mod id_tests {
     #[test]
+    fn volume_suffix() {
+        assert_eq!(super::split_volume("S_WARN@254"), ("S_WARN", 2.0));
+        assert_eq!(super::split_volume("VOICE:S_A+S_B"), ("VOICE:S_A+S_B", 1.0));
+    }
+
+    #[test]
     fn sounds_play_by_id() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
         let Ok(fs) = crate::fs::GameFs::open(&root) else {
             return;
         };
-        // S_MINECARPHIT, S_ROCKBREAKE.
-        let r = super::check_sounds(&fs, &["#2b0048".into(), "#370000".into()]);
+        // S_MINECARPHIT, S_ROCKBREAKE, and S_WARN at a volume.
+        let r = super::check_sounds(
+            &fs,
+            &["#2b0048".into(), "#370000".into(), "S_WARN@202".into()],
+        );
         assert!(
             r.iter().all(|(_, f)| f.as_ref().is_some_and(|f| f.1 > 0.0)),
             "{r:?}"

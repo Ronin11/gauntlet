@@ -81,6 +81,9 @@ pub struct Input {
     /// Left-stick axes of key-reporting controllers (Android joystick motion).
     dev_stick: HashMap<u64, Vec2>,
     dev_pressed: Vec<(u64, u32)>,
+    /// The rumble playing on each pad (dropping an effect stops it).
+    #[cfg(not(target_os = "android"))]
+    rumbles: HashMap<PadId, gilrs::ff::Effect>,
 }
 
 impl Default for Input {
@@ -114,6 +117,55 @@ impl Input {
             dev_held: HashMap::new(),
             dev_stick: HashMap::new(),
             dev_pressed: Vec::new(),
+            #[cfg(not(target_os = "android"))]
+            rumbles: HashMap::new(),
+        }
+    }
+
+    /// do_vibe: rumble a pad at `strength` (0..1) for `ms`, replacing what it
+    /// was doing. Pads without force feedback (and keyboards, and Android's
+    /// key-event controllers) are left alone.
+    #[allow(unused_variables)]
+    pub fn rumble(&mut self, src: Source, strength: f32, ms: u32) {
+        #[cfg(not(target_os = "android"))]
+        {
+            use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Repeat, Replay, Ticks};
+            let (Source::Pad(id), Some(g)) = (src, &mut self.gilrs) else {
+                return;
+            };
+            if !g.connected_gamepad(id).is_some_and(|p| p.is_ff_supported()) {
+                return;
+            }
+            let magnitude = (strength.clamp(0.0, 1.0) * u16::MAX as f32) as u16;
+            let len = Ticks::from_ms(ms.max(1));
+            let fx = EffectBuilder::new()
+                .add_effect(BaseEffect {
+                    kind: BaseEffectType::Strong { magnitude },
+                    scheduling: Replay {
+                        play_for: len,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .add_effect(BaseEffect {
+                    kind: BaseEffectType::Weak { magnitude },
+                    scheduling: Replay {
+                        play_for: len,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .gamepads(&[id])
+                .repeat(Repeat::For(len))
+                .finish(g);
+            match fx {
+                Ok(fx) => {
+                    if fx.play().is_ok() {
+                        self.rumbles.insert(id, fx);
+                    }
+                }
+                Err(e) => log::debug!("rumble: {e}"),
+            }
         }
     }
 

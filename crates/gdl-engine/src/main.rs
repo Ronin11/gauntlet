@@ -310,6 +310,24 @@ fn snapshot_game(args: &Args) -> Result<()> {
             slide: 128,
         };
     }
+    // GDL_COMPASS=1: the Compass option on. GDL_XRAY=1: every hero's X-ray on.
+    if std::env::var_os("GDL_COMPASS").is_some() {
+        g.snd.show_compass = true;
+    }
+    if std::env::var_os("GDL_XRAY").is_some() {
+        use gdl_engine::powerups as pu;
+        for p in &mut g.players {
+            p.powerups.add(pu::SPECIAL, pu::S_XRAY, 0.0, 600.0);
+            if let Some(sl) = p
+                .powerups
+                .slots
+                .iter_mut()
+                .find(|s| s.flags & pu::S_XRAY != 0)
+            {
+                sl.state = pu::ON;
+            }
+        }
+    }
     let box_close: Option<u32> = std::env::var("GDL_BOX_CLOSE")
         .ok()
         .and_then(|v| v.parse().ok());
@@ -392,6 +410,9 @@ fn snapshot_game(args: &Args) -> Result<()> {
         for name in list.split(',') {
             g.hide_object(name);
         }
+    }
+    if std::env::var_os("GDL_XRAY").is_some() {
+        println!("x-ray {:?}", g.snd.xray);
     }
     if std::env::var_os("GDL_DEBUG_CAM").is_some() {
         let (eye, at, near) = g.camera_view();

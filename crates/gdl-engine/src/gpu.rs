@@ -661,11 +661,12 @@ impl Gpu {
                     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     for (b, (_, bg)) in mesh.batches.iter().zip(&inst.bufs) {
                         let (material, _, alpha) = b.resolve(inst.part_fx.get(b.part as usize));
-                        // Parts faded by a texmod blend while they are see-through.
+                        // Parts faded by a texmod (or a see-through instance:
+                        // MBTreeSetAlpha) blend while they are see-through.
                         let kind = if b.additive {
                             2
                         } else {
-                            (b.blend || alpha < 1.0) as u8
+                            (b.blend || alpha < 1.0 || inst.tint.w < 1.0) as u8
                         };
                         if kind != pass_kind
                             || b.count == 0

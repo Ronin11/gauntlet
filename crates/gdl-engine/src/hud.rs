@@ -643,6 +643,28 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
             );
         }
     }
+    // do_got_it: each pickup's card (the S3 strip over its icon, 128 wide)
+    // slides up over its player's panel, in front of it.
+    let tower = game.wave.map(|w| w >> 8) == Some(12);
+    for g in &game.snd.got_it {
+        let slot = panels.get(g.player).map_or(g.player, |p| p.slot);
+        let x = 128.0 * slot as f32;
+        let y = g.y as f32;
+        // (Cut off at the bottom of the picture.)
+        let card = |s: &mut Scr, t: Tex, y: f32| {
+            let h = t.h as f32;
+            let shown = (384.0 - y).min(h);
+            if shown > 0.0 {
+                s.blit_uv(t, x, y, 128.0, shown, [0.0, 0.0, 1.0, shown / h], 0);
+            }
+        };
+        if let Some(t) = s.ui.get("S3") {
+            card(s, t, y);
+        }
+        if let Some(t) = g.icon(tower).and_then(|n| s.ui.get(n)) {
+            card(s, t, y + 16.0);
+        }
+    }
     // A secret level's hourglass (gamemain.c fn_800552A4): the top sand drains
     // and the bottom fills as the time runs out.
     if let Some((total, left)) = game.secret_timer {

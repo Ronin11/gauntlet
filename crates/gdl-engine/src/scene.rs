@@ -32,6 +32,13 @@ pub struct Scene {
 
 /// Instance key bit for a critter's GMETER bar.
 const METER_KEY: u64 = 1 << 63;
+/// Instance keys for a hero's X-ray content (| the player) and the compass.
+const XRAY_KEY: u64 = 1 << 62;
+const COMPASS_KEY: u64 = 1 << 61;
+/// MBTreeSetAlpha's see-through chest (0xC0) and compass (lbl_80343C20 128):
+/// invAlpha = 255 - alpha.
+const XRAY_CHEST_ALPHA: f32 = 63.0 / 255.0;
+const COMPASS_ALPHA: f32 = 127.0 / 255.0;
 
 /// Where a world point lands on the game's 512x384 screen (the 3D view is 4:3),
 /// or None behind the camera.
@@ -46,6 +53,19 @@ pub fn project(game: &Game, pos: Vec3) -> Option<(f32, f32)> {
     }
     let (x, y) = (c.x / c.w, c.y / c.w);
     Some(((x + 1.0) * 256.0, (1.0 - y) * 192.0))
+}
+
+/// MBWindowTo3D: the world point at view depth `depth` under a point of the
+/// 512x384 screen.
+pub fn unproject(game: &Game, sx: f32, sy: f32, depth: f32) -> Vec3 {
+    let (eye, at, near) = game.camera_view();
+    let m = mirror();
+    let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
+    let proj = crate::camera::projection(4.0 / 3.0, near, 1500.0);
+    let ndc = Vec3::new(sx / 256.0 - 1.0, 1.0 - sy / 192.0, 0.5);
+    let v = proj.inverse().project_point3(ndc);
+    let v = v * (depth / -v.z);
+    m.transform_point3(view.inverse().transform_point3(v))
 }
 
 impl Scene {
@@ -252,7 +272,42 @@ impl Scene {
                 _ => Vec4::ONE,
             };
             inst.tint.w *= e.fade;
+            if game.snd.xray.iter().flatten().any(|x| x.chest == e.id) {
+                inst.tint.w *= XRAY_CHEST_ALPHA;
+            }
             inst.visible = e.fade > 0.0;
+        }
+        // do_see_thru: what the chest holds, inside it at 0.65.
+        for (pi, x) in game.snd.xray.iter().enumerate() {
+            let Some(x) = x else { continue };
+            let key = XRAY_KEY | pi as u64;
+            let inst = self
+                .entities
+                .entry(key)
+                .or_insert_with(|| gpu.new_instance(&self.models[x.model]));
+            inst.transform = mirror()
+                * Mat4::from_translation(x.pos)
+                * Mat4::from_rotation_y(x.yaw)
+                * Mat4::from_scale(Vec3::splat(0.65));
+            (inst.parts, inst.hidden) = game.models[x.model].evaluate(0, 0.0);
+            inst.part_fx = game.models[x.model].texmod_fx(0, 0.0);
+            inst.tint = Vec4::ONE;
+            live.insert(key);
+        }
+        // fn_80052134: the COMPASS at screen (64, 128), 10 in front of the
+        // camera, 1.5 times its size and half see-through; it keeps the world's
+        // orientation.
+        if let Some(m) = game.snd.compass_model.filter(|_| game.snd.show_compass) {
+            let at = unproject(game, 64.0, 128.0, 10.0);
+            let inst = self
+                .entities
+                .entry(COMPASS_KEY)
+                .or_insert_with(|| gpu.new_instance(&self.models[m]));
+            inst.transform =
+                mirror() * Mat4::from_translation(at) * Mat4::from_scale(Vec3::splat(1.5));
+            (inst.parts, inst.hidden) = game.models[m].evaluate(0, 0.0);
+            inst.tint = Vec4::new(1.0, 1.0, 1.0, COMPASS_ALPHA);
+            live.insert(COMPASS_KEY);
         }
         self.entities.retain(|id, _| live.contains(id));
     }
@@ -287,6 +342,14 @@ impl Scene {
                     d.push((&self.models[gm], inst));
                 }
             }
+        }
+        for (pi, x) in game.snd.xray.iter().enumerate() {
+            if let (Some(x), Some(inst)) = (x, self.entities.get(&(XRAY_KEY | pi as u64))) {
+                d.push((&self.models[x.model], inst));
+            }
+        }
+        if let (Some(m), Some(inst)) = (game.snd.compass_model, self.entities.get(&COMPASS_KEY)) {
+            d.push((&self.models[m], inst));
         }
         d
     }

@@ -881,6 +881,16 @@ impl App {
                     } else {
                         play.game.update(TICK, &inputs);
                         play.intro += TICK;
+                        // do_vibe: only for players with the Vibration option on.
+                        for v in play.game.snd.rumble.drain(..) {
+                            let slot = play.panels.get(v.player).map_or(v.player, |p| p.slot);
+                            if r.prefs.players[slot % 4].rumble {
+                                if let Some(&src) = r.sources.get(v.player) {
+                                    let k = crate::game::sounds::VIBE[v.strength.min(4)];
+                                    r.input.rumble(src, k, v.ticks * 1000 / 60);
+                                }
+                            }
+                        }
                         // AudioMusicVolUpdate / AudioSetupLevelStreams: a new music
                         // area fades the stream out (3/127 a tick; or switches at
                         // once), plays the area's stream, and fades back in.
@@ -1046,6 +1056,8 @@ impl App {
                 for snd in p.game.sfx.drain(..) {
                     r.audio.play(fs, &snd);
                 }
+                // fn_80052134: the compass hides while the options are open.
+                p.game.snd.show_compass = r.prefs.compass && pause.is_none();
                 p.scene.sync(&r.gpu, &p.game);
                 // The game draws a 4:3 picture; keep it, centred, in any window.
                 let (w, h) = (r.config.width as f32, r.config.height as f32);

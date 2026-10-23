@@ -1,5 +1,8 @@
 //! Game state and simulation (independent of rendering).
 
+#[path = "sounds.rs"]
+pub mod sounds;
+
 use crate::character::{Animator, Model};
 use crate::collision::{Collision, Tri};
 use crate::fs::GameFs;
@@ -986,8 +989,6 @@ pub struct Game {
     pub time: f32,
     /// 60 Hz ticks since the level started.
     pub frame: u32,
-    /// Ticks until the next low-health heartbeat.
-    heartbeat: i32,
     pub rng: Rng,
     /// The level's wave, when a realm table lists it.
     pub wave: Option<u32>,
@@ -1079,6 +1080,8 @@ pub struct Game {
     /// Legend weapons the party carries: bit = the item's value (the realm of
     /// the boss it is for). One is used up when its boss fight uses it.
     pub legend_held: u16,
+    /// Event-sound timers, the got-it ticker, rumble, X-ray and compass.
+    pub snd: sounds::SoundState,
     /// Items flying out of a dying boss.
     pub spews: Vec<crate::boss::Spew>,
     /// Critter ground waves (stomps, eruptions).
@@ -1555,7 +1558,6 @@ impl Game {
             start_index: 0,
             time: 0.0,
             frame: 0,
-            heartbeat: 0,
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             wave: None,
             worlds: Default::default(),
@@ -1602,6 +1604,7 @@ impl Game {
             boss: None,
             boss_runes: 0,
             legend_held: 0,
+            snd: Default::default(),
             spews: Vec::new(),
             crit_waves: Vec::new(),
             crit_hit_until: [0.0; 4],
@@ -1961,6 +1964,11 @@ impl Game {
                 }
                 (i as u64, name.as_str(), vol)
             })
+            .chain(std::iter::once((
+                sounds::DEATH_SUCK_LOOP,
+                "S_DEATHSUCK",
+                if self.snd.death_suck > 0 { 1.0 } else { 0.0 },
+            )))
             .collect()
     }
 
@@ -2419,6 +2427,7 @@ impl Game {
                 }
                 ItemType::Powerup => {
                     let kind = pickup_kind(&info, &inst.params);
+                    self.note_special(&kind);
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     self.spawn(
                         Kind::Pickup {
@@ -2584,7 +2593,7 @@ impl Game {
                             rate: 1.0,
                         },
                     };
-                    self.spawn(
+                    let id = self.spawn(
                         Kind::Hazard {
                             radius: info.radius.max(1.0),
                             damage,
@@ -2595,6 +2604,17 @@ impl Game {
                         pos,
                         yaw,
                     );
+                    // AudioDamageTile's subtype: realm 3's FLAMEH plays as 6.
+                    let raw = info.subtype;
+                    let sub = if self.wave.map(|w| w >> 8) == Some(3)
+                        && raw == 1
+                        && info.name.eq_ignore_ascii_case("FLAMEH")
+                    {
+                        6
+                    } else {
+                        raw
+                    };
+                    self.snd.tile_sub.insert(id, (raw, sub));
                 }
                 ItemType::Trigger => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
@@ -2721,10 +2741,15 @@ impl Game {
                 self.item_model(fs, &mut cache, &mut known, &dirs, &n);
             }
         }
+        // do_see_thru's DEATH_ICON and KEYRING, StartCompass's COMPASS.
+        for n in ["DEATH_ICON", "KEYRING", "COMPASS"] {
+            self.item_model(fs, &mut cache, &mut known, &dirs, n);
+        }
         self.item_models = known
             .iter()
             .map(|(k, v)| (k.to_ascii_uppercase(), *v))
             .collect();
+        self.snd.compass_model = self.item_models.get("COMPASS").copied().flatten();
         let count = |f: fn(&Kind) -> bool| self.entities.iter().filter(|e| f(&e.kind)).count();
         log::info!(
             "{}: {} enemies, {} generators, {} pickups, {} containers, {} doors, {} models loaded",
@@ -2929,9 +2954,6 @@ impl Game {
         }
     }
 
-    /// do_weakening's heartbeat (S_WARN): for the living player with the least
-    /// health, while it is 200 or less, every 120 ticks above 100, 60 above 25 and
-    /// 30 below.
     /// do_players: the level is over once nobody is still playing. If anyone left
     /// through an exit the party follows them; otherwise everyone died.
     fn check_level_end(&mut self) {
@@ -2955,32 +2977,9 @@ impl Game {
         );
     }
 
-    fn heartbeat(&mut self) {
-        let low = self
-            .players
-            .iter()
-            .filter(|p| p.state.active() && p.health > 1.0)
-            .map(|p| p.health)
-            .min_by(|a, b| a.total_cmp(b));
-        match low {
-            Some(h) if h <= 200.0 => {
-                self.heartbeat -= 1;
-                if self.heartbeat <= 0 {
-                    self.sfx.push("S_WARN".into());
-                    self.heartbeat = if h >= 100.0 {
-                        120
-                    } else if h >= 25.0 {
-                        60
-                    } else {
-                        30
-                    };
-                }
-            }
-            _ => self.heartbeat = 0,
-        }
-    }
-
     pub fn update(&mut self, dt: f32, inputs: &[PlayerInput]) {
+        // Rumbles are the caller's to take after each update.
+        self.snd.rumble.clear();
         self.time += dt;
         self.shake.age(1);
         if let Some((_, t)) = &mut self.crystal_shown {
@@ -3027,7 +3026,7 @@ impl Game {
         self.update_waves(dt);
         self.update_spews(dt);
         self.update_boss(dt);
-        self.heartbeat();
+        self.update_sounds();
         self.check_level_end();
         self.update_camera(dt);
     }
@@ -3188,7 +3187,9 @@ impl Game {
                 }
                 p.state = PlayerState::Dead { timer: 4.0 };
                 self.deaths += 1;
-                self.sfx.push(format!("S_{}DIE1", p.class));
+                // AudioPlayerDies; kill_got_it.
+                self.sfx.extend(sounds::player_dies(p));
+                self.snd.got_it.retain(|g| g.player != i);
                 if let Some(d) = seqs.death {
                     p.animator.restart(d);
                 }
@@ -3666,7 +3667,7 @@ impl Game {
         use crate::paction::act;
         use crate::powerups as pu;
         let pi = t.pi;
-        self.sfx.push(format!("S_{}THROW", self.players[pi].class));
+        self.sfx.push(sounds::throw_sound(&self.players[pi]));
         let p = &self.players[pi];
         let ct = p.class_id % 8;
         let (mut damage, w) = (p.derived.missile_damage, p.fx.weapon);
@@ -4138,7 +4139,19 @@ impl Game {
         if p.fx.weapon & crate::powerups::W_ELEMENT != 0 {
             dmg *= ELEMENT_BONUS;
         }
+        // The hit streak counts critters and tall monsters: 3 for a kill (or
+        // a blow that does nothing: damage_enemy's -1), else 1.
+        let tall = match &self.entities[t].kind {
+            Kind::Critter(_) => true,
+            Kind::Enemy { etype, .. } => crate::enemies::TYPES[(*etype).min(33)].height * 0.5 > 2.0,
+            _ => false,
+        };
+        let was_down = Self::is_destroyed(&self.entities[t]);
         self.hit_entity(pi, t, dmg, dir, true);
+        if tall {
+            let down = self.entities.get(t).is_none_or(Self::is_destroyed);
+            self.streak_hit(pi, was_down || down);
+        }
     }
 
     /// Damage every enemy, generator and breakable within `radius`.
@@ -4575,6 +4588,10 @@ impl Game {
             dmg *= 2.0;
         }
         let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+        // AudioPlayEvt101: Death dies.
+        if r.killed && r.tier == crate::enemies::DEATH && !r.generator {
+            self.sfx_id(0x65);
+        }
         // The monster staggers (HIT1) or dies (DEATH / HIT2).
         if r.hit
             && !MAGIC_HIT.with(|m| m.get())
@@ -4740,6 +4757,7 @@ impl Game {
     /// magic); blocking halves it. The announcer speaks as health crosses 150 and
     /// 50, and the hero grunts in pain.
     pub fn damage_player(&mut self, pi: usize, dmg: f32, flags: u32) {
+        let mode = self.snd.mode.take().unwrap_or(1);
         let Some(p) = self.players.get_mut(pi) else {
             return;
         };
@@ -4804,24 +4822,10 @@ impl Game {
         }
         let old = (p.health + 0.5) as i32;
         p.health -= dmg;
-        let new = (p.health + 0.5) as i32;
-        let name = format!("VOICE:S_{}{}1", p.color, p.class);
-        if old > 150 && new <= 150 {
-            self.sfx.push(format!("{name}+S_BADLY|VOICE:S_BADLY"));
-        } else if old > 50 && new <= 50 {
-            let line = if self.frame % 2 == 0 {
-                "S_LIFEFORCE"
-            } else {
-                "S_ABOUT"
-            };
-            self.sfx.push(format!("{name}+{line}|VOICE:{line}"));
-        } else if p.hurt_flash < 0.3 && dmg > 0.0 {
-            let n = 1 + (self.time * 13.0) as u32 % 4;
-            self.sfx.push(format!("S_{}PAIN{n}|S_PLYRDMG", p.class));
-        }
         if dmg > 0.0 {
             p.hurt_flash = 1.0;
         }
+        self.damage_sounds(pi, mode, dmg, flags, old);
     }
 
     /// Advance the potion rings: each grows from a third of its radius to the
@@ -4881,7 +4885,6 @@ impl Game {
 
     /// Sound for hitting (or destroying) entity `e`.
     fn hit_sound(&self, e: &Entity, destroyed: bool) -> Option<String> {
-        let w = self.world_letter();
         Some(match &e.kind {
             Kind::Enemy { class, .. } if destroyed => {
                 let n = self
@@ -4908,8 +4911,11 @@ impl Game {
                 format!("S_{p}1DIECLOS|S_{p}DIECLOSE|S_{p}DIECLOS|S_{p}2DIECLOS|S_WEAPONHITMETA")
             }
             Kind::Enemy { .. } => "S_WEAPONHITMETA".into(),
-            Kind::Generator { .. } if destroyed => format!("S_GEN{w}CHIT1|S_WEAPONHITSTON"),
-            Kind::Generator { .. } => "S_WEAPONHITSTON".into(),
+            // AudioGeneratorDamaged / AudioGeneratorDies (items.c:2648).
+            Kind::Generator { class, .. } => {
+                let etype = self.classes.get(*class).map_or(0, |c| c.etype);
+                return self.generator_sound(etype, destroyed);
+            }
             Kind::Container { .. } if destroyed => "S_CHEST".into(),
             Kind::Container { .. } => "S_WEAPONHITWOOD".into(),
             _ => return None,
@@ -5023,6 +5029,7 @@ impl Game {
             return;
         }
         let kind = pickup_kind(&info, &[0u8; 16]);
+        self.note_special(&kind);
         let model = self
             .item_models
             .get(&info.name.to_ascii_uppercase())
@@ -5079,7 +5086,7 @@ impl Game {
             .it_holder
             .filter(|&pi| player_pos.get(pi).is_some_and(|p| p.1));
         let mut barrier_touches = Vec::new();
-        let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32)> = Vec::new();
+        let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32, u64)> = Vec::new();
         let mut fallers_started: Vec<(i32, Option<(usize, usize)>)> = Vec::new();
         let mut wall_sounds: Vec<WallSound> = Vec::new();
         let mut fallers_moved: Vec<((usize, usize), Vec3)> = Vec::new();
@@ -5139,6 +5146,8 @@ impl Game {
         // Monster melee hits: (monster, player, damage).
         let mut melee: Vec<(usize, usize, f32)> = Vec::new();
         let mut pickups: Vec<(usize, PickupKind)> = Vec::new();
+        // Each pickup's food kind for snd_eat (by its model's item name).
+        let mut pickup_food: Vec<usize> = Vec::new();
         let mut opened: Vec<(usize, usize)> = Vec::new();
         let mut key_used: Vec<usize> = Vec::new();
         let mut exits: Vec<(usize, Option<u32>)> = Vec::new();
@@ -5535,6 +5544,13 @@ impl Game {
                             }
                             if can_take(&self.players[pi], kind) {
                                 pickups.push((pi, *kind));
+                                pickup_food.push(
+                                    e.model
+                                        .and_then(|m| {
+                                            self.item_models.iter().find(|(_, v)| **v == Some(m))
+                                        })
+                                        .map_or(0, |(n, _)| sounds::food_kind(n)),
+                                );
                                 e.alive = false;
                                 break;
                             }
@@ -5839,7 +5855,14 @@ impl Game {
                                 && (pp.y - e.pos.y).abs() < 4.0
                             {
                                 let fwd = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
-                                trap_hits.push((pi, *dmg, *flags, *pp + fwd, cycle.activetime));
+                                trap_hits.push((
+                                    pi,
+                                    *dmg,
+                                    *flags,
+                                    *pp + fwd,
+                                    cycle.activetime,
+                                    e.id,
+                                ));
                             }
                         }
                     }
@@ -5919,14 +5942,19 @@ impl Game {
         }
         // Each hero is hurt by a tile at most once per what is left of its
         // cycle (fxhittime); a knocking tile pushes back along its facing.
-        for (pi, dmg, flags, from, activetime) in trap_hits {
+        for (pi, dmg, flags, from, activetime, id) in trap_hits {
             if self.time < self.players[pi].fxhittime {
                 continue;
             }
             self.players[pi].fxhittime = self.time + (activetime + 1) as f32 / 30.0;
             self.damage_from = (flags & 0x30 != 0).then_some(from);
+            // Spikes (subtypes 0, 3, 4) hurt as mode 3, the rest as 2; then
+            // AudioDamageTile.
+            let (raw, sub) = self.snd.tile_sub.get(&id).copied().unwrap_or((-1, -1));
+            self.snd.mode = Some(if matches!(raw, 0 | 3 | 4) { 3 } else { 2 });
             self.damage_player(pi, dmg, flags);
             self.damage_from = None;
+            self.damage_tile_sound(sub);
             self.post(21, Some(pi), &[]);
         }
 
@@ -6131,6 +6159,12 @@ impl Game {
                         if crate::enemies::TYPES[etype.min(33)].height * 0.5 <= 2.0);
                     (Some(e.pos), low)
                 });
+                if let Some(&Kind::Enemy {
+                    etype, strength, ..
+                }) = self.entities.get(ei).map(|e| &e.kind)
+                {
+                    self.monster_blow(pi, etype, strength);
+                }
                 self.damage_from = from;
                 self.damage_player(pi, dmg, if low { DmgType::LOW } else { 0 });
                 self.damage_from = None;
@@ -6142,21 +6176,26 @@ impl Game {
                 posts.push((m, *pi));
             }
         }
-        for (pi, kind) in pickups {
+        let realm = self.realm();
+        let mut runes_found = false;
+        for ((pi, kind), food) in pickups.into_iter().zip(pickup_food) {
+            if let Some((sub, count)) = sounds::got_it_of(&kind) {
+                self.add_got_it(pi, sub, count);
+            }
             let p = &mut self.players[pi];
-            self.sfx.push(match kind {
-                PickupKind::Food(_) => format!("S_{}EAT|S_{}EATSFX", p.class, p.class),
-                PickupKind::Key(_) => "S_PICKUPKEY".into(),
-                PickupKind::Gold(_) => "S_PICKUPCRYST".into(),
-                PickupKind::Potion(_) => "S_PICKUPMAGIC".into(),
-                PickupKind::Crystal(_) => "S_PICKUPCRYST".into(),
-                PickupKind::Scroll(_)
-                | PickupKind::Powerup { .. }
-                | PickupKind::Legend(_)
-                | PickupKind::Gargoyle(_) => "S_PICKUPSPECIAL".into(),
-                PickupKind::Shard(_) => "S_PICKUPRUNE|S_PICKUPSPECIAL".into(),
-                PickupKind::Other(_) => "S_PICKUPSPECIAL".into(),
-            });
+            self.sfx.extend(sounds::pickup_sound(&kind, realm, pi));
+            // Food: bad food's severe pain, else the eating sound.
+            match kind {
+                PickupKind::Food(hp) if hp < 0.0 => self.sfx.push(sounds::severe_pain(p)),
+                PickupKind::Food(_) => {
+                    let s = sounds::eat_food(&mut self.rng, p, food);
+                    if !s.is_empty() {
+                        self.sfx.push(s);
+                    }
+                }
+                PickupKind::Shard(_) => runes_found = true,
+                _ => {}
+            }
             match kind {
                 // heal_player: food never takes health past the maximum; spoiled
                 // food is poison gas, which armour doesn't stop.
@@ -6228,7 +6267,12 @@ impl Game {
             self.post(m, Some(pi), &[]);
         }
         for (pi, dmg) in poisoned {
+            // damage_player(-amt, 0, 2048): no cries of its own.
+            self.snd.mode = Some(0);
             self.damage_player(pi, dmg, DmgType::POISON_GAS);
+        }
+        if runes_found {
+            self.runes_found();
         }
         for sp in spawns {
             self.spawn_from_generator(sp);
@@ -6277,10 +6321,16 @@ impl Game {
             }
         }
         // Death's drain goes round armour; once it has had 100 it leaves.
+        // AudioPlayEvt102Follow: S_DEATHSUCK while Death drains;
+        // AudioPlayEvt104: its laugh as it leaves.
+        if !drains.is_empty() {
+            self.snd.death_suck = 4;
+        }
         for (pi, f) in drains {
             self.damage_player(pi, f, DmgType::NO_ARMOR);
         }
         for pi in death_done {
+            self.sfx_id(0x68);
             self.post(0x83, Some(pi), &[]);
         }
         if let Some(pi) = tagged {
@@ -6309,7 +6359,7 @@ impl Game {
             if p.state.active() {
                 p.state = PlayerState::Exiting { timer: 50.0 / 60.0 };
                 p.exit_dest = dest;
-                self.sfx.push("S_EXIT|S_PICKUPSPECIAL".into());
+                self.exit_sounds();
             }
         }
     }

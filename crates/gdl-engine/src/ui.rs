@@ -284,3 +284,37 @@ impl UiAssets {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// do_got_it's blits are all front-end textures, 128 wide.
+    #[test]
+    fn got_it_icons_exist() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        let Ok(fs) = crate::fs::GameFs::open(&root) else {
+            return;
+        };
+        let ui = super::UiAssets::load(&fs);
+        for n in [
+            "S3",
+            "KEY",
+            "KEY_RING",
+            "MEAT",
+            "BADMEAT",
+            "FRUIT",
+            "BADFRUIT",
+            "MAGIC",
+            "COINHUD",
+            "GOLD",
+            "JUNK",
+            "SPECIALS",
+            "RUNESTONE",
+            "CRYSTAL",
+            "GOLDNICON",
+            "LEGEND",
+        ] {
+            let t = ui.get(n).unwrap_or_else(|| panic!("no {n}"));
+            assert_eq!(t.w, 128, "{n}");
+        }
+    }
+}
