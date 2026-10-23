@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 pub(crate) mod items;
 mod magic;
 pub mod sounds;
+pub mod worn;
 
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
 pub const PLAYER_COLORS: [&str; 4] = ["RED", "BLU", "YEL", "GRE"];
@@ -383,6 +384,8 @@ pub struct Player {
     combo_timer: i32,
     saved_pos: Vec3,
     attached_to: Option<usize>,
+    /// What the power-ups put on the hero (PlayerProcessPowerups).
+    pub worn: worn::Worn,
 }
 
 /// Animation sequence indices for a player model.
@@ -1045,6 +1048,10 @@ pub struct Game {
     /// Potion effects in flight or spreading (start_magic).
     pub(crate) magic: Vec<magic::MagicFx>,
     pub(crate) magic_models: magic::MagicModels,
+    /// The power-up trees and objects heroes wear (worn.rs).
+    pub(crate) worn_models: worn::WornModels,
+    /// Effects riding a hero's node (the breath, the hammer's ring).
+    worn_fx: Vec<worn::WornFx>,
     /// Item damage state: blasts, bags, carried items (items.rs).
     pub(crate) items: items::ItemsState,
     /// randpottype: the colour a colourless potion takes next.
@@ -1604,6 +1611,8 @@ impl Game {
             magic: Vec::new(),
             items: Default::default(),
             magic_models: Default::default(),
+            worn_models: Default::default(),
+            worn_fx: Vec::new(),
             randpottype: 0,
             shield_cooldown: HashMap::new(),
             damg_cooldown: HashMap::new(),
@@ -1763,6 +1772,7 @@ impl Game {
                 combo_timer: 0,
                 saved_pos: Vec3::ZERO,
                 attached_to: None,
+                worn: Default::default(),
             });
         }
         // Ranged-attack projectile: the class's throw model, else its weapon.
@@ -1816,6 +1826,7 @@ impl Game {
             game.psfx.push(res);
         }
         game.load_magic_models(fs, &mut cache);
+        game.load_worn_models(fs, &mut cache, classes);
         game.cam_focus = game.players.first().map(|p| p.pos).unwrap_or(Vec3::ZERO);
         for p in &mut game.players {
             p.refresh_stats();
@@ -2875,6 +2886,7 @@ impl Game {
         }
         self.link_carried(&carriers);
         self.load_item_fx(fs, &mut cache, &mut known, &dirs);
+        self.append_bigape_powerups(fs, &mut cache, &mut known);
         self.transport.match_pads();
         // The boss, its coins and key, and the good wizard (boss levels).
         self.merge_item_models(std::mem::take(&mut known));
@@ -3810,33 +3822,23 @@ impl Game {
         }
         for (pi, mult, knock) in swings {
             let (pos, yaw) = (self.players[pi].pos, self.players[pi].yaw);
+            // pmotion.c:2716: Pojo's swing plays its ATTACK.
+            if self.players[pi].fx.special & crate::powerups::S_POJO != 0 {
+                self.players[pi].worn.pojo_swing = true;
+            }
             self.player_attack(pi, pos, yaw, mult, knock);
         }
-        for pi in breaths {
-            use crate::powerups as pu;
-            if self.players[pi].powerups.use_one(pu::SPECIAL, pu::S_BREATH)
-                || self.players[pi].fx.special & 0x400 != 0
-            {
-                let (pos, yaw) = (self.players[pi].pos, self.players[pi].yaw);
-                let front = pos + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 10.0;
-                self.area_hit(pi, front, 20.0, 40.0 * ELEMENT_BONUS);
-            }
-        }
         for pi in hammers {
-            if self.players[pi]
-                .powerups
-                .use_one(crate::powerups::WEAPON, crate::powerups::W_HAMMER)
-            {
-                self.sfx.push("S_HAMMER|S_EXPLODE1".into());
-                self.shake.start(0, 0, 30, 0.3, 200);
-                let pos = self.players[pi].pos;
-                self.area_hit(pi, pos, 35.0, 100.0);
-            }
+            self.start_hammer(pi);
+        }
+        for pi in breaths {
+            self.start_breath(pi);
         }
         for (pi, row, t0, t1, partner) in damg {
             self.fire_damage_row(pi, &row, t0, t1, partner);
         }
         self.update_fx_follow();
+        self.update_worn(dt);
         self.shield_contact(dt);
         for pi in magic_fx {
             self.start_magic_player_fx(pi);
@@ -3871,6 +3873,8 @@ impl Game {
         use crate::powerups as pu;
         let pi = t.pi;
         self.sfx.push(sounds::throw_sound(&self.players[pi]));
+        // act_bits 0x10000000: the familiars answer the throw.
+        self.players[pi].worn.shot = Some((t.aim, t.target));
         let p = &self.players[pi];
         let ct = p.class_id % 8;
         let (mut damage, w) = (p.derived.missile_damage, p.fx.weapon);
@@ -3888,6 +3892,12 @@ impl Game {
         } else {
             let offset = pdata.map(|d| d.weapon_offset);
             (m::throw_charge(t.since_swing), 1.0, offset)
+        };
+        // PlayerStartMissile: Pojo spits from lbl_8011A1A8 whatever the mode.
+        let offset = if p.fx.special & pu::S_POJO != 0 {
+            Some(m::POJO_AIM)
+        } else {
+            offset
         };
         if w & pu::W_ELEMENT != 0 {
             damage *= ELEMENT_BONUS;
@@ -3924,14 +3934,29 @@ impl Game {
     ) -> usize {
         use crate::missile as m;
         let p = &self.players[pi];
-        let (ct, speed, model, level) = (
-            p.class_id % 8,
-            p.derived.missile_speed,
-            p.proj_model,
-            p.level,
-        );
+        let (ct, speed, level) = (p.class_id % 8, p.derived.missile_speed, p.level);
+        // PlayerStartMissile's tree: the boss gauntlets' bolts, Pojo's
+        // PHOENIX_FBALL, the super shot's SUPERARROW, else the class's throw.
+        let special = p.fx.special;
+        let wm = &self.worn_models;
+        let model = if special & 0x8000 != 0 {
+            wm.boss_elec
+        } else if special & 0x4000 != 0 {
+            wm.boss_acid
+        } else if special & crate::powerups::S_POJO != 0 {
+            wm.fball
+        } else if flags & m::DMG_SUPER != 0 && flags & m::DMG_TURBO == 0 {
+            wm.superarrow
+        } else {
+            None
+        }
+        .or(p.proj_model);
         damage *= scale;
-        let desc = m::MissileInfo::for_shot(ct, flags);
+        let desc = m::MissileInfo::for_player(ct, special, flags);
+        // A bolt's own element counts as an amulet's would.
+        if desc.damage_type & 0xF != 0 && flags & 0xF == 0 {
+            damage *= ELEMENT_BONUS;
+        }
         // PlyrSfxDoDamage scales the started missiles' weight.
         let weight = if weight_mul > 0.0 {
             desc.weight * weight_mul
@@ -4366,36 +4391,6 @@ impl Game {
         if tall {
             let down = self.entities.get(t).is_none_or(Self::is_destroyed);
             self.streak_hit(pi, was_down || down);
-        }
-    }
-
-    /// Damage every enemy, generator and breakable within `radius`.
-    fn area_hit(&mut self, pi: usize, pos: Vec3, radius: f32, dmg: f32) {
-        let hits: Vec<(usize, Vec2)> = self
-            .entities
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                e.alive
-                    && matches!(
-                        e.kind,
-                        Kind::Enemy { .. }
-                            | Kind::Generator { .. }
-                            | Kind::Container { chest: false, .. }
-                            | Kind::Critter(_)
-                    )
-            })
-            .filter_map(|(i, e)| {
-                let (at, r) = match &e.kind {
-                    Kind::Critter(_) => Self::aim_point(e, pos)?,
-                    _ => (e.pos, 0.0),
-                };
-                let d = Vec2::new(at.x - pos.x, at.z - pos.z);
-                (d.length() - r < radius).then(|| (i, d.normalize_or_zero()))
-            })
-            .collect();
-        for (i, push) in hits {
-            self.hit_entity(pi, i, dmg, push, false);
         }
     }
 
@@ -5354,6 +5349,7 @@ impl Game {
                 active: p.state.active(),
                 hidden: hidden[i],
                 halo: halo[i],
+                decoy: p.worn.mikey.out().then_some(p.worn.mikey.pos),
             })
             .collect();
         let ticks = (dt * 60.0).round().max(1.0) as i32;

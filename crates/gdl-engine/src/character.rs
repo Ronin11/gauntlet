@@ -522,6 +522,16 @@ impl Model {
             .position(|n| n.name.eq_ignore_ascii_case(name))
     }
 
+    /// The part a node draws itself (MBTreeSetFlags 1 hides just it).
+    pub fn node_part(&self, node: usize) -> Option<u16> {
+        self.node_part.get(node).copied().flatten()
+    }
+
+    /// The extra parts hung on nodes (the held weapon, weaphold_node).
+    pub fn attachment_parts(&self) -> impl Iterator<Item = u16> + '_ {
+        self.attachments.iter().map(|&(p, _)| p)
+    }
+
     /// Whether node `n` is `root` or below it.
     pub fn in_subtree(&self, n: usize, root: usize) -> bool {
         let mut i = n as i32;

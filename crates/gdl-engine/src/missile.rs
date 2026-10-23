@@ -56,6 +56,20 @@ pub const BALLISTA_MISSILE_INFO: MissileInfo = MissileInfo {
     ..info(5.0, 0.0, 0.0)
 };
 
+/// BossElecMissileInfo / BossAcidMissileInfo (0x8011A118, 0x8011A148): the
+/// boss gauntlets' bolts, lightning and acid, colrad 2, unweighted.
+pub const BOSS_ELEC_MISSILE_INFO: MissileInfo = MissileInfo {
+    damage_type: 2,
+    ..info(2.0, 0.0, 0.0)
+};
+pub const BOSS_ACID_MISSILE_INFO: MissileInfo = MissileInfo {
+    damage_type: 4,
+    ..info(2.0, 0.0, 0.0)
+};
+
+/// lbl_8011A1A8: where Pojo's spit leaves, from its effectpos.
+pub const POJO_AIM: [f32; 3] = [0.0, -0.5, -1.25];
+
 /// DMG_TYPE bits PlayerStartMissile tests.
 pub const DMG_3WAY: u32 = 0x80000;
 pub const DMG_SUPER: u32 = 0x100000;
@@ -86,6 +100,18 @@ impl MissileInfo {
             BALLISTA_MISSILE_INFO
         } else {
             PLAYER_MISSILE_INFO[char_type % 8]
+        }
+    }
+
+    /// PlayerStartMissile's desc with the hero's power-up flags: the left
+    /// boss gauntlet's (p->flags 0x8000) and right's (0x4000) bolts first.
+    pub fn for_player(char_type: usize, special: u32, damage_type: u32) -> MissileInfo {
+        if special & 0x8000 != 0 {
+            BOSS_ELEC_MISSILE_INFO
+        } else if special & 0x4000 != 0 {
+            BOSS_ACID_MISSILE_INFO
+        } else {
+            Self::for_shot(char_type, damage_type)
         }
     }
 
@@ -304,6 +330,14 @@ mod tests {
         let v = launch_velocity(Vec3::Z, 250.0, 35.0, 0.0, DMG_SUPER);
         assert_eq!(v, Vec3::Z * 100.0);
         assert_eq!(MissileInfo::for_shot(0, DMG_SUPER), BALLISTA_MISSILE_INFO);
+        assert_eq!(
+            MissileInfo::for_player(0, 0x8000, DMG_SUPER),
+            BOSS_ELEC_MISSILE_INFO
+        );
+        assert_eq!(
+            MissileInfo::for_player(0, 0x4000, 0),
+            BOSS_ACID_MISSILE_INFO
+        );
         assert_eq!(
             MissileInfo::for_shot(0, DMG_SUPER | DMG_TURBO),
             PLAYER_MISSILE_INFO[0]

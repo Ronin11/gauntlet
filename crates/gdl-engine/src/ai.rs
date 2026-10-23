@@ -190,6 +190,16 @@ pub struct Seen {
     pub hidden: bool,
     /// The anti-death halo (shield_flags 0x80000): Death keeps away.
     pub halo: bool,
+    /// The hero's Mikey while it is out (field_A1C > 2): monsters measure to
+    /// and steer at it instead (calc_enemy_to_player_distance, mikey_worldmat).
+    pub decoy: Option<Vec3>,
+}
+
+impl Seen {
+    /// Where monsters go after this hero: its Mikey while one is out.
+    pub fn target(&self) -> Vec3 {
+        self.decoy.unwrap_or(self.pos)
+    }
 }
 
 /// The suicide grunt running at the party (lbl_80344748).
@@ -783,7 +793,7 @@ impl Brain {
     /// nearest visible player within sight, every eighth frame, each monster
     /// already on someone adding 2 to their distance so monsters spread out.
     fn closest_player(&mut self, me: &Me, f: &Frame, offsets: &mut [f32]) {
-        let dist = |p: &Seen| (me.pos - p.pos).length();
+        let dist = |p: &Seen| (me.pos - p.target()).length();
         if !f.players.iter().any(|p| p.active) {
             self.recognized = false;
         }
@@ -838,7 +848,7 @@ impl Brain {
                         continue;
                     }
                     if self.view < PI {
-                        let ad = (yaw_to(p.pos, me.pos) - me.yaw).abs();
+                        let ad = (yaw_to(p.target(), me.pos) - me.yaw).abs();
                         if ad > self.view {
                             continue;
                         }
@@ -1115,7 +1125,7 @@ impl Ctx<'_> {
     }
 
     fn player(&self, i: usize) -> Vec3 {
-        self.f.players.get(i).map_or(self.me.pos, |p| p.pos)
+        self.f.players.get(i).map_or(self.me.pos, |p| p.target())
     }
 
     /// get_face_ang: the bearing to the closest player (else the heading).
@@ -2469,6 +2479,53 @@ mod tests {
         let (pos7, t7, _) = run(&mut b, start, player, &walls, &paths, 4000);
         assert_eq!(t7, 4000, "the chase got round too ({pos7})");
         assert!(pos7.x < 5.0);
+    }
+
+    #[test]
+    fn a_mikey_draws_the_monster_to_it() {
+        let paths = Paths::default();
+        let mut b = Brain::new(6, 18, 0.0, 60.0);
+        // Hero 0 stands 40 off with its Mikey out 5 away; hero 1 is at 20.
+        let players = [
+            Seen {
+                pos: Vec3::new(0.0, 0.0, 40.0),
+                active: true,
+                decoy: Some(Vec3::new(5.0, 0.0, 0.0)),
+                ..Default::default()
+            },
+            Seen {
+                pos: Vec3::new(0.0, 0.0, 20.0),
+                active: true,
+                ..Default::default()
+            },
+        ];
+        let f = Frame {
+            players: &players,
+            it: None,
+            bomber: None,
+            paths: &paths,
+            frame: 0,
+            ticks: 1,
+            mrate: 1.0,
+        };
+        let me = Me {
+            slot: 0,
+            etype: 4,
+            pos: Vec3::ZERO,
+            yaw: 0.0,
+            rad: 1.5,
+            hht: 3.0,
+            spd: 0.1,
+            visactive: true,
+            busy: None,
+            reloading: false,
+            has_generator: false,
+            generated: 0,
+        };
+        b.closest_player(&me, &f, &mut [0.0, 0.0]);
+        assert_eq!(b.closest, Some(0));
+        assert!((b.actual_dist - 5.0).abs() < 1e-4);
+        assert_eq!(players[0].target(), Vec3::new(5.0, 0.0, 0.0));
     }
 
     #[test]
