@@ -353,6 +353,8 @@ impl Nav {
                 .iter()
                 .filter_map(|e| match e.kind {
                     crate::game::Kind::Hazard { radius, .. } => Some((e.pos, radius)),
+                    // A secret icon would end the level (into its secret level).
+                    crate::game::Kind::Secret { radius, .. } => Some((e.pos, radius + 1.0)),
                     _ => None,
                 })
                 .collect(),
@@ -436,6 +438,10 @@ impl Nav {
                     continue;
                 }
                 let pos = Vec3::new(p2.x, y2, p2.z);
+                // No standing near a secret icon (touching it ends the level).
+                if g.entities.iter().any(|e| matches!(e.kind, crate::game::Kind::Secret { radius, used: false, .. } if xz(e.pos - pos).length() < radius + PLAYER_RADIUS + 0.5 && (e.pos.y - pos.y).abs() < 4.0)) {
+                    continue;
+                }
                 if ids.iter().any(|&i| (self.nodes[i as usize].pos.y - y2).abs() < 1.0) {
                     continue;
                 }

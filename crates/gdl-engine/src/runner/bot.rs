@@ -80,6 +80,8 @@ pub enum Outcome {
     Died(String),
     ExitNoEnd(String),
     Nan(String),
+    /// Fell out of the world over and over.
+    FellOut(String),
     /// Left through a secret icon (not a failure of the level).
     Secret(u32),
 }
@@ -94,6 +96,7 @@ impl Outcome {
             Outcome::Died(_) => "died",
             Outcome::ExitNoEnd(_) => "exit_no_end",
             Outcome::Nan(_) => "nan",
+            Outcome::FellOut(_) => "fell_out",
             Outcome::Secret(_) => "secret",
         }
     }
@@ -106,7 +109,8 @@ impl Outcome {
             | Outcome::Timeout(s)
             | Outcome::Died(s)
             | Outcome::ExitNoEnd(s)
-            | Outcome::Nan(s) => s.clone(),
+            | Outcome::Nan(s)
+            | Outcome::FellOut(s) => s.clone(),
         }
     }
 }
@@ -166,6 +170,7 @@ pub struct Bot {
     pub used: Vec<String>,
     last_pos: Vec<Vec3>,
     falls: u32,
+    fall_times: Vec<f32>,
     pub verbose: bool,
     giveup_t: Option<f32>,
     /// Seconds spent waiting by moving platforms, in all and per object.
@@ -210,6 +215,9 @@ impl Bot {
                         e.id, e.pos
                     ),
                     Kind::Door { radius, .. } => println!("door #{} at {:?} r {radius:.1}", e.id, e.pos),
+                    Kind::Secret { radius, wave, .. } => {
+                        println!("secret #{} at {:?} r {radius:.1} -> {wave:?}", e.id, e.pos)
+                    }
                     _ => {}
                 }
             }
@@ -249,6 +257,7 @@ impl Bot {
             used: Vec::new(),
             last_pos: g.players.iter().map(|p| p.pos).collect(),
             falls: 0,
+            fall_times: Vec::new(),
             verbose,
             giveup_t: None,
             platform_wait: 0.0,
@@ -1682,7 +1691,9 @@ impl Bot {
                 if (a.wp.max(1)..=k).any(|j| self.nav.pad_edge(a.path[j - 1], a.path[j]).is_some()) {
                     continue;
                 }
-                if !n.hurts && w.walks(pos, n.pos) {
+                // Not a short cut past a secret icon.
+                let near_secret = g.entities.iter().any(|e| matches!(e.kind, Kind::Secret { radius, used: false, .. } if seg_dist(xz(pos), xz(n.pos), xz(e.pos)) < radius + PLAYER_RADIUS + 0.5 && (e.pos.y - pos.y).abs() < 4.0));
+                if !n.hurts && !near_secret && w.walks(pos, n.pos) {
                     a.wp = k;
                     a.best_d = f32::MAX;
                     a.last_adv = now;
@@ -1892,16 +1903,34 @@ impl Bot {
                     a.on_pad_t = None;
                 }
             }
-            if jump > 12.0 && !transporting && p.state.active() && self.falls < 5 {
+            if jump > 12.0 && !transporting && p.state.active() {
                 self.falls += 1;
-                self.anomalies.push(Anomaly {
-                    what: format!(
-                        "hero {i} jumped {jump:.1} units in a tick from ({:.1},{:.1},{:.1}) to ({:.1},{:.1},{:.1}) (fell out of the world and was put back?)",
-                        last.x, last.y, last.z, p.pos.x, p.pos.y, p.pos.z
-                    ),
-                    tags: vec!["other"],
-                    capture: false,
-                });
+                let fell = last.y <= g.level.worlds.min_bounds[1] + 0.5;
+                if self.falls <= 5 {
+                    self.anomalies.push(Anomaly {
+                        what: format!(
+                            "hero {i} {} from ({:.1},{:.1},{:.1}) to ({:.1},{:.1},{:.1})",
+                            if fell {
+                                "fell out of the world (below the level's lowest bound) and was put back"
+                            } else {
+                                "was moved by the game"
+                            },
+                            last.x, last.y, last.z, p.pos.x, p.pos.y, p.pos.z
+                        ),
+                        tags: vec!["other"],
+                        capture: self.falls == 1 && fell,
+                    });
+                }
+                if fell {
+                    self.fall_times.push(g.time);
+                    self.fall_times.retain(|t| g.time - t < 60.0);
+                    if self.fall_times.len() >= 5 {
+                        return Err(Outcome::FellOut(format!(
+                            "hero {i} fell out of the world 5 times in a minute; put back at ({:.1},{:.1},{:.1}) and fell again from there",
+                            p.pos.x, p.pos.y, p.pos.z
+                        )));
+                    }
+                }
             }
             if i < self.last_pos.len() {
                 self.last_pos[i] = p.pos;
