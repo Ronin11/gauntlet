@@ -619,6 +619,14 @@ impl Game {
         c.visrad = 0.0;
         let midx = self.add_model_pub(model);
         c.model = Some(midx);
+        // typeFlags 1: a SHADOW<n>L1 on the floor under it (CritterInitGeo).
+        if wad.types[root].flags & 1 != 0 {
+            let name = crate::shadow::critter_shadow_name(wad.types[root].subtype);
+            if let Some(m) = crate::shadow::load(&objects, &textures, name) {
+                let s = self.add_model_pub(m);
+                self.shadow_models.insert(midx, s);
+            }
+        }
         // typeFlags 0x800: the GMETER bar over its head (CritterAddHealthMeter).
         if wad.types[root].flags & 0x800 != 0 {
             if let Ok(m) = Model::from_anim(&objects, &textures, &anim, Some("GMETER")) {
