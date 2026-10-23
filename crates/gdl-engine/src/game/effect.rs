@@ -253,6 +253,9 @@ pub(crate) struct Effects {
     /// The damage type of the hit hit_entity is about to deal (else the
     /// player's weapon element or the potion's).
     pub hit_dtype: Option<u32>,
+    /// A melee hit's upward direction (PlayerMotion_DamageTarget: 0.05 x
+    /// the damage, at most 2), for the monster's push.
+    pub hit_lift: Option<f32>,
 }
 
 impl Default for Effects {
@@ -273,6 +276,7 @@ impl Default for Effects {
             drained: [false; 4],
             missiles: HashMap::new(),
             hit_dtype: None,
+            hit_lift: None,
         }
     }
 }

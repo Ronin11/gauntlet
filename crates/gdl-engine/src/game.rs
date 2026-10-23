@@ -417,6 +417,9 @@ pub struct MonsterSeqs {
     attack: Option<(usize, Option<usize>)>,
     power: Option<(usize, Option<usize>)>,
     hit: Option<usize>,
+    /// HIT2 and GETUP: E_HIT_REACT2 and what follows it.
+    hit2: Option<usize>,
+    getup: Option<usize>,
     death: Option<usize>,
     start: Option<usize>,
     /// THROW1 (or THROW2) and THROWF: archers and bombers.
@@ -434,6 +437,8 @@ impl MonsterSeqs {
             attack: pair("ATTACK1", "ATTACK1R").or(pair("ATTACK2", "ATTACK2R")),
             power: pair("ATTACK3", "ATTACK3R"),
             hit: s("HIT1").or(s("HIT2")),
+            hit2: s("HIT2"),
+            getup: s("GETUP"),
             death: s("DEATH").or(s("HIT2")),
             start: s("START"),
             throw: s("THROW1").or(s("THROW2")).map(|t| (t, s("THROWF"))),
@@ -456,6 +461,9 @@ pub enum EnemyState {
     Recover,
     Hurt {
         timer: f32,
+        /// E_HIT_REACT2 (then GETUP): a heavy hit's knockdown, which a
+        /// lighter hit doesn't interrupt (action.c:202).
+        heavy: bool,
     },
     Dying {
         timer: f32,
@@ -750,6 +758,11 @@ pub enum Kind {
         /// Enemy.dest: where a logic-12 generator sent it (place_logic12),
         /// for the AI to walk to; None otherwise.
         dest: Option<Vec3>,
+        /// Enemy.pushed: the knockback velocity (units a second) a hit gave
+        /// it (fn_8004DC2C), decaying x0.8 a frame (enemy.c:5391), and
+        /// Enemy.pushang, the way it faces while pushed (back at the hit).
+        pushed: Vec3,
+        pushang: f32,
     },
     Generator {
         class: usize,
@@ -2269,6 +2282,8 @@ impl Game {
                 crate::items::resolve_spew(etype, strength as i32, ai),
             ),
             dest: None,
+            pushed: Vec3::ZERO,
+            pushang: 0.0,
         }
     }
 
@@ -3299,7 +3314,7 @@ impl Game {
         let (fwd, right) = self.camera_basis();
         // Swings landing (player, damage multiplier, knockdown), throws (x size),
         // potion blasts, breath and hammer power-ups, damage rows firing.
-        let mut swings: Vec<(usize, f32, bool)> = Vec::new();
+        let mut swings: Vec<(usize, f32, u32)> = Vec::new();
         let mut throws: Vec<Throw> = Vec::new();
         // Potions released: (player, where, colour, start_magic mode), and
         // the heroes starting the MAGICFX.
@@ -3655,17 +3670,17 @@ impl Game {
                 legend_fired = true;
             }
             if bits_now & 0xFE != 0 {
-                let (mult, knock) = if bits_now & 0xF0 != 0 {
+                let mult = if bits_now & 0xF0 != 0 {
                     // Power swings: x3 and knockdown; the move's turbo is paid.
                     p.power = (p.power - p.act.coll_score).max(0.0);
                     p.act.coll_score = 0.0;
-                    (3.0, true)
+                    3.0
                 } else if bits_now & act::HIT2 != 0 {
-                    (2.0, true)
+                    2.0
                 } else {
-                    (1.0, bits_now & act::KICK != 0)
+                    1.0
                 };
-                swings.push((i, mult, knock));
+                swings.push((i, mult, bits_now));
             }
             if bits_now & act::SWING != 0 {
                 p.combo_fade = self.time;
@@ -3879,13 +3894,13 @@ impl Game {
         for (m, pi) in posts {
             self.post(m, Some(pi), &[]);
         }
-        for (pi, mult, knock) in swings {
+        for (pi, mult, bits) in swings {
             let (pos, yaw) = (self.players[pi].pos, self.players[pi].yaw);
             // pmotion.c:2716: Pojo's swing plays its ATTACK.
             if self.players[pi].fx.special & crate::powerups::S_POJO != 0 {
                 self.players[pi].worn.pojo_swing = true;
             }
-            self.player_attack(pi, pos, yaw, mult, knock);
+            self.player_attack(pi, pos, yaw, mult, bits);
         }
         for pi in hammers {
             self.start_hammer(pi);
@@ -4411,7 +4426,7 @@ impl Game {
 
     /// A swing lands (pmotion.c:2621): the one target in the facing cone within
     /// 3.5, for the melee damage times `mult` (x2 slow / step, x3 power).
-    fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, _knock: bool) {
+    fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, bits: u32) {
         let dir = Vec2::new(yaw.sin(), yaw.cos());
         let target = self
             .entities
@@ -4450,8 +4465,27 @@ impl Game {
             Kind::Enemy { etype, .. } => crate::enemies::TYPES[(*etype).min(33)].height * 0.5 > 2.0,
             _ => false,
         };
+        // pmotion.c:2654: the swing's damage type is the weapon's, a power move
+        // knocking down, a HIT2 swing knocking back, and a kick knocking down
+        // a monster at 2 health or less; its direction rises 0.05 x the
+        // damage (at most 2) (PlayerMotion_DamageTarget).
+        use crate::paction::act;
+        let mut dtype = p.fx.weapon;
+        if bits & 0xF0 != 0 {
+            dtype |= DmgType::KNOCKDOWN;
+        } else if bits & act::HIT2 != 0 {
+            dtype |= DmgType::KNOCKBACK;
+        } else if bits & act::KICK != 0
+            && matches!(self.entities[t].kind, Kind::Enemy { hp, .. } if hp <= 2.0)
+        {
+            dtype |= DmgType::KNOCKDOWN;
+        }
         let was_down = Self::is_destroyed(&self.entities[t]);
+        self.effects.hit_dtype = Some(dtype);
+        self.effects.hit_lift = Some((0.05 * dmg).min(2.0));
         self.hit_entity(pi, t, dmg, dir, true);
+        self.effects.hit_dtype = None;
+        self.effects.hit_lift = None;
         if tall {
             let down = self.entities.get(t).is_none_or(Self::is_destroyed);
             self.streak_hit(pi, was_down || down);
@@ -4863,6 +4897,10 @@ impl Game {
         if shrunk && is_enemy {
             dmg *= 2.0;
         }
+        let was = match &self.entities[t].kind {
+            Kind::Enemy { state, .. } => Some(*state),
+            _ => None,
+        };
         let r = Self::apply_hit(&mut self.entities[t], dmg, push);
         // AudioPlayEvt101: Death dies.
         if r.killed && r.tier == crate::enemies::DEATH && !r.generator {
@@ -4899,24 +4937,11 @@ impl Game {
         if is_gen && r.killed {
             self.generator_fx(t, true);
         }
-        if is_enemy && r.hit {
-            let e = &mut self.entities[t];
-            let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
-            if let (Some(seqs), Kind::Enemy { state, etype, .. }) = (seqs, &mut e.kind) {
-                if r.killed {
-                    let small = crate::enemies::is_small(*etype);
-                    *state = EnemyState::Dying {
-                        timer: if small { 0.25 } else { 0.7 },
-                    };
-                    if let Some(d) = seqs.death {
-                        e.animator.restart(d);
-                        e.animator.force_loop = false;
-                    }
-                } else if let Some(h) = seqs.hit {
-                    e.animator.restart(h);
-                    e.animator.force_loop = false;
-                }
-            }
+        if let (Some(was), true) = (was, r.hit) {
+            // PlayerMotion_DamageTarget's hit direction rises with the damage.
+            let lift = self.effects.hit_lift.take().unwrap_or(0.0);
+            let dir = Vec3::new(push.x, lift, push.y);
+            self.enemy_react(t, was, r.killed, dmg, dtype, dir);
         }
         // Generators drop a tier at 2/3 and 1/3 of their health: they then spawn
         // the lower tier, allow twice as many alive, and change model.
@@ -5205,8 +5230,107 @@ impl Game {
             )
     }
 
-    /// Damage one entity.
-    fn apply_hit(e: &mut Entity, dmg: f32, push: Vec2) -> HitResult {
+    /// fn_8004DC2C: monster `t`'s reaction to the hit it just took (it was in
+    /// state `was`). Heavy hits (knockdown, blown away, knockover, whirlwind,
+    /// or magic over 10) knock it down (E_HIT_REACT2) and push it 40 (small
+    /// monsters) or 20 along the hit; a knockback hit staggers it (HIT1) and
+    /// pushes it 8; the push is capped at 40. A reaction already playing isn't
+    /// restarted (action.c's HIT_REACT cases wait for the end).
+    pub(crate) fn enemy_react(
+        &mut self,
+        t: usize,
+        was: EnemyState,
+        killed: bool,
+        dmg: f32,
+        dtype: u32,
+        dir: Vec3,
+    ) {
+        use crate::enemies::{ACID, DEATH, GOLEM, IT};
+        let e = &mut self.entities[t];
+        let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
+        let Kind::Enemy {
+            state,
+            etype,
+            pushed,
+            pushang,
+            ..
+        } = &mut e.kind
+        else {
+            return;
+        };
+        let et = *etype;
+        let hht = crate::enemies::TYPES[et.min(33)].height * 0.5;
+        // damage_enemy returns before the reaction for Death.
+        let react = if et == DEATH {
+            None
+        } else if dtype & 0x10160 != 0 || (dmg > 10.0 && dtype & DmgType::MAGIC != 0) {
+            let scale = if et == ACID {
+                0.0
+            } else if hht <= 2.0 && et != IT {
+                40.0
+            } else if et == GOLEM {
+                2.0
+            } else {
+                20.0
+            };
+            Some((true, scale))
+        } else if dtype & DmgType::KNOCKBACK != 0 {
+            (et != GOLEM && et != ACID).then_some((false, 8.0))
+        } else {
+            (et != GOLEM).then_some((false, 0.0))
+        };
+        if let Some((_, scale)) = react.filter(|r| r.1 > 0.0) {
+            *pushed += dir * scale;
+            *pushang = dir.x.atan2(dir.z) + std::f32::consts::PI;
+            if *pushang > std::f32::consts::PI {
+                *pushang -= std::f32::consts::TAU;
+            }
+            if pushed.length_squared() > 1600.0 {
+                *pushed = pushed.normalize() * 40.0;
+            }
+        }
+        let Some(seqs) = seqs else { return };
+        if killed {
+            let small = crate::enemies::is_small(et);
+            *state = EnemyState::Dying {
+                timer: if small { 0.25 } else { 0.7 },
+            };
+            if let Some(d) = seqs.death {
+                e.animator.restart(d);
+                e.animator.force_loop = false;
+            }
+            return;
+        }
+        let Some((heavy, _)) = react else {
+            // No reaction: whatever it was doing goes on.
+            *state = was;
+            return;
+        };
+        let busy = match was {
+            EnemyState::Hurt { heavy: h, .. } => h || !heavy,
+            _ => false,
+        };
+        *state = EnemyState::Hurt {
+            timer: 0.3,
+            heavy: heavy || matches!(was, EnemyState::Hurt { heavy: true, .. }),
+        };
+        if busy {
+            return;
+        }
+        // DoEnemyAction: a model without HIT2 shows READY.
+        let anim = if heavy {
+            seqs.hit2.or(seqs.ready)
+        } else {
+            seqs.hit
+        };
+        if let Some(h) = anim {
+            e.animator.restart(h);
+            e.animator.force_loop = false;
+        }
+    }
+
+    /// Damage one entity (fn_8004DC2C's reaction and push: `enemy_react`).
+    fn apply_hit(e: &mut Entity, dmg: f32, _push: Vec2) -> HitResult {
         let mut r = HitResult::default();
         match &mut e.kind {
             Kind::Enemy {
@@ -5233,9 +5357,9 @@ impl Game {
                     *state = EnemyState::Dying { timer: 0.5 };
                     r.killed = true;
                 } else {
-                    *state = EnemyState::Hurt { timer: 0.3 };
+                    let heavy = matches!(state, EnemyState::Hurt { heavy: true, .. });
+                    *state = EnemyState::Hurt { timer: 0.3, heavy };
                 }
-                let _ = push;
             }
             Kind::Generator { hp, etype, .. } => {
                 r.hit = true;
@@ -5602,6 +5726,8 @@ impl Game {
                     brain,
                     ai,
                     dest,
+                    pushed,
+                    pushang,
                     ..
                 } => {
                     let Some(model) = e.model else { continue };
@@ -5643,6 +5769,26 @@ impl Game {
                         *cooldown -= dt;
                         e.animator.update(skel, dt);
                         continue;
+                    }
+                    // do_enemy_move adds the knockback (enemy.c:1153); while it
+                    // is pushed the monster faces back at the hit (enemy.c:1380).
+                    // The push then decays x0.8 a 30 Hz frame, an upward one
+                    // also by 100 a second (enemy.c:5391).
+                    let lifted = *pushed != Vec3::ZERO;
+                    if lifted {
+                        e.pos += *pushed * dt;
+                        if pushed.x * pushed.x + pushed.z * pushed.z > 0.1 {
+                            e.yaw = *pushang;
+                        }
+                        *pushed *= 0.8f32.powf(dt * 30.0);
+                        for c in [&mut pushed.x, &mut pushed.y, &mut pushed.z] {
+                            if c.abs() < 0.01 {
+                                *c = 0.0;
+                            }
+                        }
+                        if pushed.y > 0.0 {
+                            pushed.y = (pushed.y - 100.0 * dt).max(0.0);
+                        }
                     }
                     // do_enemy_move: a step that would touch the player (radius
                     // + 0.5 + the player's 1.5; fn_80046680's sweep) requests a
@@ -5723,7 +5869,9 @@ impl Game {
                         if o.frozen {
                             continue;
                         }
-                        e.yaw = o.yaw;
+                        if pushed.x * pushed.x + pushed.z * pushed.z <= 0.1 {
+                            e.yaw = o.yaw;
+                        }
                         releases.extend(o.release);
                         Some(o)
                     };
@@ -5732,6 +5880,14 @@ impl Game {
                             // The death (or HIT2) animation, then gone: at once for
                             // small monsters, after the 0.7 s burn for the rest.
                             *timer -= dt;
+                            if lifted {
+                                e.pos = self.collision.resolve_walls(
+                                    e.pos,
+                                    ty.radius.min(1.5),
+                                    ty.height * 0.75,
+                                    STEP_HEIGHT,
+                                );
+                            }
                             if *timer <= 0.0 {
                                 e.alive = false;
                                 // kill_enemy: Garm's pup leaves its death shot.
@@ -5746,9 +5902,16 @@ impl Game {
                             e.animator.update(skel, dt);
                             continue;
                         }
-                        EnemyState::Hurt { .. } => {
+                        EnemyState::Hurt { heavy, .. } => {
+                            // E_HIT_REACT2 goes on to GETUP where the model has it.
                             if e.animator.finished {
-                                *state = EnemyState::Chase;
+                                match seqs.getup.filter(|&g| *heavy && e.animator.seq != g) {
+                                    Some(g) => {
+                                        e.animator.restart(g);
+                                        e.animator.force_loop = false;
+                                    }
+                                    None => *state = EnemyState::Chase,
+                                }
                             }
                         }
                         EnemyState::Spawning => {
@@ -6013,7 +6176,13 @@ impl Game {
                     }
                     if let Some(g) = self.collision.ground_height(e.pos, e.pos.y + STEP_HEIGHT) {
                         if e.pos.y - g < 3.0 {
-                            e.pos.y = g;
+                            // A knocked-up monster falls back at most 16 a
+                            // second (EnemyFloorCollide's gravity).
+                            e.pos.y = if lifted && e.pos.y > g {
+                                (e.pos.y - 16.0 * dt).max(g)
+                            } else {
+                                g
+                            };
                         } else {
                             let mut vy = 0.0;
                             Self::snap_to_ground(&self.collision, &mut e.pos, &mut vy, dt);
@@ -6498,9 +6667,13 @@ impl Game {
                     // fn_8005C1DC: a shot potion sets off its magic.
                     self.damage_item(t, dmg, 0, Some(owner));
                 } else if owner < self.players.len() {
+                    // The missile's own damage type (SfxSetDamage) goes with it.
+                    let pid = self.entities[pidx].id;
+                    self.effects.hit_dtype = self.effects.missiles.get(&pid).map(|m| m.1);
                     self.hit_from = Some(ppos);
                     self.hit_entity(owner, t, dmg, dir, false);
                     self.hit_from = None;
+                    self.effects.hit_dtype = None;
                 }
                 let id = self.entities[t].id;
                 match &mut self.entities[pidx].kind {
@@ -6598,18 +6771,31 @@ impl Game {
                     && flat(new, other) < reach
                     && flat(new, other) < flat(old, other) - 1e-4
             };
-            let by_enemy = enemy_idx
-                .iter()
-                .find(|&&j| {
-                    let (rj, hj) = size(&self.entities[j]);
-                    j != i && into(self.entities[j].pos, ri + rj, hi + hj)
-                })
-                .map(|&j| self.entities[j].pos);
+            let other = enemy_idx.iter().copied().find(|&j| {
+                let (rj, hj) = size(&self.entities[j]);
+                j != i && into(self.entities[j].pos, ri + rj, hi + hj)
+            });
+            let by_enemy = other.map(|j| self.entities[j].pos);
             let by_player = player_pos
                 .iter()
                 .find(|(pp, alive)| *alive && into(*pp, ri + 0.5 + PLAYER_RADIUS, hi + 2.5))
                 .map(|p| p.0);
-            if by_enemy.is_some() || by_player.is_some() {
+            // enemy.c:1260: a monster knocked back into another goes half the
+            // way and hands it half its push.
+            let knocked = match &self.entities[i].kind {
+                Kind::Enemy {
+                    pushed,
+                    state: EnemyState::Hurt { .. } | EnemyState::Dying { .. },
+                    ..
+                } if pushed.x * pushed.x + pushed.z * pushed.z > 1.0 => Some(*pushed),
+                _ => None,
+            };
+            if let (Some(j), Some(push), None) = (other, knocked, by_player) {
+                self.entities[i].pos = old + (new - old) * 0.5;
+                if let Kind::Enemy { pushed, .. } = &mut self.entities[j].kind {
+                    *pushed += push * 0.5;
+                }
+            } else if by_enemy.is_some() || by_player.is_some() {
                 self.entities[i].pos = old;
             }
             if let Some(b) = by_enemy {
@@ -7252,6 +7438,92 @@ mod tests {
             "{seen:?}"
         );
         assert!(g.players[0].exp > 0, "the swings landed");
+    }
+
+    /// A grunt standing still 2.5 in front of a lone Warrior, and its index.
+    fn grunt_in_front(g: &mut Game) -> usize {
+        g.entities.clear();
+        g.pending_enemies.clear();
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = g.players[0].pos;
+        let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
+        let model = g.classes[class].model(1);
+        let mut kind = g.new_enemy(class, 3, EnemyState::Idle);
+        if let Kind::Enemy { speed, hp, .. } = &mut kind {
+            *speed = 0.0;
+            *hp = 1000.0;
+        }
+        g.spawn(kind, model, p + Vec3::new(0.0, 0.0, 2.5), 0.0);
+        g.entities.len() - 1
+    }
+
+    #[test]
+    fn heavy_hits_knock_monsters_back() {
+        let Some(fs) = data() else { return };
+        // fn_8004DC2C: a knockdown pushes a big monster 20 along the hit and
+        // knocks it down (HIT2); a knockback pushes 8 and staggers (HIT1); a
+        // plain hit only staggers.
+        for (dtype, heavy, push) in [
+            (DmgType::KNOCKDOWN, true, 20.0),
+            (DmgType::KNOCKBACK, false, 8.0),
+            (0, false, 0.0),
+        ] {
+            let least = push / 30.0;
+            let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+            let t = grunt_in_front(&mut g);
+            let start = g.entities[t].pos;
+            g.effects.hit_dtype = Some(dtype);
+            g.hit_entity(0, t, 5.0, Vec2::Y, true);
+            g.effects.hit_dtype = None;
+            let Kind::Enemy { state, pushed, .. } = g.entities[t].kind else {
+                panic!()
+            };
+            assert!(
+                matches!(state, EnemyState::Hurt { heavy: h, .. } if h == heavy),
+                "{dtype:x}: {state:?}"
+            );
+            if heavy {
+                let m = g.entities[t].model.unwrap();
+                let hit2 = g.monster_seqs[&m].hit2;
+                assert!(hit2.is_some() && g.entities[t].animator.seq == hit2.unwrap());
+            }
+            assert!((pushed.z - push).abs() < 1e-3, "{dtype:x}: {pushed}");
+            for _ in 0..30 {
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            }
+            let moved = g.entities[t].pos.z - start.z;
+            assert!(moved >= least, "{dtype:x}: moved {moved}");
+            if least == 0.0 {
+                assert!(moved.abs() < 0.2, "{dtype:x}: moved {moved}");
+            }
+            let Kind::Enemy { pushed, .. } = g.entities[t].kind else {
+                panic!()
+            };
+            assert!(pushed.length() < 1.0, "the push decays: {pushed}");
+        }
+    }
+
+    #[test]
+    fn power_swing_knocks_a_monster_down() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let t = grunt_in_front(&mut g);
+        let (pos, yaw) = (g.players[0].pos, g.players[0].yaw);
+        g.player_attack(0, pos, yaw, 3.0, 0x10);
+        assert!(matches!(
+            g.entities[t].kind,
+            Kind::Enemy {
+                state: EnemyState::Hurt { heavy: true, .. },
+                ..
+            }
+        ));
+        let Kind::Enemy { pushed, .. } = g.entities[t].kind else {
+            panic!()
+        };
+        // Along the hero's facing, rising with the damage; at most 40.
+        assert!(pushed.z > 10.0 && pushed.y > 0.0 && pushed.length() <= 40.0 + 1e-3);
     }
 
     #[test]

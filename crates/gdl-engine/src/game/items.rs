@@ -744,37 +744,16 @@ impl Game {
                 self.entities[t].kind = Kind::Critter(c);
             }
             (Kind::Enemy { .. }, _) => {
-                let was_hurt = matches!(
-                    self.entities[t].kind,
-                    Kind::Enemy {
-                        state: EnemyState::Hurt { .. },
-                        ..
-                    }
-                );
+                let Kind::Enemy { state: was, .. } = self.entities[t].kind else {
+                    return;
+                };
                 let r = Self::apply_hit(&mut self.entities[t], dmg, push);
                 if !r.hit {
                     return;
                 }
                 self.enemy_hit_fx(t, dtype, r.killed);
-                let e = &mut self.entities[t];
-                let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
-                if let (Some(seqs), Kind::Enemy { state, etype, .. }) = (seqs, &mut e.kind) {
-                    if r.killed {
-                        let small = crate::enemies::is_small(*etype);
-                        *state = EnemyState::Dying {
-                            timer: if small { 0.25 } else { 0.7 },
-                        };
-                        if let Some(d) = seqs.death {
-                            e.animator.restart(d);
-                            e.animator.force_loop = false;
-                        }
-                    } else if !was_hurt {
-                        if let Some(h) = seqs.hit {
-                            e.animator.restart(h);
-                            e.animator.force_loop = false;
-                        }
-                    }
-                }
+                let dir = Vec3::new(push.x, 0.0, push.y);
+                self.enemy_react(t, was, r.killed, dmg, dtype, dir);
                 let e = &self.entities[t];
                 if let Some(snd) = self.hit_sound(e, Self::is_destroyed(e)) {
                     self.sfx.push(snd);
