@@ -343,6 +343,31 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
         }
     }
+    // GDL_CONTROLS=style[,aim,attack]: every hero's Controls options (style
+    // 0 Default, 1 Arcade, 2 Robotron; aim / attack 0 off, 1 on).
+    if let Ok(v) = std::env::var("GDL_CONTROLS") {
+        let f: Vec<usize> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        for c in &mut g.controls {
+            c.control_style = f.first().copied().unwrap_or(0).min(2);
+            c.auto_aim = f.get(1).is_none_or(|&a| a != 0);
+            c.auto_attack = f.get(2).is_none_or(|&a| a != 0);
+        }
+    }
+    // GDL_TRIGGER=id: player 0 starts on the trigger with that id (its
+    // camera, shake or ambush follow).
+    if let Some(id) = std::env::var("GDL_TRIGGER")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+    {
+        let at = g.entities.iter().find_map(|e| match e.kind {
+            gdl_engine::game::Kind::Trigger { id: i, .. } if i == id => Some(e.pos),
+            _ => None,
+        });
+        match (at, g.players.first_mut()) {
+            (Some(at), Some(p)) => p.pos = at + Vec3::new(0.0, 0.5, 0.0),
+            _ => println!("GDL_TRIGGER: no trigger {id}"),
+        }
+    }
     // GDL_COMPASS=1: the Compass option on. GDL_XRAY=1: every hero's X-ray on.
     if std::env::var_os("GDL_COMPASS").is_some() {
         g.snd.show_compass = true;
@@ -865,8 +890,20 @@ fn fuzz_input(seed: u64, f: u32, i: usize) -> input::PlayerInput {
         magic: bit(3) && bit(9),
         magic_pressed: edge && bit(3) && bit(9),
         charge_pressed: edge && bit(4) && bit(10),
+        charge: bit(4) && bit(10),
         strafe: bit(5) && bit(11),
+        strafe_pressed: edge && bit(5) && bit(11),
         combo: bit(6),
+        // The C-stick (it aims under the Robotron style).
+        fire: if bit(18) {
+            Vec2::new(
+                ((next() % 200) as f32 / 100.0) - 1.0,
+                ((next() % 200) as f32 / 100.0) - 1.0,
+            )
+            .clamp_length_max(1.0)
+        } else {
+            Vec2::ZERO
+        },
         inv: gdl_engine::powerups::DPad {
             up: edge && bit(7) && bit(12),
             down: edge && bit(8) && bit(13),

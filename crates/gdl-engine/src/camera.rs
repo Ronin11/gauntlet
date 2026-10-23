@@ -769,7 +769,8 @@ impl Game {
             self.camera = self.fresh_camera();
         }
         self.limit_players_to_view();
-        if self.sumner.as_ref().is_some_and(|s| s.cam.is_some()) {
+        // StdCamFreeze: the game camera waits while a trigger camera shows.
+        if self.trigger_camera_view().is_some() {
             return;
         }
         let party = self.camera_party();

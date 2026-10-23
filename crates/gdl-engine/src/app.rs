@@ -879,6 +879,9 @@ impl App {
                             Options::game(owner)
                         });
                     } else {
+                        // PlayerControl[i]: each player's Controls options
+                        // (the menu edits them by player index).
+                        play.game.controls = r.prefs.players;
                         play.game.update(TICK, &inputs);
                         play.intro += TICK;
                         // do_vibe: only for players with the Vibration option on.

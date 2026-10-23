@@ -185,6 +185,9 @@ pub struct Critter {
     pub alpha: f32,
     /// Sight radius for golems (placed `rad` x ene_visrad), 0 = none.
     pub visrad: f32,
+    /// A placed golem or gargoyle still waiting as its statue (its AI and
+    /// targeting wait; triggers::Statue).
+    pub statue: Option<crate::triggers::Statue>,
     /// Gargoyles drop GARG<kind>.
     pub garg_kind: Option<String>,
     /// The hit node from the last collision query (hitnodeidx): part, colnode.
@@ -549,6 +552,7 @@ impl Critter {
             fx_models: Vec::new(),
             alpha: 1.0,
             visrad: 0.0,
+            statue: None,
             garg_kind: None,
             hitnode: None,
             deleted: false,
@@ -617,7 +621,7 @@ impl Critter {
 
     /// Whether the critter can be hit (`CritterDamage` ignores state < 2).
     pub fn hittable(&self) -> bool {
-        self.parts[0].state >= 2 && !self.deleted
+        self.parts[0].state >= 2 && !self.deleted && self.statue.is_none()
     }
 
     /// The live colnodes: (part, colnode, world centre, radius).
@@ -732,6 +736,10 @@ impl Game {
         };
         let (pos, yaw) = (self.entities[ei].pos, self.entities[ei].yaw);
         c.refresh_nodes(&self.models[model], pos, yaw);
+        // fn_80060114: no critter until the statue is woken.
+        if c.statue.is_some() {
+            return;
+        }
         let w = c.wad.clone();
         for p in &mut c.parts {
             p.flash = (p.flash - dt).max(0.0);
@@ -1487,7 +1495,12 @@ impl Game {
             .players
             .iter()
             .any(|p| p.fx.special & crate::powerups::S_STOPTIME != 0);
-        if !frozen {
+        if self.trigger_camera_on() {
+            // gTriggerCameraState: only CritterSelectReadyMove.
+            if c.parts[0].next < 0 {
+                Self::taunt_or_ready(c, 0, now);
+            }
+        } else if !frozen {
             if c.parts[0].next < 0 {
                 self.look_for_critical(c, 0, players, yaw);
             }

@@ -713,11 +713,12 @@ pub fn build(s: &mut Scr, game: &Game, panels: &[PanelInfo]) {
     }
     // A trigger camera letterboxes the view (bosscam.c), and Sumner's words
     // are written over the lower bar.
+    // TriggerCamUpdate's blits: 512 x lbl_80343BA8 (48) on top, 512 x 80 below.
+    if game.trigger_camera_view().is_some() {
+        s.rect(0.0, 0.0, 512.0, 48.0, [0.0, 0.0, 0.0, 1.0]);
+        s.rect(0.0, 304.0, 512.0, 80.0, [0.0, 0.0, 0.0, 1.0]);
+    }
     if let Some(sm) = &game.sumner {
-        if sm.cam.is_some() {
-            s.rect(0.0, 0.0, 512.0, 48.0, [0.0, 0.0, 0.0, 1.0]);
-            s.rect(0.0, 304.0, 512.0, 80.0, [0.0, 0.0, 0.0, 1.0]);
-        }
         if let Some(t) = &sm.text {
             crate::menu::draw_caption(s, t, 312.0);
         }

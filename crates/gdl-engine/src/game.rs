@@ -870,7 +870,7 @@ pub enum Kind {
         idle: f32,
         /// Only hits set it off (shoot_trigger).
         shoot: bool,
-        /// Touched last frame (lever pulled).
+        /// Set off last frame (daction 2: the lever shows pulled).
         pressed: bool,
         /// Struck by an attack this frame.
         hit: bool,
@@ -878,6 +878,12 @@ pub enum Kind {
         gate: Option<usize>,
         /// The trigger's id (instance params byte 6).
         id: u8,
+        /// triggerdata.flags (triggers::tflags).
+        flags: u16,
+        /// The trigger camera it starts (camid; LinkTriggerToCam).
+        cam: Option<(Vec3, Vec3, u8)>,
+        /// A door_switch (subtype 0x17): it posts the traps hint (message 5).
+        door_switch: bool,
     },
     Prop,
     /// items.c obstacles 0x28/0x31/0x34/0x35: a rock that falls (or sinks)
@@ -1021,6 +1027,11 @@ pub struct Game {
     pub scroll_box: Option<ScrollBox>,
     /// The tower's wizard: speeches, story messages and trigger cameras.
     pub sumner: Option<Box<crate::tower::Sumner>>,
+    /// A trigger's camera (TriggerCameraActivate from item update case 5).
+    pub trigger_cam: Option<crate::triggers::TriggerCamera>,
+    /// Each player's control settings (PlayerControl scheme / autoaim /
+    /// autoattack), by player index.
+    pub controls: [crate::options::PlayerPrefs; 4],
     /// Locked tower barriers touched this frame (crystal colour or 101-103).
     pub barrier_touches: Vec<usize>,
     /// World objects were hidden or shown: the scene's world mesh must be rebuilt.
@@ -1254,6 +1265,8 @@ struct PendingEnemy {
     yaw: f32,
     /// The item's visibility radius.
     visrad: f32,
+    /// Death waiting as its statue (enemydata.flags bit 1 clear).
+    statue: Option<crate::triggers::Statue>,
 }
 
 /// Parsed objects/textures/anim files shared by several models.
@@ -1423,10 +1436,40 @@ impl Game {
         }
     }
 
+    /// gTriggerCameraState != 0: a trigger camera (Sumner's or a trigger
+    /// item's) runs.
+    pub fn trigger_camera_on(&self) -> bool {
+        self.trigger_cam.is_some() || self.sumner.as_ref().is_some_and(|s| s.cam.is_some())
+    }
+
+    /// The trigger camera's view while it shows (eye, direction).
+    pub fn trigger_camera_view(&self) -> Option<(Vec3, Vec3)> {
+        if let Some(c) = self.sumner.as_ref().and_then(|s| s.cam) {
+            return Some((c.eye, c.dir));
+        }
+        self.trigger_cam
+            .filter(|c| c.showing())
+            .map(|c| (c.eye, c.dir))
+    }
+
+    /// TriggerCamUpdate for a trigger item's camera: when it ends the
+    /// controls come back (EnablePlayerControls) and the game camera goes on.
+    fn update_trigger_camera(&mut self, dt: f32) {
+        let Some(mut c) = self.trigger_cam else {
+            return;
+        };
+        let ticks = (dt * 60.0).round().max(1.0) as i32;
+        let moving = c
+            .target
+            .and_then(|m| self.movers.get(m))
+            .is_some_and(|m| m.moving);
+        self.trigger_cam = c.tick(ticks, moving).then_some(c);
+    }
+
     /// msgPost about `player` (or the party).
     pub fn post(&mut self, index: usize, player: Option<usize>, args: &[String]) -> bool {
         // msgPost is refused while a trigger camera runs.
-        if self.sumner.as_ref().is_some_and(|s| s.cam.is_some()) {
+        if self.trigger_camera_on() {
             return false;
         }
         let active: Vec<usize> = (0..self.players.len().min(4))
@@ -1608,6 +1651,8 @@ impl Game {
             scroll_rom: None,
             scroll_box: None,
             sumner: None,
+            trigger_cam: None,
+            controls: Default::default(),
             barrier_touches: Vec::new(),
             world_changed: false,
             fixed_camera: None,
@@ -2025,10 +2070,8 @@ impl Game {
     /// full within its radius and fading out by 1.5x the radius from the
     /// nearest hero; quiet (16/127) during Sumner's speeches and trigger cameras.
     pub fn ambient_levels(&self) -> Vec<(u64, &str, f32)> {
-        let hushed = self
-            .sumner
-            .as_ref()
-            .is_some_and(|s| s.cam.is_some() || s.controls_locked());
+        let hushed =
+            self.trigger_camera_on() || self.sumner.as_ref().is_some_and(|s| s.controls_locked());
         self.ambient_items
             .iter()
             .enumerate()
@@ -2092,12 +2135,161 @@ impl Game {
         let ready: Vec<usize> = (0..self.pending_enemies.len())
             .filter(|&i| {
                 let p = &self.pending_enemies[i];
-                (p.pos - at).length() <= 50.0 && self.on_screen(p.pos, 4.0 * p.visrad)
+                p.statue.is_none() && self.placement_in_view(at, p.pos, p.visrad)
             })
             .collect();
         for i in ready.into_iter().rev() {
             let p = self.pending_enemies.remove(i);
             self.spawn(p.kind, p.model, p.pos, p.yaw);
+        }
+    }
+
+    /// fn_80060114's test: a placement within 50 of the camera's attention
+    /// point `at` and on screen (4 x its visibility radius).
+    fn placement_in_view(&self, at: Vec3, pos: Vec3, visrad: f32) -> bool {
+        (pos - at).length() <= 50.0 && self.on_screen(pos, 4.0 * visrad)
+    }
+
+    /// The statues (triggers::Statue): a hero bumping one wakes it
+    /// (fn_8005D730 case 4, when its placement's rad is not negative); a
+    /// woken one in view plays its ACTIVE sequence (daction 1) and then the
+    /// monster takes its place (fn_80060114).
+    fn update_statues(&mut self) {
+        use crate::triggers::Statue;
+        let heroes: Vec<Vec3> = self
+            .players
+            .iter()
+            .filter(|p| p.state.active())
+            .map(|p| p.pos)
+            .collect();
+        // PlayerCollideEnemies' cylinder test against the item.
+        let touched = |s: &Statue| {
+            s.touch
+                && heroes.iter().any(|h| {
+                    Vec2::new(h.x - s.pos.x, h.z - s.pos.z).length() < s.radius + PLAYER_RADIUS
+                        && (h.y - s.pos.y).abs() < s.height.max(PLAYER_HEIGHT)
+                })
+        };
+        let at = if self.fixed_camera.is_some() {
+            None
+        } else {
+            Some(self.camera_view().1)
+        };
+        // Each statue's next state: still waiting, or done (the monster's turn).
+        let step = |g: &Game, s: &mut Statue| -> bool {
+            if !s.woken && touched(s) {
+                s.woken = true;
+            }
+            if s.woken
+                && !s.rising
+                && at.is_some_and(|at| g.placement_in_view(at, s.pos, s.radius.max(1.0)))
+            {
+                s.rising = true;
+            }
+            if !s.rising {
+                return false;
+            }
+            // Done once its ACTIVE sequence has played (or it has none).
+            match s.prop.and_then(|id| g.entities.iter().find(|e| e.id == id)) {
+                Some(e) => {
+                    let active = e.model.and_then(|m| g.models[m].sequence("ACTIVE"));
+                    active.is_none_or(|a| e.animator.seq == a && e.animator.finished)
+                }
+                None => true,
+            }
+        };
+        let mut starts = Vec::new();
+        let mut done = Vec::new();
+        for i in 0..self.entities.len() {
+            let Kind::Critter(c) = &self.entities[i].kind else {
+                continue;
+            };
+            let Some(mut s) = c.statue.filter(|_| self.entities[i].alive) else {
+                continue;
+            };
+            let was = s.rising;
+            let finished = step(self, &mut s);
+            if s.rising && !was {
+                starts.extend(s.prop);
+            }
+            if let Kind::Critter(c) = &mut self.entities[i].kind {
+                if finished {
+                    c.statue = None;
+                    c.alpha = 1.0;
+                    done.extend(s.prop);
+                } else {
+                    c.statue = Some(s);
+                }
+            }
+        }
+        for i in 0..self.pending_enemies.len() {
+            let Some(mut s) = self.pending_enemies[i].statue else {
+                continue;
+            };
+            let was = s.rising;
+            let finished = step(self, &mut s);
+            if s.rising && !was {
+                starts.extend(s.prop);
+            }
+            if finished {
+                done.extend(s.prop);
+            }
+            self.pending_enemies[i].statue = (!finished).then_some(s);
+        }
+        for e in self.entities.iter_mut() {
+            if starts.contains(&e.id) {
+                if let Some(a) = e.model.and_then(|m| self.models[m].sequence("ACTIVE")) {
+                    e.animator.force_loop = false;
+                    e.animator.restart(a);
+                }
+            }
+            if done.contains(&e.id) {
+                e.alive = false;
+            }
+        }
+    }
+
+    /// Trigger flag 0x2000 (item update case 5, fn_80062FF0(10, pos, 4)):
+    /// wake the nearest statue that is on screen (item active 0x4000) or
+    /// always active (0x40), if its edge is within 10 of the trigger.
+    pub(crate) fn ambush(&mut self, at: Vec3) {
+        // (fn_80062FF0 passes over statues already woken.)
+        let found =
+            |s: &crate::triggers::Statue| !s.woken && (s.always || self.on_screen(s.pos, s.radius));
+        // (critter entity or pending Death, distance to its edge)
+        let mut best: Option<(bool, usize, f32)> = None;
+        let mut consider = |critter: bool, i: usize, s: &crate::triggers::Statue| {
+            let d = Vec2::new(s.pos.x - at.x, s.pos.z - at.z).length() - s.radius;
+            if best.is_none_or(|b| d < b.2) {
+                best = Some((critter, i, d));
+            }
+        };
+        for (i, e) in self.entities.iter().enumerate() {
+            if let Kind::Critter(c) = &e.kind {
+                if let Some(s) = c.statue.filter(|s| e.alive && found(s)) {
+                    consider(true, i, &s);
+                }
+            }
+        }
+        for (i, p) in self.pending_enemies.iter().enumerate() {
+            if let Some(s) = p.statue.filter(|s| found(s)) {
+                consider(false, i, &s);
+            }
+        }
+        match best {
+            Some((true, i, d)) if d < crate::triggers::AMBUSH_RANGE => {
+                if let Kind::Critter(c) = &mut self.entities[i].kind {
+                    if let Some(s) = &mut c.statue {
+                        s.woken = true;
+                    }
+                }
+            }
+            Some((false, i, d)) if d < crate::triggers::AMBUSH_RANGE => {
+                if let Some(s) = &mut self.pending_enemies[i].statue {
+                    s.woken = true;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2491,6 +2683,45 @@ impl Game {
                     if ty == crate::enemies::IT && num_players < 2 {
                         continue;
                     }
+                    // SetItem case 4: golems, gargoyles and Death wait as
+                    // statues (the model from the monster's own files).
+                    let statue = match crate::triggers::statue_model(ty, p16(0)) {
+                        Some((name, woken)) => {
+                            let variant = self.enemy_variant(ty);
+                            let letter = self.world_letter();
+                            let sdirs: Vec<String> = match ty {
+                                29 => vec![
+                                    format!(
+                                        "MONSTERS/GOLEM/{}",
+                                        variant
+                                            .filter(|v| v.starts_with("level"))
+                                            .unwrap_or_else(|| format!("level{letter}"))
+                                    ),
+                                    "MONSTERS/GOLEM/levelA".into(),
+                                ],
+                                32 => vec![format!(
+                                    "MONSTERS/GAR_{}",
+                                    variant
+                                        .unwrap_or_else(|| "eagl".into())
+                                        .to_ascii_uppercase()
+                                )],
+                                _ => vec!["MONSTERS/DEATH".into()],
+                            };
+                            let model = self.item_model(fs, &mut cache, &mut known, &sdirs, name);
+                            let rad = f32::from_le_bytes(inst.params[4..8].try_into().unwrap());
+                            Some(crate::triggers::Statue {
+                                pos,
+                                radius: info.radius,
+                                height: info.height,
+                                touch: rad >= 0.0,
+                                always: inst.flags & 1 != 0,
+                                woken,
+                                rising: false,
+                                prop: model.map(|m| self.spawn(Kind::Prop, Some(m), pos, yaw)),
+                            })
+                        }
+                        None => None,
+                    };
                     // fn_80060114: golems, gargoyles and generals are critters.
                     if matches!(ty, 29 | 32 | 33) {
                         let variant = self.enemy_variant(ty);
@@ -2517,6 +2748,14 @@ impl Game {
                             self.spawn_critter(fs, &wad, variant.as_deref(), pos, yaw, num_players)
                         {
                             carriers.push((id, pos));
+                            if let Some(Kind::Critter(c)) = self.entity_mut(id).map(|e| &mut e.kind)
+                            {
+                                // Only its statue shows until it wakes.
+                                c.statue = statue;
+                                if statue.is_some_and(|s| s.prop.is_some()) {
+                                    c.alpha = 0.0;
+                                }
+                            }
                         }
                         continue;
                     }
@@ -2577,6 +2816,7 @@ impl Game {
                             pos,
                             yaw,
                             visrad: info.radius.max(1.0),
+                            statue,
                         });
                     }
                 }
@@ -2888,6 +3128,16 @@ impl Game {
                                 && matches!(inst.params[6], 1..=8 | 101..=103))
                             .then_some(inst.params[6] as usize),
                             id: inst.params[6],
+                            flags: crate::triggers::trigger_bits(info.subtype, p16(2) as u16),
+                            // LinkTriggerToCam: the tower keeps some indices
+                            // for its own cameras.
+                            cam: (self.wave != Some(gdl_formats::wdata::TOWER_WAVE)
+                                || !crate::triggers::tower_camera_index(inst.params[6]))
+                            .then(|| {
+                                crate::triggers::trigger_camera(&self.level.worlds, inst.params[6])
+                            })
+                            .flatten(),
+                            door_switch: info.subtype == 0x17,
                         },
                         model,
                         pos,
@@ -3265,13 +3515,16 @@ impl Game {
         // Sumner's speeches and trigger cameras take the controls away.
         let blank;
         let mut inputs = inputs;
+        let mut locked = false;
         if let Some(mut s) = self.sumner.take() {
             s.update(self);
-            if s.controls_locked() {
-                blank = vec![PlayerInput::default(); inputs.len()];
-                inputs = &blank;
-            }
+            locked = s.controls_locked();
             self.sumner = Some(s);
+        }
+        self.update_trigger_camera(dt);
+        if locked || self.trigger_cam.is_some() {
+            blank = vec![PlayerInput::default(); inputs.len()];
+            inputs = &blank;
         }
         let inputs = self.legend_freeze_inputs(inputs);
         self.update_world_motion(dt);
@@ -3281,6 +3534,7 @@ impl Game {
         self.update_music_area();
         self.legend_face_boss();
         self.update_magic(dt);
+        self.update_statues();
         self.spawn_placed_enemies();
         self.update_entities(dt);
         self.update_items(dt);
@@ -3331,7 +3585,9 @@ impl Game {
         let mut it_cleared = false;
         // Things an attack can be aimed at, with their radius.
         // "Short" targets (small monsters, breakables) get kicks and low swings.
-        let mut targets: Vec<(Vec3, f32, bool)> = self
+        // The last flag: Auto Attack swings at it when walked into (a monster,
+        // a non-boss critter or a generator; pmotion.c:1707).
+        let mut targets: Vec<(Vec3, f32, bool, bool)> = self
             .entities
             .iter()
             .filter(|e| e.alive && !matches!(e.kind, Kind::Critter(_)))
@@ -3343,7 +3599,25 @@ impl Game {
                     Kind::Container { .. } => true,
                     _ => false,
                 };
-                Some((e.pos, Self::target_radius(e)?, short))
+                let bump = matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. });
+                Some((e.pos, Self::target_radius(e)?, short, bump))
+            })
+            .collect();
+        // PlayerCollideItems: the monsters and critters a hero walks into
+        // (position, radius, half height).
+        let mut blockers: Vec<(Vec3, f32, f32)> = self
+            .entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::Enemy { state, etype, .. }
+                    if e.alive
+                        && *etype != crate::enemies::IT
+                        && !matches!(state, EnemyState::Dying { .. }) =>
+                {
+                    let t = &crate::enemies::TYPES[(*etype).min(33)];
+                    Some((e.pos, t.radius, t.height * 0.5))
+                }
+                _ => None,
             })
             .collect();
         // Critters are aimed at by their colnodes (at the players' height).
@@ -3353,18 +3627,18 @@ impl Game {
                     continue;
                 }
                 let feet = self.players.first().map_or(e.pos.y, |p| p.pos.y);
+                let bump = !c.is_boss();
                 for (_, _, p, r) in c.colliders() {
-                    targets.push((Vec3::new(p.x, feet, p.z), r, false));
+                    targets.push((Vec3::new(p.x, feet, p.z), r, false, bump));
                 }
                 let cp = c.coll_pos(0, e.pos, e.yaw);
-                targets.push((
-                    Vec3::new(cp.x, feet, cp.z),
-                    c.wad.types[c.parts[0].ty].rad,
-                    false,
-                ));
+                let t0 = &c.wad.types[c.parts[0].ty];
+                targets.push((Vec3::new(cp.x, feet, cp.z), t0.rad, false, bump));
+                blockers.push((Vec3::new(cp.x, feet, cp.z), t0.rad, t0.hht.max(2.0)));
             }
         }
         // fn_80088EF4's candidates: who could be grabbed for a combo.
+        let controls = self.controls;
         let combo_info: Vec<(Vec3, bool, u8)> = self
             .players
             .iter()
@@ -3483,27 +3757,19 @@ impl Game {
             } else {
                 p.yaw
             };
-            let mut levels = 0;
-            let mut edges = 0;
-            for (held, press, b) in [
-                (inp.attack, inp.attack_pressed, bits::ATK_QUICK),
-                (inp.slow, inp.slow_pressed, bits::ATK_SLOW),
-                (inp.turbo, inp.b_pressed, bits::TURBO | bits::DEFEND),
-                (inp.magic, inp.magic_pressed, bits::MAGIC),
-                (false, inp.charge_pressed, bits::CHARGE),
-                (inp.strafe, false, bits::STRAFE),
-                (inp.combo, false, bits::COMBO),
-            ] {
-                if held || press {
-                    levels |= b;
-                }
-                if press {
-                    edges |= b;
-                }
-            }
+            // The player's Control Style picks the buttons (SpecialData);
+            // Robotron's C-stick aims (fireang / firemag).
+            let prefs = controls[i.min(3)];
+            let (levels, edges) = inp.logical(prefs.control_style);
+            let fire = inp.fire_stick(prefs.control_style);
+            let fire_w = fwd * fire.y + right * fire.x;
+            let firemag = fire_w.length().min(1.0);
+            let fireang = fire_w.x.atan2(fire_w.y);
             let mut ctx = crate::paction::Ctx {
                 joymag,
                 stick_yaw: wrap_angle(joyang - p.yaw),
+                firemag,
+                fire_yaw: wrap_angle(fireang - joyang),
                 power: p.power,
                 potions: p.potions,
                 weapon: p.fx.weapon,
@@ -3584,37 +3850,69 @@ impl Game {
             ctx.reaction = reaction;
 
             // PlayerGetTarget: the nearest thing in the cone around the heading
-            // (the stick, else the facing), measured to its surface.
-            let heading = if joymag > 0.0 { joyang } else { p.yaw };
+            // (the fire stick, the move stick, else the facing), measured to
+            // its surface.
+            let heading = if firemag > 0.0 {
+                fireang
+            } else if joymag > 0.0 {
+                joyang
+            } else {
+                p.yaw
+            };
             let hdir = Vec2::new(heading.sin(), heading.cos());
             let cone = if self.difficulty == 0 { 0.5 } else { 0.707 };
             let found = targets
                 .iter()
-                .filter(|(t, _, _)| (t.y - p.pos.y).abs() < 5.0)
-                .filter_map(|(t, r, short)| {
+                .filter(|(t, _, _, _)| (t.y - p.pos.y).abs() < 5.0)
+                .filter_map(|(t, r, short, bump)| {
                     let d = Vec2::new(t.x - p.pos.x, t.z - p.pos.z);
                     let surf = d.length() - r;
                     (surf < TARGET_RANGE && (d.length() < 0.5 || d.normalize().dot(hdir) >= cone))
-                        .then_some((surf, d, *short, t.y - p.pos.y))
+                        .then_some((surf, d, *short, t.y - p.pos.y, *bump))
                 })
                 .min_by(|a, b| a.0.total_cmp(&b.0));
             let (tdist, attack_yaw, short) = match found {
-                Some((dist, d, short, _)) => (dist, d.x.atan2(d.y), short),
+                Some((dist, d, short, _, _)) => (dist, d.x.atan2(d.y), short),
                 None => (TARGET_RANGE, p.yaw, false),
             };
             // PlayerGetTarget's attackDir climbs to the target.
-            let aim_rise = found.map(|(_, d, _, dy)| dy.atan2(d.length()));
-            // Strafing and blocking keep the stick's direction.
-            let attack_yaw =
-                if p.act.hud & 0xC000 != 0 || levels & (bits::STRAFE | bits::DEFEND) != 0 {
-                    heading
-                } else {
-                    attack_yaw
-                };
+            let aim_rise = found.map(|(_, d, _, dy, _)| dy.atan2(d.length()));
+            // Strafing and blocking keep the stick's direction, and with Auto
+            // Aim on so does the fire stick (pmotion.c:1584).
+            let attack_yaw = if p.act.hud & 0xC000 != 0
+                || levels & (bits::STRAFE | bits::DEFEND) != 0
+                || (prefs.auto_aim && firemag > 0.0)
+            {
+                heading
+            } else {
+                attack_yaw
+            };
             ctx.melee_yaw = wrap_angle(attack_yaw - p.yaw);
-            let r = PLAYER_RADIUS;
-            let bias = if matches!(ms, 0x0F | 0x10) { 1.0 } else { 0.0 };
-            let mut coll = if short && tdist < 2.0 + r { 2 } else { 0 };
+            // Auto Attack (pmotion.c:1707): walking or running into a monster
+            // or generator, with no attack button down, swings at it.
+            let mut ms = ms;
+            if prefs.auto_attack
+                && matches!(ms, 8 | 0x0D)
+                && p.act.edge_hist == 0
+                && !(pa::QUICK..=114).contains(&p.act.cur)
+                && found.is_some_and(|f| f.4)
+                && tdist < 1.0 + PLAYER_RADIUS
+            {
+                ms = 0x0F;
+                ctx.forced = true;
+            }
+            // contactRadius and movingBias are 0 for that swing.
+            let r = if ctx.forced { 0.0 } else { PLAYER_RADIUS };
+            let bias = if matches!(ms, 0x0F | 0x10) && !ctx.forced {
+                1.0
+            } else {
+                0.0
+            };
+            let mut coll = if short && tdist < 2.0 + PLAYER_RADIUS {
+                2
+            } else {
+                0
+            };
             coll |= if tdist < 1.0 + r + bias {
                 1
             } else if tdist < 2.0 + r + bias {
@@ -3779,12 +4077,26 @@ impl Game {
                 movement = 0.5;
                 mdir = p.yaw;
             }
-            // Blocking and strafing don't turn; attacks face their target.
+            // Blocking and strafing don't turn and walk with the stick; the
+            // fire stick turns the body while the move stick walks
+            // (pmotion.c:995); standing attacks face their target with Auto
+            // Aim on (pmotion.c:2483).
             let mut head = if movement > 0.0 { mdir } else { p.yaw };
-            if matches!(ms, 2..=6 | 9..=12 | 0x11..=0x14) {
+            let mut walk = None;
+            if firemag > 0.0 {
+                head = fireang;
+                walk = Some(mdir);
+            } else if matches!(ms, 2..=6 | 9..=12 | 0x11..=0x14) {
                 head = p.yaw;
+                walk = Some(mdir);
             }
-            if (1..=10).contains(&a.action) && a.action != 7 && movement == 0.0 {
+            if (1..=10).contains(&a.action)
+                && a.action != 7
+                && movement == 0.0
+                && levels & (bits::STRAFE | bits::DEFEND) == 0
+                && prefs.auto_aim
+                && firemag == 0.0
+            {
                 head = attack_yaw;
             }
             let turn = 15.707_963 * dt * a.turn_scale;
@@ -3793,8 +4105,35 @@ impl Game {
             let grabbed = a.hud & 0x20 != 0;
             let moving = speed > 0.0 && !grabbed;
             if moving {
-                let dir = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
-                let target = p.pos + dir * speed * dt;
+                let yaw = walk.unwrap_or(p.yaw);
+                let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+                let mut target = p.pos + dir * speed * dt;
+                // PlayerCollideItems: walking into a monster stops the hero
+                // with Auto Attack on (to swing at it), else slides round
+                // it; a charge pushes on at 0.75.
+                if !matches!(a.cur, pa::COMBO_WAR2 | pa::COMBO_DWF2) {
+                    let flat = |a: Vec3, b: Vec3| Vec2::new(a.x - b.x, a.z - b.z).length();
+                    let hits: Vec<&(Vec3, f32, f32)> = blockers
+                        .iter()
+                        .filter(|(b, r, h)| {
+                            flat(target, *b) < r + PLAYER_RADIUS
+                                && flat(target, *b) < flat(p.pos, *b)
+                                && target.y > b.y - 1.0
+                                && target.y < b.y + 2.0 * h
+                        })
+                        .collect();
+                    if let Some(&&(b, r, _)) = hits.first() {
+                        if a.cur == pa::SHOVE {
+                            target = p.pos + (target - p.pos) * 0.75;
+                        } else if prefs.auto_attack || hits.len() > 1 {
+                            target = p.pos;
+                        } else {
+                            let out = Vec2::new(target.x - b.x, target.z - b.z).normalize_or_zero()
+                                * (r + PLAYER_RADIUS);
+                            target = Vec3::new(b.x + out.x, target.y, b.z + out.y);
+                        }
+                    }
+                }
                 // Don't walk off into the void: require ground within reach.
                 let probe = self.collision.ground_height(target, p.pos.y + STEP_HEIGHT);
                 if probe.is_some_and(|g| g > p.pos.y - 20.0) || !p.on_ground {
@@ -4995,6 +5334,12 @@ impl Game {
         let Kind::Critter(mut c) = std::mem::replace(&mut self.entities[t].kind, Kind::Prop) else {
             return;
         };
+        // Item damage case 4: striking a statue wakes it.
+        if let Some(s) = &mut c.statue {
+            s.woken = true;
+            self.entities[t].kind = Kind::Critter(c);
+            return;
+        }
         // PlayerDamagedEnemy ignores the boss until it wakes.
         if !c.hittable() || (c.is_boss() && !self.boss.as_ref().is_some_and(|b| b.active)) {
             self.entities[t].kind = Kind::Critter(c);
@@ -5353,6 +5698,7 @@ impl Game {
             .players
             .iter()
             .any(|p| p.fx.special & pu::S_STOPTIME != 0);
+        let tcam = self.trigger_camera_on();
         let shrunk = self
             .players
             .iter()
@@ -5366,6 +5712,22 @@ impl Game {
             .it_holder
             .filter(|&pi| player_pos.get(pi).is_some_and(|p| p.1));
         let mut barrier_touches = Vec::new();
+        // Item update case 5: what each hero stands on, who is in play
+        // (lbl_803447E0, lbl_8034476C, lbl_80344768), and the triggers set
+        // off this frame (position, flags, mover, camera, held by a hero).
+        let trigger_floors = self.world_anim.floors.clone();
+        let all_heroes: u32 = (0..self.players.len().min(4))
+            .filter(|&i| self.players[i].state.active())
+            .fold(0, |m, i| m | 1 << i);
+        let joined = self.players.len();
+        let in_play = self
+            .players
+            .iter()
+            .filter(|p| !matches!(p.state, PlayerState::Dead { .. } | PlayerState::InTower))
+            .count();
+        type Fired = (Vec3, u16, Option<usize>, Option<(Vec3, Vec3, u8)>, bool);
+        let mut trigger_fired: Vec<Fired> = Vec::new();
+        let mut door_hint = false;
         let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32, u64)> = Vec::new();
         let mut fallers_started: Vec<(i32, Option<(usize, usize)>)> = Vec::new();
         let mut wall_sounds: Vec<WallSound> = Vec::new();
@@ -5586,6 +5948,17 @@ impl Game {
                     }
                 }
                 Kind::Enemy { .. } if frozen => {}
+                // gTriggerCameraState: monsters stand (daction 0) while a
+                // trigger camera runs.
+                Kind::Enemy { state, .. } if tcam && !matches!(state, EnemyState::Dying { .. }) => {
+                    if let Some(model) = e.model {
+                        if let Some(s) = self.monster_seqs.get(&model).and_then(|s| s.ready) {
+                            e.animator.play(s);
+                            e.animator.force_loop = true;
+                        }
+                        e.animator.update(&self.models[model].skeleton, dt);
+                    }
+                }
                 Kind::Enemy {
                     strength,
                     hp,
@@ -6104,8 +6477,14 @@ impl Game {
                     pressed,
                     hit,
                     gate,
+                    flags,
+                    cam,
+                    door_switch,
                     ..
                 } => {
+                    use crate::triggers::tflags;
+                    // A latching door switch posts the traps hint every frame.
+                    door_hint |= *door_switch && *mode == TriggerMode::Latch && mover.is_some();
                     *idle -= dt;
                     // A crystal barrier only works once enough crystals are found.
                     let locked = gate.is_some_and(|c| match c {
@@ -6114,24 +6493,62 @@ impl Game {
                     });
                     // Walking into a lever or onto a pad sets it off; wall levers sit in
                     // the wall, so allow for the player's own radius.
-                    let contact = *hit
-                        || (!*shoot
-                            && player_pos.iter().any(|(pp, alive)| {
-                                *alive
-                                    && Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
-                                        < *radius + PLAYER_RADIUS + 0.6
-                                    && (pp.y - pos.y).abs() < 4.0
-                            }));
+                    let root = mover.and_then(|m| self.movers.get(m)).map(|m| m.root);
+                    let objs = &self.level.worlds.world_objects;
+                    let mut mask = 0u32;
+                    for (pi, (pp, alive)) in player_pos.iter().enumerate() {
+                        if *shoot
+                            || !*alive
+                            || Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
+                                >= *radius + PLAYER_RADIUS + 0.6
+                            || (pp.y - pos.y).abs() >= 4.0
+                        {
+                            continue;
+                        }
+                        // fn_8005D730 case 5: flag 0x100 counts only a hero on
+                        // the target; flag 0x400's first hero hears it needs
+                        // everyone (126 on a platform, else 127).
+                        let floor = trigger_floors.get(pi).copied().flatten();
+                        let on = root.is_none_or(|r| crate::triggers::on_target(objs, r, floor));
+                        if *flags & tflags::ON_TARGET != 0 && !on {
+                            continue;
+                        }
+                        if mask == 0 && joined > 1 && *flags & tflags::ALL_HEROES != 0 {
+                            let m = if *flags & tflags::ON_TARGET != 0 {
+                                126
+                            } else {
+                                127
+                            };
+                            posts.push((m, pi));
+                        }
+                        mask |= 1 << pi;
+                    }
+                    // Flag 0x400: nothing until every hero in play is on it.
+                    if *flags & tflags::ALL_HEROES != 0 && mask != all_heroes {
+                        mask = 0;
+                    }
+                    let contact = *hit || mask != 0;
                     // A locked barrier says what it needs (TowerNeedCrystalsMsg).
                     if locked && contact {
                         barrier_touches.extend(*gate);
                     }
                     let touched = !locked && contact;
                     *hit = false;
-                    let mut on = touched;
+                    let mut active = None;
                     if let Some(m) = mover.and_then(|m| self.movers.get_mut(m)) {
                         m.trigger(*mode, touched, idle);
-                        on |= m.active;
+                        active = Some(m.active);
+                    }
+                    // Flag 0x800: an empty toggle may flip again after a
+                    // second per other hero in play.
+                    if !touched && *mode == TriggerMode::Toggle && *flags & tflags::SHARE_IDLE != 0
+                    {
+                        *idle = in_play.saturating_sub(1) as f32;
+                    }
+                    let on = crate::triggers::daction(*mode, touched, active, *pressed);
+                    // Set off this frame: shake, ambush and the trigger camera.
+                    if on && !*pressed {
+                        trigger_fired.push((pos, *flags, *mover, *cam, touched));
                     }
                     // Levers swing over (ONA) and back (OFFA), then rest in ON/OFF.
                     if let Some(model) = e.model.map(|m| &self.models[m]) {
@@ -6368,6 +6785,25 @@ impl Game {
         }
 
         self.barrier_touches = barrier_touches;
+        // (Not in the attract flyby: MODE_GROUP_ATTRACT.)
+        if door_hint && self.fixed_camera.is_none() {
+            self.post(5, None, &[]);
+        }
+        for (pos, flags, mover, cam, held) in trigger_fired {
+            use crate::triggers::tflags;
+            if flags & tflags::SHAKE != 0 {
+                self.shake.start(0, 0, 0xB4, 0.1, 0x64);
+            }
+            if flags & tflags::AMBUSH != 0 {
+                self.ambush(pos);
+            }
+            // TriggerCameraActivate(target, eye, pyr, subtype, 0x1E, 0).
+            if let (Some((eye, dir, duration)), true) = (cam, held) {
+                let mut c = crate::triggers::TriggerCamera::new(eye, dir, duration as i32, 0x1E, 0);
+                c.target = mover;
+                self.trigger_cam = Some(c);
+            }
+        }
         // fn_8005EE18 case 0x34: a hero's missile sets a shoot-fall rock off.
         for &(pidx, ..) in &proj_hits {
             let ppos = self.entities[pidx].pos;
@@ -6465,6 +6901,11 @@ impl Game {
                     return false;
                 }
                 if let Kind::Critter(c) = &e.kind {
+                    // A statue is struck through its item cylinder (and wakes).
+                    if let Some(s) = c.statue.filter(|_| e.alive) {
+                        let d = Vec2::new(s.pos.x - ppos.x, s.pos.z - ppos.z).length();
+                        return d < s.radius + 0.4 && (ppos.y - s.pos.y).abs() < s.height.max(2.0);
+                    }
                     if !e.alive || !c.hittable() {
                         return false;
                     }
@@ -6936,8 +7377,8 @@ impl Game {
         if let Some((eye, at)) = self.fixed_camera {
             return (eye, at, 0.5);
         }
-        if let Some(c) = self.sumner.as_ref().and_then(|s| s.cam) {
-            return (c.eye, c.eye + c.dir * 30.0, 0.5);
+        if let Some((eye, dir)) = self.trigger_camera_view() {
+            return (eye, eye + dir * 30.0, 0.5);
         }
         let (mut eye, mut at, f) = self
             .boss_camera_view()
@@ -8422,6 +8863,174 @@ mod tests {
                 heard.extend(g.sfx.drain(..).filter(|s| s.contains("TURBO")));
             }
             assert!(!heard.is_empty(), "{class}: no turbo sounds");
+        }
+    }
+
+    /// SetItem case 4: Death of strength 0 or 2 waits as DEATHSTATUE1/2 (1
+    /// and 3 wake at once) until a hero bumps it.
+    #[test]
+    fn death_waits_as_a_statue_until_bumped() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let i = g
+            .pending_enemies
+            .iter()
+            .position(|p| p.statue.is_some_and(|s| !s.woken))
+            .expect("a Death statue");
+        let s = g.pending_enemies[i].statue.unwrap();
+        assert!(s.prop.is_some(), "DEATHSTATUE stands there");
+        let waiting = |g: &Game| {
+            g.pending_enemies
+                .iter()
+                .any(|p| p.statue.is_some_and(|t| t.pos == s.pos && !t.woken))
+        };
+        g.players[0].pos = s.pos + Vec3::new(s.radius + 6.0, 0.0, 0.0);
+        g.players[0].health = 10_000.0;
+        for _ in 0..300 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        assert!(waiting(&g), "still a statue beside a hero");
+        g.players[0].pos = s.pos;
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        assert!(!waiting(&g), "bumped awake");
+        // In view, Death takes the statue's place.
+        let death = |e: &Entity| matches!(e.kind, Kind::Enemy { etype, .. } if etype == crate::enemies::DEATH);
+        let mut made = false;
+        for _ in 0..240 {
+            g.players[0].pos = s.pos;
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            made |= g.entities.iter().any(death);
+        }
+        assert!(made, "Death made");
+        assert!(
+            g.entities.iter().all(|e| Some(e.id) != s.prop),
+            "statue gone"
+        );
+    }
+
+    /// levelA1 with only a still grunt `ahead` of the hero (who faces +z).
+    fn hero_and_grunt(fs: &GameFs, ahead: Vec3) -> Game {
+        let mut g = Game::new(fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        g.pending_enemies.clear();
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = g.players[0].pos;
+        let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
+        let model = g.classes[class].model(1);
+        let mut kind = g.new_enemy(class, 3, EnemyState::Idle);
+        if let Kind::Enemy {
+            cooldown,
+            speed,
+            hp,
+            ..
+        } = &mut kind
+        {
+            *cooldown = 99.0;
+            *speed = 0.0;
+            *hp = 1e6;
+        }
+        g.spawn(kind, model, p + ahead, 0.0);
+        g
+    }
+
+    /// Auto Attack (pmotion.c:1412, :1707): walking into a monster stops the
+    /// hero and swings at it; with it off the hero slides by, no swing.
+    #[test]
+    fn auto_attack_swings_at_what_the_hero_walks_into() {
+        let Some(fs) = data() else { return };
+        use crate::paction::p as pa;
+        for auto in [true, false] {
+            let mut g = hero_and_grunt(&fs, Vec3::new(0.3, 0.0, 4.0));
+            g.controls[0].auto_attack = auto;
+            let walk = PlayerInput {
+                stick: g.stick_toward(Vec2::new(0.0, 1.0)),
+                ..Default::default()
+            };
+            let mut swung = false;
+            let mut passed = false;
+            let grunt = g
+                .entities
+                .iter()
+                .find(|e| matches!(e.kind, Kind::Enemy { .. }))
+                .unwrap()
+                .pos;
+            for _ in 0..90 {
+                g.update(1.0 / 60.0, &[walk]);
+                let cur = g.players[0].act.cur;
+                swung |= matches!(cur, pa::QUICK | pa::KICK | pa::STEP);
+                passed |= g.players[0].pos.z > grunt.z + 0.5;
+            }
+            assert_eq!(swung, auto, "auto attack {auto}: swung");
+            assert_eq!(passed, !auto, "auto attack {auto}: walked past");
+        }
+    }
+
+    /// Robotron (control style 2): the C-stick turns the hero and attacks
+    /// that way while the move stick walks.
+    #[test]
+    fn robotron_style_aims_with_the_c_stick() {
+        let Some(fs) = data() else { return };
+        let mut g = hero_and_grunt(&fs, Vec3::new(0.0, 0.0, 30.0));
+        let fire = PlayerInput {
+            fire: g.stick_toward(Vec2::new(1.0, 0.0)),
+            ..Default::default()
+        };
+        // The Default style ignores the C-stick.
+        for _ in 0..20 {
+            g.update(1.0 / 60.0, &[fire]);
+        }
+        assert!(g.players[0].yaw.abs() < 0.1, "default: still facing +z");
+        g.controls[0].control_style = crate::input::TWIN_STICK;
+        let mut swung = false;
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[fire]);
+            swung |= g.players[0].act.motion == 0x0F;
+        }
+        assert!(
+            (wrap_angle(g.players[0].yaw - std::f32::consts::FRAC_PI_2)).abs() < 0.1,
+            "faces +x"
+        );
+        assert!(swung, "fires");
+        // Walking -z while firing +x: a strafing attack, moving backwards.
+        let z0 = g.players[0].pos.z;
+        let both = PlayerInput {
+            stick: g.stick_toward(Vec2::new(0.0, -1.0)),
+            ..fire
+        };
+        let mut strafed = false;
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[both]);
+            strafed |= (0x11..=0x14).contains(&g.players[0].act.motion);
+        }
+        assert!(strafed, "strafing attack");
+        assert!(g.players[0].pos.z < z0 - 1.0, "walked with the move stick");
+        assert!(
+            (wrap_angle(g.players[0].yaw - std::f32::consts::FRAC_PI_2)).abs() < 0.2,
+            "kept aiming +x"
+        );
+    }
+
+    /// Auto Aim (pmotion.c:2483): a standing swing turns to its target; off,
+    /// the hero swings where it faces.
+    #[test]
+    fn auto_aim_turns_a_standing_swing_to_its_target() {
+        let Some(fs) = data() else { return };
+        for aim in [true, false] {
+            // A grunt ahead and a little to the right.
+            let mut g = hero_and_grunt(&fs, Vec3::new(1.2, 0.0, 2.0));
+            g.controls[0].auto_aim = aim;
+            let atk = PlayerInput {
+                attack: true,
+                attack_pressed: true,
+                ..Default::default()
+            };
+            for _ in 0..10 {
+                g.update(1.0 / 60.0, &[atk]);
+            }
+            let turned = g.players[0].yaw > 0.2;
+            assert_eq!(turned, aim, "auto aim {aim}");
         }
     }
 }

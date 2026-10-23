@@ -612,6 +612,27 @@ pub struct Ctx {
     pub reaction: u8,
     /// The linked combo partner's char_type, while linked.
     pub partner_ct: Option<u8>,
+    /// The Robotron scheme's fire stick (firemag) and its angle from the
+    /// move stick (fireang - joyang).
+    pub firemag: f32,
+    pub fire_yaw: f32,
+    /// forceState: Auto Attack swings at what the hero walked into
+    /// (pmotion.c:1707): the plain quick swing, no power-up's.
+    pub forced: bool,
+}
+
+/// fn_80088938's quarter of an angle `d` (from the facing): back beyond 135
+/// degrees, right / left beyond 45, else forward; `(f, b, l, r)` states.
+fn strafe_dir(d: f32, (f, b, l, r): (u8, u8, u8, u8)) -> u8 {
+    if !(-2.356_194_5..=2.356_194_5).contains(&d) {
+        b
+    } else if d > 0.785_398_2 {
+        r
+    } else if d < -0.785_398_2 {
+        l
+    } else {
+        f
+    }
 }
 
 /// One player's action state.
@@ -677,23 +698,24 @@ impl Action {
             0x15
         } else if edges & bits::DEFEND != 0 {
             2
+        } else if ctx.firemag > 0.0 {
+            // The fire stick attacks: a strafing swing by its angle from the
+            // move stick, else a standing one.
+            if ctx.joymag > 0.0 {
+                strafe_dir(ctx.fire_yaw, (0x11, 0x12, 0x13, 0x14))
+            } else if levels & bits::ATK_SLOW != 0 {
+                0x10
+            } else {
+                0x0F
+            }
         } else if levels & bits::STRAFE != 0 && ctx.joymag > 0.0 {
-            let d = ctx.stick_yaw;
             let atk = levels & (bits::ATK_QUICK | bits::ATK_SLOW) != 0;
-            let (f, b, l, r) = if atk {
+            let dirs = if atk {
                 (0x11, 0x12, 0x13, 0x14)
             } else {
                 (9, 0x0A, 0x0B, 0x0C)
             };
-            if !(-2.356_194_5..=2.356_194_5).contains(&d) {
-                b
-            } else if d > 0.785_398_2 {
-                r
-            } else if d < -0.785_398_2 {
-                l
-            } else {
-                f
-            }
+            strafe_dir(ctx.stick_yaw, dirs)
         } else if edges & bits::CHARGE != 0 && ctx.power >= 5.0 {
             7
         } else if levels & bits::ATK_QUICK != 0 {
@@ -723,7 +745,10 @@ impl Action {
         let moving = ctx.joymag > 0.0;
         let close = ctx.coll & 2 != 0;
         // Power-ups that replace the swing.
-        let forced = if ctx.special & 0x3000 != 0 {
+        // forcedAnim (none for an Auto Attack swing).
+        let forced = if ctx.forced {
+            None
+        } else if ctx.special & 0x3000 != 0 {
             Some(p::BREATHE)
         } else if ctx.special & 0x8000 != 0 {
             Some(p::FIREL)
@@ -751,7 +776,7 @@ impl Action {
             0x0F => match forced {
                 Some(f) => f,
                 None if ctx.coll & 4 != 0 && !close && moving => p::STEP,
-                None if ctx.coll & 1 != 0 => {
+                None if ctx.coll & 1 != 0 || ctx.forced => {
                     if close {
                         p::KICK
                     } else {
