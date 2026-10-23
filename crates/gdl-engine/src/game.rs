@@ -224,6 +224,12 @@ impl DmgType {
     pub const LOW: u32 = 0x4000_0000;
 }
 
+/// DoAudioTallySFX's sounds by count (lbl_801234B8).
+const TALLY_SFX: [i32; 11] = [
+    0x2000b, 0x2000a, 0x20009, 0x20008, 0x20007, 0x20006, 0x20005, 0x20004, 0x20003, 0x20002,
+    0x20001,
+];
+
 /// Death's exit (enemy.c:5313): alpha +4 a tick to 255, 64 ticks.
 const DEATH_EXIT: f32 = 64.0 / 60.0;
 
@@ -1705,11 +1711,12 @@ impl Game {
         match gdl_formats::wdata::Worlds::load(|p| fs.read(p)) {
             Ok(w) => {
                 game.wave = w.wave_of_dir(level_name);
-                // Secret levels last their wavetime (+0.99 s), then send the party back.
+                // fn_800553B4: a timed level (flags & 4: the secret ones)
+                // lasts its wavetime (+0.99 s), then sends the party back.
                 if let Some(l) = game
                     .wave
-                    .filter(|w| w >> 8 == 12)
                     .and_then(|wv| w.level(wv))
+                    .filter(|l| l.flags & 4 != 0)
                 {
                     let t = l.wavetime as f32 + 0.99;
                     game.secret_timer = Some((t, t));
@@ -3289,14 +3296,29 @@ impl Game {
             }
         }
         if let Some((_, left)) = &mut self.secret_timer {
-            let before = left.ceil() as i32;
+            // fn_80054E78: each whole second a tick or tock (AudioFootstep:
+            // 24 odd, 23 even, 25 the last), "time is running out" at 8 and
+            // the 5-4-3-2-1 tally (DoAudioTallySFX) unless the level is
+            // already ending.
+            let before = *left as i32;
             *left -= dt;
-            let now = left.ceil() as i32;
-            if before != now && now == 8 {
-                self.sfx.push("S_TIMEISRUNNING".into());
-            }
-            if *left <= 0.0 && self.level_end.is_none() {
-                self.level_end = Some(LevelEnd::SecretOver);
+            let now = *left;
+            let n = now as i32;
+            if now <= 0.0 {
+                if self.level_end.is_none() {
+                    self.level_end = Some(LevelEnd::SecretOver);
+                }
+            } else if before != n {
+                self.sfx_id(match n {
+                    0 => 25,
+                    n if n & 1 != 0 => 24,
+                    _ => 23,
+                });
+                if n == 8 {
+                    self.sfx.push("S_TIMEISRUNNING".into());
+                } else if n <= 5 && self.level_end.is_none() {
+                    self.sfx_id(TALLY_SFX[n as usize]);
+                }
             }
         }
         self.msgs.tick();
@@ -8566,6 +8588,53 @@ mod tests {
         assert_eq!(g.level_end, Some(LevelEnd::Secret(0xC02)));
         let s = Game::new(&fs, "levelS3", &[("WAR", "RED")]).unwrap();
         assert_eq!(s.secret_timer.map(|t| t.0), Some(45.99));
+    }
+
+    #[test]
+    fn timed_levels_count_down_aloud() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelS3", &[("WAR", "RED")]).unwrap();
+        // A normal level isn't timed (flags & 4).
+        assert!(Game::new(&fs, "levelA1", &[("WAR", "RED")])
+            .unwrap()
+            .secret_timer
+            .is_none());
+        g.secret_timer = Some((45.99, 9.5));
+        g.sfx.clear();
+        let mut heard = Vec::new();
+        for _ in 0..(10 * 60) {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            heard.extend(
+                g.sfx
+                    .drain(..)
+                    .filter(|s| s.starts_with("#") || s.contains("TIMEIS")),
+            );
+            if g.level_end.is_some() {
+                break;
+            }
+        }
+        // 23 (0x17) on even seconds, 24 on odd, 25 at the last; the warning
+        // at 8; the tally's 5..0 (lbl_801234B8[n]).
+        let want = [
+            "#17",
+            "S_TIMEISRUNNING",
+            "#18",
+            "#17",
+            "#18",
+            "#20006",
+            "#17",
+            "#20007",
+            "#18",
+            "#20008",
+            "#17",
+            "#20009",
+            "#18",
+            "#2000a",
+            "#19",
+            "#2000b",
+        ];
+        assert_eq!(heard, want, "{heard:?}");
+        assert_eq!(g.level_end, Some(LevelEnd::SecretOver));
     }
 
     #[test]
