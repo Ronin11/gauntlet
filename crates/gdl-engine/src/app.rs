@@ -684,13 +684,15 @@ impl App {
                         r.sources = sel.sources();
                         let panels = sel.panels();
                         // New players start fresh; returning ones keep their stats,
-                        // and loaded heroes take their class's saved state.
+                        // and loaded heroes take their class's saved state. Each
+                        // comes into play invisible for a while (activate_player).
                         let mut carry: Carry = Default::default();
                         for info in &panels {
-                            carry[info.slot % 4] = Some(
-                                sel.carried(info.slot % 4)
-                                    .unwrap_or_else(crate::game::Carried::new_character),
-                            );
+                            let mut c = sel
+                                .carried(info.slot % 4)
+                                .unwrap_or_else(crate::game::Carried::new_character);
+                            c.activate(info.class);
+                            carry[info.slot % 4] = Some(c);
                         }
                         r.carry = Some(carry);
                         // A loaded hero's achievements join the party's.

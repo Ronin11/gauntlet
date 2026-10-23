@@ -147,6 +147,8 @@ pub fn derived(class: usize, a: Atts) -> Derived {
 
 /// How long power-ups last for a class (PDAT powerup_time).
 pub fn powerup_time(class: usize) -> f32 {
+    // Sumner loads the Wizard's PDATA (character 2).
+    let class = if class == SUMNER { 2 } else { class };
     CLASS_ATTS[class.min(15)].1
 }
 

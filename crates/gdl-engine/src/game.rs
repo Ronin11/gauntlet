@@ -14,9 +14,12 @@ use glam::{Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) mod effect;
+mod exits;
 pub(crate) mod items;
 mod magic;
 mod particles;
+#[cfg(test)]
+mod rule_tests;
 pub mod sounds;
 mod unlock;
 pub mod worn;
@@ -129,6 +132,15 @@ impl Carried {
             exp: 0x54218,
             ..Default::default()
         }
+    }
+
+    /// activate_player: a hero coming out of player select into play (the
+    /// tower, where no level-start camera runs) gets 5 x its class's
+    /// power-up time of invisibility (PlayerAddPowerup(0, p, 9, 4, 5)).
+    pub fn activate(&mut self, class: usize) {
+        use crate::powerups as pu;
+        let t = 5.0 * crate::stats::powerup_time(class);
+        self.powerups.add(pu::SPECIAL, pu::S_INVISIBLE, 0.0, t);
     }
 }
 
@@ -370,6 +382,10 @@ pub struct Player {
     pub hurt_flash: f32,
     /// Where this player's exit leads (None = the tower).
     pub exit_dest: Option<u32>,
+    /// Standing and waiting on an exit (DoExit).
+    pub exit: exits::ExitWait,
+    /// This frame's attempted move before collision (dpos), for doors.
+    trial_move: Vec3,
     /// Dead while others play on: "Wait In Tower" (A) / "Quit Game" (B) is up.
     pub tower_choice: bool,
     /// Chose "Quit Game": leaves the party when the level ends.
@@ -829,10 +845,14 @@ pub enum Kind {
         coll: Option<(usize, usize)>,
     },
     Exit {
+        /// fn_8005F0F4 case 9: the hero's radius plus the item's (xz), and
+        /// the item's height (plus the hero's) either way.
         radius: f32,
+        height: f32,
         /// The wave this exit leads to, or None for the tower.
         dest: Option<u32>,
         open: bool,
+        anim: Box<exits::ExitAnim>,
     },
     /// A damage tile (spikes, flames, force fields, saw blades, tentacles):
     /// it hurts only while its cycle is in sequence 2 or 4.
@@ -1104,6 +1124,8 @@ pub struct Game {
     /// The Multiplayer option: 0 Normal (shots pass heroes), 1 Shots Stun,
     /// 2 Shots Hurt.
     pub friendly_fire: usize,
+    /// The party's progress out of the level (lbl_803447D0 / lbl_803447B4).
+    pub(crate) exit_state: exits::ExitState,
     /// Each player model's action slots (InitActions) and class PDATA.
     action_seqs: Vec<crate::paction::ActionSeqs>,
     pdata: Vec<gdl_formats::pdata::PlayerData>,
@@ -1680,6 +1702,7 @@ impl Game {
             damg_cooldown: HashMap::new(),
             difficulty,
             friendly_fire: 0,
+            exit_state: Default::default(),
             action_seqs: Vec::new(),
             pdata: Vec::new(),
             psfx: Vec::new(),
@@ -1820,6 +1843,8 @@ impl Game {
                 gold: 0,
                 hurt_flash: 0.0,
                 exit_dest: None,
+                exit: Default::default(),
+                trial_move: Vec3::ZERO,
                 tower_choice: false,
                 quit: false,
                 proj_model: None,
@@ -2830,11 +2855,14 @@ impl Game {
                 ItemType::Exit => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     let dest = self.exit_dest(&inst.params);
+                    let anim = Box::new(exits::ExitAnim::new(model.map(|m| &self.models[m])));
                     self.spawn(
                         Kind::Exit {
-                            radius: info.radius.max(2.0) + 0.5,
+                            radius: PLAYER_RADIUS + info.radius,
+                            height: info.height + PLAYER_HEIGHT,
                             dest,
                             open: true,
+                            anim,
                         },
                         model,
                         pos,
@@ -3537,6 +3565,7 @@ impl Game {
             // logical buttons (controls.c): held levels and new edges.
             let wish = fwd * inp.stick.y + right * inp.stick.x;
             let joymag = wish.length().min(1.0);
+            p.exit.joymag = joymag;
             let joyang = if joymag > 0.0 {
                 wish.x.atan2(wish.y)
             } else {
@@ -3851,6 +3880,8 @@ impl Game {
             let speed = a.move_scale * p.derived.speed * movement;
             let grabbed = a.hud & 0x20 != 0;
             let moving = speed > 0.0 && !grabbed;
+            let start = p.pos;
+            p.trial_move = Vec3::ZERO;
             if moving {
                 let dir = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
                 let target = p.pos + dir * speed * dt;
@@ -3868,6 +3899,7 @@ impl Game {
             if !grabbed {
                 p.pos += p.knock_vel * dt;
                 p.knock_vel *= 0.667f32.powf(dt * 30.0);
+                p.trial_move = p.pos - start;
                 let (pos, wall) = self.collision.resolve_walls_hit(
                     p.pos,
                     PLAYER_RADIUS,
@@ -4488,7 +4520,12 @@ impl Game {
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i);
-        let Some(t) = target else { return };
+        let Some(t) = target else {
+            if self.friendly_fire == 2 {
+                self.find_closest_player(pi, dir, mult);
+            }
+            return;
+        };
         if let Kind::Trigger { hit, .. } = &mut self.entities[t].kind {
             *hit = true;
             return;
@@ -4515,6 +4552,48 @@ impl Game {
             let down = self.entities.get(t).is_none_or(Self::is_destroyed);
             self.streak_hit(pi, was_down || down);
         }
+    }
+
+    /// PlayerMotion_FindClosestPlayer (Multiplayer option 2, Shots Hurt): a
+    /// swing that found nothing else hits the nearest other hero in play
+    /// within a 45 degree cone ahead and 2 of the swinger's radius from their
+    /// surface, with the swing's damage and its direction.
+    fn find_closest_player(&mut self, pi: usize, dir: Vec2, mult: f32) {
+        let Some(p) = self.players.get(pi) else {
+            return;
+        };
+        let fwd = Vec3::new(dir.x, 0.0, dir.y);
+        let mut best = 2.0 + PLAYER_RADIUS;
+        let mut closest = None;
+        for (i, op) in self.players.iter().enumerate() {
+            if i == pi || !op.state.active() || op.exit.waiting {
+                continue;
+            }
+            let d = op.pos - p.pos;
+            let len = d.length();
+            if d.normalize_or_zero().dot(fwd) < 0.707 {
+                continue;
+            }
+            let adj = len - PLAYER_RADIUS;
+            if adj < best {
+                best = adj;
+                closest = Some(i);
+            }
+        }
+        let Some(c) = closest else { return };
+        let (dmg, from) = (p.derived.damage * mult, p.pos);
+        // The swing's knock: a power swing knocks down (0x20), HIT2 back.
+        let flags = if mult >= 3.0 {
+            DmgType::KNOCKDOWN
+        } else if mult >= 2.0 {
+            DmgType::KNOCKBACK
+        } else {
+            0
+        };
+        self.snd.mode = Some(2);
+        self.damage_from = Some(from);
+        self.damage_player(c, dmg, flags);
+        self.damage_from = None;
     }
 
     /// PlyrSfxDoDamage for one PDATA damage row due in the frame window
@@ -5098,32 +5177,51 @@ impl Game {
     }
 
     /// AddExp: scaled by the level's xpmul (less for players above its plevel);
-    /// melee exp also charges the turbo meter. Each level gained adds 100 health.
+    /// melee exp also charges the turbo meter (outside the untouchable
+    /// moves). A level-up, however many levels it is, posts msg 0x22, starts
+    /// StartLevelUpFX on the hero and adds 100 health once. A combo partner
+    /// gets the same exp (scaled again for them, mode -1).
     fn add_exp(&mut self, pi: usize, amount: f32, melee: bool) {
+        let gained = self.add_exp_sub(pi, amount, melee);
+        if let Some(g) = self.players.get(pi).and_then(|p| p.grab_partner) {
+            if g != pi && g < self.players.len() {
+                self.add_exp_sub(g, gained as f32, false);
+            }
+        }
+    }
+
+    /// AddExp for one hero (no forwarding); the exp it scaled to.
+    fn add_exp_sub(&mut self, pi: usize, amount: f32, melee: bool) -> u32 {
         let (xp_mul, plevel) = self
             .wave
             .and_then(|w| self.worlds.level(w))
             .map_or((1.0, 0.0), |l| (l.xp_mul.max(0.0), l.player_level));
         let p = &mut self.players[pi];
         let gained = crate::stats::scale_exp(amount, p.level, xp_mul, plevel);
-        if melee {
+        if melee && p.act.action < 11 {
             p.power = (p.power + 0.025 * gained as f32).min(100.0);
         }
         p.exp = p.exp.saturating_add(gained);
         let level = crate::stats::exp_to_level(p.exp);
-        if level > p.level {
-            p.health += 100.0 * (level - p.level) as f32;
+        if level > p.level && gained > 0 {
+            p.health += 100.0;
             p.level = level;
             p.refresh_stats();
             self.post(0x22, Some(pi), &[level.to_string()]);
+            self.start_level_up_fx(pi);
         }
+        gained
     }
 
-    /// damage_player: armour takes its share off each hit (not poison gas or
-    /// magic); blocking halves it. The announcer speaks as health crosses 150 and
-    /// 50, and the hero grunts in pain.
+    /// damage_player: the level's damagemul scales each hit over 1, armour
+    /// takes its share off (not poison gas or magic), and a block or charge
+    /// halves it. The announcer speaks as health crosses 150 and 50, and the
+    /// hero grunts in pain.
     pub fn damage_player(&mut self, pi: usize, dmg: f32, flags: u32) {
         let mode = self.snd.mode.take().unwrap_or(1);
+        let damagemul = self.damage_mul();
+        // A hit with a direction (dir != NULL): where it came from.
+        let directed = self.damage_from.is_some();
         let Some(p) = self.players.get_mut(pi) else {
             return;
         };
@@ -5144,6 +5242,16 @@ impl Game {
             return;
         }
         let mut dmg = dmg;
+        // Unless it is a throw (0x8000): a hero waiting on an exit (state 4)
+        // can't be hurt, and the level's damagemul scales any hit over 1.
+        if flags & 0x8000 == 0 {
+            if p.exit.waiting {
+                return;
+            }
+            if dmg > 1.0 {
+                dmg *= damagemul;
+            }
+        }
         let armor = p.fx.armor;
         use crate::powerups as pu;
         // ModifyDamage: invulnerable takes nothing, gold invulnerability turns a
@@ -5165,13 +5273,15 @@ impl Game {
         if flags & DmgType::LOW != 0 && p.fx.special & crate::powerups::S_LEVITATE != 0 {
             dmg = 0.0;
         }
-        // damage_player: a block (DEFEND2) stops the hit; a charge halves it;
-        // either way a heavy knock becomes a plain knockback.
+        // damage_player: a block (DEFEND2) stops only a hit with no
+        // direction; the back-arc test that should stop the rest can never
+        // pass as shipped (player.c:3368), so those are halved, as a charge
+        // halves everything. Either way a heavy knock becomes a knockback.
         let mut clank = None;
         if dmg > 1.0 && p.act.hud & (crate::paction::hud::BLOCK | crate::paction::hud::CHARGE) != 0
         {
             let dam = dmg;
-            if p.act.hud & crate::paction::hud::BLOCK != 0 {
+            if p.act.hud & crate::paction::hud::BLOCK != 0 && !directed {
                 dmg = 0.0;
             } else {
                 dmg *= 0.5;
@@ -5201,6 +5311,13 @@ impl Game {
             self.start_block_fx(pi, reduced);
         }
         self.damage_sounds(pi, mode, dmg, flags, old);
+    }
+
+    /// gCurLevel->damagemul (1 without a level).
+    fn damage_mul(&self) -> f32 {
+        self.wave
+            .and_then(|w| self.worlds.level(w))
+            .map_or(1.0, |l| l.damage)
     }
 
     pub(crate) fn world_letter(&self) -> char {
@@ -5493,9 +5610,19 @@ impl Game {
         let mut pickup_food: Vec<usize> = Vec::new();
         let mut opened: Vec<(usize, usize)> = Vec::new();
         let mut key_used: Vec<usize> = Vec::new();
-        let mut exits: Vec<(usize, Option<u32>)> = Vec::new();
+        // Each player's exit this tick (fn_8005D730 case 9), what the exits'
+        // case 9 sees of the party, and the level's exit progress (reset each
+        // tick until the party starts sinking).
+        let mut touched: Vec<Option<Option<u32>>> = vec![None; self.players.len()];
+        let party = self.party_on_exits();
+        let mut exit_progress = if self.exit_state.started {
+            self.exit_state.progress
+        } else {
+            0
+        };
         let mut secret: Option<u32> = None;
         let mut chest_used: Vec<usize> = Vec::new();
+        let mut chest_refused: Vec<(usize, i32)> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut chests_opened: Vec<(Vec3, Option<usize>)> = Vec::new();
         let mut proj_hits: Vec<(usize, usize, f32, Vec2, f32)> = Vec::new();
@@ -5569,6 +5696,7 @@ impl Game {
         // Each monster's move for do_enemy_move's report: (from, tried, walls
         // stopped it, touching this player).
         let mut ai_moves: HashMap<u64, (Vec3, bool, bool, Option<Vec3>)> = HashMap::new();
+        let exit_extra = self.exit_reach(0.0);
 
         for ei in 0..self.entities.len() {
             if !self.entities[ei].alive {
@@ -6106,18 +6234,28 @@ impl Game {
                         }
                     }
                 }
-                // Chests open with a key when touched (activetype 0x16 "locked").
+                // fn_8005D730 case 2: only a locked chest (active & 0x10) takes
+                // a key when touched; without one it says so (msg 2, or msg
+                // 23 for a silver chest when 2 is refused).
                 Kind::Container {
                     hp,
                     drop,
                     chest: true,
+                    sub,
                     ..
-                } if *hp > 0.0 => {
+                } if *hp > 0.0
+                    && self
+                        .items
+                        .info
+                        .get(&e.id)
+                        .and_then(|&i| self.level.worlds.item_infos.get(i))
+                        .is_some_and(|i| i.active_type & 0x10 != 0) =>
+                {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                         let close =
                             *alive && Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length() < 3.0;
                         if close && self.players[pi].keys == 0 {
-                            posts.push((2, pi));
+                            chest_refused.push((pi, *sub));
                         }
                         if close
                             && self.players[pi].keys > 0
@@ -6134,17 +6272,19 @@ impl Game {
                         }
                     }
                 }
+                // fn_8005D730 case 7: a door opens (or says it needs a key,
+                // msg 1) only for a hero not moving away from it.
                 Kind::Door { radius, coll } => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
-                        if *alive && (*pp - e.pos).length() < *radius && self.players[pi].keys == 0
-                        {
+                        let mv = self.players[pi].trial_move;
+                        let toward = Vec2::new(mv.x, mv.z)
+                            .dot(Vec2::new(e.pos.x - pp.x, e.pos.z - pp.z))
+                            >= 0.0;
+                        let touching = *alive && toward && (*pp - e.pos).length() < *radius;
+                        if touching && self.players[pi].keys == 0 {
                             posts.push((1, pi));
                         }
-                        if *alive
-                            && (*pp - e.pos).length() < *radius
-                            && self.players[pi].keys > 0
-                            && !key_used.contains(&pi)
-                        {
+                        if touching && self.players[pi].keys > 0 && !key_used.contains(&pi) {
                             key_used.push(pi);
                             if let Some(c) = coll {
                                 opened.push(*c);
@@ -6222,11 +6362,30 @@ impl Game {
                         }
                     }
                 }
-                Kind::Exit { radius, dest, open } => {
+                Kind::Exit {
+                    radius,
+                    height,
+                    dest,
+                    open,
+                    anim,
+                } => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
-                        if *open && *alive && (*pp - e.pos).length() < *radius {
-                            exits.push((pi, *dest));
+                        let xz = Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length();
+                        if *open
+                            && *alive
+                            && xz <= *radius + exit_extra
+                            && (pp.y - e.pos.y).abs() <= *height
+                        {
+                            touched[pi] = Some(*dest);
+                            if pi < 4 {
+                                anim.onexit |= 1 << pi;
+                            }
                         }
+                    }
+                    anim.update(dt, party, &mut exit_progress);
+                    if e.model.is_some() {
+                        e.animator.seq = anim.anim.seq;
+                        e.animator.frame = anim.anim.frame;
                     }
                 }
                 Kind::EnemyShot {
@@ -6891,6 +7050,11 @@ impl Game {
         for (m, pi) in posts {
             self.post(m, Some(pi), &[]);
         }
+        for (pi, sub) in chest_refused {
+            if !self.post(2, Some(pi), &[]) && sub == 48 {
+                self.post(23, Some(pi), &[]);
+            }
+        }
         for (pi, dmg) in poisoned {
             // damage_player(-amt, 0, 2048): no cries of its own.
             self.snd.mode = Some(0);
@@ -6982,14 +7146,8 @@ impl Game {
             self.level_end = Some(LevelEnd::Secret(w));
             self.sfx.push("S_SECRETCHAR|S_PICKUPSPECIAL".into());
         }
-        for (pi, dest) in exits {
-            let p = &mut self.players[pi];
-            if p.state.active() {
-                p.state = PlayerState::Exiting { timer: 50.0 / 60.0 };
-                p.exit_dest = dest;
-                self.exit_sounds();
-            }
-        }
+        self.exit_state.progress = exit_progress;
+        self.update_exits(&touched);
     }
 
     /// Camera eye and target in game coordinates.
@@ -7136,6 +7294,10 @@ impl Game {
         let Some(p) = self.players.get(pi) else {
             return PlayerInput::default();
         };
+        // On an exit: stand still so DoExit lets the bot wait there.
+        if p.exit.touch.is_some() {
+            return PlayerInput::default();
+        }
         let target =
             self.entities
                 .iter()
