@@ -25,6 +25,17 @@ pub(crate) struct ChestOpen {
     pub gone_in: Option<i32>,
 }
 
+/// A broken barrel (fn_8005C1DC's `active |= 1` on the destroying hit): its
+/// cycle (activetype 0x206 / 6 with 1: advance, stop at the end) runs IDLE ->
+/// ACTIVE, the barrel bursting apart, held its own length -> DONE (action 2).
+/// Kept on an inert shell of the barrel's model, as the item itself is gone
+/// for collision, targeting and hits.
+#[derive(Clone, Debug)]
+pub(crate) struct BrokenBarrel {
+    pub cycle: ItemCycle,
+    pub sub: i32,
+}
+
 /// sEnemyDefaultAlgorithm (enemy.c:255): the AI routine by monster type.
 pub(crate) const DEFAULT_AI: [i32; 34] = [
     2, 7, 7, 2, 7, 7, 7, 7, 7, 7, 7, 7, 2, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 0, 19, 3,
@@ -215,6 +226,8 @@ pub struct ItemsState {
     models: HashMap<&'static str, Option<usize>>,
     /// Opened chests, by entity id.
     pub(crate) chests: HashMap<u64, ChestOpen>,
+    /// Broken barrels' shells, by entity id.
+    pub(crate) broken: HashMap<u64, BrokenBarrel>,
 }
 
 /// gGameOptions.items (a debug option; GDL_ITEMS): a player count every item
@@ -748,6 +761,9 @@ impl Game {
             self.sfx_id(SFX_BARREL_HIT);
             return;
         }
+        if matches!(sub, SUB_BARREL | SUB_EXPLODE | SUB_POISON) {
+            self.break_barrel(t);
+        }
         match sub {
             SUB_EXPLODE => {
                 self.start_explosion(pos, FX_EXPBARREL, 30.0 * self.tuning.trap_damage);
@@ -769,6 +785,72 @@ impl Game {
                 }
             }
         }
+    }
+
+    /// fn_8005C1DC case 2 / case 10 with the barrel destroyed: `active |= 1`
+    /// starts its cycle where it stands (activetime 0, so it goes straight
+    /// into ACTIVE). Its contents are already out (fn_8005E90C at its matrix).
+    fn break_barrel(&mut self, t: usize) {
+        let e = &self.entities[t];
+        let Kind::Container { sub, .. } = e.kind else {
+            return;
+        };
+        let Some(m) = e.model else {
+            return;
+        };
+        if self.models[m].skeleton.sequences.len() < 2 {
+            return;
+        }
+        let (pos, yaw, scale, pitch) = (e.pos, e.yaw, e.scale, e.pitch);
+        let (active, on, off) = self
+            .items
+            .info
+            .get(&e.id)
+            .and_then(|&i| self.level.worlds.item_infos.get(i))
+            .map_or((6, 0, 0), |i| (i.active_type, i.active_on, i.active_off));
+        let mut cycle = ItemCycle::new(&self.models[m], active | 1, on, off, 1.0, &mut self.rng);
+        cycle.activetime = 0;
+        let id = self.spawn(Kind::Prop, Some(m), pos, yaw);
+        if let Some(s) = self.entities.last_mut().filter(|s| s.id == id) {
+            s.scale = scale;
+            s.pitch = pitch;
+            s.animator.force_loop = false;
+        }
+        self.items.broken.insert(id, BrokenBarrel { cycle, sub });
+    }
+
+    /// fn_800606FC for broken barrels: the cycle steps on (a & 4 with action
+    /// > 0 keeps it going off screen). An explosive or poison barrel (case
+    /// 0xA) shows alpha 0x100 - 2.83 x (activetime - 0x10) once under 0x68
+    /// in ACTIVE and is gone at action 2; a plain one (case 2 / 0xA, 0x2B)
+    /// stays in DONE.
+    fn update_broken_barrels(&mut self, dt: f32) {
+        if self.items.broken.is_empty() {
+            return;
+        }
+        for e in self.entities.iter_mut() {
+            let Some(b) = self.items.broken.get_mut(&e.id) else {
+                continue;
+            };
+            if !e.alive {
+                continue;
+            }
+            b.cycle.update(dt, true, &mut self.rng);
+            e.animator.seq = b.cycle.anim.seq;
+            e.animator.frame = b.cycle.anim.frame;
+            if matches!(b.sub, SUB_EXPLODE | SUB_POISON) {
+                if b.cycle.action == 1 && b.cycle.activetime < 0x68 {
+                    let a = (256.0 - 2.83 * (b.cycle.activetime - 0x10) as f32).min(255.0);
+                    e.fade = a.max(0.0) / 255.0;
+                } else if b.cycle.action >= 2 {
+                    e.alive = false;
+                }
+            }
+        }
+        let entities = &self.entities;
+        self.items
+            .broken
+            .retain(|id, _| entities.iter().any(|e| e.id == *id && e.alive));
     }
 
     /// Whether a hero's missile at `p` (radius `mr`) touches a potion lying at
@@ -959,6 +1041,7 @@ impl Game {
         self.update_bags(dt);
         self.update_carried();
         self.update_trap_chests();
+        self.update_broken_barrels(dt);
         self.enemy_world_damage();
     }
 
@@ -1541,6 +1624,99 @@ mod tests {
         assert!(!alive(&g, b), "the blast sets the next barrel off");
         assert!(!alive(&g, mon), "the grunt beside it dies");
         assert!(g.players[0].health < before, "the hero 6 away is hurt");
+    }
+
+    fn is_barrel(k: &Kind) -> bool {
+        matches!(
+            k,
+            Kind::Container {
+                sub: SUB_BARREL,
+                chest: false,
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn broken_barrels_play_their_break_before_settling() {
+        // fn_8005C1DC: the destroying hit sets active |= 1 and fn_800606FC
+        // runs the barrel's cycle IDLE -> ACTIVE (it bursts) -> DONE; a
+        // plain barrel's pieces stay, an explosive one's are gone at DONE.
+        let Some(fs) = data() else { return };
+        let mut g = quiet(&fs, &[is_barrel, is_exp]);
+        let at = g.players[0].pos;
+        let a = copy_item(&mut g, is_barrel, at + Vec3::new(3.0, 0.0, 0.0)).expect("a barrel");
+        let model = g
+            .entities
+            .iter()
+            .find(|e| e.id == a)
+            .unwrap()
+            .model
+            .unwrap();
+        let active = g.models[model].sequence("ACTIVE").unwrap();
+        let done = g.models[model].sequence("DONE").unwrap();
+        let t = g.entities.iter().position(|e| e.id == a).unwrap();
+        g.hit_entity(0, t, 50.0, Vec2::X, false);
+        assert!(
+            !alive(&g, a),
+            "the barrel itself is gone for hits and collision"
+        );
+        let shell = |g: &Game| {
+            g.entities
+                .iter()
+                .find(|e| e.alive && g.items.broken.contains_key(&e.id))
+                .map(|e| (e.id, e.animator.seq, e.animator.frame))
+        };
+        let (sid, ..) = shell(&g).expect("its pieces are left to break apart");
+        let mut frames = Vec::new();
+        for _ in 0..240 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            let (id, seq, frame) = shell(&g).expect("a plain barrel's pieces stay");
+            assert_eq!(id, sid);
+            frames.push((seq, frame));
+        }
+        let breaking: Vec<f32> = frames
+            .iter()
+            .filter(|f| f.0 == active)
+            .map(|f| f.1)
+            .collect();
+        assert!(
+            breaking.len() > 20,
+            "ACTIVE plays for a while: {}",
+            breaking.len()
+        );
+        assert!(
+            breaking.windows(2).all(|w| w[1] >= w[0]) && breaking.last() > breaking.first(),
+            "the break advances"
+        );
+        let first_done = frames
+            .iter()
+            .position(|f| f.0 == done)
+            .expect("it settles in DONE");
+        assert!(frames[..first_done].iter().all(|f| f.0 != done));
+        assert!(
+            frames[first_done..].iter().all(|f| f.0 == done),
+            "and stays there"
+        );
+
+        // An explosive barrel's pieces fly, then are gone (case 0xA action 2);
+        // its scorch debris stays.
+        let b = copy_item(&mut g, is_exp, at + Vec3::new(-20.0, 0.0, 0.0)).unwrap();
+        let t = g.entities.iter().position(|e| e.id == b).unwrap();
+        g.hit_entity(0, t, 50.0, Vec2::X, false);
+        let pieces = g
+            .entities
+            .iter()
+            .rev()
+            .find(|e| e.alive && g.items.broken.contains_key(&e.id))
+            .map(|e| e.id)
+            .unwrap();
+        assert_ne!(pieces, sid);
+        step(&mut g, 0.25);
+        assert!(alive(&g, pieces), "still bursting");
+        step(&mut g, 4.0);
+        assert!(!alive(&g, pieces), "gone once done");
+        assert!(alive(&g, sid), "the plain barrel's pieces remain");
     }
 
     #[test]
