@@ -358,7 +358,7 @@ impl Default for MiniInv {
 }
 
 /// D-pad edges for the mini-inventory.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DPad {
     pub up: bool,
     pub down: bool,

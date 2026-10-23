@@ -87,7 +87,7 @@ fn by_a_chest(fs: &GameFs, locked: bool) -> (Game, u64) {
     let (id, pos) = (e.id, e.pos);
     if !locked {
         let i = g.items.info[&id];
-        g.level.worlds.item_infos[i].active_type &= !0x10;
+        std::sync::Arc::make_mut(&mut g.level).worlds.item_infos[i].active_type &= !0x10;
     }
     g.players[0].pos = pos + Vec3::X * 2.0;
     g.players[0].keys = 1;

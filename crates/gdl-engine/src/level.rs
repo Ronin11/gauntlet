@@ -8,6 +8,7 @@ use gdl_formats::{Objects, Worlds};
 use glam::{Mat4, Vec3};
 use std::collections::HashSet;
 
+#[derive(Clone)]
 pub struct Level {
     pub name: String,
     pub objects: Objects,

@@ -50,7 +50,7 @@ impl Game {
                 .ok()
                 .and_then(|d| Objects::parse(&d).ok());
             if let (Some(o), Ok(t)) = (objects, fs.read(&format!("{dir}/textures.ngc"))) {
-                self.psys_banks.push((o, t));
+                self.psys_banks.push(std::sync::Arc::new((o, t)));
             }
         }
         self.particles.default_tex = [
@@ -115,7 +115,7 @@ impl Game {
             .or_else(|| {
                 self.psys_banks
                     .iter()
-                    .find_map(|(o, t)| crate::mesh::decode_bitmap(o, t, name))
+                    .find_map(|b| crate::mesh::decode_bitmap(&b.0, &b.1, name))
             })?;
         Some(self.particles.texture(name, img))
     }

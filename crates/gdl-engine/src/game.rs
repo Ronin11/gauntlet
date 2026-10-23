@@ -375,6 +375,7 @@ pub enum LevelEnd {
     SecretOver,
 }
 
+#[derive(Clone)]
 pub struct Player {
     pub model: usize,
     pub pos: Vec3,
@@ -464,6 +465,7 @@ pub struct Player {
 }
 
 /// Animation sequence indices for a player model.
+#[derive(Clone)]
 pub struct PlayerSeqs {
     ready: usize,
     falling: Option<usize>,
@@ -771,6 +773,7 @@ pub(crate) struct PlyrSfx {
 
 /// An effect parented to a hero's model (DoPlyrSfx's SfxSetParent): it keeps
 /// its place in the hero's frame.
+#[derive(Clone)]
 struct FxFollow {
     id: u64,
     player: usize,
@@ -1022,6 +1025,7 @@ pub enum Shape {
     },
 }
 
+#[derive(Clone)]
 pub struct Entity {
     pub id: u64,
     pub solid: Option<Shape>,
@@ -1040,6 +1044,7 @@ pub struct Entity {
 }
 
 /// A monster type (`GRU`, `RAT`, ...) with a model per strength level.
+#[derive(Clone)]
 pub struct MonsterClass {
     pub name: String,
     /// Tier models 0-3, then the A (archer), B (bomber) and S (suicide) trees.
@@ -1075,12 +1080,13 @@ impl MonsterClass {
     }
 }
 
+#[derive(Clone)]
 pub struct Game {
-    pub level: Level,
+    pub level: std::sync::Arc<Level>,
     pub collision: Collision,
     /// WorldObjGetAllFlags per world object (PlayerMotion_FloorFX).
     obj_flags: Vec<u32>,
-    pub models: Vec<Model>,
+    pub models: Vec<std::sync::Arc<Model>>,
     pub player_seqs: Vec<PlayerSeqs>,
     monster_seqs: HashMap<usize, MonsterSeqs>,
     /// A hero's or critter's shadow object (load_player_geo's SHADOWL1,
@@ -1250,7 +1256,7 @@ pub struct Game {
     /// The particle systems and missile streaks (psys.rs, particles.rs).
     pub particles: crate::psys::Particles,
     /// WEAPONS', POWERUPS' and STATIC's textures, for MBOX_FindTexture.
-    psys_banks: Vec<(Objects, Vec<u8>)>,
+    psys_banks: Vec<std::sync::Arc<(Objects, Vec<u8>)>>,
     /// Each entity made from a placed item: its instance index in the
     /// level file (savestate.rs matches saved state by it).
     pub(crate) placed: HashMap<u64, u32>,
@@ -1367,6 +1373,7 @@ impl ItemCycle {
 
 /// A placed monster waiting to come into view (an ENE item before
 /// fn_80060114 turns it into an enemy).
+#[derive(Clone)]
 struct PendingEnemy {
     kind: Kind,
     model: Option<usize>,
@@ -1771,7 +1778,7 @@ impl Game {
 
         let mut game = Game {
             obj_flags: level.worlds.all_flags(),
-            level,
+            level: std::sync::Arc::new(level),
             collision,
             models: Vec::new(),
             player_seqs: Vec::new(),
@@ -1931,7 +1938,7 @@ impl Game {
                     .and_then(|d| gdl_formats::pdata::PlayerData::parse(&d).ok())
                     .unwrap_or_default(),
             );
-            game.models.push(m);
+            game.models.push(std::sync::Arc::new(m));
         }
         // load_player_geo: each hero's SHADOWL1, from its own model bank.
         for (i, (class, color)) in classes.iter().enumerate() {
@@ -2119,7 +2126,7 @@ impl Game {
     }
 
     fn add_model(&mut self, m: Model) -> usize {
-        self.models.push(m);
+        self.models.push(std::sync::Arc::new(m));
         self.models.len() - 1
     }
 
@@ -3238,7 +3245,7 @@ impl Game {
                 ItemType::Exit => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     let dest = self.exit_dest(&inst.params);
-                    let anim = Box::new(exits::ExitAnim::new(model.map(|m| &self.models[m])));
+                    let anim = Box::new(exits::ExitAnim::new(model.map(|m| &*self.models[m])));
                     self.spawn(
                         Kind::Exit {
                             radius: PLAYER_RADIUS + info.radius,
@@ -8621,6 +8628,65 @@ impl Game {
     }
 }
 
+impl Game {
+    /// A 64-bit digest of the hot simulation state (FNV-1a over the frame, the
+    /// RNG, every hero's place and stats, every entity's place and life, and
+    /// the movers), the same on every build and platform for the same state.
+    /// Two games that agree here have, with overwhelming likelihood, run the
+    /// same ticks on the same inputs: the check for determinism tests, for a
+    /// clone that must keep running as its original did, and later for
+    /// desync detection between peers.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut put = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        let f = |v: f32| v.to_bits().to_le_bytes();
+        let v3 = |v: Vec3| [f(v.x), f(v.y), f(v.z)].concat();
+        put(&self.frame.to_le_bytes());
+        put(&self.rng.0.to_le_bytes());
+        put(&f(self.time));
+        put(&(self.players.len() as u32).to_le_bytes());
+        for p in &self.players {
+            put(&v3(p.pos));
+            put(&f(p.yaw));
+            put(&f(p.health));
+            put(&p.level.to_le_bytes());
+            put(&p.exp.to_le_bytes());
+            put(&p.keys.to_le_bytes());
+            put(&p.potions.to_le_bytes());
+            put(&p.gold.to_le_bytes());
+            let (tag, t) = match p.state {
+                PlayerState::Normal => (0u8, 0.0),
+                PlayerState::Dead { timer } => (1, timer),
+                PlayerState::Exiting { timer } => (2, timer),
+                PlayerState::Exited => (3, 0.0),
+                PlayerState::InTower => (4, 0.0),
+            };
+            put(&[tag]);
+            put(&f(t));
+        }
+        put(&(self.entities.len() as u32).to_le_bytes());
+        for e in &self.entities {
+            put(&e.id.to_le_bytes());
+            put(&v3(e.pos));
+            put(&f(e.yaw));
+            put(&[e.alive as u8]);
+            put(&f(e.fade));
+        }
+        put(&(self.movers.len() as u32).to_le_bytes());
+        for m in &self.movers {
+            put(&f(m.offset));
+            put(&[m.active as u8, m.shown as u8]);
+        }
+        put(&self.next_id.to_le_bytes());
+        h
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10611,6 +10677,70 @@ mod tests {
             }
             let turned = g.players[0].yaw > 0.2;
             assert_eq!(turned, aim, "auto aim {aim}");
+        }
+    }
+
+    /// Bot-driven inputs for every hero, from the game's own state.
+    fn bot_inputs(g: &Game) -> Vec<PlayerInput> {
+        (0..g.players.len()).map(|i| g.bot_input(i)).collect()
+    }
+
+    #[test]
+    fn a_clone_keeps_running_as_the_original_does() {
+        let Some(fs) = data() else {
+            eprintln!("game data not found; skipping");
+            return;
+        };
+        let mut a = Game::new(&fs, "levelA1", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
+        for _ in 0..240 {
+            let inputs = bot_inputs(&a);
+            a.update(1.0 / 60.0, &inputs);
+        }
+        let mut b = a.clone();
+        assert_eq!(a.fingerprint(), b.fingerprint(), "a fresh clone matches");
+        for frame in 0..600 {
+            let ia = bot_inputs(&a);
+            let ib = bot_inputs(&b);
+            assert_eq!(ia, ib, "frame {frame}: the bots see the same game");
+            a.update(1.0 / 60.0, &ia);
+            b.update(1.0 / 60.0, &ib);
+            if frame % 60 == 59 {
+                assert_eq!(
+                    a.fingerprint(),
+                    b.fingerprint(),
+                    "frame {frame}: the clone diverged"
+                );
+            }
+        }
+        assert!(a.frame > 800, "the games ran: frame {}", a.frame);
+    }
+
+    #[test]
+    fn two_games_on_the_same_inputs_agree() {
+        let Some(fs) = data() else {
+            eprintln!("game data not found; skipping");
+            return;
+        };
+        let heroes = [
+            ("WAR", "RED"),
+            ("VAL", "BLU"),
+            ("WIZ", "YEL"),
+            ("ARC", "GRE"),
+        ];
+        let mut a = Game::new(&fs, "levelA1", &heroes).unwrap();
+        let mut b = Game::new(&fs, "levelA1", &heroes).unwrap();
+        assert_eq!(a.fingerprint(), b.fingerprint(), "fresh games match");
+        for frame in 0..900 {
+            let inputs = bot_inputs(&a);
+            a.update(1.0 / 60.0, &inputs);
+            b.update(1.0 / 60.0, &inputs);
+            if frame % 60 == 59 {
+                assert_eq!(
+                    a.fingerprint(),
+                    b.fingerprint(),
+                    "frame {frame}: the games diverged"
+                );
+            }
         }
     }
 }

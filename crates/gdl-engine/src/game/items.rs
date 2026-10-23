@@ -209,7 +209,7 @@ pub struct Bag {
 }
 
 /// The item state that rides along with the game.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ItemsState {
     pub blasts: Vec<Blast>,
     pub bags: Vec<Bag>,

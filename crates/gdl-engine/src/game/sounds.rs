@@ -150,7 +150,7 @@ pub(crate) struct HeroSound {
     streak_time: f32,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SoundState {
     pub(crate) heroes: [HeroSound; 4],
     /// damage_player's mode for the next call (2 tile / thrown, 3 poison

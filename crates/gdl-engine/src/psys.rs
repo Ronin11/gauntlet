@@ -1475,6 +1475,7 @@ pub enum Owner {
 }
 
 /// Every particle system of the level, with what their draws share.
+#[derive(Clone)]
 pub struct Particles {
     /// MBPsysStartFrame's frame counter.
     pub frame: u32,

@@ -171,6 +171,7 @@ const TEMPLE_PORTAL: u32 = 0x500;
 const HELL_PORTAL: u32 = 0x600;
 const CITADEL_PORTAL: u32 = 0x803;
 
+#[derive(Clone)]
 pub struct Sumner {
     /// The resident Sumner at the lectern, and his idle sequence (lbl_80344C90).
     gwiz: Option<u64>,

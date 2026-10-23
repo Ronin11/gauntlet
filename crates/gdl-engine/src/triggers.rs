@@ -246,6 +246,7 @@ pub fn tower_camera_index(id: u8) -> bool {
 }
 
 /// A world object (with its children) moved by triggers.
+#[derive(Clone)]
 pub struct Mover {
     pub root: usize,
     pub objects: Vec<usize>,

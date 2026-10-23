@@ -255,6 +255,7 @@ pub(crate) struct LiveFx {
 }
 
 /// The effect system's state (EffectInfo, the live pool's bookkeeping).
+#[derive(Clone)]
 pub(crate) struct Effects {
     pub defs: Vec<Option<FxDef>>,
     /// EnemyFxPage.hitfx / deathfx: GENHIT / GENDIE custom rows by monster type.

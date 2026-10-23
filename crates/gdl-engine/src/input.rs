@@ -7,7 +7,7 @@ use glam::Vec2;
 use std::collections::{HashMap, HashSet};
 use winit::keyboard::KeyCode;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerInput {
     /// Left stick / WASD, x = right, y = up (screen relative), magnitude 0..1.
     pub stick: Vec2,
