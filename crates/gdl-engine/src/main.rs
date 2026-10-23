@@ -758,6 +758,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 hud::build(&mut s, &g, &panels);
                 if let Some(o) = options::Options::demo(name, demo_ticks) {
                     o.draw(&mut s);
+                    arrow = o.cursor(&s);
                 }
             }
             // hintmenu[:path]: Sumner's menu with the town open (GDL_HINT_FACTS
@@ -790,6 +791,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 s.quad_screen("TITLE", 0);
                 if let Some(o) = options::Options::demo(name, demo_ticks) {
                     o.draw(&mut s);
+                    arrow = o.cursor(&s);
                 }
             }
             // credits[:scroll[:rz]]: rz as if R and Z were held (the version).
