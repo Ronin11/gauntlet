@@ -230,6 +230,19 @@ const TALLY_SFX: [i32; 11] = [
     0x20001,
 ];
 
+/// fn_80055AFC's state: ticks in the level (lbl_803447CC), the period clock
+/// (F4), nags so far (E8), whether this period and the last were quiet (EC,
+/// 80344780), and fighting this frame (lbl_803447E4).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FollowNag {
+    pub level_ticks: i32,
+    pub timer: i32,
+    pub count: i32,
+    pub quiet: bool,
+    pub was_quiet: bool,
+    pub fighting: bool,
+}
+
 /// Death's exit (enemy.c:5313): alpha +4 a tick to 255, 64 ticks.
 const DEATH_EXIT: f32 = 64.0 / 60.0;
 
@@ -1151,6 +1164,11 @@ pub struct Game {
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
     pub(crate) hit_from: Option<Vec3>,
+    /// Player.hit_streak: generator monsters each hero has killed since
+    /// last destroying a generator (PlayerDamagedEnemy / PlayerDamagedItem).
+    pub(crate) gen_streak: [u32; 4],
+    /// fn_80055AFC's "Follow" nag.
+    pub(crate) nag: FollowNag,
     /// The effect table and the effects it runs (effect.rs).
     pub(crate) effects: effect::Effects,
     /// The particle systems and missile streaks (psys.rs, particles.rs).
@@ -1684,6 +1702,8 @@ impl Game {
             critter_wads: HashMap::new(),
             wizard_model: None,
             hit_from: None,
+            gen_streak: [0; 4],
+            nag: FollowNag::default(),
             effects: Default::default(),
             particles: Default::default(),
             psys_banks: Vec::new(),
@@ -3354,9 +3374,54 @@ impl Game {
         self.update_spews(dt);
         self.update_boss(dt);
         self.update_sounds();
+        self.follow_nag(dt);
         self.check_level_end();
         self.update_camera(dt);
         self.update_particles();
+    }
+
+    /// fn_80055AFC: 20 s into a level (not a secret one) with no boss, a
+    /// stretch of 10 s (7 s once it has nagged) without fighting brings out
+    /// the milestone arrows and the "Follow" voice (msg 29), once per quiet
+    /// stretch. Retail creates no milestone arrow nodes, so only the voice
+    /// comes, and only the test level T2 has milestones at all.
+    fn follow_nag(&mut self, dt: f32) {
+        let ticks = (dt * 60.0).round() as i32;
+        let n = &mut self.nag;
+        let fighting = std::mem::take(&mut n.fighting);
+        if self.wave.is_some_and(|w| w >> 8 == 12) {
+            return;
+        }
+        n.level_ticks += ticks;
+        if n.level_ticks < 1200 {
+            return;
+        }
+        let limit = if n.count == 0 { 600 } else { 420 };
+        let mut fighting = fighting;
+        if !self.players.iter().any(|p| p.state.active()) {
+            n.timer = limit;
+            fighting = true;
+        }
+        if self.boss.is_some() {
+            return;
+        }
+        if fighting {
+            n.quiet = false;
+        }
+        n.timer += ticks;
+        if n.timer < limit {
+            return;
+        }
+        let post = n.quiet && !n.was_quiet && !self.ai_paths.milestones.is_empty();
+        if n.quiet {
+            n.count += 1;
+        }
+        n.was_quiet = n.quiet;
+        n.quiet = true;
+        n.timer -= limit;
+        if post {
+            self.post(29, None, &[]);
+        }
     }
 
     fn update_players(&mut self, dt: f32, inputs: &[PlayerInput]) {
@@ -3379,6 +3444,20 @@ impl Game {
         let mut hammers: Vec<usize> = Vec::new();
         let mut damg: Vec<DamgFire> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
+        // lbl_80344740: the monsters on screen (do_enemies' visible count),
+        // for the turbo and combo hints.
+        let crowd = self
+            .entities
+            .iter()
+            .filter(|e| match &e.kind {
+                Kind::Enemy { etype, .. } if e.alive => {
+                    let r = crate::enemies::TYPES[(*etype).min(33)].radius;
+                    self.on_screen(e.pos, 2.0 * r)
+                }
+                _ => false,
+            })
+            .count();
+        let party = self.players.len();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
         let mut floor_fx: Vec<(usize, i32, Vec3)> = Vec::new();
         let mut fallen: Vec<usize> = Vec::new();
@@ -3810,6 +3889,16 @@ impl Game {
             // The meter fills while not in a turbo move; a charge drains it.
             if p.act.action < 11 {
                 p.power = (p.power + TURBO_FILL * dt).min(100.0);
+                // pmotion.c:1755: with 15 or more monsters on screen, a full
+                // meter says to use turbo (msg 110); at 40 with partners, to
+                // try a combo (111).
+                if crowd >= 15 {
+                    if p.power >= 100.0 {
+                        posts.push((110, i));
+                    } else if p.power >= 40.0 && party > 1 {
+                        posts.push((111, i));
+                    }
+                }
             }
             if p.act.cur == pa::SHOVE {
                 p.power = (p.power - 20.0 * dt).max(0.0);
@@ -4498,6 +4587,22 @@ impl Game {
             *hit = true;
             return;
         }
+        // PlayerMotion_HitTarget: a swing that lands on a nameless obstacle
+        // (the breakable walls) says it takes multiple hits (msg 20).
+        if let Kind::Container {
+            chest: false,
+            armor,
+            sub,
+            ..
+        } = self.entities[t].kind
+        {
+            let nameless = self.level.worlds.item_infos.iter().any(|i| {
+                i.item_type == ItemType::Obstacle && i.subtype == sub && i.name.is_empty()
+            });
+            if nameless && armor >= 0.0 && self.entities[t].alive {
+                self.post(20, Some(pi), &[]);
+            }
+        }
         let p = &self.players[pi];
         let mut dmg = p.derived.damage * mult;
         // Growth doubles melee; an amulet gives every hit its element.
@@ -4915,6 +5020,15 @@ impl Game {
     /// Damage entity `t` on player `pi`'s behalf: sounds, experience (more for
     /// melee, which also charges the turbo meter) and anything it drops.
     pub(crate) fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
+        // lbl_803447E4: a hero fighting (damage_enemy, or a swing at a
+        // generator or obstacle) holds off the Follow nag.
+        if matches!(
+            self.entities[t].kind,
+            Kind::Enemy { .. } | Kind::Critter(_) | Kind::Generator { .. }
+        ) || melee && matches!(self.entities[t].kind, Kind::Container { .. })
+        {
+            self.nag.fighting = true;
+        }
         if matches!(self.entities[t].kind, Kind::Critter(_)) {
             self.hit_critter(pi, t, dmg, push, melee);
             return;
@@ -4950,6 +5064,9 @@ impl Game {
             Kind::Enemy { state, .. } => Some(*state),
             _ => None,
         };
+        // birth_style 0: made by a generator (not placed, nor a lookout).
+        let spawned_by_gen = matches!(&self.entities[t].kind,
+            Kind::Enemy { brain, ai, .. } if brain.generator.is_some() && *ai != 15);
         let death = match &self.entities[t].kind {
             Kind::Enemy {
                 etype: crate::enemies::DEATH,
@@ -5056,6 +5173,19 @@ impl Game {
                 st.generators_destroyed += 1;
             } else {
                 st.enemies_killed += 1;
+            }
+            // PlayerDamagedEnemy: ten generator monsters killed without
+            // destroying a generator says to destroy them (msg 22), outside
+            // boss levels; destroying one starts the count again.
+            if let Some(n) = self.gen_streak.get_mut(pi) {
+                if r.generator {
+                    *n = 0;
+                } else if spawned_by_gen {
+                    *n += 1;
+                    if *n >= 10 && self.boss.is_none() {
+                        self.post(22, Some(pi), &[]);
+                    }
+                }
             }
         }
         if r.hit {
@@ -5203,6 +5333,7 @@ impl Game {
         // damage_player: a block (DEFEND2) stops the hit; a charge halves it;
         // either way a heavy knock becomes a plain knockback.
         let mut clank = None;
+        let mut learn_block = false;
         if dmg > 1.0 && p.act.hud & (crate::paction::hud::BLOCK | crate::paction::hud::CHARGE) != 0
         {
             let dam = dmg;
@@ -5211,13 +5342,20 @@ impl Game {
             } else {
                 dmg *= 0.5;
             }
-            // StartBlockFX when the block took more than 2 off.
+            // StartBlockFX when the block took more than 2 off (hud 0x2000:
+            // this hero has blocked).
             if dam - dmg > 2.0 {
                 clank = Some(dmg);
+                p.act.hud |= 0x2000;
             }
             if flags & 0x10160 != 0 {
                 flags = (flags & !0x10160) | DmgType::KNOCKBACK;
             }
+        } else if dmg > 15.0 && flags & 0x10160 != 0 && p.act.hud & 0x2000 == 0 && self.time > 60.0
+        {
+            // player.c:3403: a heavy hit taken unblocked, by a hero who has
+            // never blocked, a minute in: learn to block (msg 0x7D).
+            learn_block = true;
         }
         // For PlayerKnockback: the damage, its flags and the push away from
         // where it came from.
@@ -5234,6 +5372,9 @@ impl Game {
         }
         if let Some(reduced) = clank {
             self.start_block_fx(pi, reduced);
+        }
+        if learn_block {
+            self.post(0x7D, Some(pi), &[]);
         }
         self.damage_sounds(pi, mode, dmg, flags, old);
     }
@@ -5305,6 +5446,7 @@ impl Game {
     /// leaves when that runs out or its victim dies (AudioPlayEvt104);
     /// otherwise S_DEATHSUCK goes on (AudioPlayEvt102Follow).
     fn death_drain(&mut self, ei: usize, pi: usize, fight: f32, tier2: bool) {
+        self.nag.fighting = true;
         let mut died = false;
         if tier2 {
             self.death_exp(pi, -1);
@@ -7089,6 +7231,7 @@ impl Game {
             self.boss_generate_enemy(pos, vel);
         }
         for (ei, pi, dmg) in melee {
+            self.nag.fighting = true;
             let dmg = if shrunk { dmg * 0.5 } else { dmg };
             let special = self.players[pi].fx.special;
             if special & (pu::S_HANDOFDEATH | pu::S_VAMPIRE) != 0 {
@@ -7828,6 +7971,108 @@ mod tests {
             panic!()
         };
         assert_eq!(dhp, 99.0);
+    }
+
+    #[test]
+    fn follow_nag_after_a_quiet_stretch() {
+        let Some(fs) = data() else { return };
+        // Only the test level T2 has milestones; without them nothing is said.
+        let mut g = Game::new(&fs, "levelT2", &[("WAR", "RED")]).unwrap();
+        assert!(!g.ai_paths.milestones.is_empty());
+        g.entities.clear();
+        g.pending_enemies.clear();
+        let mut at = None;
+        for f in 0..(48 * 60) {
+            g.msgs.shown = None;
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            if g.sfx.iter().any(|s| s.contains("S_FOLLOW")) {
+                assert!(at.is_none(), "once per quiet stretch");
+                at = Some(f);
+            }
+            g.sfx.clear();
+        }
+        // 20 s in, a first (hidden) period of 10 s, then the first quiet one.
+        let f = at.expect("the Follow voice");
+        assert!((40 * 60 - 2..=40 * 60 + 2).contains(&f), "{f}");
+    }
+
+    #[test]
+    fn hints_for_blocking_and_generators() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let shown = |g: &Game| g.msgs.shown.as_ref().map(|s| s.index);
+        // A heavy hit taken unblocked a minute in: learn to block.
+        g.time = 61.0;
+        g.msgs.shown = None;
+        g.damage_player(0, 30.0, DmgType::KNOCKDOWN);
+        assert_eq!(shown(&g), Some(0x7D));
+        // Ten generator monsters killed: destroy the generators.
+        let t = grunt_in_front(&mut g);
+        let gen = g.spawn(Kind::Prop, None, Vec3::ZERO, 0.0);
+        g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
+        for k in 0..10 {
+            let t = if k == 0 {
+                t
+            } else {
+                let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
+                let p = g.players[0].pos + Vec3::new(0.0, 0.0, 2.5);
+                g.spawn(g.new_enemy(class, 1, EnemyState::Idle), None, p, 0.0);
+                g.entities.len() - 1
+            };
+            if let Kind::Enemy { brain, hp, .. } = &mut g.entities[t].kind {
+                brain.generator = Some(gen);
+                *hp = 1.0;
+            }
+            assert_ne!(shown(&g), Some(22), "{k}");
+            g.hit_entity(0, t, 100.0, Vec2::Y, true);
+        }
+        assert_eq!(g.gen_streak[0], 10);
+        assert_eq!(shown(&g), Some(22));
+    }
+
+    #[test]
+    fn turbo_and_wall_hints() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let t = grunt_in_front(&mut g);
+        // Fifteen monsters on screen and a full meter: use turbo (110).
+        let (class, model) = match g.entities[t].kind {
+            Kind::Enemy { class, .. } => (class, g.entities[t].model),
+            _ => unreachable!(),
+        };
+        let p = g.players[0].pos;
+        for k in 0..15 {
+            let a = k as f32 * 0.4;
+            let mut kind = g.new_enemy(class, 1, EnemyState::Idle);
+            if let Kind::Enemy { cooldown, .. } = &mut kind {
+                *cooldown = 99.0;
+            }
+            g.spawn(kind, model, p + Vec3::new(a.sin(), 0.0, a.cos()) * 7.0, 0.0);
+        }
+        g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
+        g.players[0].power = 100.0;
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(110));
+        // A swing at a breakable wall (the nameless obstacle 0x2A, which the
+        // port doesn't place yet): it takes multiple hits (20).
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        let at = g.players[0].pos;
+        g.spawn(
+            Kind::Container {
+                hp: 25.0,
+                drop: None,
+                chest: false,
+                armor: 1.0,
+                sub: 0x2A,
+            },
+            None,
+            at + Vec3::Z * 2.0,
+            0.0,
+        );
+        g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
+        g.player_attack(0, at, 0.0, 1.0, 0);
+        assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(20));
     }
 
     #[test]
