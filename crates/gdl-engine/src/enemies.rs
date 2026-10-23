@@ -38,6 +38,8 @@ const fn t(
 pub const GRUNT: usize = 4;
 pub const KNIGHT: usize = 5;
 pub const RAT: usize = 3;
+pub const ACID: usize = 21;
+pub const GOLEM: usize = 29;
 pub const DEATH: usize = 30;
 pub const IT: usize = 31;
 /// Types up to here are "regular": their health scales with the tier.

@@ -37,6 +37,8 @@ pub struct PlayerInput {
     /// The C-stick (right stick), x = right, y = up: Robotron style's
     /// firing direction (fireang / firemag).
     pub fire: Vec2,
+    /// Start held (the reset combo).
+    pub start: bool,
     /// The d-pad's share of `stick` (menus move with either; in play the d-pad
     /// runs the mini-inventory instead of walking).
     pub dpad: Vec2,
@@ -445,6 +447,7 @@ impl Input {
                     fire: Vec2::ZERO,
                     combo: self.held(KeyCode::KeyO),
                     start_pressed: self.just_pressed(KeyCode::Enter),
+                    start: self.held(KeyCode::Enter),
                     dpad: Vec2::ZERO,
                     // Tab / Q / E / R stand in for the d-pad.
                     inv: crate::powerups::DPad {
@@ -514,6 +517,7 @@ impl Input {
                     fire: Vec2::ZERO,
                     combo: h(BUTTON_R1),
                     start_pressed: p(BUTTON_START),
+                    start: h(BUTTON_START),
                 }
             }
             #[cfg(not(target_os = "android"))]
@@ -570,6 +574,7 @@ impl Input {
                     fire: Vec2::new(pad.value(Axis::RightStickX), pad.value(Axis::RightStickY)),
                     combo: pad.is_pressed(Button::RightTrigger),
                     start_pressed: pressed(Button::Start),
+                    start: pad.is_pressed(Button::Start),
                 }
             }
             #[cfg(target_os = "android")]

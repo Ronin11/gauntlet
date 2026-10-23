@@ -447,7 +447,7 @@ pub const PLAYER_RGB: [[f32; 3]; 4] = [
 ];
 
 /// A joined player's place on the HUD.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PanelInfo {
     /// Column 0..3 (the player's slot).
     pub slot: usize,
@@ -457,6 +457,8 @@ pub struct PanelInfo {
     pub colour: usize,
     /// Character class id (WAR 0 .. HYE 15, SUM 16).
     pub class: usize,
+    /// A hidden character's row in `cheats::HIDDEN` (hidden_code).
+    pub hidden: Option<usize>,
 }
 
 /// player_pal: text colours per costume colour.
@@ -750,6 +752,59 @@ pub fn boss_meter_images(fs: &GameFs, dir: &str) -> Vec<(String, Image)> {
         }
     }
     out
+}
+
+/// The secret levels' coin icons (16_<CLS>COIN, 16_SUM), which live in the
+/// ITEMS/levelS bank, for [`Hud::load_images`].
+pub fn coin_images(fs: &GameFs) -> Vec<(String, Image)> {
+    let dir = "ITEMS/levelS";
+    let Ok(objs) = fs
+        .read(&format!("{dir}/objects.ngc"))
+        .map_err(anyhow::Error::from)
+        .and_then(|d| Ok(gdl_formats::Objects::parse(&d)?))
+    else {
+        return Vec::new();
+    };
+    let Ok(tex) = fs.read(&format!("{dir}/textures.ngc")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Image)> = Vec::new();
+    for d in &objs.bitmap_defs {
+        let name = d.name.to_ascii_uppercase();
+        if !name.starts_with("16_") || out.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if let Some(b) = objs.bitmaps.get(d.tex_index as usize) {
+            if let Ok(img) = gdl_formats::texture::decode_ngc(b, &tex) {
+                out.push((name, img));
+            }
+        }
+    }
+    out
+}
+
+/// do_got_it's coin counter in a secret level (got_type >= 0x200): the
+/// level's coin icon at (box_x + 0x1C, 0x120) and found / placed beside it.
+pub fn build_coins(s: &mut Scr, game: &Game, panels: &[PanelInfo], bank: Option<&TexBank>) {
+    for (pi, info) in panels.iter().enumerate() {
+        let Some((icon, n, total)) = game.coin_counter(pi) else {
+            continue;
+        };
+        let x0 = 128.0 * (info.slot % 4) as f32;
+        if let Some(t) = bank.and_then(|b| b.get(&icon)) {
+            s.blit(t, x0 + 28.0, 288.0, 16.0, 16.0, 0);
+        }
+        let text = format!("{n}/{total}");
+        s.text(
+            1.5,
+            x0 + 48.0,
+            292.0,
+            crate::ui::FONT_8HI,
+            0xFFFFFF,
+            0,
+            &text,
+        );
+    }
 }
 
 /// The boss level's overlay: the boss health meters (HealthMeterUpdate) and

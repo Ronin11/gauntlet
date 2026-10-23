@@ -14,10 +14,14 @@ use glam::{Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) mod effect;
+mod exits;
 pub(crate) mod items;
 mod magic;
 mod particles;
+#[cfg(test)]
+mod rule_tests;
 pub mod sounds;
+mod unlock;
 pub mod worn;
 
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
@@ -114,6 +118,30 @@ impl Carried {
             ..Default::default()
         }
     }
+
+    /// player_get_from_save's fixed loadout for playable Sumner: level 99,
+    /// full health, 5000 gold, 9 keys, 9 potions and no power-ups (his 999
+    /// attributes come with `Player::sumner`).
+    pub fn sumner() -> Carried {
+        Carried {
+            health: max_health(99),
+            gold: 5000,
+            keys: 9,
+            potions: vec![0; 9],
+            level: 99,
+            exp: 0x54218,
+            ..Default::default()
+        }
+    }
+
+    /// activate_player: a hero coming out of player select into play (the
+    /// tower, where no level-start camera runs) gets 5 x its class's
+    /// power-up time of invisibility (PlayerAddPowerup(0, p, 9, 4, 5)).
+    pub fn activate(&mut self, class: usize) {
+        use crate::powerups as pu;
+        let t = 5.0 * crate::stats::powerup_time(class);
+        self.powerups.add(pu::SPECIAL, pu::S_INVISIBLE, 0.0, t);
+    }
 }
 
 impl Player {
@@ -149,7 +177,12 @@ impl Player {
 
     /// PlayerUpdateAtts + player_scale_att for the current level.
     pub fn refresh_stats(&mut self) {
-        let a = crate::stats::atts(self.class_id, self.level, self.bonus);
+        let class = if self.sumner {
+            crate::stats::SUMNER
+        } else {
+            self.class_id
+        };
+        let a = crate::stats::atts(class, self.level, self.bonus);
         self.derived = crate::stats::derived(self.class_id, a);
     }
 }
@@ -223,6 +256,28 @@ impl DmgType {
     /// A low blow (short monsters): levitation dodges it.
     pub const LOW: u32 = 0x4000_0000;
 }
+
+/// DoAudioTallySFX's sounds by count (lbl_801234B8).
+const TALLY_SFX: [i32; 11] = [
+    0x2000b, 0x2000a, 0x20009, 0x20008, 0x20007, 0x20006, 0x20005, 0x20004, 0x20003, 0x20002,
+    0x20001,
+];
+
+/// fn_80055AFC's state: ticks in the level (lbl_803447CC), the period clock
+/// (F4), nags so far (E8), whether this period and the last were quiet (EC,
+/// 80344780), and fighting this frame (lbl_803447E4).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FollowNag {
+    pub level_ticks: i32,
+    pub timer: i32,
+    pub count: i32,
+    pub quiet: bool,
+    pub was_quiet: bool,
+    pub fighting: bool,
+}
+
+/// Death's exit (enemy.c:5313): alpha +4 a tick to 255, 64 ticks.
+const DEATH_EXIT: f32 = 64.0 / 60.0;
 
 /// ModifyDamage: an elemental hit on a target with no affinity does 1.5x. Every
 /// potion, turbo move and amulet hit has an element; monsters here are neutral.
@@ -349,6 +404,10 @@ pub struct Player {
     pub hurt_flash: f32,
     /// Where this player's exit leads (None = the tower).
     pub exit_dest: Option<u32>,
+    /// Standing and waiting on an exit (DoExit).
+    pub exit: exits::ExitWait,
+    /// This frame's attempted move before collision (dpos), for doors.
+    trial_move: Vec3,
     /// Dead while others play on: "Wait In Tower" (A) / "Quit Game" (B) is up.
     pub tower_choice: bool,
     /// Chose "Quit Game": leaves the party when the level ends.
@@ -388,6 +447,15 @@ pub struct Player {
     attached_to: Option<usize>,
     /// What the power-ups put on the hero (PlayerProcessPowerups).
     pub worn: worn::Worn,
+    /// Playable Sumner (character 2 with hidden_code player_sumner_desc):
+    /// the fixed 999 attributes.
+    pub sumner: bool,
+    /// got_count / got_timer for a secret level's coin counter
+    /// (towerAwardWorldRunes), and the secret classes this hero has unlocked
+    /// in the level (save.class_unlock bits).
+    pub coins: u32,
+    pub coin_timer: f32,
+    pub class_unlock: u16,
 }
 
 /// Animation sequence indices for a player model.
@@ -417,6 +485,9 @@ pub struct MonsterSeqs {
     attack: Option<(usize, Option<usize>)>,
     power: Option<(usize, Option<usize>)>,
     hit: Option<usize>,
+    /// HIT2 and GETUP: E_HIT_REACT2 and what follows it.
+    hit2: Option<usize>,
+    getup: Option<usize>,
     death: Option<usize>,
     start: Option<usize>,
     /// THROW1 (or THROW2) and THROWF: archers and bombers.
@@ -434,6 +505,8 @@ impl MonsterSeqs {
             attack: pair("ATTACK1", "ATTACK1R").or(pair("ATTACK2", "ATTACK2R")),
             power: pair("ATTACK3", "ATTACK3R"),
             hit: s("HIT1").or(s("HIT2")),
+            hit2: s("HIT2"),
+            getup: s("GETUP"),
             death: s("DEATH").or(s("HIT2")),
             start: s("START"),
             throw: s("THROW1").or(s("THROW2")).map(|t| (t, s("THROWF"))),
@@ -456,6 +529,9 @@ pub enum EnemyState {
     Recover,
     Hurt {
         timer: f32,
+        /// E_HIT_REACT2 (then GETUP): a heavy hit's knockdown, which a
+        /// lighter hit doesn't interrupt (action.c:202).
+        heavy: bool,
     },
     Dying {
         timer: f32,
@@ -736,8 +812,9 @@ pub enum Kind {
         /// Seconds until the next throw or cast (idle_secs / counter1), or the
         /// suicide charge's clock.
         reload: f32,
-        /// Death: health drained so far; IT and the rest: unused.
-        drained: f32,
+        /// Death's flag2: it left having drained its fill (or its victim),
+        /// and says so as it goes (0x81 / 0x83); unused for the rest.
+        drained: bool,
         /// The Warlock's blink: seconds left seen (> 0) or unseen (< 0).
         blink: f32,
         /// do_ai's state: its move_logic routine and what that keeps.
@@ -750,6 +827,11 @@ pub enum Kind {
         /// Enemy.dest: where a logic-12 generator sent it (place_logic12),
         /// for the AI to walk to; None otherwise.
         dest: Option<Vec3>,
+        /// Enemy.pushed: the knockback velocity (units a second) a hit gave
+        /// it (fn_8004DC2C), decaying x0.8 a frame (enemy.c:5391), and
+        /// Enemy.pushang, the way it faces while pushed (back at the hit).
+        pushed: Vec3,
+        pushang: f32,
     },
     Generator {
         class: usize,
@@ -799,10 +881,14 @@ pub enum Kind {
         coll: Option<(usize, usize)>,
     },
     Exit {
+        /// fn_8005F0F4 case 9: the hero's radius plus the item's (xz), and
+        /// the item's height (plus the hero's) either way.
         radius: f32,
+        height: f32,
         /// The wave this exit leads to, or None for the tower.
         dest: Option<u32>,
         open: bool,
+        anim: Box<exits::ExitAnim>,
     },
     /// A damage tile (spikes, flames, force fields, saw blades, tentacles):
     /// it hurts only while its cycle is in sequence 2 or 4.
@@ -1085,6 +1171,8 @@ pub struct Game {
     /// The Multiplayer option: 0 Normal (shots pass heroes), 1 Shots Stun,
     /// 2 Shots Hurt.
     pub friendly_fire: usize,
+    /// The party's progress out of the level (lbl_803447D0 / lbl_803447B4).
+    pub(crate) exit_state: exits::ExitState,
     /// Each player model's action slots (InitActions) and class PDATA.
     action_seqs: Vec<crate::paction::ActionSeqs>,
     pdata: Vec<gdl_formats::pdata::PlayerData>,
@@ -1095,6 +1183,8 @@ pub struct Game {
     item_models: HashMap<String, Option<usize>>,
     /// A secret level's countdown: (total, seconds left).
     pub secret_timer: Option<(f32, f32)>,
+    /// sVisibleSumCoinCount: the gold pieces placed in the level.
+    pub visible_coins: u32,
     /// The party's shards (runestones, 13 bits) and gargoyle items (fangs,
     /// feathers, claws; -1 once their gate has opened).
     pub shards: u16,
@@ -1133,12 +1223,19 @@ pub struct Game {
     pub crit_waves: Vec<crate::critter::Wave>,
     /// player.fxhittime: a critter's melee and cones skip a player until then.
     pub crit_hit_until: [f32; 4],
+    /// CritterPlayerNTargets: critter parts aiming at each player this frame.
+    pub crit_ntargets: [f32; 4],
     /// Parsed CRITTER WADs by file name.
     pub critter_wads: HashMap<String, std::sync::Arc<gdl_formats::critter::CritterWad>>,
     /// The good wizard's model (atree WIZARD in the level's item file).
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
     pub(crate) hit_from: Option<Vec3>,
+    /// Player.hit_streak: generator monsters each hero has killed since
+    /// last destroying a generator (PlayerDamagedEnemy / PlayerDamagedItem).
+    pub(crate) gen_streak: [u32; 4],
+    /// fn_80055AFC's "Follow" nag.
+    pub(crate) nag: FollowNag,
     /// The effect table and the effects it runs (effect.rs).
     pub(crate) effects: effect::Effects,
     /// The particle systems and missile streaks (psys.rs, particles.rs).
@@ -1618,6 +1715,20 @@ impl Game {
         classes: &[(&str, &str)],
         difficulty: usize,
     ) -> Result<Game> {
+        Self::new_heroes(fs, level_name, classes, &[], difficulty)
+    }
+
+    /// A level whose heroes may wear a hidden character's model
+    /// (load_player_geo's hidden_code: PLAYERS/<class>/<dir> in place of the
+    /// colour's model; the class's sounds and colour stay).
+    pub fn new_heroes(
+        fs: &GameFs,
+        level_name: &str,
+        classes: &[(&str, &str)],
+        models: &[Option<&str>],
+        difficulty: usize,
+    ) -> Result<Game> {
+        let model_dir = |i: usize| models.get(i).copied().flatten();
         let level = Level::load(fs, level_name)?;
         let mut collision = Collision::new(build_collision(&level));
         let world_anim = crate::worldanim::WorldAnims::new(&level, &mut collision);
@@ -1679,12 +1790,14 @@ impl Game {
             damg_cooldown: HashMap::new(),
             difficulty,
             friendly_fire: 0,
+            exit_state: Default::default(),
             action_seqs: Vec::new(),
             pdata: Vec::new(),
             psfx: Vec::new(),
             fx_follow: Vec::new(),
             item_models: HashMap::new(),
             secret_timer: None,
+            visible_coins: 0,
             shards: 0,
             garg_items: [0; 3],
             welcome: 300,
@@ -1703,9 +1816,12 @@ impl Game {
             spews: Vec::new(),
             crit_waves: Vec::new(),
             crit_hit_until: [0.0; 4],
+            crit_ntargets: [0.0; 4],
             critter_wads: HashMap::new(),
             wizard_model: None,
             hit_from: None,
+            gen_streak: [0; 4],
+            nag: FollowNag::default(),
             effects: Default::default(),
             particles: Default::default(),
             psys_banks: Vec::new(),
@@ -1733,11 +1849,12 @@ impl Game {
         match gdl_formats::wdata::Worlds::load(|p| fs.read(p)) {
             Ok(w) => {
                 game.wave = w.wave_of_dir(level_name);
-                // Secret levels last their wavetime (+0.99 s), then send the party back.
+                // fn_800553B4: a timed level (flags & 4: the secret ones)
+                // lasts its wavetime (+0.99 s), then sends the party back.
                 if let Some(l) = game
                     .wave
-                    .filter(|w| w >> 8 == 12)
                     .and_then(|wv| w.level(wv))
+                    .filter(|l| l.flags & 4 != 0)
                 {
                     let t = l.wavetime as f32 + 0.99;
                     game.secret_timer = Some((t, t));
@@ -1765,8 +1882,8 @@ impl Game {
             Err(e) => log::warn!("realm tables: {e:#}"),
         }
 
-        for (class, color) in classes {
-            let m = Model::load_player(fs, class, color)?;
+        for (i, (class, color)) in classes.iter().enumerate() {
+            let m = Model::load_player(fs, class, model_dir(i).unwrap_or(color))?;
             game.player_seqs.push(PlayerSeqs::find(&m));
             game.action_seqs
                 .push(crate::paction::ActionSeqs::new(&m.skeleton));
@@ -1780,7 +1897,7 @@ impl Game {
         }
         // load_player_geo: each hero's SHADOWL1, from its own model bank.
         for (i, (class, color)) in classes.iter().enumerate() {
-            if let Some(m) = crate::shadow::load_player(fs, class, color) {
+            if let Some(m) = crate::shadow::load_player(fs, class, model_dir(i).unwrap_or(color)) {
                 let idx = game.add_model(m);
                 game.shadow_models.insert(i, idx);
             }
@@ -1818,6 +1935,8 @@ impl Game {
                 gold: 0,
                 hurt_flash: 0.0,
                 exit_dest: None,
+                exit: Default::default(),
+                trial_move: Vec3::ZERO,
                 tower_choice: false,
                 quit: false,
                 proj_model: None,
@@ -1844,11 +1963,15 @@ impl Game {
                 saved_pos: Vec3::ZERO,
                 attached_to: None,
                 worn: Default::default(),
+                sumner: false,
+                coins: 0,
+                coin_timer: -1.0,
+                class_unlock: 0,
             });
         }
         // Ranged-attack projectile: the class's throw model, else its weapon.
         for (i, (class, color)) in classes.iter().enumerate() {
-            let dir = format!("PLAYERS/{class}/{color}");
+            let dir = format!("PLAYERS/{class}/{}", model_dir(i).unwrap_or(color));
             let Some(asset) = load_asset(fs, &dir) else {
                 continue;
             };
@@ -2368,10 +2491,30 @@ impl Game {
                 })
                 .unwrap_or_default();
             if let Kind::Enemy { ai, brain, .. } = &mut kind {
-                *ai = crate::items::algorithm(etype, spew);
+                // generate_single sets a lookout's algorithm outright.
+                *ai = if sp.ai == 15 {
+                    15
+                } else {
+                    crate::items::algorithm(etype, spew)
+                };
                 brain.generator = Some(sp.generator);
                 if spew == 13 {
                     brain.prev = chain.tail;
+                }
+            }
+            // items.c:3935: once a hit egg has set num_generated to 3, the
+            // next logic-12 spawn starts a new clutch.
+            if spew == 12 {
+                if let Some(Kind::Generator { chain, .. }) = self
+                    .entities
+                    .iter_mut()
+                    .find(|e| e.id == sp.generator)
+                    .map(|e| &mut e.kind)
+                {
+                    if chain.generated >= 3 {
+                        chain.generated -= 3;
+                        chain.flags = 0;
+                    }
                 }
             }
             let id = self.spawn(kind, model, Vec3::new(p.x, g, p.z), a);
@@ -2398,7 +2541,10 @@ impl Game {
                 .find(|e| e.id == sp.generator)
                 .map(|e| &mut e.kind)
             {
-                chain.generated += 1;
+                // place_logic12's spawns aren't counted (items.c:3973).
+                if spew != 12 {
+                    chain.generated += 1;
+                }
                 if spew == 13 {
                     chain.tail = Some(id);
                 }
@@ -2453,7 +2599,7 @@ impl Game {
             attacks: 0,
             target: None,
             reload: 0.0,
-            drained: 0.0,
+            drained: false,
             blink: 0.0,
             brain: Box::new(crate::ai::Brain::new(strength as i32, ai, 0.0, sight)),
             ai: crate::items::algorithm(
@@ -2461,6 +2607,8 @@ impl Game {
                 crate::items::resolve_spew(etype, strength as i32, ai),
             ),
             dest: None,
+            pushed: Vec3::ZERO,
+            pushang: 0.0,
         }
     }
 
@@ -2895,6 +3043,9 @@ impl Game {
                 ItemType::Powerup => {
                     let kind = pickup_kind(&info, &inst.params);
                     self.note_special(&kind);
+                    if matches!(kind, PickupKind::Gold(_)) {
+                        self.visible_coins += 1;
+                    }
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     self.spawn(
                         Kind::Pickup {
@@ -3016,11 +3167,14 @@ impl Game {
                 ItemType::Exit => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     let dest = self.exit_dest(&inst.params);
+                    let anim = Box::new(exits::ExitAnim::new(model.map(|m| &self.models[m])));
                     self.spawn(
                         Kind::Exit {
-                            radius: info.radius.max(2.0) + 0.5,
+                            radius: PLAYER_RADIUS + info.radius,
+                            height: info.height + PLAYER_HEIGHT,
                             dest,
                             open: true,
+                            anim,
                         },
                         model,
                         pos,
@@ -3496,15 +3650,35 @@ impl Game {
                 self.crystal_shown = None;
             }
         }
-        if let Some((_, left)) = &mut self.secret_timer {
-            let before = left.ceil() as i32;
-            *left -= dt;
-            let now = left.ceil() as i32;
-            if before != now && now == 8 {
-                self.sfx.push("S_TIMEISRUNNING".into());
+        for p in &mut self.players {
+            if p.coin_timer > 0.0 {
+                p.coin_timer -= dt;
             }
-            if *left <= 0.0 && self.level_end.is_none() {
-                self.level_end = Some(LevelEnd::SecretOver);
+        }
+        if let Some((_, left)) = &mut self.secret_timer {
+            // fn_80054E78: each whole second a tick or tock (AudioFootstep:
+            // 24 odd, 23 even, 25 the last), "time is running out" at 8 and
+            // the 5-4-3-2-1 tally (DoAudioTallySFX) unless the level is
+            // already ending.
+            let before = *left as i32;
+            *left -= dt;
+            let now = *left;
+            let n = now as i32;
+            if now <= 0.0 {
+                if self.level_end.is_none() {
+                    self.level_end = Some(LevelEnd::SecretOver);
+                }
+            } else if before != n {
+                self.sfx_id(match n {
+                    0 => 25,
+                    n if n & 1 != 0 => 24,
+                    _ => 23,
+                });
+                if n == 8 {
+                    self.sfx.push("S_TIMEISRUNNING".into());
+                } else if n <= 5 && self.level_end.is_none() {
+                    self.sfx_id(TALLY_SFX[n as usize]);
+                }
             }
         }
         self.msgs.tick();
@@ -3544,16 +3718,61 @@ impl Game {
         self.update_spews(dt);
         self.update_boss(dt);
         self.update_sounds();
+        self.follow_nag(dt);
         self.check_level_end();
         self.update_camera(dt);
         self.update_particles();
+    }
+
+    /// fn_80055AFC: 20 s into a level (not a secret one) with no boss, a
+    /// stretch of 10 s (7 s once it has nagged) without fighting brings out
+    /// the milestone arrows and the "Follow" voice (msg 29), once per quiet
+    /// stretch. Retail creates no milestone arrow nodes, so only the voice
+    /// comes, and only the test level T2 has milestones at all.
+    fn follow_nag(&mut self, dt: f32) {
+        let ticks = (dt * 60.0).round() as i32;
+        let n = &mut self.nag;
+        let fighting = std::mem::take(&mut n.fighting);
+        if self.wave.is_some_and(|w| w >> 8 == 12) {
+            return;
+        }
+        n.level_ticks += ticks;
+        if n.level_ticks < 1200 {
+            return;
+        }
+        let limit = if n.count == 0 { 600 } else { 420 };
+        let mut fighting = fighting;
+        if !self.players.iter().any(|p| p.state.active()) {
+            n.timer = limit;
+            fighting = true;
+        }
+        if self.boss.is_some() {
+            return;
+        }
+        if fighting {
+            n.quiet = false;
+        }
+        n.timer += ticks;
+        if n.timer < limit {
+            return;
+        }
+        let post = n.quiet && !n.was_quiet && !self.ai_paths.milestones.is_empty();
+        if n.quiet {
+            n.count += 1;
+        }
+        n.was_quiet = n.quiet;
+        n.quiet = true;
+        n.timer -= limit;
+        if post {
+            self.post(29, None, &[]);
+        }
     }
 
     fn update_players(&mut self, dt: f32, inputs: &[PlayerInput]) {
         let (fwd, right) = self.camera_basis();
         // Swings landing (player, damage multiplier, knockdown), throws (x size),
         // potion blasts, breath and hammer power-ups, damage rows firing.
-        let mut swings: Vec<(usize, f32, bool)> = Vec::new();
+        let mut swings: Vec<(usize, f32, u32)> = Vec::new();
         let mut throws: Vec<Throw> = Vec::new();
         // Potions released: (player, where, colour, start_magic mode), and
         // the heroes starting the MAGICFX.
@@ -3569,6 +3788,20 @@ impl Game {
         let mut hammers: Vec<usize> = Vec::new();
         let mut damg: Vec<DamgFire> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
+        // lbl_80344740: the monsters on screen (do_enemies' visible count),
+        // for the turbo and combo hints.
+        let crowd = self
+            .entities
+            .iter()
+            .filter(|e| match &e.kind {
+                Kind::Enemy { etype, .. } if e.alive => {
+                    let r = crate::enemies::TYPES[(*etype).min(33)].radius;
+                    self.on_screen(e.pos, 2.0 * r)
+                }
+                _ => false,
+            })
+            .count();
+        let party = self.players.len();
         let mut key_drops: Vec<(Vec3, u32)> = Vec::new();
         let mut floor_fx: Vec<(usize, i32, Vec3)> = Vec::new();
         let mut fallen: Vec<usize> = Vec::new();
@@ -3752,6 +3985,7 @@ impl Game {
             // logical buttons (controls.c): held levels and new edges.
             let wish = fwd * inp.stick.y + right * inp.stick.x;
             let joymag = wish.length().min(1.0);
+            p.exit.joymag = joymag;
             let joyang = if joymag > 0.0 {
                 wish.x.atan2(wish.y)
             } else {
@@ -3953,17 +4187,17 @@ impl Game {
                 legend_fired = true;
             }
             if bits_now & 0xFE != 0 {
-                let (mult, knock) = if bits_now & 0xF0 != 0 {
+                let mult = if bits_now & 0xF0 != 0 {
                     // Power swings: x3 and knockdown; the move's turbo is paid.
                     p.power = (p.power - p.act.coll_score).max(0.0);
                     p.act.coll_score = 0.0;
-                    (3.0, true)
+                    3.0
                 } else if bits_now & act::HIT2 != 0 {
-                    (2.0, true)
+                    2.0
                 } else {
-                    (1.0, bits_now & act::KICK != 0)
+                    1.0
                 };
-                swings.push((i, mult, knock));
+                swings.push((i, mult, bits_now));
             }
             if bits_now & act::SWING != 0 {
                 p.combo_fade = self.time;
@@ -4044,6 +4278,16 @@ impl Game {
             // The meter fills while not in a turbo move; a charge drains it.
             if p.act.action < 11 {
                 p.power = (p.power + TURBO_FILL * dt).min(100.0);
+                // pmotion.c:1755: with 15 or more monsters on screen, a full
+                // meter says to use turbo (msg 110); at 40 with partners, to
+                // try a combo (111).
+                if crowd >= 15 {
+                    if p.power >= 100.0 {
+                        posts.push((110, i));
+                    } else if p.power >= 40.0 && party > 1 {
+                        posts.push((111, i));
+                    }
+                }
             }
             if p.act.cur == pa::SHOVE {
                 p.power = (p.power - 20.0 * dt).max(0.0);
@@ -4104,6 +4348,8 @@ impl Game {
             let speed = a.move_scale * p.derived.speed * movement;
             let grabbed = a.hud & 0x20 != 0;
             let moving = speed > 0.0 && !grabbed;
+            let start = p.pos;
+            p.trial_move = Vec3::ZERO;
             if moving {
                 let yaw = walk.unwrap_or(p.yaw);
                 let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
@@ -4148,6 +4394,7 @@ impl Game {
             if !grabbed {
                 p.pos += p.knock_vel * dt;
                 p.knock_vel *= 0.667f32.powf(dt * 30.0);
+                p.trial_move = p.pos - start;
                 let (pos, wall) = self.collision.resolve_walls_hit(
                     p.pos,
                     PLAYER_RADIUS,
@@ -4218,13 +4465,13 @@ impl Game {
         for (m, pi) in posts {
             self.post(m, Some(pi), &[]);
         }
-        for (pi, mult, knock) in swings {
+        for (pi, mult, bits) in swings {
             let (pos, yaw) = (self.players[pi].pos, self.players[pi].yaw);
             // pmotion.c:2716: Pojo's swing plays its ATTACK.
             if self.players[pi].fx.special & crate::powerups::S_POJO != 0 {
                 self.players[pi].worn.pojo_swing = true;
             }
-            self.player_attack(pi, pos, yaw, mult, knock);
+            self.player_attack(pi, pos, yaw, mult, bits);
         }
         for pi in hammers {
             self.start_hammer(pi);
@@ -4750,7 +4997,7 @@ impl Game {
 
     /// A swing lands (pmotion.c:2621): the one target in the facing cone within
     /// 3.5, for the melee damage times `mult` (x2 slow / step, x3 power).
-    fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, _knock: bool) {
+    fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, bits: u32) {
         let dir = Vec2::new(yaw.sin(), yaw.cos());
         let target = self
             .entities
@@ -4768,10 +5015,31 @@ impl Game {
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i);
-        let Some(t) = target else { return };
+        let Some(t) = target else {
+            if self.friendly_fire == 2 {
+                self.find_closest_player(pi, dir, mult);
+            }
+            return;
+        };
         if let Kind::Trigger { hit, .. } = &mut self.entities[t].kind {
             *hit = true;
             return;
+        }
+        // PlayerMotion_HitTarget: a swing that lands on a nameless obstacle
+        // (the breakable walls) says it takes multiple hits (msg 20).
+        if let Kind::Container {
+            chest: false,
+            armor,
+            sub,
+            ..
+        } = self.entities[t].kind
+        {
+            let nameless = self.level.worlds.item_infos.iter().any(|i| {
+                i.item_type == ItemType::Obstacle && i.subtype == sub && i.name.is_empty()
+            });
+            if nameless && armor >= 0.0 && self.entities[t].alive {
+                self.post(20, Some(pi), &[]);
+            }
         }
         let p = &self.players[pi];
         let mut dmg = p.derived.damage * mult;
@@ -4789,12 +5057,73 @@ impl Game {
             Kind::Enemy { etype, .. } => crate::enemies::TYPES[(*etype).min(33)].height * 0.5 > 2.0,
             _ => false,
         };
+        // pmotion.c:2654: the swing's damage type is the weapon's, a power move
+        // knocking down, a HIT2 swing knocking back, and a kick knocking down
+        // a monster at 2 health or less; its direction rises 0.05 x the
+        // damage (at most 2) (PlayerMotion_DamageTarget).
+        use crate::paction::act;
+        let mut dtype = p.fx.weapon;
+        if bits & 0xF0 != 0 {
+            dtype |= DmgType::KNOCKDOWN;
+        } else if bits & act::HIT2 != 0 {
+            dtype |= DmgType::KNOCKBACK;
+        } else if bits & act::KICK != 0
+            && matches!(self.entities[t].kind, Kind::Enemy { hp, .. } if hp <= 2.0)
+        {
+            dtype |= DmgType::KNOCKDOWN;
+        }
         let was_down = Self::is_destroyed(&self.entities[t]);
+        self.effects.hit_dtype = Some(dtype);
+        self.effects.hit_lift = Some((0.05 * dmg).min(2.0));
         self.hit_entity(pi, t, dmg, dir, true);
+        self.effects.hit_dtype = None;
+        self.effects.hit_lift = None;
         if tall {
             let down = self.entities.get(t).is_none_or(Self::is_destroyed);
             self.streak_hit(pi, was_down || down);
         }
+    }
+
+    /// PlayerMotion_FindClosestPlayer (Multiplayer option 2, Shots Hurt): a
+    /// swing that found nothing else hits the nearest other hero in play
+    /// within a 45 degree cone ahead and 2 of the swinger's radius from their
+    /// surface, with the swing's damage and its direction.
+    fn find_closest_player(&mut self, pi: usize, dir: Vec2, mult: f32) {
+        let Some(p) = self.players.get(pi) else {
+            return;
+        };
+        let fwd = Vec3::new(dir.x, 0.0, dir.y);
+        let mut best = 2.0 + PLAYER_RADIUS;
+        let mut closest = None;
+        for (i, op) in self.players.iter().enumerate() {
+            if i == pi || !op.state.active() || op.exit.waiting {
+                continue;
+            }
+            let d = op.pos - p.pos;
+            let len = d.length();
+            if d.normalize_or_zero().dot(fwd) < 0.707 {
+                continue;
+            }
+            let adj = len - PLAYER_RADIUS;
+            if adj < best {
+                best = adj;
+                closest = Some(i);
+            }
+        }
+        let Some(c) = closest else { return };
+        let (dmg, from) = (p.derived.damage * mult, p.pos);
+        // The swing's knock: a power swing knocks down (0x20), HIT2 back.
+        let flags = if mult >= 3.0 {
+            DmgType::KNOCKDOWN
+        } else if mult >= 2.0 {
+            DmgType::KNOCKBACK
+        } else {
+            0
+        };
+        self.snd.mode = Some(2);
+        self.damage_from = Some(from);
+        self.damage_player(c, dmg, flags);
+        self.damage_from = None;
     }
 
     /// PlyrSfxDoDamage for one PDATA damage row due in the frame window
@@ -5171,6 +5500,15 @@ impl Game {
     /// Damage entity `t` on player `pi`'s behalf: sounds, experience (more for
     /// melee, which also charges the turbo meter) and anything it drops.
     pub(crate) fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
+        // lbl_803447E4: a hero fighting (damage_enemy, or a swing at a
+        // generator or obstacle) holds off the Follow nag.
+        if matches!(
+            self.entities[t].kind,
+            Kind::Enemy { .. } | Kind::Critter(_) | Kind::Generator { .. }
+        ) || melee && matches!(self.entities[t].kind, Kind::Container { .. })
+        {
+            self.nag.fighting = true;
+        }
         if matches!(self.entities[t].kind, Kind::Critter(_)) {
             self.hit_critter(pi, t, dmg, push, melee);
             return;
@@ -5202,23 +5540,50 @@ impl Game {
         if shrunk && is_enemy {
             dmg *= 2.0;
         }
+        let was = match &self.entities[t].kind {
+            Kind::Enemy { state, .. } => Some(*state),
+            _ => None,
+        };
+        // birth_style 0: made by a generator (not placed, nor a lookout).
+        let spawned_by_gen = matches!(&self.entities[t].kind,
+            Kind::Enemy { brain, ai, .. } if brain.generator.is_some() && *ai != 15);
+        let death = match &self.entities[t].kind {
+            Kind::Enemy {
+                etype: crate::enemies::DEATH,
+                hp,
+                strength,
+                ..
+            } => Some((*hp, *strength == 2)),
+            _ => None,
+        };
         let r = Self::apply_hit(&mut self.entities[t], dmg, push);
         // AudioPlayEvt101: Death dies.
         if r.killed && r.tier == crate::enemies::DEATH && !r.generator {
             self.sfx_id(0x65);
         }
-        // The monster staggers (HIT1) or dies (DEATH / HIT2).
-        if r.hit
-            && MAGIC_HIT.with(|m| m.get()) == 0
-            && matches!(
-                self.entities[t].kind,
-                Kind::Enemy {
-                    etype: crate::enemies::DEATH,
-                    ..
+        // damage_enemy (enemy.c:5976): magic kills Death and heals a hero
+        // above level 75 by part of what it had left; with the anti-Death
+        // shield each hit gives +1 health (a tier-2 Death's: experience),
+        // without it the hero hears it can't be hurt (msg 0).
+        if let (Some((hp, tier2)), true) = (death, r.hit) {
+            let p = &mut self.players[pi];
+            if MAGIC_HIT.with(|m| m.get()) != 0 {
+                if p.level > 75 {
+                    let k = 0.032 * (p.level - 75) as f32 + 0.2;
+                    let cap = max_health(p.level);
+                    if p.health < cap {
+                        p.health = (p.health + hp * k).min(cap);
+                    }
                 }
-            )
-        {
-            self.post(0, Some(pi), &[]);
+            } else if p.fx.armor & crate::powerups::A_ANTIDEATH != 0 {
+                if tier2 {
+                    self.death_exp(pi, 1);
+                } else {
+                    p.health += 1.0;
+                }
+            } else {
+                self.post(0, Some(pi), &[]);
+            }
         }
         // damage_enemy's burst by the hit's element (the potion's, the
         // weapon's, or what the caller dealt).
@@ -5238,24 +5603,11 @@ impl Game {
         if is_gen && r.killed {
             self.generator_fx(t, true);
         }
-        if is_enemy && r.hit {
-            let e = &mut self.entities[t];
-            let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
-            if let (Some(seqs), Kind::Enemy { state, etype, .. }) = (seqs, &mut e.kind) {
-                if r.killed {
-                    let small = crate::enemies::is_small(*etype);
-                    *state = EnemyState::Dying {
-                        timer: if small { 0.25 } else { 0.7 },
-                    };
-                    if let Some(d) = seqs.death {
-                        e.animator.restart(d);
-                        e.animator.force_loop = false;
-                    }
-                } else if let Some(h) = seqs.hit {
-                    e.animator.restart(h);
-                    e.animator.force_loop = false;
-                }
-            }
+        if let (Some(was), true) = (was, r.hit) {
+            // PlayerMotion_DamageTarget's hit direction rises with the damage.
+            let lift = self.effects.hit_lift.take().unwrap_or(0.0);
+            let dir = Vec3::new(push.x, lift, push.y);
+            self.enemy_react(t, was, r.killed, dmg, dtype, dir);
         }
         // Generators drop a tier at 2/3 and 1/3 of their health: they then spawn
         // the lower tier, allow twice as many alive, and change model.
@@ -5301,6 +5653,19 @@ impl Game {
                 st.generators_destroyed += 1;
             } else {
                 st.enemies_killed += 1;
+            }
+            // PlayerDamagedEnemy: ten generator monsters killed without
+            // destroying a generator says to destroy them (msg 22), outside
+            // boss levels; destroying one starts the count again.
+            if let Some(n) = self.gen_streak.get_mut(pi) {
+                if r.generator {
+                    *n = 0;
+                } else if spawned_by_gen {
+                    *n += 1;
+                    if *n >= 10 && self.boss.is_none() {
+                        self.post(22, Some(pi), &[]);
+                    }
+                }
             }
         }
         if r.hit {
@@ -5384,32 +5749,51 @@ impl Game {
     }
 
     /// AddExp: scaled by the level's xpmul (less for players above its plevel);
-    /// melee exp also charges the turbo meter. Each level gained adds 100 health.
+    /// melee exp also charges the turbo meter (outside the untouchable
+    /// moves). A level-up, however many levels it is, posts msg 0x22, starts
+    /// StartLevelUpFX on the hero and adds 100 health once. A combo partner
+    /// gets the same exp (scaled again for them, mode -1).
     fn add_exp(&mut self, pi: usize, amount: f32, melee: bool) {
+        let gained = self.add_exp_sub(pi, amount, melee);
+        if let Some(g) = self.players.get(pi).and_then(|p| p.grab_partner) {
+            if g != pi && g < self.players.len() {
+                self.add_exp_sub(g, gained as f32, false);
+            }
+        }
+    }
+
+    /// AddExp for one hero (no forwarding); the exp it scaled to.
+    fn add_exp_sub(&mut self, pi: usize, amount: f32, melee: bool) -> u32 {
         let (xp_mul, plevel) = self
             .wave
             .and_then(|w| self.worlds.level(w))
             .map_or((1.0, 0.0), |l| (l.xp_mul.max(0.0), l.player_level));
         let p = &mut self.players[pi];
         let gained = crate::stats::scale_exp(amount, p.level, xp_mul, plevel);
-        if melee {
+        if melee && p.act.action < 11 {
             p.power = (p.power + 0.025 * gained as f32).min(100.0);
         }
         p.exp = p.exp.saturating_add(gained);
         let level = crate::stats::exp_to_level(p.exp);
-        if level > p.level {
-            p.health += 100.0 * (level - p.level) as f32;
+        if level > p.level && gained > 0 {
+            p.health += 100.0;
             p.level = level;
             p.refresh_stats();
             self.post(0x22, Some(pi), &[level.to_string()]);
+            self.start_level_up_fx(pi);
         }
+        gained
     }
 
-    /// damage_player: armour takes its share off each hit (not poison gas or
-    /// magic); blocking halves it. The announcer speaks as health crosses 150 and
-    /// 50, and the hero grunts in pain.
+    /// damage_player: the level's damagemul scales each hit over 1, armour
+    /// takes its share off (not poison gas or magic), and a block or charge
+    /// halves it. The announcer speaks as health crosses 150 and 50, and the
+    /// hero grunts in pain.
     pub fn damage_player(&mut self, pi: usize, dmg: f32, flags: u32) {
         let mode = self.snd.mode.take().unwrap_or(1);
+        let damagemul = self.damage_mul();
+        // A hit with a direction (dir != NULL): where it came from.
+        let directed = self.damage_from.is_some();
         let Some(p) = self.players.get_mut(pi) else {
             return;
         };
@@ -5430,6 +5814,16 @@ impl Game {
             return;
         }
         let mut dmg = dmg;
+        // Unless it is a throw (0x8000): a hero waiting on an exit (state 4)
+        // can't be hurt, and the level's damagemul scales any hit over 1.
+        if flags & 0x8000 == 0 {
+            if p.exit.waiting {
+                return;
+            }
+            if dmg > 1.0 {
+                dmg *= damagemul;
+            }
+        }
         let armor = p.fx.armor;
         use crate::powerups as pu;
         // ModifyDamage: invulnerable takes nothing, gold invulnerability turns a
@@ -5451,24 +5845,34 @@ impl Game {
         if flags & DmgType::LOW != 0 && p.fx.special & crate::powerups::S_LEVITATE != 0 {
             dmg = 0.0;
         }
-        // damage_player: a block (DEFEND2) stops the hit; a charge halves it;
-        // either way a heavy knock becomes a plain knockback.
+        // damage_player: a block (DEFEND2) stops only a hit with no
+        // direction; the back-arc test that should stop the rest can never
+        // pass as shipped (player.c:3368), so those are halved, as a charge
+        // halves everything. Either way a heavy knock becomes a knockback.
         let mut clank = None;
+        let mut learn_block = false;
         if dmg > 1.0 && p.act.hud & (crate::paction::hud::BLOCK | crate::paction::hud::CHARGE) != 0
         {
             let dam = dmg;
-            if p.act.hud & crate::paction::hud::BLOCK != 0 {
+            if p.act.hud & crate::paction::hud::BLOCK != 0 && !directed {
                 dmg = 0.0;
             } else {
                 dmg *= 0.5;
             }
-            // StartBlockFX when the block took more than 2 off.
+            // StartBlockFX when the block took more than 2 off (hud 0x2000:
+            // this hero has blocked).
             if dam - dmg > 2.0 {
                 clank = Some(dmg);
+                p.act.hud |= 0x2000;
             }
             if flags & 0x10160 != 0 {
                 flags = (flags & !0x10160) | DmgType::KNOCKBACK;
             }
+        } else if dmg > 15.0 && flags & 0x10160 != 0 && p.act.hud & 0x2000 == 0 && self.time > 60.0
+        {
+            // player.c:3403: a heavy hit taken unblocked, by a hero who has
+            // never blocked, a minute in: learn to block (msg 0x7D).
+            learn_block = true;
         }
         // For PlayerKnockback: the damage, its flags and the push away from
         // where it came from.
@@ -5486,7 +5890,17 @@ impl Game {
         if let Some(reduced) = clank {
             self.start_block_fx(pi, reduced);
         }
+        if learn_block {
+            self.post(0x7D, Some(pi), &[]);
+        }
         self.damage_sounds(pi, mode, dmg, flags, old);
+    }
+
+    /// gCurLevel->damagemul (1 without a level).
+    fn damage_mul(&self) -> f32 {
+        self.wave
+            .and_then(|w| self.worlds.level(w))
+            .map_or(1.0, |l| l.damage)
     }
 
     pub(crate) fn world_letter(&self) -> char {
@@ -5550,8 +5964,213 @@ impl Game {
             )
     }
 
-    /// Damage one entity.
-    fn apply_hit(e: &mut Entity, dmg: f32, push: Vec2) -> HitResult {
+    /// fn_80046140's drain by Death `ei` of hero `pi`: a tier-2 Death takes
+    /// experience (AddExp mode -2; msg 0x80), the rest health round armour
+    /// (msg 0x82). Death pays `fight` from its own health each time, and
+    /// leaves when that runs out or its victim dies (AudioPlayEvt104);
+    /// otherwise S_DEATHSUCK goes on (AudioPlayEvt102Follow).
+    fn death_drain(&mut self, ei: usize, pi: usize, fight: f32, tier2: bool) {
+        self.nag.fighting = true;
+        let mut died = false;
+        if tier2 {
+            self.death_exp(pi, -1);
+            self.post(0x80, Some(pi), &[]);
+        } else {
+            let was = self.players[pi].health > 0.0;
+            self.damage_player(pi, fight, DmgType::NO_ARMOR);
+            died = was && self.players[pi].health <= 0.0;
+            self.post(0x82, Some(pi), &[]);
+        }
+        let Kind::Enemy {
+            hp, state, drained, ..
+        } = &mut self.entities[ei].kind
+        else {
+            return;
+        };
+        if died {
+            *hp = 0.0;
+        }
+        *hp -= fight;
+        if *hp >= 0.0 {
+            self.snd.death_suck = 4;
+        } else {
+            *drained = true;
+            *state = EnemyState::Dying { timer: DEATH_EXIT };
+            self.sfx_id(0x68);
+        }
+    }
+
+    /// AddExp mode -2 (Death's): `sign` x 1% of the level's step, (lv - 1) x
+    /// 60 + 1000 (4600 past 60); none taken at 99. Lost experience can take
+    /// levels away (ModifyExp; AudioExp "lost a level"), gained can add them.
+    fn death_exp(&mut self, pi: usize, sign: i32) {
+        let p = &mut self.players[pi];
+        if sign < 0 && p.level == 99 {
+            return;
+        }
+        let step = if p.level <= 60 {
+            (p.level as i32 - 1) * 60 + 1000
+        } else {
+            4600
+        };
+        let amount = sign * (0.01 * step as f32) as i32;
+        p.exp = (p.exp as i64 + amount as i64).max(0) as u32;
+        let level = crate::stats::exp_to_level(p.exp);
+        if amount < 0 && level < p.level {
+            p.level = level.max(1);
+            p.refresh_stats();
+            let name = format!("VOICE:S_{}{}1", p.color, p.class);
+            self.sfx
+                .push(format!("{name}+S_LOSTLEVEL|VOICE:S_LOSTLEVEL"));
+        } else if amount > 0 && level > p.level {
+            p.level = level.min(99);
+            p.refresh_stats();
+            p.health += 100.0;
+            self.post(0x22, Some(pi), &[level.to_string()]);
+            self.start_level_up_fx(pi);
+        }
+    }
+
+    /// damage_enemy (enemy.c:6116) / uncouple_enemy: hitting an egg not yet
+    /// hatched sets its generator's flags to 7 (the clutch hatches) and
+    /// num_generated to 3; hitting or killing a lookout turns its generator
+    /// into an ordinary one (ai 0), and a dead lookout's no longer counts.
+    fn alert_generator(&mut self, t: usize, killed: bool) {
+        let Kind::Enemy { brain, etype, .. } = &self.entities[t].kind else {
+            return;
+        };
+        if *etype == crate::enemies::DEATH {
+            return;
+        }
+        let (alg, mode1) = (brain.alg(), brain.mode1());
+        let Some(gid) = brain.generator else { return };
+        let Some(Kind::Generator {
+            ai, chain, spawned, ..
+        }) = self
+            .entities
+            .iter_mut()
+            .find(|e| e.id == gid && e.alive)
+            .map(|e| &mut e.kind)
+        else {
+            return;
+        };
+        if alg == 12 && mode1 < 2 {
+            chain.flags = 7;
+            chain.generated = 3;
+        } else if alg == 15 {
+            *ai = 0;
+            if killed {
+                spawned.clear();
+            }
+        }
+    }
+
+    /// fn_8004DC2C: monster `t`'s reaction to the hit it just took (it was in
+    /// state `was`). Heavy hits (knockdown, blown away, knockover, whirlwind,
+    /// or magic over 10) knock it down (E_HIT_REACT2) and push it 40 (small
+    /// monsters) or 20 along the hit; a knockback hit staggers it (HIT1) and
+    /// pushes it 8; the push is capped at 40. A reaction already playing isn't
+    /// restarted (action.c's HIT_REACT cases wait for the end).
+    pub(crate) fn enemy_react(
+        &mut self,
+        t: usize,
+        was: EnemyState,
+        killed: bool,
+        dmg: f32,
+        dtype: u32,
+        dir: Vec3,
+    ) {
+        use crate::enemies::{ACID, DEATH, GOLEM, IT};
+        self.alert_generator(t, killed);
+        let e = &mut self.entities[t];
+        let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
+        let Kind::Enemy {
+            state,
+            etype,
+            pushed,
+            pushang,
+            ..
+        } = &mut e.kind
+        else {
+            return;
+        };
+        let et = *etype;
+        let hht = crate::enemies::TYPES[et.min(33)].height * 0.5;
+        // damage_enemy returns before the reaction for Death.
+        let react = if et == DEATH {
+            None
+        } else if dtype & 0x10160 != 0 || (dmg > 10.0 && dtype & DmgType::MAGIC != 0) {
+            let scale = if et == ACID {
+                0.0
+            } else if hht <= 2.0 && et != IT {
+                40.0
+            } else if et == GOLEM {
+                2.0
+            } else {
+                20.0
+            };
+            Some((true, scale))
+        } else if dtype & DmgType::KNOCKBACK != 0 {
+            (et != GOLEM && et != ACID).then_some((false, 8.0))
+        } else {
+            (et != GOLEM).then_some((false, 0.0))
+        };
+        if let Some((_, scale)) = react.filter(|r| r.1 > 0.0) {
+            *pushed += dir * scale;
+            *pushang = dir.x.atan2(dir.z) + std::f32::consts::PI;
+            if *pushang > std::f32::consts::PI {
+                *pushang -= std::f32::consts::TAU;
+            }
+            if pushed.length_squared() > 1600.0 {
+                *pushed = pushed.normalize() * 40.0;
+            }
+        }
+        if killed && et == DEATH {
+            *state = EnemyState::Dying { timer: DEATH_EXIT };
+            return;
+        }
+        let Some(seqs) = seqs else { return };
+        if killed {
+            let small = crate::enemies::is_small(et);
+            *state = EnemyState::Dying {
+                timer: if small { 0.25 } else { 0.7 },
+            };
+            if let Some(d) = seqs.death {
+                e.animator.restart(d);
+                e.animator.force_loop = false;
+            }
+            return;
+        }
+        let Some((heavy, _)) = react else {
+            // No reaction: whatever it was doing goes on.
+            *state = was;
+            return;
+        };
+        let busy = match was {
+            EnemyState::Hurt { heavy: h, .. } => h || !heavy,
+            _ => false,
+        };
+        *state = EnemyState::Hurt {
+            timer: 0.3,
+            heavy: heavy || matches!(was, EnemyState::Hurt { heavy: true, .. }),
+        };
+        if busy {
+            return;
+        }
+        // DoEnemyAction: a model without HIT2 shows READY.
+        let anim = if heavy {
+            seqs.hit2.or(seqs.ready)
+        } else {
+            seqs.hit
+        };
+        if let Some(h) = anim {
+            e.animator.restart(h);
+            e.animator.force_loop = false;
+        }
+    }
+
+    /// Damage one entity (fn_8004DC2C's reaction and push: `enemy_react`).
+    fn apply_hit(e: &mut Entity, dmg: f32, _push: Vec2) -> HitResult {
         let mut r = HitResult::default();
         match &mut e.kind {
             Kind::Enemy {
@@ -5578,9 +6197,9 @@ impl Game {
                     *state = EnemyState::Dying { timer: 0.5 };
                     r.killed = true;
                 } else {
-                    *state = EnemyState::Hurt { timer: 0.3 };
+                    let heavy = matches!(state, EnemyState::Hurt { heavy: true, .. });
+                    *state = EnemyState::Hurt { timer: 0.3, heavy };
                 }
-                let _ = push;
             }
             Kind::Generator { hp, etype, .. } => {
                 r.hit = true;
@@ -5773,13 +6392,15 @@ impl Game {
         let mut spawns: Vec<Spawn> = Vec::new();
         let mut shots: Vec<Shot> = Vec::new();
         let mut blasts: Vec<(Vec3, f32)> = Vec::new();
-        let mut drains: Vec<(usize, f32)> = Vec::new();
+        // Death's drains: (Death, victim, its fight, tier 2).
+        let mut drains: Vec<(usize, usize, f32, bool)> = Vec::new();
+        // Deaths gone after draining: their message, and to whom.
+        let mut death_left: Vec<(usize, Option<usize>)> = Vec::new();
         // Garm's swings (StartEnemyAtkFX) and deaths (fn_8004F1DC).
         let mut garm_atk: Vec<(u64, usize)> = Vec::new();
         let mut garm_dead: Vec<Vec3> = Vec::new();
         // Death and whom it drains (StartDeathFX on both).
         let mut drain_fx: Vec<(u64, usize)> = Vec::new();
-        let mut death_done: Vec<usize> = Vec::new();
         let mut tagged: Option<usize> = None;
         let halo: Vec<bool> = self
             .players
@@ -5796,9 +6417,19 @@ impl Game {
         let mut pickup_food: Vec<usize> = Vec::new();
         let mut opened: Vec<(usize, usize)> = Vec::new();
         let mut key_used: Vec<usize> = Vec::new();
-        let mut exits: Vec<(usize, Option<u32>)> = Vec::new();
+        // Each player's exit this tick (fn_8005D730 case 9), what the exits'
+        // case 9 sees of the party, and the level's exit progress (reset each
+        // tick until the party starts sinking).
+        let mut touched: Vec<Option<Option<u32>>> = vec![None; self.players.len()];
+        let party = self.party_on_exits();
+        let mut exit_progress = if self.exit_state.started {
+            self.exit_state.progress
+        } else {
+            0
+        };
         let mut secret: Option<u32> = None;
         let mut chest_used: Vec<usize> = Vec::new();
+        let mut chest_refused: Vec<(usize, i32)> = Vec::new();
         let mut posts: Vec<(usize, usize)> = Vec::new();
         let mut chests_opened: Vec<(Vec3, Option<usize>)> = Vec::new();
         let mut proj_hits: Vec<(usize, usize, f32, Vec2, f32)> = Vec::new();
@@ -5858,12 +6489,12 @@ impl Game {
                 }
                 _ => None,
             });
-        let generators: HashMap<u64, u32> = self
+        let generators: HashMap<u64, bool> = self
             .entities
             .iter()
             .filter(|e| e.alive)
             .filter_map(|e| match &e.kind {
-                Kind::Generator { chain, .. } => Some((e.id, chain.generated)),
+                Kind::Generator { chain, .. } => Some((e.id, chain.flags == 7)),
                 _ => None,
             })
             .collect();
@@ -5872,6 +6503,7 @@ impl Game {
         // Each monster's move for do_enemy_move's report: (from, tried, walls
         // stopped it, touching this player).
         let mut ai_moves: HashMap<u64, (Vec3, bool, bool, Option<Vec3>)> = HashMap::new();
+        let exit_extra = self.exit_reach(0.0);
 
         for ei in 0..self.entities.len() {
             if !self.entities[ei].alive {
@@ -5897,8 +6529,24 @@ impl Game {
                 } => {
                     let (ai, height) = (*ai, *height);
                     let on = visible[ei];
+                    let full = enemy_count + spawns.len() >= self.max_enemies;
+                    if ai == 15 {
+                        // generate_single: a lookout generator keeps one
+                        // lookout out, on screen or not (items.c:3917).
+                        if spawned.is_empty() && !boss_dying && !full {
+                            spawns.push(Spawn {
+                                class: *class,
+                                ai: 15,
+                                strength: *strength,
+                                pos,
+                                yaw: e.yaw,
+                                generator: e.id,
+                                recycle: false,
+                                height,
+                            });
+                        }
                     // generate_enemy refuses everything once the boss is dying.
-                    if (*always || on) && spawned.len() < *max && !boss_dying {
+                    } else if (*always || on) && spawned.len() < *max && !boss_dying {
                         if *timer > 0.0 {
                             *timer -= dt * 60.0;
                         } else {
@@ -5975,6 +6623,8 @@ impl Game {
                     brain,
                     ai,
                     dest,
+                    pushed,
+                    pushang,
                     ..
                 } => {
                     let Some(model) = e.model else { continue };
@@ -6016,6 +6666,26 @@ impl Game {
                         *cooldown -= dt;
                         e.animator.update(skel, dt);
                         continue;
+                    }
+                    // do_enemy_move adds the knockback (enemy.c:1153); while it
+                    // is pushed the monster faces back at the hit (enemy.c:1380).
+                    // The push then decays x0.8 a 30 Hz frame, an upward one
+                    // also by 100 a second (enemy.c:5391).
+                    let lifted = *pushed != Vec3::ZERO;
+                    if lifted {
+                        e.pos += *pushed * dt;
+                        if pushed.x * pushed.x + pushed.z * pushed.z > 0.1 {
+                            e.yaw = *pushang;
+                        }
+                        *pushed *= 0.8f32.powf(dt * 30.0);
+                        for c in [&mut pushed.x, &mut pushed.y, &mut pushed.z] {
+                            if c.abs() < 0.01 {
+                                *c = 0.0;
+                            }
+                        }
+                        if pushed.y > 0.0 {
+                            pushed.y = (pushed.y - 100.0 * dt).max(0.0);
+                        }
                     }
                     // do_enemy_move: a step that would touch the player (radius
                     // + 0.5 + the player's 1.5; fn_80046680's sweep) requests a
@@ -6070,10 +6740,10 @@ impl Game {
                             has_generator: brain
                                 .generator
                                 .is_some_and(|g| generators.contains_key(&g)),
-                            generated: brain
+                            hatch: brain
                                 .generator
                                 .and_then(|g| generators.get(&g).copied())
-                                .unwrap_or(0),
+                                .unwrap_or(false),
                         };
                         let probe = crate::ai::WorldProbe {
                             coll: &self.collision,
@@ -6096,15 +6766,41 @@ impl Game {
                         if o.frozen {
                             continue;
                         }
-                        e.yaw = o.yaw;
+                        if pushed.x * pushed.x + pushed.z * pushed.z <= 0.1 {
+                            e.yaw = o.yaw;
+                        }
                         releases.extend(o.release);
                         Some(o)
                     };
                     match state {
                         EnemyState::Dying { timer } => {
+                            // Death rises 10 a second as it fades out (alpha +4
+                            // a tick), then is gone; having drained its fill
+                            // it says so (enemy.c:5313).
+                            if *etype == crate::enemies::DEATH {
+                                *timer -= dt;
+                                e.fade = (*timer / DEATH_EXIT).clamp(0.0, 1.0);
+                                e.pos.y += 10.0 * dt;
+                                if *timer <= 0.0 {
+                                    e.alive = false;
+                                    if *drained {
+                                        let m = if *strength == 2 { 0x81 } else { 0x83 };
+                                        death_left.push((m, target.map(|t| t.0)));
+                                    }
+                                }
+                                continue;
+                            }
                             // The death (or HIT2) animation, then gone: at once for
                             // small monsters, after the 0.7 s burn for the rest.
                             *timer -= dt;
+                            if lifted {
+                                e.pos = self.collision.resolve_walls(
+                                    e.pos,
+                                    ty.radius.min(1.5),
+                                    ty.height * 0.75,
+                                    STEP_HEIGHT,
+                                );
+                            }
                             if *timer <= 0.0 {
                                 e.alive = false;
                                 // kill_enemy: Garm's pup leaves its death shot.
@@ -6119,9 +6815,16 @@ impl Game {
                             e.animator.update(skel, dt);
                             continue;
                         }
-                        EnemyState::Hurt { .. } => {
+                        EnemyState::Hurt { heavy, .. } => {
+                            // E_HIT_REACT2 goes on to GETUP where the model has it.
                             if e.animator.finished {
-                                *state = EnemyState::Chase;
+                                match seqs.getup.filter(|&g| *heavy && e.animator.seq != g) {
+                                    Some(g) => {
+                                        e.animator.restart(g);
+                                        e.animator.force_loop = false;
+                                    }
+                                    None => *state = EnemyState::Chase,
+                                }
                             }
                         }
                         EnemyState::Spawning => {
@@ -6149,20 +6852,18 @@ impl Game {
                                     continue;
                                 }
                             } else if *etype == DEATH {
-                                // Death drains whoever it touches, 3 ticks at a
-                                // time, until it has taken 100, then leaves.
+                                // fn_80046140: Death drains whoever it touches
+                                // every 3 ticks (health, or a tier-2 Death's
+                                // experience), paying its fight from its own
+                                // health each time.
                                 if let Some(pi) = contact.filter(|&pi| !halo[pi]) {
                                     walk = false;
+                                    // coll_pnum: whom it says it leaves.
+                                    *target = Some((pi, false));
                                     drain_fx.push((e.id, pi));
                                     if *reload <= 0.0 {
                                         *reload = 3.0 / 60.0;
-                                        let f = self.tuning.damage;
-                                        drains.push((pi, f));
-                                        *drained += f;
-                                        if *drained >= 100.0 {
-                                            *state = EnemyState::Dying { timer: 1.0 };
-                                            death_done.push(pi);
-                                        }
+                                        drains.push((ei, pi, self.tuning.damage, *strength == 2));
                                     }
                                     if let Some((a, _)) = seqs.attack {
                                         if e.animator.seq != a {
@@ -6386,7 +7087,13 @@ impl Game {
                     }
                     if let Some(g) = self.collision.ground_height(e.pos, e.pos.y + STEP_HEIGHT) {
                         if e.pos.y - g < 3.0 {
-                            e.pos.y = g;
+                            // A knocked-up monster falls back at most 16 a
+                            // second (EnemyFloorCollide's gravity).
+                            e.pos.y = if lifted && e.pos.y > g {
+                                (e.pos.y - 16.0 * dt).max(g)
+                            } else {
+                                g
+                            };
                         } else {
                             let mut vy = 0.0;
                             Self::snap_to_ground(&self.collision, &mut e.pos, &mut vy, dt);
@@ -6420,18 +7127,28 @@ impl Game {
                         }
                     }
                 }
-                // Chests open with a key when touched (activetype 0x16 "locked").
+                // fn_8005D730 case 2: only a locked chest (active & 0x10) takes
+                // a key when touched; without one it says so (msg 2, or msg
+                // 23 for a silver chest when 2 is refused).
                 Kind::Container {
                     hp,
                     drop,
                     chest: true,
+                    sub,
                     ..
-                } if *hp > 0.0 => {
+                } if *hp > 0.0
+                    && self
+                        .items
+                        .info
+                        .get(&e.id)
+                        .and_then(|&i| self.level.worlds.item_infos.get(i))
+                        .is_some_and(|i| i.active_type & 0x10 != 0) =>
+                {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                         let close =
                             *alive && Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length() < 3.0;
                         if close && self.players[pi].keys == 0 {
-                            posts.push((2, pi));
+                            chest_refused.push((pi, *sub));
                         }
                         if close
                             && self.players[pi].keys > 0
@@ -6448,17 +7165,19 @@ impl Game {
                         }
                     }
                 }
+                // fn_8005D730 case 7: a door opens (or says it needs a key,
+                // msg 1) only for a hero not moving away from it.
                 Kind::Door { radius, coll } => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
-                        if *alive && (*pp - e.pos).length() < *radius && self.players[pi].keys == 0
-                        {
+                        let mv = self.players[pi].trial_move;
+                        let toward = Vec2::new(mv.x, mv.z)
+                            .dot(Vec2::new(e.pos.x - pp.x, e.pos.z - pp.z))
+                            >= 0.0;
+                        let touching = *alive && toward && (*pp - e.pos).length() < *radius;
+                        if touching && self.players[pi].keys == 0 {
                             posts.push((1, pi));
                         }
-                        if *alive
-                            && (*pp - e.pos).length() < *radius
-                            && self.players[pi].keys > 0
-                            && !key_used.contains(&pi)
-                        {
+                        if touching && self.players[pi].keys > 0 && !key_used.contains(&pi) {
                             key_used.push(pi);
                             if let Some(c) = coll {
                                 opened.push(*c);
@@ -6580,11 +7299,30 @@ impl Game {
                         }
                     }
                 }
-                Kind::Exit { radius, dest, open } => {
+                Kind::Exit {
+                    radius,
+                    height,
+                    dest,
+                    open,
+                    anim,
+                } => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
-                        if *open && *alive && (*pp - e.pos).length() < *radius {
-                            exits.push((pi, *dest));
+                        let xz = Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length();
+                        if *open
+                            && *alive
+                            && xz <= *radius + exit_extra
+                            && (pp.y - e.pos.y).abs() <= *height
+                        {
+                            touched[pi] = Some(*dest);
+                            if pi < 4 {
+                                anim.onexit |= 1 << pi;
+                            }
                         }
+                    }
+                    anim.update(dt, party, &mut exit_progress);
+                    if e.model.is_some() {
+                        e.animator.seq = anim.anim.seq;
+                        e.animator.frame = anim.anim.frame;
                     }
                 }
                 Kind::EnemyShot {
@@ -6939,9 +7677,13 @@ impl Game {
                     // fn_8005C1DC: a shot potion sets off its magic.
                     self.damage_item(t, dmg, 0, Some(owner));
                 } else if owner < self.players.len() {
+                    // The missile's own damage type (SfxSetDamage) goes with it.
+                    let pid = self.entities[pidx].id;
+                    self.effects.hit_dtype = self.effects.missiles.get(&pid).map(|m| m.1);
                     self.hit_from = Some(ppos);
                     self.hit_entity(owner, t, dmg, dir, false);
                     self.hit_from = None;
+                    self.effects.hit_dtype = None;
                 }
                 let id = self.entities[t].id;
                 match &mut self.entities[pidx].kind {
@@ -7039,18 +7781,31 @@ impl Game {
                     && flat(new, other) < reach
                     && flat(new, other) < flat(old, other) - 1e-4
             };
-            let by_enemy = enemy_idx
-                .iter()
-                .find(|&&j| {
-                    let (rj, hj) = size(&self.entities[j]);
-                    j != i && into(self.entities[j].pos, ri + rj, hi + hj)
-                })
-                .map(|&j| self.entities[j].pos);
+            let other = enemy_idx.iter().copied().find(|&j| {
+                let (rj, hj) = size(&self.entities[j]);
+                j != i && into(self.entities[j].pos, ri + rj, hi + hj)
+            });
+            let by_enemy = other.map(|j| self.entities[j].pos);
             let by_player = player_pos
                 .iter()
                 .find(|(pp, alive)| *alive && into(*pp, ri + 0.5 + PLAYER_RADIUS, hi + 2.5))
                 .map(|p| p.0);
-            if by_enemy.is_some() || by_player.is_some() {
+            // enemy.c:1260: a monster knocked back into another goes half the
+            // way and hands it half its push.
+            let knocked = match &self.entities[i].kind {
+                Kind::Enemy {
+                    pushed,
+                    state: EnemyState::Hurt { .. } | EnemyState::Dying { .. },
+                    ..
+                } if pushed.x * pushed.x + pushed.z * pushed.z > 1.0 => Some(*pushed),
+                _ => None,
+            };
+            if let (Some(j), Some(push), None) = (other, knocked, by_player) {
+                self.entities[i].pos = old + (new - old) * 0.5;
+                if let Kind::Enemy { pushed, .. } = &mut self.entities[j].kind {
+                    *pushed += push * 0.5;
+                }
+            } else if by_enemy.is_some() || by_player.is_some() {
                 self.entities[i].pos = old;
             }
             if let Some(b) = by_enemy {
@@ -7139,6 +7894,7 @@ impl Game {
             self.boss_generate_enemy(pos, vel);
         }
         for (ei, pi, dmg) in melee {
+            self.nag.fighting = true;
             let dmg = if shrunk { dmg * 0.5 } else { dmg };
             let special = self.players[pi].fx.special;
             if special & (pu::S_HANDOFDEATH | pu::S_VAMPIRE) != 0 {
@@ -7177,6 +7933,7 @@ impl Game {
         }
         let realm = self.realm();
         let mut runes_found = false;
+        let mut coins_got = 0;
         for ((pi, kind), food) in pickups.into_iter().zip(pickup_food) {
             if let Some((sub, count)) = sounds::got_it_of(&kind) {
                 self.add_got_it(pi, sub, count);
@@ -7206,6 +7963,7 @@ impl Game {
                 PickupKind::Gold(v) => {
                     p.gold = (p.gold + v).min(99_999);
                     p.stats.gold_found += v;
+                    coins_got += 1;
                 }
                 // Potions are used last in, first out.
                 PickupKind::Potion(c) => {
@@ -7262,8 +8020,19 @@ impl Game {
                 PickupKind::Other(_) => {}
             }
         }
+        // The secret realm's gold counts towards its secret character.
+        if realm == Some(12) {
+            for _ in 0..coins_got {
+                self.secret_coin();
+            }
+        }
         for (m, pi) in posts {
             self.post(m, Some(pi), &[]);
+        }
+        for (pi, sub) in chest_refused {
+            if !self.post(2, Some(pi), &[]) && sub == 48 {
+                self.post(23, Some(pi), &[]);
+            }
         }
         for (pi, dmg) in poisoned {
             // damage_player(-amt, 0, 2048): no cries of its own.
@@ -7313,14 +8082,11 @@ impl Game {
         for (pos, dmg) in blasts {
             self.suicide_explosion(pos, dmg);
         }
-        // Death's drain goes round armour; once it has had 100 it leaves.
-        // AudioPlayEvt102Follow: S_DEATHSUCK while Death drains;
-        // AudioPlayEvt104: its laugh as it leaves.
-        if !drains.is_empty() {
-            self.snd.death_suck = 4;
+        for (ei, pi, f, tier2) in drains {
+            self.death_drain(ei, pi, f, tier2);
         }
-        for (pi, f) in drains {
-            self.damage_player(pi, f, DmgType::NO_ARMOR);
+        for (m, pi) in death_left {
+            self.post(m, pi, &[]);
         }
         for (id, pi) in drain_fx {
             self.note_drain(id, pi);
@@ -7330,10 +8096,6 @@ impl Game {
         }
         for at in garm_dead {
             self.garm_death_fx(at);
-        }
-        for pi in death_done {
-            self.sfx_id(0x68);
-            self.post(0x83, Some(pi), &[]);
         }
         if let Some(pi) = tagged {
             self.it_holder = Some(pi);
@@ -7356,14 +8118,8 @@ impl Game {
             self.level_end = Some(LevelEnd::Secret(w));
             self.sfx.push("S_SECRETCHAR|S_PICKUPSPECIAL".into());
         }
-        for (pi, dest) in exits {
-            let p = &mut self.players[pi];
-            if p.state.active() {
-                p.state = PlayerState::Exiting { timer: 50.0 / 60.0 };
-                p.exit_dest = dest;
-                self.exit_sounds();
-            }
-        }
+        self.exit_state.progress = exit_progress;
+        self.update_exits(&touched);
     }
 
     /// Camera eye and target in game coordinates.
@@ -7510,6 +8266,10 @@ impl Game {
         let Some(p) = self.players.get(pi) else {
             return PlayerInput::default();
         };
+        // On an exit: stand still so DoExit lets the bot wait there.
+        if p.exit.touch.is_some() {
+            return PlayerInput::default();
+        }
         let target =
             self.entities
                 .iter()
@@ -7693,6 +8453,300 @@ mod tests {
             "{seen:?}"
         );
         assert!(g.players[0].exp > 0, "the swings landed");
+    }
+
+    /// A grunt standing still 2.5 in front of a lone Warrior, and its index.
+    fn grunt_in_front(g: &mut Game) -> usize {
+        g.entities.clear();
+        g.pending_enemies.clear();
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = g.players[0].pos;
+        let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
+        let model = g.classes[class].model(1);
+        let mut kind = g.new_enemy(class, 3, EnemyState::Idle);
+        if let Kind::Enemy { speed, hp, .. } = &mut kind {
+            *speed = 0.0;
+            *hp = 1000.0;
+        }
+        g.spawn(kind, model, p + Vec3::new(0.0, 0.0, 2.5), 0.0);
+        g.entities.len() - 1
+    }
+
+    #[test]
+    fn heavy_hits_knock_monsters_back() {
+        let Some(fs) = data() else { return };
+        // fn_8004DC2C: a knockdown pushes a big monster 20 along the hit and
+        // knocks it down (HIT2); a knockback pushes 8 and staggers (HIT1); a
+        // plain hit only staggers.
+        for (dtype, heavy, push) in [
+            (DmgType::KNOCKDOWN, true, 20.0),
+            (DmgType::KNOCKBACK, false, 8.0),
+            (0, false, 0.0),
+        ] {
+            let least = push / 30.0;
+            let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+            let t = grunt_in_front(&mut g);
+            let start = g.entities[t].pos;
+            g.effects.hit_dtype = Some(dtype);
+            g.hit_entity(0, t, 5.0, Vec2::Y, true);
+            g.effects.hit_dtype = None;
+            let Kind::Enemy { state, pushed, .. } = g.entities[t].kind else {
+                panic!()
+            };
+            assert!(
+                matches!(state, EnemyState::Hurt { heavy: h, .. } if h == heavy),
+                "{dtype:x}: {state:?}"
+            );
+            if heavy {
+                let m = g.entities[t].model.unwrap();
+                let hit2 = g.monster_seqs[&m].hit2;
+                assert!(hit2.is_some() && g.entities[t].animator.seq == hit2.unwrap());
+            }
+            assert!((pushed.z - push).abs() < 1e-3, "{dtype:x}: {pushed}");
+            for _ in 0..30 {
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            }
+            let moved = g.entities[t].pos.z - start.z;
+            assert!(moved >= least, "{dtype:x}: moved {moved}");
+            if least == 0.0 {
+                assert!(moved.abs() < 0.2, "{dtype:x}: moved {moved}");
+            }
+            let Kind::Enemy { pushed, .. } = g.entities[t].kind else {
+                panic!()
+            };
+            assert!(pushed.length() < 1.0, "the push decays: {pushed}");
+        }
+    }
+
+    #[test]
+    fn power_swing_knocks_a_monster_down() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let t = grunt_in_front(&mut g);
+        let (pos, yaw) = (g.players[0].pos, g.players[0].yaw);
+        g.player_attack(0, pos, yaw, 3.0, 0x10);
+        assert!(matches!(
+            g.entities[t].kind,
+            Kind::Enemy {
+                state: EnemyState::Hurt { heavy: true, .. },
+                ..
+            }
+        ));
+        let Kind::Enemy { pushed, .. } = g.entities[t].kind else {
+            panic!()
+        };
+        // Along the hero's facing, rising with the damage; at most 40.
+        assert!(pushed.z > 10.0 && pushed.y > 0.0 && pushed.length() <= 40.0 + 1e-3);
+    }
+
+    /// A lone Warrior on the first level with a Death class, and Death (tier
+    /// `tier`) touching him, still; returns its index.
+    fn death_touching(fs: &GameFs, tier: usize) -> Option<(Game, usize)> {
+        for lv in [
+            "levelA1", "levelA2", "levelA3", "levelB1", "levelB2", "levelC1",
+        ] {
+            let mut g = Game::new(fs, lv, &[("WAR", "RED")]).unwrap();
+            let Some(class) = g
+                .classes
+                .iter()
+                .position(|c| c.etype == crate::enemies::DEATH)
+            else {
+                continue;
+            };
+            g.entities.clear();
+            g.pending_enemies.clear();
+            for _ in 0..30 {
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            }
+            let model = g.classes[class].model(1);
+            let mut kind = g.new_enemy(class, tier, EnemyState::Chase);
+            if let Kind::Enemy {
+                speed, recognized, ..
+            } = &mut kind
+            {
+                *speed = 0.0;
+                *recognized = true;
+            }
+            let at = g.players[0].pos + Vec3::new(0.0, 0.0, 2.6);
+            g.spawn(kind, model, at, std::f32::consts::PI);
+            let t = g.entities.len() - 1;
+            return Some((g, t));
+        }
+        None
+    }
+
+    #[test]
+    fn tier_two_death_drains_experience() {
+        let Some(fs) = data() else { return };
+        let Some((mut g, t)) = death_touching(&fs, 2) else {
+            return;
+        };
+        // Level 10: 1% of 9 x 60 + 1000 = 15 a drain.
+        g.players[0].exp = crate::stats::level_to_exp(10) + 20;
+        g.players[0].level = 10;
+        let hp = g.players[0].health;
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = &g.players[0];
+        assert!(p.level < 10, "drained a level away: {} {}", p.level, p.exp);
+        assert!(p.health >= hp, "health untouched");
+        assert!(g.sfx.iter().any(|s| s.contains("S_LOSTLEVEL")));
+        assert!(g.sfx.iter().any(|v| v.contains("S_DEATHDRAINXP")));
+        let Kind::Enemy { hp, .. } = g.entities[t].kind else {
+            panic!()
+        };
+        assert!(hp < 100.0, "each drain costs Death its fight");
+    }
+
+    #[test]
+    fn death_leaves_when_its_victim_dies_and_fades_out() {
+        let Some(fs) = data() else { return };
+        let Some((mut g, t)) = death_touching(&fs, 1) else {
+            return;
+        };
+        let id = g.entities[t].id;
+        g.players[0].health = 1.0;
+        let mut rose = false;
+        let mut faded = false;
+        let y0 = g.entities[t].pos.y;
+        for _ in 0..120 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            if let Some(e) = g.entities.iter().find(|e| e.id == id) {
+                rose |= e.pos.y > y0 + 3.0;
+                faded |= e.fade < 0.5 && e.fade > 0.0;
+            }
+        }
+        assert!(rose && faded, "rises as it fades");
+        assert!(
+            !g.entities.iter().any(|e| e.id == id),
+            "gone after its exit"
+        );
+        assert!(
+            g.sfx.iter().any(|v| v.contains("S_DEATHDRAINS")),
+            "{:?}",
+            g.sfx
+        );
+    }
+
+    #[test]
+    fn hitting_death_with_the_shield_heals() {
+        let Some(fs) = data() else { return };
+        let Some((mut g, t)) = death_touching(&fs, 1) else {
+            return;
+        };
+        g.players[0].fx.armor |= crate::powerups::A_ANTIDEATH;
+        let hp = g.players[0].health;
+        g.hit_entity(0, t, 20.0, Vec2::Y, true);
+        assert_eq!(g.players[0].health, hp + 1.0);
+        let Kind::Enemy { hp: dhp, .. } = g.entities[t].kind else {
+            panic!()
+        };
+        assert_eq!(dhp, 99.0);
+    }
+
+    #[test]
+    fn follow_nag_after_a_quiet_stretch() {
+        let Some(fs) = data() else { return };
+        // Only the test level T2 has milestones; without them nothing is said.
+        let mut g = Game::new(&fs, "levelT2", &[("WAR", "RED")]).unwrap();
+        assert!(!g.ai_paths.milestones.is_empty());
+        g.entities.clear();
+        g.pending_enemies.clear();
+        let mut at = None;
+        for f in 0..(48 * 60) {
+            g.msgs.shown = None;
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            if g.sfx.iter().any(|s| s.contains("S_FOLLOW")) {
+                assert!(at.is_none(), "once per quiet stretch");
+                at = Some(f);
+            }
+            g.sfx.clear();
+        }
+        // 20 s in, a first (hidden) period of 10 s, then the first quiet one.
+        let f = at.expect("the Follow voice");
+        assert!((40 * 60 - 2..=40 * 60 + 2).contains(&f), "{f}");
+    }
+
+    #[test]
+    fn hints_for_blocking_and_generators() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let shown = |g: &Game| g.msgs.shown.as_ref().map(|s| s.index);
+        // A heavy hit taken unblocked a minute in: learn to block.
+        g.time = 61.0;
+        g.msgs.shown = None;
+        g.damage_player(0, 30.0, DmgType::KNOCKDOWN);
+        assert_eq!(shown(&g), Some(0x7D));
+        // Ten generator monsters killed: destroy the generators.
+        let t = grunt_in_front(&mut g);
+        let gen = g.spawn(Kind::Prop, None, Vec3::ZERO, 0.0);
+        g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
+        for k in 0..10 {
+            let t = if k == 0 {
+                t
+            } else {
+                let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
+                let p = g.players[0].pos + Vec3::new(0.0, 0.0, 2.5);
+                g.spawn(g.new_enemy(class, 1, EnemyState::Idle), None, p, 0.0);
+                g.entities.len() - 1
+            };
+            if let Kind::Enemy { brain, hp, .. } = &mut g.entities[t].kind {
+                brain.generator = Some(gen);
+                *hp = 1.0;
+            }
+            assert_ne!(shown(&g), Some(22), "{k}");
+            g.hit_entity(0, t, 100.0, Vec2::Y, true);
+        }
+        assert_eq!(g.gen_streak[0], 10);
+        assert_eq!(shown(&g), Some(22));
+    }
+
+    #[test]
+    fn turbo_and_wall_hints() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let t = grunt_in_front(&mut g);
+        // Fifteen monsters on screen and a full meter: use turbo (110).
+        let (class, model) = match g.entities[t].kind {
+            Kind::Enemy { class, .. } => (class, g.entities[t].model),
+            _ => unreachable!(),
+        };
+        let p = g.players[0].pos;
+        for k in 0..15 {
+            let a = k as f32 * 0.4;
+            let mut kind = g.new_enemy(class, 1, EnemyState::Idle);
+            if let Kind::Enemy { cooldown, .. } = &mut kind {
+                *cooldown = 99.0;
+            }
+            g.spawn(kind, model, p + Vec3::new(a.sin(), 0.0, a.cos()) * 7.0, 0.0);
+        }
+        g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
+        g.players[0].power = 100.0;
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(110));
+        // A swing at a breakable wall (the nameless obstacle 0x2A, which the
+        // port doesn't place yet): it takes multiple hits (20).
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        let at = g.players[0].pos;
+        g.spawn(
+            Kind::Container {
+                hp: 25.0,
+                drop: None,
+                chest: false,
+                armor: 1.0,
+                sub: 0x2A,
+            },
+            None,
+            at + Vec3::Z * 2.0,
+            0.0,
+        );
+        g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
+        g.player_attack(0, at, 0.0, 1.0, 0);
+        assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(20));
     }
 
     #[test]
@@ -8453,6 +9507,53 @@ mod tests {
         assert_eq!(g.level_end, Some(LevelEnd::Secret(0xC02)));
         let s = Game::new(&fs, "levelS3", &[("WAR", "RED")]).unwrap();
         assert_eq!(s.secret_timer.map(|t| t.0), Some(45.99));
+    }
+
+    #[test]
+    fn timed_levels_count_down_aloud() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelS3", &[("WAR", "RED")]).unwrap();
+        // A normal level isn't timed (flags & 4).
+        assert!(Game::new(&fs, "levelA1", &[("WAR", "RED")])
+            .unwrap()
+            .secret_timer
+            .is_none());
+        g.secret_timer = Some((45.99, 9.5));
+        g.sfx.clear();
+        let mut heard = Vec::new();
+        for _ in 0..(10 * 60) {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            heard.extend(
+                g.sfx
+                    .drain(..)
+                    .filter(|s| s.starts_with("#") || s.contains("TIMEIS")),
+            );
+            if g.level_end.is_some() {
+                break;
+            }
+        }
+        // 23 (0x17) on even seconds, 24 on odd, 25 at the last; the warning
+        // at 8; the tally's 5..0 (lbl_801234B8[n]).
+        let want = [
+            "#17",
+            "S_TIMEISRUNNING",
+            "#18",
+            "#17",
+            "#18",
+            "#20006",
+            "#17",
+            "#20007",
+            "#18",
+            "#20008",
+            "#17",
+            "#20009",
+            "#18",
+            "#2000a",
+            "#19",
+            "#2000b",
+        ];
+        assert_eq!(heard, want, "{heard:?}");
+        assert_eq!(g.level_end, Some(LevelEnd::SecretOver));
     }
 
     #[test]

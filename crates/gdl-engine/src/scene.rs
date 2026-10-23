@@ -408,7 +408,7 @@ impl Scene {
                 let inst = self.entities.get_mut(&e.id).unwrap();
                 // The root's sequence with each child's branch on top; broken
                 // plates swapped, dead heads hidden.
-                let world = model.pose_layers(&c.layers());
+                let world = c.pose(model);
                 let hidden = c.hidden_nodes(model);
                 let r = &c.parts[0];
                 (inst.parts, inst.hidden) =

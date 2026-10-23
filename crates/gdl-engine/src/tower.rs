@@ -858,14 +858,26 @@ impl Sumner {
                     32
                 };
             }
-            113 | 114
-                if self.banked_runes & 0x3FE == 0x3FE && self.banked_shards & 0xFFF == 0xFFF =>
-            {
-                self.follow = if self.banked_runes & 0x7FE != 0x7FE {
-                    21
+            // Runes 13-14 place nothing; the next step is as for the others
+            // (20 becomes 21, or none once all eleven runes are in), and any
+            // step fades the hell portal (fn_8005B558(0x600)).
+            113 | 114 => {
+                let shards = self.banked_shards & 0xFFF == 0xFFF;
+                self.follow = if self.banked_runes & 0x3FE == 0x3FE && shards {
+                    if self.banked_runes & 0x7FE != 0x7FE {
+                        21
+                    } else {
+                        0
+                    }
+                } else if shards {
+                    24
                 } else {
-                    0
+                    22
                 };
+                if self.follow != 0 {
+                    let portal = Self::portal(g, HELL_PORTAL);
+                    Self::set_fade(g, portal, 0.0);
+                }
             }
             _ => {}
         }
@@ -1030,6 +1042,26 @@ mod tests {
         assert!(g.scroll_box.is_none());
         run(&mut g, 70);
         assert_eq!(g.crystals[1], -1);
+    }
+
+    /// SumnerSpeechEnd for speeches 113/114: the follow step runs whether
+    /// or not every rune is in.
+    #[test]
+    fn late_rune_speeches_pick_their_follow_step() {
+        let Some((fs, mut g)) = tower() else { return };
+        let mut s = Sumner::new(&fs, &mut g, Entry::default());
+        for (runes, shards, follow) in [
+            (0x7FE, 0xFFF, 0),
+            (0x3FE, 0xFFF, 21),
+            (0x002, 0xFFF, 24),
+            (0x3FE, 0x001, 22),
+        ] {
+            s.banked_runes = runes;
+            s.banked_shards = shards;
+            s.speech = 113;
+            s.speech_end(&mut g);
+            assert_eq!((s.speech, s.follow), (-1, follow), "{runes:#x} {shards:#x}");
+        }
     }
 
     #[test]

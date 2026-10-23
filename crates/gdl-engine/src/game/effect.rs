@@ -20,6 +20,9 @@ pub(crate) const FX_EXPPOISON2: usize = 26;
 pub(crate) const FX_EXPPOISON3: usize = 27;
 pub(crate) const FX_EXPRING: usize = 28;
 pub(crate) const FX_GENDEST: usize = 30;
+/// lbl_80122E60: StartLevelUpFX's rows by class_id (the colour): YEL, BLU,
+/// RED, GRE.
+pub(crate) const FX_LEVELUP: usize = 57;
 pub(crate) const FX_BLOCK: usize = 66;
 pub(crate) const FX_ENTER: usize = 67;
 pub(crate) const FX_SUICIDEEXP: usize = 80;
@@ -126,6 +129,16 @@ const ROWS: [(&str, i32, i32); 80] = [
     ("GETGARG", -512, 0),
     ("GETRUNE", -512, 0),
 ];
+
+/// A hero's class_id (colour index) by colour code: YEL 0, BLU 1, RED 2, GRE 3.
+pub(crate) fn colour_index(color: &str) -> usize {
+    match color {
+        "YEL" => 0,
+        "BLU" => 1,
+        "RED" => 2,
+        _ => 3,
+    }
+}
 
 /// MagicView.hitmorph (lbl_80122D98): what a missile bursting on a wall
 /// becomes, by element (SPARKS, FIREHIT, then HITCOL).
@@ -253,6 +266,9 @@ pub(crate) struct Effects {
     /// The damage type of the hit hit_entity is about to deal (else the
     /// player's weapon element or the potion's).
     pub hit_dtype: Option<u32>,
+    /// A melee hit's upward direction (PlayerMotion_DamageTarget: 0.05 x
+    /// the damage, at most 2), for the monster's push.
+    pub hit_lift: Option<f32>,
 }
 
 impl Default for Effects {
@@ -273,6 +289,7 @@ impl Default for Effects {
             drained: [false; 4],
             missiles: HashMap::new(),
             hit_dtype: None,
+            hit_lift: None,
         }
     }
 }
@@ -775,6 +792,16 @@ impl Game {
         self.start_fx(FX_ENTER, pos, 0.0, 0.0)
     }
 
+    /// AddExp's level-up: StartLevelUpFX(0, class_id), the hero's colour's
+    /// LEVELUP row for its animation's length, riding the hero.
+    pub(crate) fn start_level_up_fx(&mut self, pi: usize) -> Option<u64> {
+        let ty = FX_LEVELUP + colour_index(&self.players.get(pi)?.color);
+        let time = self.fx_time(ty);
+        let id = self.start_fx(ty, Vec3::ZERO, 0.0, time)?;
+        self.parent_fx(id, ty, time, FxParent::Player(pi));
+        Some(id)
+    }
+
     /// damage_player's block clank: StartBlockFX for `time` (0.333-1 s) on
     /// the hero, in their colour at alpha 0x40, then not again for 60 x
     /// `time` ticks.
@@ -785,12 +812,7 @@ impl Game {
         let time = (0.01 * reduced).clamp(0.333, 1.0);
         self.effects.block_timer[pi] = time;
         let id = self.start_fx(FX_BLOCK, Vec3::ZERO, 0.0, time)?;
-        let colour = match self.players[pi].color.as_str() {
-            "YEL" => 0,
-            "BLU" => 1,
-            "RED" => 2,
-            _ => 3,
-        };
+        let colour = colour_index(&self.players[pi].color);
         self.tint_fx(id, COLOUR_TINT[colour]);
         self.set_fx_alpha(id, 0x40);
         self.parent_fx(id, FX_BLOCK, time, FxParent::Player(pi));
@@ -925,15 +947,30 @@ impl Game {
         self.start_enter_fx((lo + hi) * 0.5);
     }
 
-    /// The drain arcs: Death keeps its specialfx while it lives; a drained
-    /// hero has theirs only while drained (DeleteEffect mode 0 after).
+    /// The drain arcs: Death keeps its specialfx until it dies (enemy.c:5317
+    /// deletes it as the exit starts); a drained hero has theirs only while
+    /// drained (DeleteEffect mode 0 after).
     fn update_death_fx(&mut self) {
+        let leaving = |e: &Entity| {
+            matches!(
+                e.kind,
+                Kind::Enemy {
+                    state: crate::game::EnemyState::Dying { .. },
+                    ..
+                }
+            )
+        };
         let gone: Vec<u64> = self
             .effects
             .death_fx
             .keys()
             .copied()
-            .filter(|&id| !self.entities.iter().any(|e| e.id == id && e.alive))
+            .filter(|&id| {
+                !self
+                    .entities
+                    .iter()
+                    .any(|e| e.id == id && e.alive && !leaving(e))
+            })
             .collect();
         for id in gone {
             if let Some(fx) = self.effects.death_fx.remove(&id) {

@@ -2,8 +2,6 @@
 //! the player with ENGLISH.ROM text and an announcer line, shown once per the
 //! message's "seen" rule, with hints spaced out by a growing delay.
 
-use std::collections::HashSet;
-
 /// One gMsgDescTable entry: priority, seen-rule category, ENGLISH.ROM message
 /// (or -1: never shown), which line (-1 = all), and the announcer sound.
 #[derive(Clone, Copy, Debug)]
@@ -1830,8 +1828,9 @@ pub struct Messages {
     /// ENGLISH.ROM messages, by index.
     pub text: Vec<Vec<String>>,
     pub shown: Option<Shown>,
-    /// Messages each player has seen (help_disp).
-    seen: [HashSet<usize>; 4],
+    /// Each player's save.help_disp: per message, SEEN_NOW (since the hero
+    /// was loaded) | SEEN_EVER once shown (empty = none seen).
+    help_disp: [Vec<u8>; 4],
     delay: i32,
     step: usize,
     /// Announcer lines to play, drained by the game.
@@ -1843,6 +1842,24 @@ impl Messages {
         Messages {
             text,
             ..Default::default()
+        }
+    }
+
+    /// Player `p`'s help_disp, for its save.
+    pub fn help_disp(&self, p: usize) -> [u8; 256] {
+        let mut out = [0; 256];
+        if let Some(hd) = self.help_disp.get(p) {
+            for (o, b) in out.iter_mut().zip(hd) {
+                *o = *b;
+            }
+        }
+        out
+    }
+
+    /// Player `p` brings the messages its save has seen.
+    pub fn set_help_disp(&mut self, p: usize, hd: &[u8; 256]) {
+        if let Some(d) = self.help_disp.get_mut(p) {
+            *d = hd.to_vec();
         }
     }
 
@@ -1862,13 +1879,17 @@ impl Messages {
         if d.text < 0 {
             return false;
         }
-        let pl = player.unwrap_or(0).min(3);
-        let seen_by = |p: usize| self.seen[p].contains(&index);
+        let pl = player.map(|p| p.min(3));
+        let flags = |p: usize| self.help_disp[p].get(index).copied().unwrap_or(0);
+        // msgWorldFlags: category 1 checks this session's bit, 2 and 3 any.
         let ok = match d.category {
             0 => true,
-            1 => !active.iter().any(|&p| seen_by(p)),
-            2 => !seen_by(pl),
-            _ => !active.iter().all(|&p| seen_by(p)),
+            1 => !active.iter().any(|&p| flags(p) & 0xF != 0),
+            2 => match pl {
+                Some(p) => flags(p) == 0,
+                None => !active.iter().any(|&p| flags(p) != 0),
+            },
+            _ => !active.iter().all(|&p| flags(p) != 0),
         };
         if !ok {
             return false;
@@ -1905,10 +1926,14 @@ impl Messages {
             .collect();
         let n = if d.line >= 0 { 1 } else { all.len().max(1) };
         for &p in active {
-            if d.category == 2 && p != pl {
+            if d.category == 0 || (d.category == 2 && pl.is_some_and(|pl| p != pl)) {
                 continue;
             }
-            self.seen[p].insert(index);
+            let hd = &mut self.help_disp[p.min(3)];
+            if hd.len() < 256 {
+                hd.resize(256, 0);
+            }
+            hd[index] |= crate::save::SEEN_NOW | crate::save::SEEN_EVER;
         }
         self.shown = Some(Shown {
             index,
@@ -1955,6 +1980,36 @@ mod tests {
         t[97] = vec!["LEVEL %d\nEXPERIENCE".into()];
         t[91] = vec!["COLLECT GOLD".into(), "TO BUY POWERUPS".into()];
         t
+    }
+
+    /// help_disp goes into the save: after a load only "seen at all" is
+    /// left, which still holds back categories 2 and 3; category 1 is once
+    /// per session.
+    #[test]
+    fn seen_messages_survive_a_save() {
+        use crate::save::{HeroSave, SEEN_EVER, SEEN_NOW};
+        let mut r = rom();
+        r[25] = vec!["ONCE A SESSION".into()];
+        r[58] = vec!["THIS PLAYER".into()];
+        let mut m = Messages::new(r.clone());
+        for i in [15, 46, 57] {
+            assert!(m.post(i, Some(0), &[0], &[]), "{i}");
+            m.shown = None;
+        }
+        let hd = m.help_disp(0);
+        assert_eq!(hd[15], SEEN_NOW | SEEN_EVER);
+        assert_eq!(m.help_disp(1)[15], 0);
+        let mut h = HeroSave::new("X", 0, 0);
+        h.help_disp = hd;
+        let h = h.loaded();
+        let mut m = Messages::new(r);
+        m.set_help_disp(0, &h.help_disp);
+        assert!(!m.post(15, Some(0), &[0], &[]), "category 3: seen before");
+        assert!(!m.post(46, Some(0), &[0], &[]), "category 2: seen before");
+        assert!(m.post(57, Some(0), &[0], &[]), "category 1: a new session");
+        m.shown = None;
+        // A second hero who has not seen it brings a category 3 hint back.
+        assert!(m.post(15, Some(0), &[0, 1], &[]));
     }
 
     #[test]

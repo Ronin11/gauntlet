@@ -249,8 +249,8 @@ pub struct Me {
     pub reloading: bool,
     /// Spawned by a generator that still stands.
     pub has_generator: bool,
-    /// How many that generator has made (place_logic12's three eggs).
-    pub generated: u32,
+    /// That generator's gen.flags is 7: its logic-12 eggs hatch.
+    pub hatch: bool,
 }
 
 /// A routine's result.
@@ -303,7 +303,11 @@ enum Post {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GenAi {
     pub tail: Option<u64>,
+    /// num_generated (ai 12 counts only what a hit egg sets: 3).
     pub generated: u32,
+    /// gen.flags: logic 12's eggs laid (1 left, 2 right, 4 in place); 7
+    /// hatches them.
+    pub flags: u8,
 }
 
 /// The Enemy record's AI fields (init_enemy_vars / format_brain).
@@ -450,6 +454,11 @@ impl Brain {
     /// The algorithm it runs (once settled).
     pub fn alg(&self) -> i32 {
         self.algorithm
+    }
+
+    /// mode1: logic 12's egg is laid (1) or hatched (2).
+    pub fn mode1(&self) -> i32 {
+        self.mode1
     }
 
     /// Take the algorithm init_enemy settled (until the first tick).
@@ -1682,7 +1691,8 @@ impl Ctx<'_> {
 
     /// move_logic12: a logic-12 generator's egg stands where place_logic12
     /// put it (the game snaps it to Enemy.dest) facing the player until its
-    /// generator has laid all three, then chases.
+    /// generator's flags reach 7 (all three laid, the generator full, or an
+    /// egg hit), then chases.
     fn logic12(&mut self) {
         if self.bomber_near() {
             return self.delegate(24);
@@ -1697,7 +1707,7 @@ impl Ctx<'_> {
         self.commit(Post::None);
         if self.b.mode1 == 0 {
             self.b.mode1 = 1;
-        } else if self.me.generated >= 3 {
+        } else if self.me.hatch {
             self.b.mode1 = 2;
         }
     }
@@ -2321,7 +2331,7 @@ mod tests {
                 busy: None,
                 reloading: false,
                 has_generator: false,
-                generated: 0,
+                hatch: false,
             };
             let touching = flat(pos, player) < 1.5 + 0.5 + 1.5;
             let out = brain.think(&me, &f, &mut [0.0], walls, &mut dice, touching.then_some(0));
@@ -2520,7 +2530,7 @@ mod tests {
             busy: None,
             reloading: false,
             has_generator: false,
-            generated: 0,
+            hatch: false,
         };
         b.closest_player(&me, &f, &mut [0.0, 0.0]);
         assert_eq!(b.closest, Some(0));
@@ -2563,7 +2573,7 @@ mod tests {
                 busy: None,
                 reloading: false,
                 has_generator: false,
-                generated: 0,
+                hatch: false,
             };
             let out = b.think(&me, &f, &mut [0.0], &walls, &mut dice, None);
             if out.explode {
@@ -2623,7 +2633,7 @@ mod tests {
                 busy: None,
                 reloading: false,
                 has_generator: false,
-                generated: 0,
+                hatch: false,
             };
             b.think(&me, &f, &mut [0.0], &walls, dice, None)
         };

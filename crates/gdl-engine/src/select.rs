@@ -9,6 +9,7 @@
 
 use crate::game::Carried;
 use crate::input::{PlayerInput, Source};
+use crate::options::PlayerPrefs;
 use crate::optmenu::{Event, Item, OptMenu, Repeat};
 use crate::save::{HeroSave, MemCard};
 use crate::screen::Scr;
@@ -214,6 +215,8 @@ struct Player {
     file_cursor: i32,
     /// sel_save_file.
     save_file: usize,
+    /// hidden_code: a hidden character's row in `cheats::HIDDEN`.
+    hidden: Option<usize>,
 }
 
 /// What the party brings to player select: the memory card, each column's
@@ -225,6 +228,9 @@ pub struct Party {
     pub carry: [Option<Carried>; 4],
     pub heroes: [Option<HeroSave>; 4],
     pub progress: crate::progress::Progress,
+    /// Each pad's settings (PlayerControl), saved with a hero and set from a
+    /// loaded one.
+    pub controls: [PlayerPrefs; 4],
 }
 
 /// Out-of-game player data the select screen reads (the save file).
@@ -240,6 +246,8 @@ pub struct Select {
     card: MemCard,
     /// The party's realm progress, for saves.
     party: crate::progress::Progress,
+    /// PlayerControl per column.
+    controls: [PlayerPrefs; 4],
     /// lbl_80344BB4: ticks before another save may start.
     debounce: i32,
     /// Consecutive frames with every joined player ready and idle.
@@ -258,6 +266,7 @@ impl Select {
             progress,
             card: MemCard::in_memory(),
             party: Default::default(),
+            controls: Default::default(),
             debounce: 0,
             idle_frames: 0,
             ticks: 0,
@@ -296,6 +305,7 @@ impl Select {
             p.character = info.class;
             p.class = info.class;
             p.in_tower = true;
+            p.hidden = info.hidden;
             // PlayerSaveState cleared save.saved during play.
             p.saved = 0;
             p.hero = HeroSave::new(&p.name, p.character, p.colour);
@@ -310,6 +320,7 @@ impl Select {
     pub fn with_party(mut self, party: Party) -> Select {
         self.card = party.card;
         self.party = party.progress;
+        self.controls = party.controls;
         for (col, p) in self.players.iter_mut().enumerate() {
             let Some(p) = p else {
                 continue;
@@ -328,6 +339,11 @@ impl Select {
     /// character.
     pub fn carried(&self, col: usize) -> Option<Carried> {
         self.players.get(col)?.as_ref()?.carried.clone()
+    }
+
+    /// Each column's pad settings, as a loaded hero may have changed them.
+    pub fn controls(&self) -> [PlayerPrefs; 4] {
+        self.controls
     }
 
     /// Each column's save image, kept for the next visit.
@@ -533,6 +549,7 @@ impl Select {
             step: 0,
             file_cursor: -1,
             save_file: 0,
+            hidden: None,
         };
         p.center_menu();
         self.players[col] = Some(p);
@@ -556,6 +573,7 @@ impl Select {
                     name: p.name.clone(),
                     colour: p.colour,
                     class: p.character,
+                    hidden: p.hidden,
                 })
             })
             .collect()
@@ -656,6 +674,7 @@ impl Select {
         let card = &mut self.card;
         let party = &self.party;
         let debounce = &mut self.debounce;
+        let controls = &mut self.controls[col];
         let p = self.players[col].as_mut().unwrap();
         let unlock = progress.class_unlock | p.hero.class_unlock;
         // do_optmenu's sounds: A plays the select sound, B the exit sound.
@@ -698,10 +717,16 @@ impl Select {
             State::Selecting(Motion::Name) => {
                 p.hide_select_blits();
                 if p.update_name(inp, sfx, ticks) {
-                    p.class = DEFAULT_CLASS;
                     p.hero.name = p.name.clone();
-                    p.state = State::Selecting(Motion::Class);
-                    p.entered_class = false;
+                    // set_hidden_player: a hidden character's name skips the
+                    // class pick.
+                    if let Some(h) = crate::cheats::hidden_for(&p.name) {
+                        p.init_hidden(h, party, sfx);
+                    } else {
+                        p.class = DEFAULT_CLASS;
+                        p.state = State::Selecting(Motion::Class);
+                        p.entered_class = false;
+                    }
                 } else if p.name_timer == 0 && inp.b_pressed && p.name.is_empty() {
                     // B with nothing typed goes back to New / Load.
                     p.back_to_save();
@@ -782,10 +807,16 @@ impl Select {
                             p.goto_card(Motion::CardLoad);
                         }
                     }
+                    // set_hidden_player: a hidden character stays one.
                     Event::Chose(CHANGE) => {
-                        p.class = p.character;
-                        p.entered_class = false;
-                        p.state = State::Selecting(Motion::Class);
+                        match p.hidden.or_else(|| crate::cheats::hidden_for(&p.name)) {
+                            Some(h) => p.init_hidden(h, party, sfx),
+                            None => {
+                                p.class = p.character;
+                                p.entered_class = false;
+                                p.state = State::Selecting(Motion::Class);
+                            }
+                        }
                     }
                     Event::Chose(QUIT) => {
                         if p.saved != 0 {
@@ -849,7 +880,7 @@ impl Select {
                 0..=2 => p.step += frame as i32,
                 3 => match card.load(p.save_file) {
                     Some(h) => {
-                        p.apply_hero(h);
+                        *controls = p.apply_hero(h);
                         p.step = 4;
                     }
                     None => p.step = -1,
@@ -857,12 +888,18 @@ impl Select {
                 t if t >= 0 => {
                     p.step += 1;
                     if p.step >= 120 {
-                        // The loaded hero picks a class (its own highlighted).
-                        p.class = p.character;
-                        p.entered_class = false;
-                        p.state = State::Selecting(Motion::Class);
-                        p.in_tower = true;
                         p.step = -1;
+                        if let Some(h) = crate::cheats::hidden_for(&p.name) {
+                            // set_hidden_player: a hidden character's save.
+                            p.init_hidden(h, party, sfx);
+                        } else {
+                            // The loaded hero picks a class (its own
+                            // highlighted).
+                            p.class = p.character;
+                            p.entered_class = false;
+                            p.state = State::Selecting(Motion::Class);
+                            p.in_tower = true;
+                        }
                     }
                 }
                 _ => {
@@ -959,7 +996,7 @@ impl Select {
                 },
                 1 | 2 => p.step += frame as i32,
                 3 => {
-                    let ok = p.write(card, party);
+                    let ok = p.write(card, party, *controls);
                     // PlayerWriteSaveFile marks the hero saved either way.
                     p.saved = 1;
                     p.step = if ok { 4 } else { -1 };
@@ -1050,11 +1087,14 @@ fn placeholder(src: Source) -> Player {
         step: 0,
         file_cursor: -1,
         save_file: 0,
+        hidden: None,
     }
 }
 
+/// The class pick's `class < 8 || class_unlock & (1 << (class - 8))`; for
+/// Sumner (16) that is bit 0x100.
 fn known_of(class: usize, unlock: u16) -> bool {
-    class < 8 || (class < 16 && unlock & (1 << (class - 8)) != 0)
+    class < 8 || (class <= 16 && unlock & (1 << (class - 8)) != 0)
 }
 
 fn step(class: usize, dir: i32, unlock: u16) -> usize {
@@ -1217,6 +1257,7 @@ impl Player {
         self.carried = None;
         self.saved = -1;
         self.file_cursor = -1;
+        self.hidden = None;
     }
 
     /// Motions 5 and 10: the memory card list, left-aligned at x + 4, y 70,
@@ -1261,32 +1302,77 @@ impl Player {
 
     /// PlayerLoadSaveFile: the hero's name, colour and last class, with that
     /// class's state.
-    fn apply_hero(&mut self, h: HeroSave) {
+    /// Also player_get_from_save's PlayerControl from the save, and help_disp
+    /// keeps only what was ever seen. Returns the hero's pad settings.
+    fn apply_hero(&mut self, h: HeroSave) -> PlayerPrefs {
+        let h = h.loaded();
         self.name = h.name.clone();
         self.colour = h.colour & 3;
         self.character = h.character.min(15);
         self.class = self.character;
         self.carried = h.carried(self.character);
+        self.hidden = None;
+        let controls = h.controls;
         self.hero = h;
         self.saved = 1;
+        controls
     }
 
     /// change_player: the class being left keeps its state in the save image
     /// and the new class takes its own slot (a class never played starts
-    /// over at level 1).
+    /// over at level 1). Class 16 is Sumner, with his fixed loadout
+    /// (player_get_from_save), never saved; any other class drops a hidden
+    /// character's model.
     fn change_player(&mut self, class: usize, party: &crate::progress::Progress) {
         if let Some(c) = self.carried.take() {
             self.hero.store(self.character, self.colour, &c, party);
         }
         self.character = class;
-        self.carried = self.hero.carried(class);
+        self.hidden = None;
+        self.carried = if class == crate::stats::SUMNER {
+            Some(Carried::sumner())
+        } else {
+            self.hero.carried(class)
+        };
     }
 
-    /// PlayerWriteSaveFile: store the live state and write the image.
-    fn write(&mut self, card: &mut MemCard, party: &crate::progress::Progress) -> bool {
+    /// set_hidden_player found a hidden character (by name, or the one
+    /// already chosen): init_player_change takes the player straight to
+    /// ready as its class and colour, welcomed without a name.
+    fn init_hidden(&mut self, h: usize, party: &crate::progress::Progress, sfx: &mut Vec<String>) {
+        let hid = crate::cheats::HIDDEN[h];
+        self.colour = hid.colour;
+        self.change_player(hid.class, party);
+        self.hidden = Some(h);
+        self.class = self.character;
+        // AudioWelcomeBack(i, 0) plays S_WELCOME for a new character,
+        // AudioWelcome(i, 0) S_WELCOMEBACK.
+        let exp = self.carried.as_ref().map_or(0, |c| c.exp);
+        sfx.push(
+            if exp == 0 {
+                "VOICE:S_WELCOME"
+            } else {
+                "VOICE:S_WELCOMEBACK"
+            }
+            .into(),
+        );
+        self.lock_in();
+        self.in_tower = true;
+        self.state = State::Ready;
+    }
+
+    /// PlayerWriteSaveFile: store the live state (and PlayerControl) and
+    /// write the image.
+    fn write(
+        &mut self,
+        card: &mut MemCard,
+        party: &crate::progress::Progress,
+        controls: PlayerPrefs,
+    ) -> bool {
         let c = self.carried.clone().unwrap_or_else(Carried::new_character);
         self.hero.name = self.name.clone();
         self.hero.store(self.character, self.colour, &c, party);
+        self.hero.controls = controls;
         card.write(self.save_file, &self.hero)
     }
 
@@ -1935,12 +2021,14 @@ mod tests {
             name: "BOB".into(),
             colour: 2,
             class: 0,
+            hidden: None,
         }];
         let sel = Select::from_game(&panels, &[Source::Keyboard]).with_party(Party {
             card: MemCard::in_memory(),
             carry: [Some(c.clone()), None, None, None],
             heroes: Default::default(),
             progress: progress.clone(),
+            controls: Default::default(),
         });
         (sel, c, progress)
     }
@@ -2180,5 +2268,112 @@ mod tests {
             },
         );
         assert_eq!(motion(&sel, 0), State::Selecting(Motion::Character));
+    }
+
+    /// A new hero named `name`: New, the name, the end mark and its blink.
+    fn named(name: &str) -> Select {
+        let mut sel = Select::with_first(Source::Keyboard);
+        tick(&mut sel, a());
+        sel.players[0].as_mut().unwrap().name = name.into();
+        tick(&mut sel, a());
+        idle(&mut sel, 40);
+        sel
+    }
+
+    /// Load card file `file` into a new game's first column (cursor on it).
+    fn load_from(card: MemCard) -> Select {
+        let mut sel = Select::with_first(Source::Keyboard).with_party(Party {
+            card,
+            ..Default::default()
+        });
+        tick(&mut sel, stick(0.0, -1.0));
+        tick(&mut sel, a());
+        tick(&mut sel, a());
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Loading));
+        idle(&mut sel, 30);
+        sel
+    }
+
+    #[test]
+    fn hidden_names_skip_the_class_pick() {
+        let sel = named("ICE600");
+        let p = pl(&sel, 0);
+        assert_eq!(p.state, State::Ready);
+        assert_eq!((p.character, p.colour, p.hidden), (4, 2, Some(0)));
+        let panel = &sel.panels()[0];
+        assert_eq!((panel.class, panel.colour, panel.hidden), (4, 2, Some(0)));
+        assert!(sel.sfx.iter().any(|s| s == "VOICE:S_WELCOME"));
+        // DBRNKR is row 16, AYA555's Valkyrie.
+        assert_eq!(pl(&named("DBRNKR"), 0).hidden, Some(16));
+        assert_eq!(pl(&named("DBRNKR"), 0).character, 1);
+        // Other names pick a class.
+        assert_eq!(motion(&named("BOB"), 0), State::Selecting(Motion::Class));
+        assert_eq!(motion(&named("10000K"), 0), State::Selecting(Motion::Class));
+        // Change keeps a hidden character one.
+        let mut sel = named("PNK666");
+        sel.players[0].as_mut().unwrap().open_character_menu(CHANGE);
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Ready);
+        assert_eq!(pl(&sel, 0).hidden, Some(4));
+        // A saved hidden character loads straight back as one.
+        sel.players[0].as_mut().unwrap().open_character_menu(DONE);
+        save_to(&mut sel, 0);
+        idle(&mut sel, 70);
+        let mut sel = load_from(sel.card().clone());
+        idle(&mut sel, 35);
+        assert_eq!(motion(&sel, 0), State::Ready);
+        assert_eq!((pl(&sel, 0).character, pl(&sel, 0).hidden), (7, Some(4)));
+    }
+
+    #[test]
+    fn unlocked_sumner_plays_his_fixed_loadout() {
+        assert!(!known_of(16, 0xFF));
+        assert!(known_of(16, 0x100));
+        assert_eq!(step(15, 1, 0x100), 16);
+        assert_eq!(step(15, 1, 0xFF), 0);
+        let mut sel = named("BOB");
+        let p = sel.players[0].as_mut().unwrap();
+        p.hero.class_unlock = 0x100;
+        p.class = 16;
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Ready);
+        let c = sel.carried(0).unwrap();
+        assert_eq!((c.level, c.exp, c.gold, c.keys), (99, 0x54218, 5000, 9));
+        assert_eq!((c.potions.len(), c.health), (9, 9999.0));
+        assert_eq!(sel.panels()[0].class, 16);
+        // Leaving him saves nothing over a class.
+        let p = sel.players[0].as_mut().unwrap();
+        p.change_player(2, &Default::default());
+        assert_eq!(p.carried, None);
+        assert!(p.hero.classes.iter().all(|c| c.carried.is_none()));
+        // A secret class shows once its bit is set.
+        let mut sel = named("ANN");
+        sel.players[0].as_mut().unwrap().hero.class_unlock = 1 << 2;
+        sel.players[0].as_mut().unwrap().class = 10;
+        tick(&mut sel, a());
+        assert_eq!(motion(&sel, 0), State::Ready);
+        assert_eq!(sel.panels()[0].class, 10);
+    }
+
+    #[test]
+    fn a_hero_keeps_its_pad_settings_and_seen_messages() {
+        let (mut sel, _, _) = veteran();
+        let mine = PlayerPrefs {
+            control_style: 2,
+            rumble: false,
+            auto_attack: false,
+            auto_aim: true,
+        };
+        sel.controls[0] = mine;
+        sel.players[0].as_mut().unwrap().hero.help_disp[5] =
+            crate::save::SEEN_NOW | crate::save::SEEN_EVER;
+        save_to(&mut sel, 1);
+        idle(&mut sel, 70);
+        let card = sel.card().clone();
+        assert_eq!(card.load(1).unwrap().controls, mine);
+        let sel = load_from(card);
+        assert_eq!(sel.controls()[0], mine, "player_get_from_save");
+        assert_eq!(pl(&sel, 0).hero.help_disp[5], crate::save::SEEN_EVER);
     }
 }

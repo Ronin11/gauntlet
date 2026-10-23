@@ -157,6 +157,13 @@ pub struct Part {
     pub flash: f32,
     /// A child's branch is hidden once its death has played out.
     pub gone: bool,
+    /// The look-at nodes (hitnode0 / hitnode1: headnode, its parent with
+    /// typeFlags 0x10, and eyenode) and their turn so far (headyaw,
+    /// headpitch, eyeyaw, eyepitch).
+    pub head_node: Option<usize>,
+    pub eye_node: Option<usize>,
+    pub head_look: (f32, f32),
+    pub eye_look: (f32, f32),
 }
 
 /// A spawned critter (root + children).
@@ -203,6 +210,8 @@ pub struct Critter {
     /// A tint and scale set on it (the Bellows' green, 0.8 size).
     pub tint: Option<[f32; 4]>,
     pub scale: f32,
+    /// Look-at local rotations (node, pitch/yaw/roll) put on the pose.
+    pub look: Vec<(usize, [f32; 3])>,
 }
 
 impl PartialEq for Critter {
@@ -306,6 +315,73 @@ fn yaw_dir(yaw: f32) -> Vec3 {
     Vec3::new(yaw.sin(), 0.0, yaw.cos())
 }
 
+/// GetYawPitch.
+fn yaw_pitch(v: Vec3) -> (f32, f32) {
+    (v.x.atan2(v.z), v.y.atan2(Vec2::new(v.x, v.z).length()))
+}
+
+/// ExtractPYR (ml_fmath.c) on a node's local matrix. It undoes
+/// CreatePYRMatrix for a turn about one axis only; combined turns come back
+/// changed, as in the original.
+pub fn extract_pyr(m: Mat4) -> [f32; 3] {
+    let m = m.to_cols_array();
+    if (1.0 - m[2].abs()).abs() < 1e-4 {
+        let a0 = m[9].atan2(m[5]);
+        let a1 = if m[2] > 0.0 {
+            -std::f32::consts::FRAC_PI_2
+        } else {
+            std::f32::consts::FRAC_PI_2
+        };
+        return [a0, a1, 0.0];
+    }
+    let a0 = (-m[6]).atan2(m[10]);
+    let c0 = a0.cos();
+    if c0 == 0.0 {
+        let (a1, a2) = if a0 > 0.0 {
+            ((-m[2]).atan2(-m[6]), (-m[8]).atan2(-m[9]))
+        } else {
+            ((-m[2]).atan2(m[6]), m[8].atan2(m[9]))
+        };
+        return [a0, a1, a2];
+    }
+    let mag = m[10] / c0;
+    let a1 = (-m[2]).atan2(mag);
+    let a2 = (-m[1] / mag).atan2(m[0] / mag);
+    [a0, a1, a2]
+}
+
+/// NodeLookAtPos: the turn toward `target` (from the node's world matrix)
+/// eases in at 90 degrees a second into `state` (yaw, pitch); the node's
+/// local pitch and yaw then move toward it by at most `max_yaw` /
+/// `max_pitch`. Without a target it eases back to the animation.
+#[allow(clippy::too_many_arguments)]
+fn node_look_at(
+    world: Mat4,
+    local: Mat4,
+    target: Option<Vec3>,
+    state: &mut (f32, f32),
+    max_yaw: f32,
+    max_pitch: f32,
+    init_pitch: f32,
+    dt: f32,
+) -> [f32; 3] {
+    let (yawv, pitchv) = match target {
+        Some(t) => {
+            let (ny, np) = yaw_pitch(world.z_axis.truncate());
+            let (ty, tp) = yaw_pitch(t - world.w_axis.truncate());
+            (ty - ny, tp - np + init_pitch)
+        }
+        None => (0.0, 0.0),
+    };
+    let step = std::f32::consts::FRAC_PI_2 * dt;
+    state.0 += wrap(yawv - state.0).clamp(-step, step);
+    state.1 += wrap(pitchv - state.1).clamp(-step, step);
+    let mut pyr = extract_pyr(local);
+    pyr[1] += wrap(state.0 - pyr[1]).clamp(-max_yaw, max_yaw);
+    pyr[0] += wrap(state.1 - pyr[0]).clamp(-max_pitch, max_pitch);
+    pyr
+}
+
 impl Part {
     fn new(wad: &CritterWad, ty: usize, ene_health: f32) -> Part {
         let t = &wad.types[ty];
@@ -356,6 +432,10 @@ impl Part {
             fball_cap: 0.0,
             flash: 0.0,
             gone: false,
+            head_node: None,
+            eye_node: None,
+            head_look: (0.0, 0.0),
+            eye_look: (0.0, 0.0),
         }
     }
 
@@ -529,6 +609,15 @@ impl Critter {
                 })
                 .collect();
             p.anim = Animator::new(0);
+            let t = &w.types[p.ty];
+            p.head_node = model.node_index16(&t.headnode);
+            if t.flags & 0x10 != 0 {
+                p.head_node = p
+                    .head_node
+                    .and_then(|n| model.node_parent(n))
+                    .or(p.head_node);
+            }
+            p.eye_node = model.node_index16(&t.eyenode);
         }
         let t0 = &w.types[root];
         let movecenter = if t0.movecenter[1] >= 999.0 {
@@ -561,6 +650,7 @@ impl Critter {
             gmeter: None,
             tint: None,
             scale: 1.0,
+            look: Vec::new(),
             wad,
         }
     }
@@ -596,14 +686,15 @@ impl Critter {
         h
     }
 
+    /// The model-space node matrices of the current pose, heads turned.
+    pub fn pose(&self, model: &Model) -> Vec<Mat4> {
+        model.pose_layers_look(&self.layers(), &self.look)
+    }
+
     /// Refresh the node world matrices for the current pose.
     pub fn refresh_nodes(&mut self, model: &Model, pos: Vec3, yaw: f32) {
         let body = Mat4::from_translation(pos) * Mat4::from_rotation_y(yaw);
-        self.nodes = model
-            .pose_layers(&self.layers())
-            .into_iter()
-            .map(|m| body * m)
-            .collect();
+        self.nodes = self.pose(model).into_iter().map(|m| body * m).collect();
     }
 
     fn node_world(&self, node: Option<usize>, pos: Vec3, yaw: f32) -> Mat4 {
@@ -711,6 +802,8 @@ impl Game {
     /// ProcessCritterList: every critter, once a frame.
     pub(crate) fn update_critters(&mut self, dt: f32) {
         let players = self.critter_players();
+        // CritterInitPlayerData.
+        self.crit_ntargets = [0.0; 4];
         for ei in 0..self.entities.len() {
             if !self.entities[ei].alive || !matches!(self.entities[ei].kind, Kind::Critter(_)) {
                 continue;
@@ -813,7 +906,7 @@ impl Game {
     }
 
     /// CritterGetTargetPlayers for part `pi`.
-    fn get_targets(&self, c: &mut Critter, pi: usize, players: &[PInfo], pos: Vec3, yaw: f32) {
+    fn get_targets(&mut self, c: &mut Critter, pi: usize, players: &[PInfo], pos: Vec3, yaw: f32) {
         let boss = c.is_boss();
         let cp = c.coll_pos(pi, pos, yaw);
         let fwd = yaw_dir(yaw);
@@ -859,6 +952,91 @@ impl Game {
                 .unwrap_or(p.targets.len());
             p.targets.insert(at, t);
             p.targets.truncate(4);
+        }
+        for t in &p.targets {
+            self.crit_ntargets[t.pidx] += 1.0;
+        }
+    }
+
+    /// CritterGetSingleTargetPlayer (golems): the best visible player, by
+    /// score alone.
+    fn get_single_target(&mut self, c: &mut Critter, players: &[PInfo], pos: Vec3, yaw: f32) {
+        let cp = c.coll_pos(0, pos, yaw);
+        let fwd = yaw_dir(yaw);
+        let w = c.wad.clone();
+        let visrad = c.visrad;
+        let p = &mut c.parts[0];
+        p.targets.clear();
+        if p.health <= 0.0 {
+            return;
+        }
+        let vis = w.types[p.ty].vis;
+        for (i, pl) in players.iter().enumerate() {
+            if !pl.active || pl.hidden {
+                continue;
+            }
+            let (mut score, dp, dist, dpos) =
+                calc_target(p.difficulty, Some(&vis), cp, fwd, pl.col);
+            if visrad > 0.0 && score > visrad {
+                continue;
+            }
+            if self.time < self.crit_hit_until[i] {
+                score *= 1000.0;
+            }
+            if p.targets.first().is_none_or(|t| score < t.testdist) {
+                p.targets = vec![Target {
+                    pidx: i,
+                    dist,
+                    dp,
+                    testdist: score,
+                    dpos,
+                    invanger: 1.0,
+                }];
+            }
+        }
+        if let Some(t) = p.targets.first() {
+            self.crit_ntargets[t.pidx] += 1.0;
+        }
+    }
+
+    /// CritterResolveMultipleTargets: when more parts aim at one player than
+    /// it deserves (2 for players who hurt the boss little, 3, or 4 for its
+    /// worst enemies), idle children drop that player, the farthest first.
+    fn resolve_multiple_targets(&mut self, c: &mut Critter) {
+        let alive = c.parts[1..].iter().filter(|p| p.health > 0.0).count();
+        if alive == 0 || c.parts[0].pattern >= 0 {
+            return;
+        }
+        for k in 0..c.parts[0].targets.len() {
+            let Some(rec) = c.parts[0].targets.get(k).copied() else {
+                break;
+            };
+            let threshold = if rec.invanger > 1.0 {
+                2.0
+            } else if rec.invanger > 0.75 {
+                3.0
+            } else {
+                4.0
+            };
+            while self.crit_ntargets[rec.pidx] > threshold {
+                let mut owner: Option<(usize, usize, f32)> = None;
+                for (ci, ch) in c.parts.iter().enumerate().skip(1) {
+                    if ch.pattern >= 0 {
+                        continue;
+                    }
+                    if let Some(j) = ch.targets.iter().position(|t| t.pidx == rec.pidx) {
+                        let d = ch.targets[j].testdist;
+                        if owner.is_none_or(|o| d > o.2) {
+                            owner = Some((ci, j, d));
+                        }
+                    }
+                }
+                let Some((ci, j, _)) = owner else {
+                    break;
+                };
+                c.parts[ci].targets.remove(j);
+                self.crit_ntargets[rec.pidx] -= 1.0;
+            }
         }
     }
 
@@ -1295,6 +1473,7 @@ impl Game {
             self.get_targets(c, pi, players, pos, yaw);
             c.parts[pi].set_difficulty(&w, eh);
         }
+        self.resolve_multiple_targets(c);
         // CritterProcessSafeRocks (SafeRockHide: the WAD has a SPOUT2).
         let hide = w.damage.iter().any(|d| d.kind == 6);
         self.process_safe_rocks(hide, dt);
@@ -1309,20 +1488,17 @@ impl Game {
             let far = if far <= 0.0 { 1e21 } else { far };
             let b = self.boss.get_or_insert_with(Default::default);
             if b.wake_time == 0.0 {
+                // typeFlags 0x80 (the Chimera) waits for its floor to move:
+                // see the floor snap below.
                 if t0.flags & 0x80 == 0 {
                     b.wake_time = now + 2.0;
-                } else if far < t0.activedist.max(1.0) {
-                    // [CHOICE] typeFlags 0x80 (Chimera) waits for a floor trigger
-                    // (triggerstate 0x10) we don't track: the first player in
-                    // its wake distance counts instead.
-                    b.wake_time = now + 2.0;
-                    b.targeted = true;
                 }
             } else if now >= b.wake_time && (t0.activedist <= 0.0 || far < t0.activedist) {
+                // CritterActivateChain.
                 for p in &mut c.parts {
                     p.state = 3;
                 }
-                self.boss_activate();
+                self.boss_activate(true);
             }
         }
         // Move choice.
@@ -1464,10 +1640,24 @@ impl Game {
                 self.rotate(ei, c, pi, &m, players, dt);
             }
         }
+        c.look.clear();
+        for pi in 0..c.parts.len() {
+            let m = c.parts[pi].mv(&w, c.parts[pi].cur).cloned();
+            self.look_at_player(c, pi, m.as_ref(), players, ei, dt);
+        }
         // Floor snap (FloorCollide: a radius-5 sphere from 4 above, down).
         let t0 = &w.types[c.parts[0].ty];
-        if let Some(g) = self.critter_floor(self.entities[ei].pos) {
+        if let Some((g, floor)) = self.critter_floor_hit(self.entities[ei].pos) {
             self.entities[ei].pos.y = g + t0.y_offset;
+            // A sleeping typeFlags-0x80 boss wakes when the floor it stands
+            // on (or that floor's parent) moves: triggerstate 0x10.
+            let asleep = self.boss.as_ref().is_some_and(|b| b.wake_time == 0.0);
+            if c.parts[0].state == 0 && asleep && t0.flags & 0x80 != 0 && self.floor_moving(floor) {
+                if let Some(b) = self.boss.as_mut() {
+                    b.wake_time = now + 2.0;
+                }
+                self.boss_activate(false);
+            }
         }
         // Held players ride on the move node.
         self.carry_grabbed(c, ei);
@@ -1479,9 +1669,7 @@ impl Game {
         let (pos, yaw) = (self.entities[ei].pos, self.entities[ei].yaw);
         let model = self.entities[ei].model.unwrap_or(0);
         let w = c.wad.clone();
-        // CritterGetSingleTargetPlayer: the best target only.
-        self.get_targets(c, 0, players, pos, yaw);
-        c.parts[0].targets.truncate(1);
+        self.get_single_target(c, players, pos, yaw);
         c.parts[0].set_difficulty(&w, self.tuning.health);
         if c.parts[0].state == 0 {
             c.parts[0].state = 3;
@@ -1560,8 +1748,71 @@ impl Game {
             if !self.translate(ei, c, &m, dt, players) {
                 self.rotate(ei, c, 0, &m, players, dt);
             }
+            c.look.clear();
+            self.look_at_player(c, 0, Some(&m), players, ei, dt);
         }
         self.carry_grabbed(c, ei);
+    }
+
+    /// CritterLookAtPlayer: part `pi`'s head and eye nodes turn toward its
+    /// target (not during INIT or START; DEATH, flag-1 moves, a freeze or
+    /// blindness turn them back).
+    fn look_at_player(
+        &self,
+        c: &mut Critter,
+        pi: usize,
+        m: Option<&Move>,
+        players: &[PInfo],
+        ei: usize,
+        dt: f32,
+    ) {
+        if m.is_some_and(|m| m.kind == M_START || m.kind == M_INIT) {
+            return;
+        }
+        let Some(model) = self.entities[ei].model.and_then(|i| self.models.get(i)) else {
+            return;
+        };
+        let p = &c.parts[pi];
+        let rest = m.is_some_and(|m| m.kind == M_DEATH || m.flags & 1 != 0)
+            || p.freeze > 0.0
+            || p.blind > 0.0;
+        let target = (!rest && p.tgt >= 0)
+            .then(|| players.get(p.tgt as usize).map(|pl| pl.col))
+            .flatten();
+        let t = &c.wad.types[p.ty];
+        let e = &self.entities[ei];
+        let body = Mat4::from_translation(e.pos) * Mat4::from_rotation_y(e.yaw);
+        let nodes = [
+            (p.head_node, t.look[0], t.look[2], t.look[4], false),
+            (p.eye_node, t.look[1], t.look[3], t.look[5], true),
+        ];
+        for (node, max_yaw, max_pitch, init_pitch, eye) in nodes {
+            let Some(n) = node else { continue };
+            let ms = c.pose(model);
+            let Some(&nm) = ms.get(n) else { continue };
+            let p = &mut c.parts[pi];
+            let state = if eye {
+                &mut p.eye_look
+            } else {
+                &mut p.head_look
+            };
+            let pyr = node_look_at(
+                body * nm,
+                model
+                    .node_parent(n)
+                    .map_or(Mat4::IDENTITY, |q| ms[q])
+                    .inverse()
+                    * nm,
+                target,
+                state,
+                max_yaw,
+                max_pitch,
+                init_pitch,
+                dt,
+            );
+            c.look.retain(|l| l.0 != n);
+            c.look.push((n, pyr));
+        }
     }
 
     /// CritterMoveSetup: the target and the move node.
@@ -1827,6 +2078,39 @@ impl Game {
                 let at = self.players[i].pos + Vec3::Y * 2.5;
                 self.critter_sfx(c, d.hitfx as usize, at);
             }
+        }
+        self.node_enemy_collide(point, r, amount);
+    }
+
+    /// CritterNodeEnemyCollide: the same node hits live monsters (not IT)
+    /// whose cylinder it is in, as damage_enemy with no player behind it.
+    fn node_enemy_collide(&mut self, point: Vec3, r: f32, amount: f32) {
+        let hits: Vec<usize> = self
+            .entities
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.alive)
+            .filter_map(|(t, e)| match &e.kind {
+                Kind::Enemy { state, etype, .. }
+                    if *etype != crate::enemies::IT
+                        && !matches!(
+                            state,
+                            crate::game::EnemyState::Spawning
+                                | crate::game::EnemyState::Dying { .. }
+                                | crate::game::EnemyState::Asleep
+                        ) =>
+                {
+                    let ty = &crate::enemies::TYPES[(*etype).min(33)];
+                    let hht = ty.height * 0.5;
+                    let dxz = Vec2::new(e.pos.x - point.x, e.pos.z - point.z).length();
+                    (dxz < ty.radius + r && (point.y - (e.pos.y + hht)).abs() < hht + r)
+                        .then_some(t)
+                }
+                _ => None,
+            })
+            .collect();
+        for t in hits {
+            self.world_hit(None, t, amount, Vec2::ZERO, 0);
         }
     }
 
@@ -2521,12 +2805,43 @@ impl Game {
     /// it touches. A floor edge within 5 units counts, as the sphere rests on
     /// it (the Dragon stands at the lip of its ledge this way).
     pub(crate) fn critter_floor(&self, pos: Vec3) -> Option<f32> {
+        self.critter_floor_hit(pos).map(|(g, _)| g)
+    }
+
+    /// The floor object `obj`'s triggerstate, or its parent's, has bit 0x10:
+    /// a trigger's target that is moving (the item world-object update).
+    pub(crate) fn floor_moving(&self, obj: i32) -> bool {
+        let objs = &self.level.worlds.world_objects;
+        if obj < 0 || obj as usize >= objs.len() {
+            return false;
+        }
+        let obj = obj as usize;
+        let is_child = |root: usize| {
+            let mut ch = objs[root].child_index;
+            while ch >= 0 && (ch as usize) < objs.len() {
+                if ch as usize == obj {
+                    return true;
+                }
+                ch = objs[ch as usize].next_index;
+            }
+            false
+        };
+        self.movers
+            .iter()
+            .any(|m| m.moving && (m.root == obj || is_child(m.root)))
+    }
+
+    /// [`Game::critter_floor`] with the world object of the floor it rests
+    /// on (gFloorCollisionResult.obj, -1 for none).
+    pub(crate) fn critter_floor_hit(&self, pos: Vec3) -> Option<(f32, i32)> {
         const R: f32 = 5.0;
         let top = pos.y + 4.0;
-        let mut best: Option<f32> = None;
+        let mut best: Option<(f32, i32)> = None;
         let mut probe = |p: Vec3| {
-            if let Some(g) = self.collision.ground_height(p, top) {
-                best = Some(best.map_or(g, |b: f32| b.max(g)));
+            if let Some((g, o)) = self.collision.ground_hit(p, top) {
+                if best.is_none_or(|b| g > b.0) {
+                    best = Some((g, o));
+                }
             }
         };
         probe(pos);
@@ -2874,5 +3189,49 @@ mod tests {
                 && kinds.contains(&ET_GARGOYLE),
             "{seen:?}"
         );
+    }
+
+    /// ExtractPYR undoes CreatePYRMatrix about one axis; a combined turn
+    /// comes back as the original's formula has it.
+    #[test]
+    fn extract_pyr_of_pyr_matrix() {
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-4);
+        for a in [[0.5, 0.0, 0.0], [0.0, -1.2, 0.0], [0.0, 0.0, 0.3]] {
+            let b = extract_pyr(crate::character::pyr_matrix(a));
+            assert!(near(a, b), "{a:?} -> {b:?}");
+        }
+        let b = extract_pyr(crate::character::pyr_matrix([0.3, -0.7, 0.2]));
+        assert!(near(b, [0.225_161_86, -0.723_334, 0.004_284_45]), "{b:?}");
+    }
+
+    /// CritterNodeEnemyCollide: a critter's NODE damage also lands on
+    /// monsters inside its reach, with no player credited.
+    #[test]
+    fn critter_melee_hits_monsters() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
+        let model = g.classes[class].model(1);
+        let kind = g.new_enemy(class, 1, crate::game::EnemyState::Idle);
+        let at = g.players[0].pos + Vec3::new(0.0, 0.0, 20.0);
+        let id = g.spawn(kind, model, at, 0.0);
+        let hp = |g: &Game| {
+            g.entities
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| match e.kind {
+                    Kind::Enemy { hp, .. } => hp,
+                    _ => 0.0,
+                })
+                .unwrap()
+        };
+        let hp0 = hp(&g);
+        let exp0 = g.players[0].exp;
+        g.node_enemy_collide(at + Vec3::new(0.0, 1.0, 8.0), 1.0, 5.0);
+        assert_eq!(hp(&g), hp0, "out of reach");
+        g.node_enemy_collide(at + Vec3::new(0.5, 1.0, 0.0), 1.0, 5.0);
+        assert_eq!(hp(&g), hp0 - 5.0);
+        assert_eq!(g.players[0].exp, exp0, "no experience");
     }
 }

@@ -668,7 +668,9 @@ impl Game {
 
     /// Testing aid: the boss wakes (if asleep) and takes a fatal hit.
     pub fn kill_boss(&mut self) {
-        self.boss_activate();
+        if !self.boss.as_ref().is_some_and(|b| b.active) {
+            self.boss_activate(true);
+        }
         let Some((ei, _)) = self.boss_critter_mut() else {
             return;
         };
@@ -1162,13 +1164,14 @@ impl Game {
         }
     }
 
-    /// BossActivate: the fight starts (the boss becomes a target and the
-    /// level music switches to its boss part).
-    pub(crate) fn boss_activate(&mut self) {
+    /// BossActivate(obj, flag): the fight starts (gBossActive; the boss
+    /// becomes a camera target once) and, with `music`, the level music
+    /// switches to its boss part.
+    pub(crate) fn boss_activate(&mut self, music: bool) {
         if let Some(b) = self.boss.as_mut() {
-            if !b.active {
-                b.active = true;
-                b.targeted = true;
+            b.active = true;
+            b.targeted = true;
+            if music {
                 // sMusicSubIndex = sMusicSubState = 1: the boss part, faded in.
                 self.music_area = (1, 1);
             }
@@ -2466,6 +2469,7 @@ mod tests {
             );
             let act = g.boss_critter().unwrap().1.wad.types[0].activedist;
             face_boss(&mut g, if act > 0.0 { act * 0.5 } else { 25.0 });
+            move_boss_floor(&mut g);
             let mut moves = std::collections::BTreeSet::new();
             let hp0 = g.players[0].health;
             let mut hurt = 0.0f32;
@@ -2625,9 +2629,28 @@ mod tests {
         assert!(checked > 0);
     }
 
+    /// Set off the mover the boss stands on (the Chimera's elevator), as
+    /// its pressure pad would.
+    fn move_boss_floor(g: &mut Game) {
+        let Some(pos) = g.boss_critter().map(|(e, _)| e.pos) else {
+            return;
+        };
+        let Some((_, floor)) = g.critter_floor_hit(pos) else {
+            return;
+        };
+        for m in &mut g.movers {
+            if floor >= 0 && m.objects.contains(&(floor as usize)) {
+                m.active = true;
+            }
+        }
+    }
+
     fn wake(g: &mut Game) {
+        move_boss_floor(g);
         for _ in 0..1200 {
-            if g.boss.as_ref().is_some_and(|b| b.active) {
+            if g.boss.as_ref().is_some_and(|b| b.active)
+                && g.boss_critter().is_some_and(|(_, c)| c.parts[0].state == 3)
+            {
                 return;
             }
             g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
@@ -3022,5 +3045,130 @@ mod tests {
         }
         eprintln!("H4: lost {lost:?}, escorts {escorts}");
         assert!(escorts >= 2, "no GARM2 escorts");
+    }
+
+    /// CritterBossAI: the Chimera (typeFlags 0x80) sleeps however close the
+    /// players are, until the floor it stands on (A5FLOOR#00, child of the
+    /// A5ELEVATOR mover) moves; it wakes 2 s later.
+    #[test]
+    fn chimera_wakes_by_its_elevator() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA5", &[("WAR", "RED")]).unwrap();
+        let elevator = g
+            .movers
+            .iter()
+            .position(|m| g.level.worlds.world_objects[m.root].name == "A5ELEVATOR")
+            .unwrap();
+        let pad = g
+            .entities
+            .iter()
+            .find(|e| matches!(e.kind, Kind::Trigger { mover: Some(m), .. } if m == elevator))
+            .map(|e| e.pos)
+            .unwrap();
+        // Next to the boss but off the pad: it stays asleep.
+        face_boss(&mut g, 10.0);
+        for _ in 0..300 {
+            g.players[0].pos.z = g.players[0].pos.z.min(pad.z - 6.0);
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        }
+        assert!(!g.boss.as_ref().unwrap().active, "{}", boss_state(&g));
+        assert_eq!(g.boss_critter().unwrap().1.parts[0].state, 0);
+        // On the pad the elevator moves: BossActivate(c, 0) now, the
+        // critters wake 2 s on (CritterActivateChain).
+        g.players[0].pos = pad;
+        let mut woke = None;
+        for f in 0..600 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            if g.boss_critter().unwrap().1.parts[0].state == 3 {
+                woke = Some(f);
+                break;
+            }
+        }
+        assert!(g.boss.as_ref().unwrap().active);
+        let f = woke.expect("the Chimera never woke");
+        assert!((115..=125).contains(&f), "woke on frame {f}");
+    }
+
+    /// CritterLookAtPlayer: a boss's head node turns toward its target
+    /// beyond what the animation does (the Dragon's neck, the Lich's head).
+    #[test]
+    fn boss_heads_turn_toward_their_target() {
+        let Some(fs) = data() else { return };
+        for lvl in ["B6", "G5", "A5"] {
+            let mut g = Game::new(&fs, &format!("level{lvl}"), &[("WAR", "RED")]).unwrap();
+            face_boss(&mut g, 25.0);
+            wake(&mut g);
+            let mut best = f32::MAX;
+            let mut turned = 0;
+            for f in 0..900 {
+                // Keep the hero off to one side.
+                if f == 0 {
+                    let (bp, yaw) = g.boss_critter().map(|(e, _)| (e.pos, e.yaw)).unwrap();
+                    let side = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+                    let p = g.players[0].pos + side * 12.0;
+                    if let Some(gy) = g.collision.ground_height(p, bp.y + 30.0) {
+                        g.players[0].pos = Vec3::new(p.x, gy, p.z);
+                    }
+                }
+                g.players[0].health = 999.0;
+                g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                let (e, c) = g.boss_critter().unwrap();
+                let model = &g.models[e.model.unwrap()];
+                let body = glam::Mat4::from_translation(e.pos) * glam::Mat4::from_rotation_y(e.yaw);
+                for p in &c.parts {
+                    let (Some(n), true) = (p.head_node, p.tgt >= 0) else {
+                        continue;
+                    };
+                    if !c.look.iter().any(|l| l.0 == n) {
+                        continue;
+                    }
+                    let to = g.players[p.tgt as usize].pos + Vec3::Y * 2.5;
+                    let err = |m: glam::Mat4| {
+                        let w = body * m;
+                        let f = w.z_axis.truncate();
+                        let d = to - w.w_axis.truncate();
+                        let a = f.x.atan2(f.z) - d.x.atan2(d.z);
+                        a.sin().atan2(a.cos()).abs()
+                    };
+                    let looked = err(c.pose(model)[n]);
+                    let plain = err(model.pose_layers(&c.layers())[n]);
+                    best = best.min(looked - plain);
+                    turned += 1;
+                }
+            }
+            assert!(turned > 0, "{lvl}: no head looked");
+            assert!(
+                best < -0.05,
+                "{lvl}: the head never turned toward the hero ({best})"
+            );
+        }
+    }
+
+    /// CritterResolveMultipleTargets: a lone hero who hasn't hurt the
+    /// Chimera (invanger 11) is aimed at by two of its four parts; the
+    /// other heads, farthest first, let it go.
+    #[test]
+    fn chimera_heads_spread_their_targets() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA5", &[("WAR", "RED")]).unwrap();
+        face_boss(&mut g, 20.0);
+        wake(&mut g);
+        let mut checked = 0;
+        for _ in 0..10 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            let (_, c) = g.boss_critter().unwrap();
+            let aiming = c.parts.iter().filter(|p| !p.targets.is_empty()).count();
+            if c.parts[0].pattern < 0 && !c.parts[0].targets.is_empty() {
+                assert_eq!(
+                    aiming,
+                    2,
+                    "{:?}",
+                    c.parts.iter().map(|p| p.targets.len()).collect::<Vec<_>>()
+                );
+                assert_eq!(g.crit_ntargets[0], 2.0);
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
     }
 }

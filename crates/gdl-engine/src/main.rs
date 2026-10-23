@@ -464,7 +464,13 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 println!("GDL_FX: no effect {what}");
             }
         }
+        let ended = g.level_end.is_some();
         g.update(1.0 / 60.0, &inputs);
+        if !ended {
+            if let Some(end) = &g.level_end {
+                println!("t={f} level end {end:?}");
+            }
+        }
         sfx_seen.extend(g.sfx.drain(..));
         if f % 600 == 0 {
             let p = &g.players[0];
@@ -680,18 +686,28 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 .position(|k| k == col)
                 .unwrap_or(slot % 4),
             class: select::CLASSES.iter().position(|k| k == c).unwrap_or(0),
+            hidden: None,
         })
         .collect();
-    let boss_bank = g.boss_model_dir().map(|d| {
-        let imgs = hud::boss_meter_images(&fs, &d);
-        hud.load_images(&gpu.device, &gpu.queue, &imgs)
-    });
+    let boss_bank = match g.boss_model_dir() {
+        Some(d) => Some(hud.load_images(&gpu.device, &gpu.queue, &hud::boss_meter_images(&fs, &d))),
+        None if g.wave.is_some_and(|w| w >> 8 == 12) => {
+            Some(hud.load_images(&gpu.device, &gpu.queue, &hud::coin_images(&fs)))
+        }
+        None => None,
+    };
     let draw_hud = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
         hud::build(
             &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
             &g,
             &panels,
+        );
+        hud::build_coins(
+            &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
+            &g,
+            &panels,
+            boss_bank.as_ref(),
         );
         hud::build_boss(
             &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
@@ -776,13 +792,35 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     o.draw(&mut s);
                 }
             }
+            // credits[:scroll[:rz]]: rz as if R and Z were held (the version).
             Some(name) if name.starts_with("credits") => {
-                let scroll = name
-                    .strip_prefix("credits:")
+                let mut parts = name.split(':').skip(1);
+                let scroll = parts.next().and_then(|n| n.parse().ok()).unwrap_or(300);
+                let mut a = gdl_engine::attract::Attract::credits_demo(&fs, scroll);
+                a.triggers = parts.next() == Some("rz");
+                a.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100), None);
+            }
+            // saver[:ticks]: the screen saver's weapons after that many ticks.
+            Some(name) if name == "saver" || name.starts_with("saver:") => {
+                let ticks = name
+                    .strip_prefix("saver:")
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(300);
-                gdl_engine::attract::Attract::credits_demo(&fs, scroll)
-                    .draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100), None);
+                let mut s = gdl_engine::screensaver::Saver::new(1);
+                for _ in 0..ticks {
+                    s.tick(gdl_engine::camera::half_tans());
+                }
+                if let Ok(mut m) = gdl_engine::screensaver::SaverModels::load(&fs, &gpu) {
+                    let k = (w as f32 / 512.0).min(h as f32 / 384.0);
+                    let vp = [
+                        (w as f32 - 512.0 * k) / 2.0,
+                        (h as f32 - 384.0 * k) / 2.0,
+                        512.0 * k,
+                        384.0 * k,
+                    ];
+                    m.draw(&s, &gpu, view, &gpu.depth_view(w, h), vp);
+                }
+                return;
             }
             Some(name) if name == "shop" || name.starts_with("shop:") => {
                 if let Some((sh, ticks)) = &shop_screen {
