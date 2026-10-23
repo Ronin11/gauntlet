@@ -368,6 +368,12 @@ impl<'a> MeshBuilder<'a> {
     }
 }
 
+/// `MBOX_FindTexture` in one bank: the named bitmap, decoded.
+pub fn decode_bitmap(objects: &Objects, textures: &[u8], name: &str) -> Option<Image> {
+    let i = find_bitmap(objects, name)?;
+    texture::decode_ngc(objects.bitmaps.get(i as usize)?, textures).ok()
+}
+
 /// A bitmap's index by name (the bank's texture definitions, `texcmp` ignores case).
 fn find_bitmap(objects: &Objects, name: &str) -> Option<u16> {
     let name = name.trim();

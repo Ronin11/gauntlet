@@ -235,6 +235,9 @@ pub struct Worlds {
     pub locators: Vec<Locator>,
     /// World-object keyframe animations (`gWorldInfo.worldanims`).
     pub world_anims: Vec<WorldAnim>,
+    /// The particle-system templates `PSYS<id>` objects select
+    /// (`gWorldInfo.worldpsys`, version >= 2 header words 0x1C/0x1D).
+    pub world_psys: Vec<crate::psys::PsysRecord>,
 }
 
 fn rotate_by_quat(v: [f32; 3], q: [f32; 4]) -> [f32; 3] {
@@ -344,7 +347,32 @@ fn parse_world_anims(r: Le, nobjs: usize) -> Result<Vec<WorldAnim>> {
     Ok(out)
 }
 
+/// InitWorldInfo's particle templates: for header version >= 2, `blob[0x1C]`
+/// records at offset `blob[0x1D]`.
+fn parse_world_psys(r: Le) -> Result<Vec<crate::psys::PsysRecord>> {
+    let magic = r.u32(0x18 * 4).unwrap_or(0);
+    let version = if magic & 0xF00B_AB00 == 0xF00B_AB00 {
+        magic & 0xFF
+    } else {
+        0
+    };
+    let at = r.u32(0x1D * 4).unwrap_or(0) as usize;
+    if version < 2 || at == 0 {
+        return Ok(Vec::new());
+    }
+    let count = r.u32(0x1C * 4)? as usize;
+    crate::psys::PsysRecord::parse_list(r, at, count).context("world psys")
+}
+
 impl Worlds {
+    /// WorldPsysActivate's template for a world object: the record whose id
+    /// is the character after "PSYS" in its name (GetWorldPsysIdx).
+    pub fn psys_for(&self, obj: &WorldObject) -> Option<&crate::psys::PsysRecord> {
+        let at = obj.name.find("PSYS")?;
+        let id = *obj.name.as_bytes().get(at + 4)?;
+        self.world_psys.iter().find(|p| p.id == id)
+    }
+
     pub fn parse(data: &[u8]) -> Result<Self> {
         let r = Le::new(data);
         let wo_count = r.u32(0)? as usize;
@@ -490,6 +518,7 @@ impl Worlds {
         }
 
         let world_anims = parse_world_anims(r, world_objects.len())?;
+        let world_psys = parse_world_psys(r)?;
 
         Ok(Worlds {
             world_objects,
@@ -503,6 +532,7 @@ impl Worlds {
             item_instances,
             locators,
             world_anims,
+            world_psys,
         })
     }
 
@@ -589,6 +619,40 @@ mod tests {
             .filter(|(o, f)| o.name.starts_with("H1FLOORB") && *f & 0xF0000 == 0x10000)
             .count();
         assert_eq!(burning, 13);
+    }
+
+    #[test]
+    fn world_psys_templates() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../game-data/files/Gauntlet/LEVELS/levelH1/WORLDS.PS2");
+        let Ok(data) = std::fs::read(p) else { return };
+        let w = Worlds::parse(&data).unwrap();
+        let ids: String = w.world_psys.iter().map(|p| p.id as char).collect();
+        assert_eq!(ids, "ABDEFGHIJK");
+        let a = &w.world_psys[0];
+        assert_eq!((a.version, a.preset, a.enables), (0x101, 5, 0x56be1));
+        assert_eq!((a.flags, a.flag_mask), (0x288, 0x288));
+        assert_eq!(a.tex_name, "P_TORCH");
+        assert_eq!(a.p_lifefade, [0.2, 0.22]);
+        assert_eq!((a.e_angle, a.speed, a.gravity), (80.0, 4.0, -0.38));
+        assert_eq!(a.rgba, [0, 0xFF_FFFF, 0xFF_FFFF, 0]);
+        assert_eq!(a.width, [2.8, 2.0, 2.0, 0.1]);
+        // Objects name their template: H1PSYSJ1 uses J (POOLFIRE).
+        let o = w
+            .world_objects
+            .iter()
+            .find(|o| o.name == "H1PSYSJ1")
+            .unwrap();
+        assert_eq!(
+            o.flags & world_flags::PARTICLE_SYSTEM,
+            world_flags::PARTICLE_SYSTEM
+        );
+        assert_eq!(w.psys_for(o).unwrap().tex_name, "POOLFIRE");
+        // Its collision triangle faces down; WorldPsysActivate negates it.
+        assert_eq!(
+            w.coll_tris[o.coll_tri_index as usize].norm,
+            [0.0, -1.0, 0.0]
+        );
     }
 
     #[test]

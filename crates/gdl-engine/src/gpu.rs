@@ -2,6 +2,7 @@
 //! world geometry and actors.
 
 use crate::mesh::{MeshData, TexAnimKind, Vertex};
+use crate::psys::Blend;
 use crate::texanim::{self, GlobalState};
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -48,6 +49,58 @@ pub struct Gpu {
     model_layout: wgpu::BindGroupLayout,
     sampler_repeat: wgpu::Sampler,
     white: wgpu::TextureView,
+    /// Sprite pipelines by [blend][z compare][z write] (pbBlitSetDrawRegs).
+    sprite: Vec<wgpu::RenderPipeline>,
+}
+
+/// One corner of a sprite or streak quad (world space, already mirrored).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
+pub struct SpriteVertex {
+    pub pos: [f32; 3],
+    pub uv: [f32; 2],
+    pub color: [f32; 4],
+}
+
+/// A run of quads drawn with one texture and draw state.
+#[derive(Clone, Copy, Debug)]
+pub struct SpriteDraw {
+    /// Index into the layer's textures (None: white).
+    pub texture: Option<usize>,
+    pub blend: Blend,
+    pub ztest: bool,
+    pub zwrite: bool,
+    pub first: u32,
+    pub count: u32,
+}
+
+/// The particle and streak quads of a frame, drawn after the meshes (the
+/// psys queue MBDrawPsysObjects flushes), with their textures.
+pub struct SpriteLayer {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    /// Quads the buffers hold.
+    capacity: usize,
+    materials: Vec<wgpu::BindGroup>,
+    white: wgpu::BindGroup,
+    draws: Vec<SpriteDraw>,
+}
+
+impl SpriteLayer {
+    /// Textures uploaded so far.
+    pub fn texture_count(&self) -> usize {
+        self.materials.len()
+    }
+}
+
+fn blend_index(b: Blend) -> usize {
+    match b {
+        Blend::Alpha => 0,
+        Blend::Add => 1,
+        Blend::AddOne => 2,
+        Blend::Darken => 3,
+        Blend::Replace => 4,
+    }
 }
 
 struct GpuBatch {
@@ -300,6 +353,82 @@ impl Gpu {
             ..Default::default()
         });
 
+        // Sprites: GX's blend factors, alpha compare > 2, z per the node.
+        let sprite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sprite layout"),
+            bind_group_layouts: &[&globals_layout, &material_layout],
+            push_constant_ranges: &[],
+        });
+        let sprite_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4];
+        let factor = |src, dst| wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: src,
+                dst_factor: dst,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::OVER,
+        };
+        use wgpu::BlendFactor as F;
+        let blends = [
+            factor(F::SrcAlpha, F::OneMinusSrcAlpha),
+            factor(F::SrcAlpha, F::One),
+            factor(F::One, F::One),
+            factor(F::Zero, F::SrcAlpha),
+            factor(F::One, F::Zero),
+        ];
+        let mut sprite = Vec::new();
+        for blend in blends {
+            for ztest in [false, true] {
+                for zwrite in [false, true] {
+                    sprite.push(
+                        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: Some("sprite"),
+                            layout: Some(&sprite_layout),
+                            vertex: wgpu::VertexState {
+                                module: &shader,
+                                entry_point: Some("vs_sprite"),
+                                buffers: &[wgpu::VertexBufferLayout {
+                                    array_stride: std::mem::size_of::<SpriteVertex>() as u64,
+                                    step_mode: wgpu::VertexStepMode::Vertex,
+                                    attributes: &sprite_attrs,
+                                }],
+                                compilation_options: Default::default(),
+                            },
+                            fragment: Some(wgpu::FragmentState {
+                                module: &shader,
+                                entry_point: Some("fs_sprite"),
+                                targets: &[Some(wgpu::ColorTargetState {
+                                    format: color_format,
+                                    blend: Some(blend),
+                                    write_mask: wgpu::ColorWrites::ALL,
+                                })],
+                                compilation_options: Default::default(),
+                            }),
+                            primitive: wgpu::PrimitiveState {
+                                topology: wgpu::PrimitiveTopology::TriangleList,
+                                cull_mode: None,
+                                ..Default::default()
+                            },
+                            depth_stencil: Some(wgpu::DepthStencilState {
+                                format: DEPTH_FORMAT,
+                                depth_write_enabled: zwrite,
+                                depth_compare: if ztest {
+                                    wgpu::CompareFunction::LessEqual
+                                } else {
+                                    wgpu::CompareFunction::Always
+                                },
+                                stencil: Default::default(),
+                                bias: Default::default(),
+                            }),
+                            multisample: Default::default(),
+                            multiview: None,
+                            cache: None,
+                        }),
+                    );
+                }
+            }
+        }
+
         let white = upload_texture(&device, &queue, &Image::solid(4, 4, [255, 255, 255, 255]));
         Gpu {
             device,
@@ -314,7 +443,92 @@ impl Gpu {
             model_layout,
             sampler_repeat,
             white,
+            sprite,
         }
+    }
+
+    fn material(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.material_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.white),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
+                },
+            ],
+        })
+    }
+
+    fn sprite_buffers(&self, quads: usize) -> (wgpu::Buffer, wgpu::Buffer) {
+        let vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sprite vbuf"),
+            size: (quads * 4 * std::mem::size_of::<SpriteVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let idx: Vec<u32> = (0..quads as u32)
+            .flat_map(|q| [0, 1, 2, 0, 2, 3].map(|k| q * 4 + k))
+            .collect();
+        let ibuf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sprite ibuf"),
+                contents: bytemuck::cast_slice(&idx),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        (vbuf, ibuf)
+    }
+
+    /// An empty sprite layer.
+    pub fn new_sprite_layer(&self) -> SpriteLayer {
+        let capacity = 1024;
+        let (vbuf, ibuf) = self.sprite_buffers(capacity);
+        SpriteLayer {
+            vbuf,
+            ibuf,
+            capacity,
+            materials: Vec::new(),
+            white: self.material(&self.white),
+            draws: Vec::new(),
+        }
+    }
+
+    /// Upload a sprite texture; its index is the layer's next.
+    pub fn add_sprite_texture(&self, layer: &mut SpriteLayer, img: &Image) {
+        let view = self.upload_texture(img);
+        layer.materials.push(self.material(&view));
+    }
+
+    /// This frame's quads (4 corners each, fan order) and their draws.
+    pub fn set_sprites(
+        &self,
+        layer: &mut SpriteLayer,
+        quads: &[[SpriteVertex; 4]],
+        draws: Vec<SpriteDraw>,
+    ) {
+        if quads.len() > layer.capacity {
+            let cap = quads.len().next_power_of_two();
+            (layer.vbuf, layer.ibuf) = self.sprite_buffers(cap);
+            layer.capacity = cap;
+        }
+        if !quads.is_empty() {
+            self.queue
+                .write_buffer(&layer.vbuf, 0, bytemuck::cast_slice(quads));
+        }
+        layer.draws = draws;
     }
 
     pub fn upload_texture(&self, img: &Image) -> wgpu::TextureView {
@@ -544,7 +758,7 @@ impl Gpu {
         clear: [f64; 3],
         draws: &[(&GpuMesh, &Instance)],
     ) {
-        self.render_viewport(target, depth, globals, clear, draws, None);
+        self.render_viewport(target, depth, globals, clear, draws, None, None);
     }
 
     /// Draw over what is already in `target` (keeping its colour, clearing depth),
@@ -557,11 +771,12 @@ impl Gpu {
         draws: &[(&GpuMesh, &Instance)],
         viewport: [f32; 4],
     ) {
-        self.render_pass(target, depth, globals, None, draws, Some(viewport));
+        self.render_pass(target, depth, globals, None, draws, Some(viewport), None);
     }
 
     /// As [`Gpu::render`], drawing the scene only into `viewport` (x, y, w, h in
-    /// pixels); the rest of the target is just cleared.
+    /// pixels); the rest of the target is just cleared. `sprites` draw last.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_viewport(
         &self,
         target: &wgpu::TextureView,
@@ -570,10 +785,20 @@ impl Gpu {
         clear: [f64; 3],
         draws: &[(&GpuMesh, &Instance)],
         viewport: Option<[f32; 4]>,
+        sprites: Option<&SpriteLayer>,
     ) {
-        self.render_pass(target, depth, globals, Some(clear), draws, viewport);
+        self.render_pass(
+            target,
+            depth,
+            globals,
+            Some(clear),
+            draws,
+            viewport,
+            sprites,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_pass(
         &self,
         target: &wgpu::TextureView,
@@ -582,6 +807,7 @@ impl Gpu {
         clear: Option<[f64; 3]>,
         draws: &[(&GpuMesh, &Instance)],
         viewport: Option<[f32; 4]>,
+        sprites: Option<&SpriteLayer>,
     ) {
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(globals));
@@ -681,11 +907,26 @@ impl Gpu {
                     }
                 }
             }
+            if let Some(layer) = sprites.filter(|l| !l.draws.is_empty()) {
+                pass.set_vertex_buffer(0, layer.vbuf.slice(..));
+                pass.set_index_buffer(layer.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                for d in &layer.draws {
+                    let k = blend_index(d.blend) * 4 + (d.ztest as usize) * 2 + d.zwrite as usize;
+                    pass.set_pipeline(&self.sprite[k]);
+                    let mat = d
+                        .texture
+                        .and_then(|t| layer.materials.get(t))
+                        .unwrap_or(&layer.white);
+                    pass.set_bind_group(1, mat, &[]);
+                    pass.draw_indexed(d.first * 6..(d.first + d.count) * 6, 0, 0..1);
+                }
+            }
         }
         self.queue.submit([enc.finish()]);
     }
 
     /// Render offscreen and read back as RGBA8.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_to_image(
         &self,
         width: u32,
@@ -693,6 +934,7 @@ impl Gpu {
         globals: &Globals,
         clear: [f64; 3],
         draws: &[(&GpuMesh, &Instance)],
+        sprites: Option<&SpriteLayer>,
         overlay: Option<&dyn Fn(&wgpu::TextureView)>,
     ) -> Result<Image> {
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -711,7 +953,7 @@ impl Gpu {
         });
         let view = tex.create_view(&Default::default());
         let depth = self.depth_view(width, height);
-        self.render(&view, &depth, globals, clear, draws);
+        self.render_viewport(&view, &depth, globals, clear, draws, None, sprites);
         if let Some(f) = overlay {
             f(&view);
         }

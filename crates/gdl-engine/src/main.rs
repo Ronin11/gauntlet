@@ -230,7 +230,7 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
     let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
     let proj = Mat4::perspective_rh(50f32.to_radians(), w as f32 / h as f32, 0.1, 500.0);
     let g = gpu::globals(proj * view, m.transform_point3(eye), [0.0; 3], 0.0);
-    let img = gpu.render_to_image(w, h, &g, scene::CLEAR, &[(&gm, &inst)], None)?;
+    let img = gpu.render_to_image(w, h, &g, scene::CLEAR, &[(&gm, &inst)], None, None)?;
     write_png(args.snapshot.as_ref().unwrap(), &img)
 }
 
@@ -431,6 +431,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 None => inp,
             })
             .collect();
+        // GDL_FX=<row|GENHIT|GENDIE>[:frame]: start an effect in front of
+        // player 0 (default on the first frame).
+        if let Ok(v) = std::env::var("GDL_FX") {
+            let (what, at) = v.split_once(':').unwrap_or((&v, "1"));
+            if at.parse::<u32>().ok() == Some(f) && !g.debug_fx(what) {
+                println!("GDL_FX: no effect {what}");
+            }
+        }
         g.update(1.0 / 60.0, &inputs);
         sfx_seen.extend(g.sfx.drain(..));
         if f % 600 == 0 {
@@ -452,6 +460,24 @@ fn snapshot_game(args: &Args) -> Result<()> {
     if let Ok(list) = std::env::var("GDL_HIDE") {
         for name in list.split(',') {
             g.hide_object(name);
+        }
+    }
+    if std::env::var_os("GDL_PSYS").is_some() {
+        let p = &g.particles;
+        let live: usize = p.systems.iter().map(|(_, s)| s.len()).sum();
+        println!(
+            "psys {} systems, {} particles, {} textures, {} streaks",
+            p.systems.len(),
+            live,
+            p.textures.len(),
+            p.streaks.len()
+        );
+        for (o, s) in p
+            .systems
+            .iter()
+            .filter(|(o, s)| !s.is_empty() || !matches!(o, gdl_engine::psys::Owner::World(_)))
+        {
+            println!("  {o:?}: {} at {:?}", s.len(), s.node.w_axis.truncate());
         }
     }
     if std::env::var_os("GDL_XRAY").is_some() {
@@ -769,13 +795,22 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 &globals,
                 scene::CLEAR,
                 &sc.draws(&g),
+                Some(sc.sprites()),
                 Some(&draw_screen),
             )?
         }
-        Some(_) => gpu.render_to_image(w, h, &globals, scene::CLEAR, &[], Some(&draw_screen))?,
-        None => {
-            gpu.render_to_image(w, h, &globals, scene::CLEAR, &sc.draws(&g), Some(&draw_hud))?
+        Some(_) => {
+            gpu.render_to_image(w, h, &globals, scene::CLEAR, &[], None, Some(&draw_screen))?
         }
+        None => gpu.render_to_image(
+            w,
+            h,
+            &globals,
+            scene::CLEAR,
+            &sc.draws(&g),
+            Some(sc.sprites()),
+            Some(&draw_hud),
+        )?,
     };
     write_png(args.snapshot.as_ref().unwrap(), &img)
 }

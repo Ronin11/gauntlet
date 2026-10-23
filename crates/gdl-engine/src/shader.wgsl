@@ -85,3 +85,35 @@ fn fs_opaque(v: VsOut) -> @location(0) vec4<f32> {
 fn fs_blend(v: VsOut) -> @location(0) vec4<f32> {
     return shade(v);
 }
+
+// Particles and streaks: world-space corners, texture x vertex colour
+// (GXSetChanMatColor), GX's alpha compare (> 2).
+struct SpriteIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+
+struct SpriteOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_sprite(v: SpriteIn) -> SpriteOut {
+    var o: SpriteOut;
+    o.clip = g.view_proj * vec4<f32>(v.pos, 1.0);
+    o.uv = v.uv;
+    o.color = v.color;
+    return o;
+}
+
+@fragment
+fn fs_sprite(v: SpriteOut) -> @location(0) vec4<f32> {
+    let c = textureSample(t_diffuse, s_diffuse, v.uv) * v.color;
+    if (c.a <= 2.0 / 255.0) {
+        discard;
+    }
+    return c;
+}

@@ -1022,6 +1022,7 @@ impl App {
                     CLEAR,
                     &play.scene.draws(&play.game),
                     Some(vp),
+                    Some(play.scene.sprites()),
                 );
                 let mut s = Scr::new(&mut canvas, &r.hud.ui, ticks);
                 s.bars(1.0);
@@ -1076,6 +1077,7 @@ impl App {
                     CLEAR,
                     &p.scene.draws(&p.game),
                     Some(vp),
+                    Some(p.scene.sprites()),
                 );
                 hud::build(
                     &mut Scr::new(&mut canvas, &r.hud.ui, ticks),

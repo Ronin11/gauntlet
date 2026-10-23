@@ -32,6 +32,7 @@ pub mod optmenu;
 pub mod paction;
 pub mod powerups;
 pub mod progress;
+pub mod psys;
 pub mod save;
 pub mod scene;
 pub mod screen;

@@ -67,6 +67,18 @@ pub struct Model {
     /// Sequence texmods and texmod nodes, linked to the mesh's flipbooks and
     /// parts (None when the model has none).
     texmods: Option<TexmodLinks>,
+    /// The tree's particle nodes (AtreeNodeInit case 4).
+    pub psys: Vec<ModelPsys>,
+}
+
+/// A particle node of a model's tree: MBNewWorldPsys under the node with its
+/// record and direction; its texture when the model's own bank has it.
+#[derive(Clone, Debug)]
+pub struct ModelPsys {
+    pub node: usize,
+    pub record: gdl_formats::psys::PsysRecord,
+    pub dir: [f32; 3],
+    pub image: Option<gdl_formats::Image>,
 }
 
 /// A texmod node: the parts of its subtree and its flipbook in `MeshData::seq_anims`.
@@ -255,7 +267,36 @@ impl Model {
             None,
             &[],
             (&anim.texmods, &[]),
-        ))
+        )
+        .with_psys(anim, objects, textures))
+    }
+
+    /// The tree's particle nodes, with their textures from this bank
+    /// (MBOX_FindTexture finds the rest in the other loaded banks).
+    fn with_psys(mut self, anim: &Anim, objects: &Objects, textures: &[u8]) -> Self {
+        let mut images: Vec<(String, Option<gdl_formats::Image>)> = Vec::new();
+        for (ni, n) in self.skeleton.nodes.iter().enumerate() {
+            let Some((ri, dir)) = n.psys else { continue };
+            let Some(record) = anim.psys.get(ri).cloned() else {
+                continue;
+            };
+            let name = record.tex_name.clone();
+            let image = match images.iter().find(|(k, _)| *k == name) {
+                Some((_, img)) => img.clone(),
+                None => {
+                    let img = crate::mesh::decode_bitmap(objects, textures, &name);
+                    images.push((name, img.clone()));
+                    img
+                }
+            };
+            self.psys.push(ModelPsys {
+                node: ni,
+                record,
+                dir,
+                image,
+            });
+        }
+        self
     }
 
     /// [`Model::from_anim`] plus replacement objects for some nodes, by name
@@ -292,7 +333,8 @@ impl Model {
             None,
             &alts,
             (&anim.texmods, &[]),
-        ))
+        )
+        .with_psys(anim, objects, textures))
     }
 
     /// `texmods`: the bank's texmod table and the other banks external
@@ -411,6 +453,7 @@ impl Model {
             alt_parts,
             part_count: next_part as usize,
             texmods: None,
+            psys: Vec::new(),
         };
         model.texmods = TexmodLinks::new(&model);
         model
@@ -500,6 +543,7 @@ impl Model {
             alt_parts: Vec::new(),
             part_count: 1,
             texmods: None,
+            psys: Vec::new(),
         })
     }
 

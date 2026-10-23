@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 pub(crate) mod effect;
 pub(crate) mod items;
 mod magic;
+mod particles;
 pub mod sounds;
 pub mod worn;
 
@@ -683,6 +684,8 @@ pub(crate) struct PlyrSfx {
     effect: bool,
     model: Option<usize>,
     sound: Option<String>,
+    /// A particle record's texture (its fxdesc, MBOX_FindTexture_Sub).
+    psys_tex: Option<usize>,
 }
 
 /// An effect parented to a hero's model (DoPlyrSfx's SfxSetParent): it keeps
@@ -1127,6 +1130,10 @@ pub struct Game {
     pub(crate) hit_from: Option<Vec3>,
     /// The effect table and the effects it runs (effect.rs).
     pub(crate) effects: effect::Effects,
+    /// The particle systems and missile streaks (psys.rs, particles.rs).
+    pub particles: crate::psys::Particles,
+    /// WEAPONS', POWERUPS' and STATIC's textures, for MBOX_FindTexture.
+    psys_banks: Vec<(Objects, Vec<u8>)>,
 }
 
 /// items.c's animated-item cycle (an item with an atree and active & 1): it
@@ -1655,6 +1662,8 @@ impl Game {
             wizard_model: None,
             hit_from: None,
             effects: Default::default(),
+            particles: Default::default(),
+            psys_banks: Vec::new(),
         };
         game.ai_paths =
             crate::ai::Paths::new(&game.level.worlds.locators, game.level.start_positions()[0]);
@@ -1849,6 +1858,7 @@ impl Game {
             p.refresh_stats();
         }
         game.populate(fs, classes.len());
+        game.init_particles(fs);
         Ok(game)
     }
 
@@ -1881,10 +1891,24 @@ impl Game {
         };
         let sound =
             (r.flags & 0x0F00_0000 == 0 && !r.snddesc.is_empty()).then(|| r.snddesc.clone());
+        // A particle's texture: the hero's SFX bank, else the global ones.
+        let psys_tex = if r.flags & 0x0F00_0000 != 0 {
+            let own = dirs.iter().find_map(|d| {
+                let a = cache
+                    .entry(d.clone())
+                    .or_insert_with(|| load_asset(fs, d))
+                    .as_ref()?;
+                crate::mesh::decode_bitmap(&a.objects, &a.textures, name)
+            });
+            self.psys_texture(name, own.as_ref())
+        } else {
+            None
+        };
         PlyrSfx {
             effect,
             model,
             sound,
+            psys_tex,
         }
     }
 
@@ -2380,7 +2404,8 @@ impl Game {
                     if let Ok(m) =
                         Model::from_anim(&asset.objects, &asset.textures, anim, Some(name))
                     {
-                        if !m.mesh.indices.is_empty() {
+                        // A tree of only particle nodes still is one.
+                        if !m.mesh.indices.is_empty() || !m.psys.is_empty() {
                             found = Some(m);
                             break;
                         }
@@ -3267,6 +3292,7 @@ impl Game {
         self.update_sounds();
         self.check_level_end();
         self.update_camera(dt);
+        self.update_particles();
     }
 
     fn update_players(&mut self, dt: f32, inputs: &[PlayerInput]) {
@@ -4089,6 +4115,7 @@ impl Game {
             self.effects
                 .missiles
                 .insert(id, (desc.hit_effect, flags | desc.damage_type));
+            self.start_streak(id, pi, flags, desc.radius(flags), m::lifetime(flags));
         }
         shots
     }
@@ -4684,8 +4711,8 @@ impl Game {
         let res = self.psfx[m].get(idx as usize).cloned().unwrap_or_default();
         let f = rec.flags;
         let mut result = None;
-        // Hiding the hero (0x400), SetSkinFX (0x100) and the particle
-        // systems (0x0F000000, PsfxDoParticle) are not drawn.
+        // Hiding the hero (0x400) and SetSkinFX (0x100) are not drawn;
+        // particle records (0x0F000000) are PsfxDoParticle's.
         if f & 0x0F00_0300 == 0 {
             let l = if riding {
                 Vec3::from(rec.offset)
@@ -4699,6 +4726,8 @@ impl Game {
                 offset.map_or(l, |o| o + l)
             };
             result = self.do_plyr_sfx(pi, &rec, &res, at, riding, partner);
+        } else if f & 0x0F00_0000 != 0 {
+            self.psfx_particle(pi, &rec, res.psys_tex);
         }
         if f & 0x0F00_0000 == 0 {
             if let Some(s) = res.sound {

@@ -98,6 +98,9 @@ pub struct PlayerData {
     /// fam_proj_offset: where a familiar's or the Phoenix's shot starts, in the
     /// player's frame, scaled by the hero's node scale.
     pub fam_proj_offset: [f32; 3],
+    /// streakfwdmul: how far ahead of a thrown weapon its streak reaches
+    /// (combat.c StartMissile's SfxSetStreak), in 30 Hz frames of flight.
+    pub streak_fwd_mul: f32,
 }
 
 impl PlayerData {
@@ -192,6 +195,7 @@ impl PlayerData {
             }
             pd.familiar_offset = v(0x164)?;
             pd.fam_proj_offset = v(0x170)?;
+            pd.streak_fwd_mul = r.f32(o + 0x17C)?;
         }
         Ok(pd)
     }

@@ -5,6 +5,7 @@
 //! `GetAnimAngXYZVal` (anim_play.c in the GameCube decompilation).
 
 use crate::bin::Le;
+use crate::psys::{PsysRecord, PSYS_RECORD_SIZE};
 use anyhow::{Context, Result};
 
 pub const ANIM_SKELETAL: u16 = 1;
@@ -96,6 +97,10 @@ pub struct ANode {
     pub obj_anim_first: Option<usize>,
     /// For texture-animation nodes: the node's texmod record.
     pub texmod: Option<TexMod>,
+    /// For particle nodes (AtreeNodeInit case 4): the node's index in
+    /// [`Anim::psys`] and its emission direction (`AtreeNodeDef.audioParams`,
+    /// MBNewWorldPsys's override).
+    pub psys: Option<(usize, [f32; 3])>,
 }
 
 /// Object ("vertex") animation: a run of whole meshes swapped per frame.
@@ -175,6 +180,8 @@ pub struct Anim {
     /// The atreelist's texmod table: the global ones plus those referenced by
     /// sequences and texmod nodes.
     pub texmods: Vec<TexMod>,
+    /// The atreelist's particle-system records (v8+ `npsys` / `psys`).
+    pub psys: Vec<PsysRecord>,
 }
 
 fn wrap_angle(v: f32) -> f32 {
@@ -203,9 +210,22 @@ impl Anim {
                 texmods.push(TexMod::parse(r, texmods_ptr + i * TEXMOD_SIZE)?);
             }
         }
+        // v8+: the particle-system records (fn_8001267C).
+        let (npsys, psys_ptr) = if version >= 8 {
+            (r.i32(0x10)?.max(0) as usize, r.u32(0x14)? as usize)
+        } else {
+            (0, 0)
+        };
+        let psys = if psys_ptr != 0 {
+            PsysRecord::parse_list(r, psys_ptr, npsys)?
+        } else {
+            Vec::new()
+        };
         let tm = Texmods {
             list: &texmods,
             ptr: texmods_ptr,
+            psys_ptr,
+            npsys: psys.len(),
         };
         let mut atrees = Vec::with_capacity(count);
         for i in 0..count {
@@ -220,6 +240,7 @@ impl Anim {
             version,
             atrees,
             texmods,
+            psys,
         })
     }
 
@@ -233,6 +254,9 @@ impl Anim {
 struct Texmods<'a> {
     list: &'a [TexMod],
     ptr: usize,
+    /// The particle-system records' offset and count.
+    psys_ptr: usize,
+    npsys: usize,
 }
 
 fn parse_atree(r: Le, name: String, h: usize, tm: &Texmods) -> Result<ATree> {
@@ -275,7 +299,26 @@ fn parse_atree(r: Le, name: String, h: usize, tm: &Texmods) -> Result<ATree> {
             parent: r.i32(o + 56)?,
             obj_anim_first: None,
             texmod: None,
+            psys: None,
         });
+    }
+
+    // Particle nodes: like a texmod node's, the data offset is relative to the
+    // sequence table and lands on a particle-system record.
+    for (i, n) in nodes.iter_mut().enumerate() {
+        if n.anim_type != ANIM_PARTICLE || tm.psys_ptr == 0 {
+            continue;
+        }
+        let at = seq_ptr as i64 + n.seq_info_offset as i32 as i64 - tm.psys_ptr as i64;
+        if at >= 0
+            && (at as usize).is_multiple_of(PSYS_RECORD_SIZE)
+            && (at as usize / PSYS_RECORD_SIZE) < tm.npsys
+        {
+            n.psys = Some((
+                at as usize / PSYS_RECORD_SIZE,
+                r.vec3(anode_ptr + i * 60 + 0x14)?,
+            ));
+        }
     }
 
     // Texture-animation nodes: the node's data offset, relative to the
@@ -578,6 +621,45 @@ mod tests {
         let t = nodes[6].texmod.as_ref().unwrap();
         assert_eq!(nodes[6].name, "TEXMOD6_4_16_LEGGENIETEX");
         assert_eq!((t.start_frame, t.frames), (4, 16));
+    }
+
+    #[test]
+    fn particle_nodes_resolve() {
+        let Some(d) = read("WEAPONS/ANIM.PS2") else {
+            return;
+        };
+        let a = Anim::parse(&d).unwrap();
+        assert_eq!(a.psys.len(), 21);
+        // BLOODFX1: three emitters on records 12-14, aimed up and ahead.
+        let t = a.atrees.iter().find(|t| t.name == "BLOODFX1").unwrap();
+        let p: Vec<_> = t.nodes.iter().filter_map(|n| n.psys).collect();
+        assert_eq!(p.iter().map(|p| p.0).collect::<Vec<_>>(), [12, 13, 14]);
+        assert!((p[0].1[1] - 0.5).abs() < 1e-3 && (p[0].1[2] - 0.866).abs() < 1e-3);
+        let r = &a.psys[12];
+        assert_eq!((r.id, r.preset, r.enables), (b'M', 5, 0x66a71));
+        assert_eq!(r.tex_name, "BLOOD_SM");
+        assert_eq!((r.e_lifefade, r.p_lifefade), ([0.3, 2.0], [0.3, 0.8]));
+        assert_eq!((r.e_angle, r.gravity, r.speed), (180.0, 0.7, 7.0));
+        assert_eq!(r.e_rate, [25.0, 25.0, 0.0, 0.0]);
+        assert_eq!(r.rgba[3], 0x4cff_ffff);
+        // Every particle node of every bank lands on a record.
+        for rel in [
+            "POWERUPS/ANIM.PS2",
+            "MONSTERS/GRU/ANIM.PS2",
+            "ITEMS/levelL/ANIM.PS2",
+        ] {
+            let Some(d) = read(rel) else { return };
+            let a = Anim::parse(&d).unwrap();
+            for t in &a.atrees {
+                for n in t.nodes.iter().filter(|n| n.anim_type == ANIM_PARTICLE) {
+                    assert!(
+                        n.psys.is_some_and(|p| p.0 < a.psys.len()),
+                        "{rel} {}",
+                        t.name
+                    );
+                }
+            }
+        }
     }
 
     #[test]

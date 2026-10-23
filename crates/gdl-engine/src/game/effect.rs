@@ -303,7 +303,7 @@ fn match_tree(
         let time = tree_time(tree);
         let model = Model::from_anim(&asset.objects, &asset.textures, anim, Some(&tree.name))
             .ok()
-            .filter(|m| !m.mesh.indices.is_empty())
+            .filter(|m| !m.mesh.indices.is_empty() || !m.psys.is_empty())
             .map(|m| g.add_model(m));
         Some((model, time))
     })();

@@ -1,7 +1,7 @@
 //! GPU-side mirror of a [`Game`]: uploaded meshes and per-frame instance updates.
 
 use crate::game::{EnemyState, Game, Kind, PlayerState};
-use crate::gpu::{self, Gpu, GpuMesh, Instance};
+use crate::gpu::{self, Gpu, GpuMesh, Instance, SpriteDraw, SpriteLayer, SpriteVertex};
 use anyhow::Result;
 use glam::{Mat4, Vec3, Vec4};
 use std::collections::HashMap;
@@ -34,6 +34,25 @@ pub struct Scene {
     worn: Vec<(u64, usize)>,
     /// The model of each shadow instance in `entities`, by key.
     shadow_models: HashMap<u64, usize>,
+    /// This frame's particles and missile streaks.
+    sprites: SpriteLayer,
+}
+
+/// DrawPsysSub's screen limits on the GameCube's 640x480: both corners
+/// within 16 pixels of the screen, at least a pixel across.
+const SPRITE_MARGIN: [f32; 2] = [32.0 / 640.0, 32.0 / 480.0];
+const SPRITE_MIN: [f32; 2] = [2.0 / 640.0, 2.0 / 480.0];
+/// pbWindow's far plane.
+const SPRITE_FAR: f32 = 1500.0;
+
+/// 0xAARRGGBB as a vertex colour.
+fn argb(c: u32) -> [f32; 4] {
+    [
+        ((c >> 16) & 0xFF) as f32 / 255.0,
+        ((c >> 8) & 0xFF) as f32 / 255.0,
+        (c & 0xFF) as f32 / 255.0,
+        (c >> 24) as f32 / 255.0,
+    ]
 }
 
 /// Instance key bit for a critter's GMETER bar.
@@ -128,7 +147,111 @@ impl Scene {
             seethrough: None,
             worn: Vec::new(),
             shadow_models: HashMap::new(),
+            sprites: gpu.new_sprite_layer(),
         })
+    }
+
+    /// The particle and streak quads [`Scene::sync`] built.
+    pub fn sprites(&self) -> &SpriteLayer {
+        &self.sprites
+    }
+
+    /// MBDrawPsysObjects: each psys's sprites as camera-facing quads (its
+    /// texture, blend and z), culled and capped as DrawPsysSub does, then
+    /// the missile streaks.
+    fn sync_sprites(&mut self, gpu: &Gpu, game: &Game) {
+        let parts = &game.particles;
+        while self.sprites.texture_count() < parts.textures.len() {
+            let i = self.sprites.texture_count();
+            gpu.add_sprite_texture(&mut self.sprites, &parts.textures[i]);
+        }
+        let (eye, at, near) = game.camera_view();
+        let m = mirror();
+        let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
+        let vp = crate::camera::projection(4.0 / 3.0, near, SPRITE_FAR) * view;
+        // The view's right and up rows (lbl_80344EE8's basis).
+        let right = Vec3::new(view.x_axis.x, view.y_axis.x, view.z_axis.x);
+        let up = Vec3::new(view.x_axis.y, view.y_axis.y, view.z_axis.y);
+        let on_screen = |c: Vec4| {
+            let (x, y) = (c.x / c.w, c.y / c.w);
+            (-1.0 - SPRITE_MARGIN[0]..1.0 + SPRITE_MARGIN[0]).contains(&x)
+                && (-1.0 - SPRITE_MARGIN[1]..1.0 + SPRITE_MARGIN[1]).contains(&y)
+        };
+        let mut quads: Vec<[SpriteVertex; 4]> = Vec::new();
+        let mut draws = Vec::new();
+        for b in parts.batches() {
+            let first = quads.len() as u32;
+            // Half a texel in from each edge.
+            let (tw, th) = b
+                .tex
+                .and_then(|t| parts.textures.get(t))
+                .map_or((16.0, 16.0), |t| (t.width as f32, t.height as f32));
+            let (u0, u1) = (0.5 / tw, (tw - 0.5) / tw);
+            let (v0, v1) = (0.5 / th, (th - 0.5) / th);
+            for &(pos, w, c) in &b.sprites {
+                if quads.len() >= crate::psys::MAX_QUADS {
+                    break;
+                }
+                let p = m.transform_point3(pos);
+                let h = w * 0.5;
+                let k1 = vp * (p - (right + up) * h).extend(1.0);
+                if k1.w <= near || k1.w >= SPRITE_FAR || !on_screen(k1) {
+                    continue;
+                }
+                let k2 = vp * (p + (right + up) * h).extend(1.0);
+                if k2.w <= 0.0 || !on_screen(k2) {
+                    continue;
+                }
+                if (k2.x / k2.w - k1.x / k1.w).abs() < SPRITE_MIN[0]
+                    || (k2.y / k2.w - k1.y / k1.w).abs() < SPRITE_MIN[1]
+                {
+                    continue;
+                }
+                let color = argb(c);
+                let v = |d: Vec3, uv: [f32; 2]| SpriteVertex {
+                    pos: (p + d * h).to_array(),
+                    uv,
+                    color,
+                };
+                quads.push([
+                    v(up - right, [u0, v0]),
+                    v(up + right, [u1, v0]),
+                    v(right - up, [u1, v1]),
+                    v(-right - up, [u0, v1]),
+                ]);
+            }
+            let count = quads.len() as u32 - first;
+            if count > 0 {
+                draws.push(SpriteDraw {
+                    texture: b.tex,
+                    blend: b.blend,
+                    ztest: b.ztest,
+                    zwrite: b.zwrite,
+                    first,
+                    count,
+                });
+            }
+        }
+        // UpdateFXStreak's quads (MBPolyInst: alpha blended, z written).
+        for s in &parts.streaks {
+            let color = argb(s.color);
+            let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+            let q = std::array::from_fn(|i| SpriteVertex {
+                pos: m.transform_point3(s.corners[i]).to_array(),
+                uv: uv[i],
+                color,
+            });
+            draws.push(SpriteDraw {
+                texture: s.tex,
+                blend: crate::psys::Blend::Alpha,
+                ztest: true,
+                zwrite: true,
+                first: quads.len() as u32,
+                count: 1,
+            });
+            quads.push(q);
+        }
+        gpu.set_sprites(&mut self.sprites, &quads, draws);
     }
 
     pub fn sync(&mut self, gpu: &Gpu, game: &Game) {
@@ -411,6 +534,7 @@ impl Scene {
         }
         self.entities.retain(|id, _| live.contains(id));
         self.shadow_models.retain(|id, _| live.contains(id));
+        self.sync_sprites(gpu, game);
     }
 
     /// Put shadow `key` where `s` says, at its body's opacity.

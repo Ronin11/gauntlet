@@ -98,6 +98,10 @@ in `~/.android/gauntlet-rs.keystore`.
 - **Thrown weapons** fly like the original's: per-class weight and arc, 3-way and 5-way
   fans, launch-time wall checks, wall-hit sounds.
 - **Texture animation**: lava, water, torches, skies and glowing models.
+- **Particles** from the decompiled MB particle system: the levels' fire, smoke and mist
+  emitters, blood, sparks, gem sparkles, generator hits, the wizard's wrist sparks and
+  amulet glows, each from the game's own particle records and presets; thrown weapons
+  leave the original's coloured streak.
 - **Save games** on a virtual memory card, with the original's load/save screens.
 - **Power-ups** wait in each player's inventory until switched on from the D-pad, as on
   GameCube; the name shows over the player's panel, glowing while it is on.
@@ -108,7 +112,8 @@ in `~/.android/gauntlet-rs.keystore`.
 
 ## Not done yet (roadmap)
 
-- Particle effects and most hit/burst effect models
+- Firework and flame particle presets (sfx.c's festival explosions), trigger-driven
+  world emitters
 - Android touch controls (Bluetooth controllers work)
 
 ## Layout
@@ -136,7 +141,8 @@ gauntlet --snapshot out.png --simulate 600 --bot   # headless test run + screens
 Headless test hooks (environment variables): `GDL_MUTE=1` (no audio), `GDL_FUZZ=seed`
 (random inputs), `GDL_LEGEND=1` (the party holds the realm's Item of Legend), `GDL_INV=1`
 (power-up inventory), `GDL_PUP=9:80,lvl:85` (power-ups switched on by type:hex flags, hero level), `GDL_SUMNER=welcome|runes=..|shards=..|exp=N`, `GDL_FLYBY=1`,
-`GDL_NO_BOSS_CAMERA=1`, `GDL_DEBUG_CAM=1`.
+`GDL_NO_BOSS_CAMERA=1`, `GDL_DEBUG_CAM=1`, `GDL_PSYS=1` (particle systems at the end),
+`GDL_FX=<row|GENHIT|GENDIE>[:frame]` (start an effect in front of player 0).
 
 ## Credits and references
 

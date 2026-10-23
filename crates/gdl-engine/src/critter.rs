@@ -2679,7 +2679,7 @@ impl Game {
                 let m = anim
                     .filter(|a| a.atrees.iter().any(|t| t.name.eq_ignore_ascii_case(&name)))
                     .and_then(|a| Model::from_anim(objects, textures, a, Some(&name)).ok())
-                    .filter(|m| !m.mesh.indices.is_empty())
+                    .filter(|m| !m.mesh.indices.is_empty() || !m.psys.is_empty())
                     .or_else(|| Model::from_objects_anim(objects, textures, anim, &[&name]));
                 let idx = m.map(|m| self.add_model_pub(m));
                 known.insert(name, idx);
