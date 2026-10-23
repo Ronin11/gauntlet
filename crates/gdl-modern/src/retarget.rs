@@ -18,7 +18,7 @@
 
 use crate::ModernModel;
 use anyhow::{bail, Result};
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat3, Mat4, Quat, Vec3};
 
 struct Pair {
     node: usize,
@@ -31,9 +31,11 @@ struct Pair {
 
 pub struct Retarget {
     pairs: Vec<Pair>,
-    /// The game skeleton is a mirror image of the modern rig (left on -x while
-    /// facing +z), so directions and rotations are reflected across x.
-    reflect_x: bool,
+    /// Modern space to game space: carries the modern rig's forward, up and left
+    /// onto the game's (+z, +y and the side its left hip is on). Rigs can face
+    /// any way, and the game's space is a mirror image of a standard one, so this
+    /// can be a rotation, a reflection, or both.
+    basis: Mat3,
     /// The game node that moves the whole body (`ROOT_PELVIS`).
     root: usize,
     /// Joints in an order where parents come first.
@@ -48,21 +50,23 @@ fn rotation(m: &Mat4) -> Quat {
     Quat::from_mat3(&glam::Mat3::from_cols(x, y, z)).normalize()
 }
 
-/// `M q M` for the reflection M = diag(-1, 1, 1).
-fn reflect(q: Quat) -> Quat {
-    Quat::from_xyzw(q.x, -q.y, -q.z, q.w)
+/// The unit vector along `v` with its height removed.
+fn level(v: Vec3) -> Vec3 {
+    Vec3::new(v.x, 0.0, v.z).normalize_or_zero()
 }
 
 impl Retarget {
     /// `game_nodes` / `game_parents`: the skeleton's node names and parents;
     /// `game_ref`: its model-space matrices in the reference pose (used to tell
-    /// left from right); `map` and `aim`: see [`crate::mapping`].
+    /// left from right); `map` and `aim`: see [`crate::mapping`]; `forward`: two
+    /// modern joints (heel, toe) that point the way the rig faces.
     pub fn new(
         model: &ModernModel,
         game_nodes: &[&str],
         game_ref: &[Mat4],
         map: &[(&str, &str)],
         aim: &[(&str, &str)],
+        forward: (&str, &str),
     ) -> Result<Self> {
         let node_of = |name: &str| game_nodes.iter().position(|g| g.eq_ignore_ascii_case(name));
         let mut pairs = Vec::new();
@@ -109,15 +113,36 @@ impl Retarget {
         }
         let find = |name: &str| pairs.iter().find(|p| game_nodes[p.node] == name);
         let root = find("ROOT_PELVIS").map(|p| p.node).unwrap_or(pairs[0].node);
-        // Left is on -x in the game; check the modern rig puts it on +x.
-        let reflect_x = match (find("L_HIP"), find("R_HIP")) {
-            (Some(l), Some(r)) => {
-                let game = game_ref[l.node].w_axis.x - game_ref[r.node].w_axis.x;
-                let modern = model.joints[l.joint].rest_world.w_axis.x
-                    - model.joints[r.joint].rest_world.w_axis.x;
-                game.signum() != modern.signum()
+        let pos = |name: &str| {
+            model
+                .joint(name)
+                .map(|j| model.joints[j].rest_world.w_axis.truncate())
+        };
+        let basis = match (find("L_HIP"), find("R_HIP"), pos(forward.0), pos(forward.1)) {
+            (Some(l), Some(r), Some(heel), Some(toe)) => {
+                let left_m = level(
+                    model.joints[l.joint].rest_world.w_axis.truncate()
+                        - model.joints[r.joint].rest_world.w_axis.truncate(),
+                );
+                // Forward is square to the hips (the toes can point elsewhere, and
+                // a rig made from a three-quarter view stands turned); the toes
+                // only say front from back.
+                let mut fwd_m = left_m.cross(Vec3::Y);
+                if fwd_m.dot(level(toe - heel)) < 0.0 {
+                    fwd_m = -fwd_m;
+                }
+                // The game faces +z with up +y; only which side is left varies (its
+                // reference stance can have the hips twisted, so don't copy that).
+                let side = (game_ref[l.node].w_axis.x - game_ref[r.node].w_axis.x).signum();
+                let left_g = Vec3::X * side;
+                if left_m == Vec3::ZERO || fwd_m == Vec3::ZERO || left_g == Vec3::ZERO {
+                    bail!("can't tell which way the rig faces");
+                }
+                let modern = Mat3::from_cols(fwd_m, Vec3::Y, left_m);
+                let game = Mat3::from_cols(Vec3::Z, Vec3::Y, left_g);
+                game * modern.transpose()
             }
-            _ => false,
+            _ => bail!("need L_HIP, R_HIP and the forward joints to orient the rig"),
         };
         let mut order: Vec<usize> = (0..model.joints.len()).collect();
         let depth = |mut j: usize| {
@@ -131,10 +156,20 @@ impl Retarget {
         order.sort_by_key(|&j| depth(j));
         Ok(Retarget {
             pairs,
-            reflect_x,
+            basis,
             root,
             order,
         })
+    }
+
+    /// A point or direction of the modern model, in game space (unscaled).
+    pub fn to_game(&self, v: Vec3) -> Vec3 {
+        self.basis * v
+    }
+
+    /// Whether going to game space turns the model inside out (flips winding).
+    pub fn mirrors(&self) -> bool {
+        self.basis.determinant() < 0.0
     }
 
     /// Game-space scale of the modern model: the game pelvis' height over the
@@ -158,21 +193,12 @@ impl Retarget {
         game_now: &[Mat4],
     ) -> Vec<Mat4> {
         let scale = self.scale(model, game_ref);
-        let refl = |v: Vec3| {
-            if self.reflect_x {
-                Vec3::new(-v.x, v.y, v.z)
-            } else {
-                v
-            }
-        };
+        let to_modern = self.basis.transpose();
+        let refl = |v: Vec3| to_modern * v;
         // The rotation each game node made since the reference pose, in modern space.
         let delta = |n: usize| {
             let d = rotation(&game_now[n]) * rotation(&game_ref[n]).inverse();
-            if self.reflect_x {
-                reflect(d)
-            } else {
-                d
-            }
+            Quat::from_mat3(&(to_modern * Mat3::from_quat(d) * self.basis)).normalize()
         };
         let by_joint: Vec<Option<usize>> = {
             let mut v = vec![None; model.joints.len()];

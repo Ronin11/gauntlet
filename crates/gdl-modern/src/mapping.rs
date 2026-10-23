@@ -45,3 +45,6 @@ pub const BIPED_AIM: &[(&str, &str)] = &[
     ("R_ELBO", "R_WRIST"),
     ("NECK", "HEAD"),
 ];
+
+/// Two joints (heel, toe) that point the way a biped rig faces.
+pub const BIPED_FORWARD: (&str, &str) = ("L_Foot", "L_ToeBase");

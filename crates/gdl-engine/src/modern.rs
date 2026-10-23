@@ -42,6 +42,7 @@ impl ModernHero {
             &game_ref,
             mapping::BIPED,
             mapping::BIPED_AIM,
+            mapping::BIPED_FORWARD,
         )?;
         let scale = retarget.scale(&model, &game_ref);
         Ok(ModernHero {
@@ -53,13 +54,12 @@ impl ModernHero {
     }
 
     /// The mesh posed as the game's `game_now` node matrices, in game model
-    /// space (x mirrored from the glTF, like the rest of the game's models).
+    /// space.
     pub fn mesh(&self, game_now: &[Mat4]) -> Result<MeshData> {
         let mats = self
             .retarget
             .skin_matrices(&self.model, &self.game_ref, game_now);
         let posed = retarget::skin(&self.model, &mats);
-        let flip = |v: Vec3| Vec3::new(-v.x, v.y, v.z);
         let tex = self
             .model
             .texture
@@ -68,20 +68,25 @@ impl ModernHero {
         let mut m = MeshData::default();
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for ((p, n), v) in posed.iter().zip(&self.model.vertices) {
-            let p = flip(*p) * self.scale;
+            let p = self.retarget.to_game(*p) * self.scale;
             lo = lo.min(p);
             hi = hi.max(p);
             m.vertices.push(Vertex {
                 pos: p.into(),
-                normal: flip(*n).into(),
+                normal: self.retarget.to_game(*n).into(),
                 color: [1.0; 4],
                 uv: v.uv.into(),
                 lm_uv: [0.0; 2],
             });
         }
-        // The x flip reverses winding.
+        // A mirroring conversion reverses winding.
+        let mirrored = self.retarget.mirrors();
         for t in self.model.indices.chunks_exact(3) {
-            m.indices.extend([t[0], t[2], t[1]]);
+            m.indices.extend(if mirrored {
+                [t[0], t[2], t[1]]
+            } else {
+                [t[0], t[1], t[2]]
+            });
         }
         m.batches.push(Batch {
             start: 0,

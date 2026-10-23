@@ -43,7 +43,7 @@ fn rest_pose_skins_to_itself() {
         ("L_HIP", "L_Thigh"),
         ("R_HIP", "R_Thigh"),
     ];
-    let r = Retarget::new(&m, &names, &game, &map, &[]).unwrap();
+    let r = Retarget::new(&m, &names, &game, &map, &[], mapping::BIPED_FORWARD).unwrap();
     let mats = r.skin_matrices(&m, &game, &game);
     let posed = skin(&m, &mats);
     let worst = posed
