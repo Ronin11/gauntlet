@@ -174,7 +174,28 @@ impl WalkWorld<'_> {
                 self.cracks.borrow_mut().push(target);
             }
         }
-        let q = if ok || !h.on_ground { target } else { p };
+        let mut q = if ok || !h.on_ground { target } else { p };
+        // A seam narrower than a running step: a careful player creeps up
+        // to its edge, then one full step clears it.
+        if probe.is_none() && h.on_ground && s > 0.0 {
+            let fwd = Vec3::new(dir.x, 0.0, dir.y);
+            let mut edge = 0.0;
+            let mut k = 0.02;
+            while k < s {
+                if col.ground_hit(p + fwd * k, p.y + self.step_up).is_some() {
+                    edge = k;
+                } else {
+                    break;
+                }
+                k += 0.02;
+            }
+            let leap = p + fwd * (edge + STEP);
+            if let Some((g, o)) = col.ground_hit(leap, p.y + self.step_up) {
+                if p.y - g <= STAIR_RISE + if Some(o) == under { 1.0 } else { 0.0 } {
+                    q = leap;
+                }
+            }
+        }
         let (mut pos, wall_hit) =
             col.resolve_walls_stairs(q, PLAYER_RADIUS, PLAYER_HEIGHT, self.step_up, STAIR_RISE);
         if h.on_ground {
@@ -738,7 +759,7 @@ impl Nav {
                 break;
             }
             for e in self.all_edges(g, n) {
-                if closed.contains(&e.to) || self.blocked.contains_key(&(n, e.to)) {
+                if closed.contains(&e.to) || !self.nodes[e.to as usize].alive || self.blocked.contains_key(&(n, e.to)) {
                     continue;
                 }
                 let ng = gc + e.cost;
@@ -765,7 +786,7 @@ impl Nav {
                 break;
             }
             for e in self.all_edges(g, n) {
-                if seen.insert(e.to) {
+                if self.nodes[e.to as usize].alive && seen.insert(e.to) {
                     stack.push(e.to);
                 }
             }

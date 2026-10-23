@@ -170,6 +170,9 @@ pub struct Bot {
     giveup_t: Option<f32>,
     /// Seconds spent waiting by moving platforms, in all and per object.
     platform_wait: f32,
+    mover_wait: f32,
+    unblocks: u32,
+    rounds: u32,
     run_to: HashMap<u64, Vec3>,
     ran: HashSet<u64>,
     waited: HashMap<u64, f32>,
@@ -249,6 +252,9 @@ impl Bot {
             verbose,
             giveup_t: None,
             platform_wait: 0.0,
+            mover_wait: 0.0,
+            unblocks: 0,
+            rounds: 0,
             run_to: HashMap::default(),
             ran: HashSet::default(),
             waited: HashMap::default(),
@@ -854,7 +860,31 @@ impl Bot {
             }
         }
         // Movers may still be on their way: wait for them before giving up.
-        if g.movers.iter().any(|m| m.moving) {
+        // Everything tried: like a player going round again, give every
+        // enabler another chance (twice, while there is time).
+        if self.rounds < 2 && g.time < self.timeout - 300.0 {
+            self.rounds += 1;
+            self.tried.clear();
+            self.failed.retain(|o| matches!(o, Obj::Exit(_)));
+            self.nav.blocked.clear();
+            self.ran.clear();
+            let line = format!("enablers exhausted: going round again (round {})", self.rounds + 1);
+            self.log(g, line);
+            self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
+            return Ok(());
+        }
+        // Edges blocked after getting stuck may be what hides the way:
+        // forget them (a few times) and look again.
+        if !self.nav.blocked.is_empty() && self.unblocks < 3 {
+            self.unblocks += 1;
+            self.nav.blocked.clear();
+            self.log(g, "no way found: forgetting blocked edges and looking again".into());
+            self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
+            return Ok(());
+        }
+        // (Not for ever: some targets never stop.)
+        if g.movers.iter().any(|m| m.moving) && self.mover_wait < 20.0 {
+            self.mover_wait += 2.0;
             self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
             return Ok(());
         }
@@ -1522,11 +1552,19 @@ impl Bot {
                     };
                 }
             }
-            Obj::Smash(_) if in_goal => {
+            Obj::Smash(id) if in_goal => {
                 a.arrived.get_or_insert(now);
                 a.last_adv = now;
                 if let Some(t) = target {
-                    return self.attack_toward(g, i, t, true);
+                    // A breakable wall takes the swings of a hero touching
+                    // it: lean into it while swinging.
+                    let wall = matches!(Self::ent(g, id).map(|e| &e.kind), Some(Kind::Wall(_)));
+                    let mut inp = self.attack_toward(g, i, t, true);
+                    if wall {
+                        let d = xz(t - pos).normalize_or_zero();
+                        inp.stick = g.stick_toward(d) * 0.5;
+                    }
+                    return inp;
                 }
             }
             Obj::Lectern if in_goal => {
@@ -1756,8 +1794,22 @@ impl Bot {
             }
         }
         let mag = if a.wp >= a.path.len() && dist < 1.5 { 0.5 } else { 1.0 };
+        // Keep to the planned line (the walk the nav checked): steer at a
+        // point a little ahead on the segment from the last waypoint.
+        let mut steer = d;
+        if a.wp > 0 && a.wp < a.path.len() {
+            let s0 = xz(self.nav.nodes[a.path[a.wp - 1] as usize].pos);
+            let s1 = xz(goal);
+            let seg = s1 - s0;
+            let len = seg.length();
+            if len > 0.5 {
+                let t = ((xz(pos) - s0).dot(seg) / (len * len)).clamp(0.0, 1.0);
+                let carrot = s0 + seg * (t + 1.2 / len).min(1.0);
+                steer = carrot - xz(pos);
+            }
+        }
         PlayerInput {
-            stick: g.stick_toward(d.normalize_or_zero()) * mag,
+            stick: g.stick_toward(steer.normalize_or_zero()) * mag,
             ..Default::default()
         }
     }
@@ -1915,6 +1967,10 @@ impl Bot {
                 p.pos.x, p.pos.y, p.pos.z, p.health, p.keys, p.state,
                 a.obj.map_or("-".into(), |o| o.name()), a.obj_t, a.stucks,
                 a.target.map(|t| (t.x, t.y, t.z))
+            );
+            s += &format!(
+                "  level {} exp {}, killed {} monsters and {} generators, gold {}\n",
+                p.level, p.exp, p.stats.enemies_killed, p.stats.generators_destroyed, p.gold
             );
             let path: Vec<String> = a
                 .path
