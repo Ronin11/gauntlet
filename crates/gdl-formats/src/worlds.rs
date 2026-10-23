@@ -197,6 +197,21 @@ pub enum LocatorType {
     Unknown(i8),
 }
 
+/// A world object's keyframe animation (gauntworld.c `struct worldanim`,
+/// 0x10 bytes, from the worlds file's version >= 1 header words 0x19..0x1B).
+#[derive(Debug, Clone)]
+pub struct WorldAnim {
+    /// The animated world object (`objidx`).
+    pub obj: usize,
+    /// Frame count (`nframes`).
+    pub nframes: i16,
+    /// Initial `curframe`.
+    pub curframe: f32,
+    /// The decoded keyframe stream (`data`: mode word, record size, offset
+    /// into the animheader's block); None when its mode has no channels.
+    pub track: Option<crate::anim::Track>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Locator {
     pub kind: LocatorType,
@@ -218,6 +233,8 @@ pub struct Worlds {
     pub item_infos: Vec<ItemInfo>,
     pub item_instances: Vec<ItemInstance>,
     pub locators: Vec<Locator>,
+    /// World-object keyframe animations (`gWorldInfo.worldanims`).
+    pub world_anims: Vec<WorldAnim>,
 }
 
 fn rotate_by_quat(v: [f32; 3], q: [f32; 4]) -> [f32; 3] {
@@ -253,6 +270,78 @@ fn plane_to_world(norm: [f32; 3], scale: f32, v0: [f32; 3], x: f32, z: f32) -> [
     let q = [-c0 * s1, s0 * c1, s0 * s1, c0 * c1];
     let d = rotate_by_quat([x, 0.0, z], q);
     [v0[0] + d[0], v0[1] + d[1], v0[2] + d[2]]
+}
+
+/// InitWorldInfo's world-animation block: header magic 0xF00BABvv at word
+/// 0x18; for vv >= 1, the animheader (SetupAnimHeader: delta tables and the
+/// keyframe block, offsets from itself) at word 0x19 and `nworldanims`
+/// records at word 0x1B.
+fn parse_world_anims(r: Le, nobjs: usize) -> Result<Vec<WorldAnim>> {
+    let magic = r.u32(0x18 * 4).unwrap_or(0);
+    let version = if magic & 0xF00B_AB00 == 0xF00B_AB00 {
+        magic & 0xFF
+    } else {
+        0
+    };
+    let hdr = r.u32(0x19 * 4).unwrap_or(0) as usize;
+    if version < 1 || hdr == 0 {
+        return Ok(Vec::new());
+    }
+    let count = r.u32(0x1A * 4)? as usize;
+    let recs = r.u32(0x1B * 4)? as usize;
+    let table = |w: usize| -> Result<Option<Vec<f32>>> {
+        let p = r.u32(hdr + w * 4)? as usize;
+        if p == 0 {
+            return Ok(None);
+        }
+        (0..256)
+            .map(|i| r.f32(hdr + p + i * 4))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    };
+    let tables = [table(0)?, table(1)?, table(2)?];
+    let block = hdr + r.u32(hdr + 12)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = recs + i * 16;
+        let obj = r.i16(o)?;
+        let nframes = r.i16(o + 2)?;
+        let curframe = r.f32(o + 8)?;
+        let data = r.u32(o + 12)? as usize;
+        if obj < 0 || obj as usize >= nobjs {
+            continue;
+        }
+        // DoWorldAnimation skips a track without data.
+        if data == 0 {
+            continue;
+        }
+        // The stream header: mode, record size, keyframe offset.
+        let track = {
+            let mode = r.u16(data)?;
+            let size = r.u16(data + 2)? as usize;
+            let at = block + r.u32(data + 4)? as usize;
+            if mode & 0xFFF == 0 {
+                None
+            } else {
+                let t = [
+                    tables[0].as_deref(),
+                    tables[1].as_deref(),
+                    tables[2].as_deref(),
+                ];
+                Some(
+                    crate::anim::decode_track(r, at, mode, size, nframes.max(1) as usize, t)
+                        .with_context(|| format!("world anim {i}"))?,
+                )
+            }
+        };
+        out.push(WorldAnim {
+            obj: obj as usize,
+            nframes,
+            curframe,
+            track,
+        });
+    }
+    Ok(out)
 }
 
 impl Worlds {
@@ -400,6 +489,8 @@ impl Worlds {
             });
         }
 
+        let world_anims = parse_world_anims(r, world_objects.len())?;
+
         Ok(Worlds {
             world_objects,
             coll_tris,
@@ -411,6 +502,7 @@ impl Worlds {
             item_infos,
             item_instances,
             locators,
+            world_anims,
         })
     }
 
@@ -497,5 +589,24 @@ mod tests {
             .filter(|(o, f)| o.name.starts_with("H1FLOORB") && *f & 0xF0000 == 0x10000)
             .count();
         assert_eq!(burning, 13);
+    }
+
+    #[test]
+    fn world_anims_parse() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../game-data/files/Gauntlet/LEVELS/levelA2/WORLDS.PS2");
+        let Ok(data) = std::fs::read(p) else { return };
+        let w = Worlds::parse(&data).unwrap();
+        assert_eq!(w.world_anims.len(), 11);
+        let hog = w
+            .world_anims
+            .iter()
+            .find(|a| w.world_objects[a.obj].name == "A2HOG04")
+            .unwrap();
+        assert_eq!(hog.nframes, 260);
+        let t = hog.track.as_ref().unwrap();
+        // A yaw track keyed over the whole run.
+        assert_eq!(t.flags & 0xFFF, 2);
+        assert!(t.keys.len() > 100 && t.keys.last().unwrap().0 < 260);
     }
 }

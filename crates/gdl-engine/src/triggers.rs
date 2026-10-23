@@ -4,6 +4,7 @@
 
 use crate::collision::Collision;
 use crate::level::Level;
+use crate::worldanim::{wflags, WorldAnims};
 use glam::Vec3;
 
 /// Rate moving world objects slide at (lbl_803470F0, units per second).
@@ -73,6 +74,12 @@ pub struct Mover {
     pub shown: bool,
     /// Where it is, for sounds.
     pub pos: Vec3,
+    /// The target has a world animation (flag 0x2000000): triggers steer the
+    /// animation instead of sliding it.
+    pub animated: bool,
+    /// The target also turns or animates (it is in `WorldAnims::dynamic`):
+    /// the slide moves its node (mat[3][1]) and the collision follows that.
+    node: bool,
 }
 
 impl Mover {
@@ -105,6 +112,27 @@ impl Mover {
             moving: false,
             shown: flags8 & 0x10 == 0,
             pos: Vec3::from(level.world_pos[root]),
+            animated: false,
+            node: false,
+        }
+    }
+
+    /// A slider whose target also turns (a rotator's elevator): slide its
+    /// node instead of its triangles.
+    pub fn on_node(&mut self, wa: &mut WorldAnims) {
+        self.node = true;
+        self.tris.clear();
+        wa.slide(self.root, self.offset);
+    }
+
+    /// A target with a world animation: SetItem case 5 sets it to play
+    /// backwards (0x100000) at rest; its collision moves with the animation.
+    pub fn animate(&mut self, wa: &mut WorldAnims) {
+        self.animated = true;
+        self.tris.clear();
+        self.offset = 0.0;
+        if let Some(f) = wa.flags.get_mut(self.root) {
+            *f |= wflags::REVERSE;
         }
     }
 
@@ -151,8 +179,26 @@ impl Mover {
 
     /// Slide toward the active/inactive height and move the collision with it.
     /// Returns (started, stopped) moving this frame.
-    pub fn update(&mut self, collision: &mut Collision, dt: f32) -> (bool, bool) {
+    /// `ridden`: a hero stands on the target (did_generate >= 2), which holds
+    /// targets without flag 8 still.
+    pub fn update(
+        &mut self,
+        collision: &mut Collision,
+        wa: &mut WorldAnims,
+        ridden: bool,
+        dt: f32,
+    ) -> (bool, bool) {
         let was_moving = self.moving;
+        if self.animated && !self.fades() {
+            self.update_anim(wa, ridden);
+            self.held = false;
+            return (self.moving && !was_moving, was_moving && !self.moving);
+        }
+        if !self.fades() && self.flags8 & 8 == 0 && ridden {
+            self.moving = false;
+            self.held = false;
+            return (false, was_moving);
+        }
         if self.fades() {
             self.shown = self.active || self.held;
             for &(i, _) in &self.tris {
@@ -166,6 +212,9 @@ impl Mover {
             self.moving = delta.abs() > 0.001;
             if self.moving {
                 self.offset += delta.clamp(-step, step);
+                if self.node {
+                    wa.slide(self.root, self.offset);
+                }
                 for &(i, rest) in &self.tris {
                     collision.tris[i].v = rest.map(|v| v + Vec3::Y * self.offset);
                 }
@@ -178,7 +227,58 @@ impl Mover {
             self.active = false;
         }
         self.held = false;
+        if let Some(f) = wa.flags.get_mut(self.root) {
+            if self.moving {
+                *f |= wflags::ANIMATING;
+            } else {
+                *f &= !wflags::ANIMATING;
+            }
+        }
         (self.moving && !was_moving, was_moving && !self.moving)
+    }
+
+    /// fn_80062A00's 0x2000000 branch: point the target's animation forward
+    /// (0x200000) while triggered and backward (0x100000) otherwise; a
+    /// ping-pong target (0x20) loops while held and stops (both) once it
+    /// comes round. It acts until the animation reaches that end.
+    fn update_anim(&mut self, wa: &mut WorldAnims, ridden: bool) {
+        let Some(f) = wa.flags.get_mut(self.root) else {
+            return;
+        };
+        if self.flags8 & 8 == 0 && ridden {
+            *f |= wflags::REVERSE | wflags::FORWARD;
+            self.moving = false;
+            return;
+        }
+        let mut act = true;
+        if self.flags8 & 0x20 != 0 {
+            if self.held {
+                *f &= !(wflags::REVERSE | wflags::FORWARD);
+            } else if *f & wflags::AT_END != 0 {
+                *f |= wflags::REVERSE | wflags::FORWARD;
+                act = false;
+            }
+        } else {
+            if self.active {
+                *f = (*f | wflags::FORWARD) & !wflags::REVERSE;
+            } else {
+                *f = (*f | wflags::REVERSE) & !wflags::FORWARD;
+            }
+            if (*f & wflags::REVERSE != 0 && *f & wflags::AT_START != 0)
+                || (*f & wflags::FORWARD != 0 && *f & wflags::AT_END != 0)
+            {
+                act = false;
+            }
+        }
+        if act {
+            *f |= wflags::ACTING;
+        } else {
+            *f &= !wflags::ACTING;
+        }
+        self.moving = act;
+        if self.momentary() {
+            self.active = false;
+        }
     }
 
     /// Put the collision at the starting offset.

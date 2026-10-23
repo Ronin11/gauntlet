@@ -372,7 +372,7 @@ fn parse_atree(r: Le, name: String, h: usize, tm: &Texmods) -> Result<ATree> {
     })
 }
 
-fn decode_track(
+pub(crate) fn decode_track(
     r: Le,
     at: usize,
     flags: u16,

@@ -19,6 +19,15 @@ pub struct Collision {
     nx: usize,
     nz: usize,
     grid: Vec<Vec<u32>>,
+    /// Triangles of moving world objects, kept out of the grid
+    /// (WorldDynCollide): per group, an XZ bounding circle and the triangles.
+    dynamic: Vec<DynGroup>,
+}
+
+struct DynGroup {
+    centre: Vec2,
+    radius: f32,
+    tris: Vec<u32>,
 }
 
 /// Surfaces steeper than this (normal.y below it) are walls.
@@ -122,6 +131,48 @@ impl Collision {
             nx,
             nz,
             grid,
+            dynamic: Vec::new(),
+        }
+    }
+
+    /// Take these groups of triangles out of the static grid: they move
+    /// (animated world objects). Call [`Collision::refit_dynamic`] after
+    /// moving them.
+    pub fn make_dynamic(&mut self, groups: Vec<Vec<usize>>) {
+        let moving: std::collections::HashSet<u32> =
+            groups.iter().flatten().map(|&i| i as u32).collect();
+        if moving.is_empty() {
+            return;
+        }
+        for cell in &mut self.grid {
+            cell.retain(|i| !moving.contains(i));
+        }
+        self.dynamic.extend(
+            groups
+                .into_iter()
+                .filter(|g| !g.is_empty())
+                .map(|g| DynGroup {
+                    centre: Vec2::ZERO,
+                    radius: 0.0,
+                    tris: g.into_iter().map(|i| i as u32).collect(),
+                }),
+        );
+        self.refit_dynamic();
+    }
+
+    /// Recompute the moving groups' bounding circles.
+    pub fn refit_dynamic(&mut self) {
+        for g in &mut self.dynamic {
+            let mut lo = Vec2::splat(f32::MAX);
+            let mut hi = Vec2::splat(f32::MIN);
+            for &i in &g.tris {
+                for v in self.tris[i as usize].v {
+                    lo = lo.min(Vec2::new(v.x, v.z));
+                    hi = hi.max(Vec2::new(v.x, v.z));
+                }
+            }
+            g.centre = (lo + hi) * 0.5;
+            g.radius = (hi - lo).length() * 0.5;
         }
     }
 
@@ -142,6 +193,11 @@ impl Collision {
                         seen.push(i);
                     }
                 }
+            }
+        }
+        for g in &self.dynamic {
+            if (g.centre - p).length() <= g.radius + r + 0.01 {
+                seen.extend_from_slice(&g.tris);
             }
         }
         seen.into_iter().filter(|&i| self.enabled[i as usize])
@@ -256,7 +312,7 @@ impl Collision {
         let mut cands: Vec<u32> = Vec::new();
         for s in 0..=steps {
             let p = from + dir * (s as f32 / steps as f32);
-            for i in self.cells_around(Vec2::new(p.x, p.z), 0.0) {
+            for i in self.cells_around(Vec2::new(p.x, p.z), self.cell * 0.25) {
                 if !cands.contains(&i) {
                     cands.push(i);
                 }

@@ -39,5 +39,7 @@ pub mod shop;
 pub mod stats;
 pub mod texanim;
 pub mod tower;
+pub mod transport;
 pub mod triggers;
 pub mod ui;
+pub mod worldanim;
