@@ -7769,6 +7769,7 @@ impl Game {
                 e.kind,
                 Kind::Enemy { .. } | Kind::Critter(_) | Kind::Hazard { .. }
             ) && !self.items.chests.contains_key(&e.id)
+                && !self.items.broken.contains_key(&e.id)
             {
                 if let Some(m) = e.model {
                     e.animator.update(&self.models[m].skeleton, dt);
