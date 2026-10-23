@@ -1664,9 +1664,13 @@ impl Game {
     }
 
     /// Close the tower portals whose level isn't open (fn_8005B5B8): the portal
-    /// stops being an exit and its "_ACTIVE" glow object is hidden.
+    /// stops being an exit, its model becomes EXIT_OFF (the dark centre) and
+    /// its "_ACTIVE" glow object is hidden.
     pub fn close_portals(&mut self, open: impl Fn(u32) -> bool) {
         let mut glows = Vec::new();
+        let off = self.model_named("EXIT_OFF");
+        let collision = &self.collision;
+        let floor = |p: Vec3| collision.ground_height(p + Vec3::Y * 2.0, p.y + 2.0);
         for e in &mut self.entities {
             if let Kind::Exit {
                 dest: Some(w),
@@ -1676,7 +1680,17 @@ impl Game {
             {
                 if !open(*w) {
                     *o = false;
-                    let letter = self.worlds.realm(*w >> 8).map_or('?', |r| r.letter);
+                    if off.is_some() {
+                        e.model = off;
+                        e.animator = Animator::new(0);
+                        // Not in the original: the pads sit up to 0.25 under
+                        // the ring's floor, which hid the flat disc here.
+                        if let Some(y) = floor(e.pos) {
+                            e.pos.y = e.pos.y.max(y + 0.02);
+                        }
+                    }
+                    // "L1NSNC%c%d_ACTIVE" with world + 0x40 and gate + 1.
+                    let letter = char::from(0x40 + (*w >> 8) as u8);
                     glows.push(format!("L1NSNC{letter}{}_ACTIVE", (*w & 0xFF) + 1));
                 }
             }
@@ -3419,7 +3433,8 @@ impl Game {
         }
         // The tower's Sumners and the shard and runestone effects.
         if self.wave == Some(gdl_formats::wdata::TOWER_WAVE) {
-            let mut names: Vec<String> = vec!["GWIZ".into(), "WIZARD".into()];
+            // EXIT_OFF: the closed portals' model (fn_8005B5B8).
+            let mut names: Vec<String> = vec!["GWIZ".into(), "WIZARD".into(), "EXIT_OFF".into()];
             names.extend((1..=8).map(|n| format!("SHARD{n}")));
             names.extend((1..=13).map(|n| format!("RUNE{n}")));
             for n in names {
@@ -7349,6 +7364,11 @@ impl Game {
                     open,
                     anim,
                 } => {
+                    // A closed tower portal (active = -0x8000) is no longer
+                    // updated: EXIT_OFF stands still.
+                    if !*open {
+                        continue;
+                    }
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                         let xz = Vec2::new(pp.x - e.pos.x, pp.z - e.pos.z).length();
                         if *open
