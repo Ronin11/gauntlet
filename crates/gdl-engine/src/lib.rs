@@ -1,6 +1,7 @@
 //! Gauntlet Dark Legacy engine: rendering, simulation, input and audio on top of the
 //! original game data. The desktop binary (`gauntlet`) and the Android app both use it.
 
+pub mod ai;
 pub mod app;
 pub mod attract;
 pub mod audio;
