@@ -813,6 +813,7 @@ dependencies = [
  "font8x8",
  "gcdisc",
  "gdl-formats",
+ "gdl-modern",
  "gdl-sim",
  "gilrs",
  "glam",

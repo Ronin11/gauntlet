@@ -729,6 +729,11 @@ impl Model {
         (parts, hidden)
     }
 
+    /// Every skeleton node's model-space matrix at a frame of a sequence.
+    pub fn node_world(&self, seq: usize, frame: f32) -> Vec<Mat4> {
+        self.node_transforms(&self.skeleton.sample(seq, frame))
+    }
+
     /// A skeleton node's model-space matrix at a frame of a sequence.
     pub fn node_matrix(&self, seq: usize, frame: f32, name: &str) -> Option<Mat4> {
         let i = self

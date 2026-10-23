@@ -19,6 +19,7 @@ pub mod hud;
 pub mod input;
 pub mod mapscreen;
 pub mod menu;
+pub mod modern;
 pub mod movie;
 pub mod options;
 pub mod optmenu;

@@ -19,6 +19,10 @@ struct Args {
     screen: Option<String>,
     size: (u32, u32),
     character: Option<String>,
+    /// --modern: a rigged .glb drawn beside --char, in the same pose.
+    modern: Option<PathBuf>,
+    /// --modern-ref SEQ[:FRAME]: the game pose the glTF's bind pose matches.
+    modern_ref: String,
     seq: String,
     frame: f32,
     simulate: u32,
@@ -96,6 +100,8 @@ Testing:
   --save-state [N:]<s>  With --snapshot: save a state on simulated frame N (default:
                         after the simulation) to slot or file <s> (GDL_SAVE_STATE)
   --char CLASS/COLOR    Snapshot a single character (or monster/NAME)
+  --modern <glb>        With --char: also draw a rigged glTF in the same pose, beside it
+  --modern-ref SEQ[:F]  The game pose the glTF's bind pose matches (default READY:0)
   --seq NAME --frame F  Animation sequence and frame for --char
   --eye x,y,z --at x,y,z --size WxH   Snapshot camera";
 
@@ -111,6 +117,8 @@ fn parse_args() -> Result<Args> {
         screen: None,
         size: (1280, 720),
         character: None,
+        modern: None,
+        modern_ref: "READY".into(),
         seq: "READY".into(),
         frame: 0.0,
         simulate: 0,
@@ -148,6 +156,8 @@ fn parse_args() -> Result<Args> {
             }
             "--snapshot" => a.snapshot = Some(val()?.into()),
             "--char" => a.character = Some(val()?),
+            "--modern" => a.modern = Some(val()?.into()),
+            "--modern-ref" => a.modern_ref = val()?,
             "--seq" => a.seq = val()?,
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
@@ -266,14 +276,40 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
     (inst.parts, inst.hidden) = cm.evaluate(seq, args.frame);
     inst.part_fx = cm.texmod_fx(seq, args.frame);
 
-    let at = args.at.unwrap_or(Vec3::new(0.0, 2.5, 0.0));
-    let eye = args.eye.unwrap_or(Vec3::new(0.0, 3.0, 9.0));
+    // --modern: the glTF in the same pose, to the right of the original.
+    let modern = match &args.modern {
+        Some(path) => {
+            let (rs, rf) = args
+                .modern_ref
+                .split_once(':')
+                .unwrap_or((&args.modern_ref, "0"));
+            let ref_seq = cm
+                .sequence(rs)
+                .with_context(|| format!("no sequence {rs} for --modern-ref"))?;
+            let hero = gdl_engine::modern::ModernHero::load(path, &cm, ref_seq, rf.parse()?)?;
+            let mesh = gpu.upload_mesh(&hero.mesh(&cm.node_world(seq, args.frame))?)?;
+            let mut inst = gpu.new_instance(&mesh);
+            inst.transform = mirror() * Mat4::from_translation(Vec3::new(4.0, 0.0, 0.0));
+            Some((mesh, inst))
+        }
+        None => None,
+    };
+    let at = args.at.unwrap_or(if modern.is_some() {
+        Vec3::new(-2.0, 2.5, 0.0)
+    } else {
+        Vec3::new(0.0, 2.5, 0.0)
+    });
+    let eye = args.eye.unwrap_or(Vec3::new(at.x, 3.0, 9.0));
     let (w, h) = args.size;
     let m = mirror();
     let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
     let proj = Mat4::perspective_rh(50f32.to_radians(), w as f32 / h as f32, 0.1, 500.0);
     let g = gpu::globals(proj * view, m.transform_point3(eye), [0.0; 3], 0.0);
-    let img = gpu.render_to_image(w, h, &g, scene::CLEAR, &[(&gm, &inst)], None, None)?;
+    let mut draws = vec![(&gm, &inst)];
+    if let Some((m, i)) = &modern {
+        draws.push((m, i));
+    }
+    let img = gpu.render_to_image(w, h, &g, scene::CLEAR, &draws, None, None)?;
     write_png(args.snapshot.as_ref().unwrap(), &img)
 }
 

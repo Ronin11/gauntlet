@@ -4,6 +4,7 @@
 //! [`mapping`] says which glTF joint stands in for each game skeleton node.
 
 pub mod mapping;
+pub mod retarget;
 
 use anyhow::{bail, Context, Result};
 use glam::{Mat4, Vec2, Vec3};
@@ -128,15 +129,28 @@ impl ModernModel {
                 Some(t) => t.into_f32().collect(),
                 None => vec![[0.0; 2]; pos.len()],
             };
-            let jn: Vec<[u16; 4]> = r.read_joints(0).context("no JOINTS_0")?.into_u16().collect();
-            let wt: Vec<[f32; 4]> = r.read_weights(0).context("no WEIGHTS_0")?.into_f32().collect();
-            if [nrm.len(), uv.len(), jn.len(), wt.len()].iter().any(|&n| n != pos.len()) {
+            let jn: Vec<[u16; 4]> = r
+                .read_joints(0)
+                .context("no JOINTS_0")?
+                .into_u16()
+                .collect();
+            let wt: Vec<[f32; 4]> = r
+                .read_weights(0)
+                .context("no WEIGHTS_0")?
+                .into_f32()
+                .collect();
+            if [nrm.len(), uv.len(), jn.len(), wt.len()]
+                .iter()
+                .any(|&n| n != pos.len())
+            {
                 bail!("mismatched vertex attribute counts");
             }
             for i in 0..pos.len() {
                 vertices.push(SkinVertex {
                     pos: mesh_world.transform_point3(pos[i].into()),
-                    normal: mesh_world.transform_vector3(nrm[i].into()).normalize_or_zero(),
+                    normal: mesh_world
+                        .transform_vector3(nrm[i].into())
+                        .normalize_or_zero(),
                     uv: uv[i].into(),
                     joints: jn[i],
                     weights: wt[i],
@@ -147,12 +161,21 @@ impl ModernModel {
                 None => indices.extend(base..vertices.len() as u32),
             }
             if texture.is_none() {
-                if let Some(t) = prim.material().pbr_metallic_roughness().base_color_texture() {
+                if let Some(t) = prim
+                    .material()
+                    .pbr_metallic_roughness()
+                    .base_color_texture()
+                {
                     texture = rgba8(&images[t.texture().source().index()]);
                 }
             }
         }
-        Ok(ModernModel { vertices, indices, joints, texture })
+        Ok(ModernModel {
+            vertices,
+            indices,
+            joints,
+            texture,
+        })
     }
 
     pub fn joint(&self, name: &str) -> Option<usize> {
@@ -165,9 +188,17 @@ fn rgba8(img: &gltf::image::Data) -> Option<Texture> {
     let n = (img.width * img.height) as usize;
     let rgba = match img.format {
         Format::R8G8B8A8 => img.pixels.clone(),
-        Format::R8G8B8 => img.pixels.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        Format::R8G8B8 => img
+            .pixels
+            .chunks(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
         Format::R8 => img.pixels.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         _ => return None,
     };
-    (rgba.len() == n * 4).then_some(Texture { width: img.width, height: img.height, rgba })
+    (rgba.len() == n * 4).then_some(Texture {
+        width: img.width,
+        height: img.height,
+        rgba,
+    })
 }
