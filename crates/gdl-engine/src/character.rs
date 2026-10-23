@@ -597,6 +597,17 @@ impl Model {
     /// frame)` replaces the poses of `root`'s subtree (a critter's child parts,
     /// such as the Chimera's heads, animate their own branch of the shared tree).
     pub fn pose_layers(&self, layers: &[(Option<usize>, usize, f32)]) -> Vec<Mat4> {
+        self.pose_layers_look(layers, &[])
+    }
+
+    /// [`Model::pose_layers`] with some nodes' local rotations replaced by
+    /// pitch/yaw/roll angles (CreatePYRMatrix on the node, as
+    /// NodeLookAtPos turns a critter's head).
+    pub fn pose_layers_look(
+        &self,
+        layers: &[(Option<usize>, usize, f32)],
+        look: &[(usize, [f32; 3])],
+    ) -> Vec<Mat4> {
         let Some(&(_, seq, frame)) = layers.first() else {
             return self.node_transforms(&[]);
         };
@@ -612,7 +623,33 @@ impl Model {
                 }
             }
         }
+        for &(n, pyr) in look {
+            if let Some(p) = poses.get_mut(n) {
+                p.pyr = pyr;
+                p.pyr_order = true;
+            }
+        }
         self.node_transforms(&poses)
+    }
+
+    /// A skeleton node's parent, if any.
+    pub fn node_parent(&self, n: usize) -> Option<usize> {
+        let p = self.skeleton.nodes.get(n)?.parent;
+        usize::try_from(p).ok().filter(|&p| p < n)
+    }
+
+    /// AtreeFindNodeIdx(..., name, 0x10): node names compare on their first
+    /// 16 characters (the WAD's name fields hold no more).
+    pub fn node_index16(&self, name: &str) -> Option<usize> {
+        if name.is_empty() {
+            return None;
+        }
+        let key = |s: &str| s.chars().take(16).collect::<String>().to_ascii_uppercase();
+        let want = key(name);
+        self.skeleton
+            .nodes
+            .iter()
+            .position(|n| key(&n.name) == want)
     }
 
     /// Part transforms and visibility from node matrices ([`Model::pose_layers`]):

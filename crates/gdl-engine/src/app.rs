@@ -55,6 +55,98 @@ struct Playing {
 /// Indexed by slot (column), so players keep their stats whoever joins.
 type Carry = [Option<crate::game::Carried>; 4];
 
+/// Whether a level start refreshes the players' checkpoint (save_backup):
+/// start_level skips PlayerSaveState in the secret levels (realm 12), and
+/// PlayerSaveState(i, 1) keeps the old backup in waves 5/1 and 6/1.
+fn checkpoint_at(wave: Option<u32>) -> bool {
+    !matches!(wave, Some(0x501 | 0x601)) && wave.is_none_or(|w| w >> 8 != 12)
+}
+
+/// padUpdate's gPadResetHoldTimer: a pad holding exactly Start + X + B
+/// (PAD_RESET_COMBO_B, 0x1600) counts up; past 500 ms sysPollResetButton
+/// fires and the system resets (OSResetSystem).
+const RESET_HOLD_MS: f32 = 500.0;
+
+/// Start + X + B with no other button (stick moves don't count).
+fn reset_combo(i: &PlayerInput) -> bool {
+    i.start
+        && i.magic
+        && i.turbo
+        && !i.attack
+        && !i.slow
+        && !i.strafe
+        && !i.combo
+        && i.dpad == glam::Vec2::ZERO
+}
+
+/// Advance each source's reset hold timer by one tick; true when one is past
+/// [`RESET_HOLD_MS`].
+fn reset_held(timers: &mut Vec<(Source, f32)>, all: &[(Source, PlayerInput)]) -> bool {
+    timers.retain(|(s, _)| all.iter().any(|(a, _)| a == s));
+    let mut fire = false;
+    for (src, inp) in all {
+        let t = match timers.iter_mut().find(|(s, _)| s == src) {
+            Some((_, t)) => t,
+            None => {
+                timers.push((*src, 0.0));
+                &mut timers.last_mut().unwrap().1
+            }
+        };
+        *t = if reset_combo(inp) {
+            *t + TICK * 1000.0
+        } else {
+            0.0
+        };
+        fire |= *t > RESET_HOLD_MS;
+    }
+    fire
+}
+
+/// PlayerControl[].levels: the buttons a source holds (and the stick and
+/// d-pad directions), as ScreenSaver compares them from tick to tick.
+fn held_levels(i: &PlayerInput) -> u32 {
+    let bits = [
+        i.attack,
+        i.turbo,
+        i.slow,
+        i.magic,
+        i.strafe,
+        i.combo,
+        i.start,
+        i.stick.x > 0.5,
+        i.stick.x < -0.5,
+        i.stick.y > 0.5,
+        i.stick.y < -0.5,
+        i.dpad.x > 0.5,
+        i.dpad.x < -0.5,
+        i.dpad.y > 0.5,
+        i.dpad.y < -0.5,
+    ];
+    bits.iter()
+        .enumerate()
+        .fold(0, |m, (k, &b)| m | (u32::from(b) << k))
+}
+
+/// ScreenSaver counts idle time except in the attract loop (title screen
+/// included), the movies (MG_GAMEMOVIE) and the ending.
+fn saver_counts(screen: &Screen) -> bool {
+    matches!(
+        screen,
+        Screen::Select(_)
+            | Screen::Loading { .. }
+            | Screen::Map { .. }
+            | Screen::Shop { .. }
+            | Screen::Playing { .. }
+            | Screen::GameOver { .. }
+    )
+}
+
+/// OptionsStart: "Quit Level" is greyed out (value -1) while
+/// sMusicTrackHi == 0xC.
+fn quit_level_disabled(wave: Option<u32>) -> bool {
+    wave.is_some_and(|w| w >> 8 == 0xC)
+}
+
 /// Each column's save image (Player.save), kept between visits to player
 /// select.
 type Heroes = [Option<HeroSave>; 4];
@@ -66,12 +158,17 @@ fn party_for(
     carry: &Option<Carry>,
     heroes: &Heroes,
     progress: &Progress,
+    prefs: &Prefs,
 ) -> crate::select::Party {
+    let mut card = card.clone();
+    // saveSave writes the current gameOpts with every hero.
+    card.set_opts(prefs.game_opts());
     crate::select::Party {
-        card: card.clone(),
+        card,
         carry: carry.clone().unwrap_or_default(),
         heroes: heroes.clone(),
         progress: progress.clone(),
+        controls: prefs.players,
     }
 }
 
@@ -81,6 +178,7 @@ fn party_in_game(
     card: &MemCard,
     heroes: &Heroes,
     progress: &Progress,
+    prefs: &Prefs,
 ) -> crate::select::Party {
     let mut carry: Carry = Default::default();
     for (info, p) in play.panels.iter().zip(&play.game.players) {
@@ -92,7 +190,40 @@ fn party_in_game(
     progress.shards = play.game.shards;
     progress.runes |= play.game.runes | play.game.boss_runes;
     progress.legend = play.game.legend_held;
-    party_for(card, &Some(carry), heroes, &progress)
+    let mut heroes = heroes.clone();
+    bank_heroes(&play.game, &play.panels, &mut heroes);
+    party_for(card, &Some(carry), &heroes, &progress, prefs)
+}
+
+/// What lives in each player's save image during play goes back to the
+/// column's hero: the secret classes unlocked (save.class_unlock) and the
+/// messages seen (save.help_disp).
+fn bank_heroes(game: &Game, panels: &[PanelInfo], heroes: &mut Heroes) {
+    for (i, (info, p)) in panels.iter().zip(&game.players).enumerate() {
+        let h = heroes[info.slot % 4]
+            .get_or_insert_with(|| HeroSave::new(&info.name, info.class.min(15), info.colour));
+        h.class_unlock |= p.class_unlock;
+        h.help_disp = game.msgs.help_disp(i);
+    }
+}
+
+/// A level's heroes as their saves and names make them: playable Sumner's
+/// loadout, the messages each has seen, and the name cheats
+/// (set_hidden_player from load_player_geo).
+fn setup_heroes(game: &mut Game, panels: &[PanelInfo], carry: &Option<Carry>, heroes: &Heroes) {
+    for (i, (info, p)) in panels.iter().zip(&mut game.players).enumerate() {
+        let slot = info.slot % 4;
+        if info.class == crate::stats::SUMNER {
+            p.sumner = true;
+            let c = carry.as_ref().and_then(|c| c[slot].clone());
+            p.restore(&c.unwrap_or_else(crate::game::Carried::sumner));
+        } else if info.hidden.is_none() {
+            crate::cheats::apply_cheats(&info.name, p);
+        }
+        if let Some(h) = &heroes[slot] {
+            game.msgs.set_help_disp(i, &h.help_disp);
+        }
+    }
 }
 
 enum Screen {
@@ -189,6 +320,14 @@ struct Running {
     sources: Vec<Source>,
     /// Escape was pressed this frame.
     escape: bool,
+    /// Each input source's reset-combo hold (ms).
+    reset_hold: Vec<(Source, f32)>,
+    /// ScreenSaver: ticks with no change in the held buttons (lbl_80344A48),
+    /// each source's held buttons last tick, the running saver and its models.
+    idle: u32,
+    idle_levels: Vec<(Source, u32)>,
+    saver: Option<crate::screensaver::Saver>,
+    saver_models: Option<crate::screensaver::SaverModels>,
     last: Instant,
     acc: f32,
     window: Arc<Window>,
@@ -275,6 +414,13 @@ impl App {
             };
             (screen, sources)
         };
+        // init_prefs, then check_prefs_loaded: the options saved on the card.
+        let card = MemCard::open(self.cfg.save_dir.as_deref());
+        let mut prefs = Prefs::default();
+        if let Some(o) = card.opts() {
+            prefs.apply_game_opts(&o);
+        }
+        audio.set_volumes(&prefs);
         Ok(Running {
             surface,
             config,
@@ -286,11 +432,11 @@ impl App {
             music_switch: None,
             music_fade: 1.0,
             progress: Progress::default(),
-            prefs: Prefs::default(),
+            prefs,
             suspended: None,
             carry: None,
             checkpoint: None,
-            card: MemCard::open(self.cfg.save_dir.as_deref()),
+            card,
             heroes: Default::default(),
             movie_tex: None,
             cursor,
@@ -299,6 +445,11 @@ impl App {
             input,
             sources,
             escape: false,
+            reset_hold: Vec::new(),
+            idle: 0,
+            idle_levels: Vec::new(),
+            saver: None,
+            saver_models: None,
             last: Instant::now(),
             acc: 0.0,
             window,
@@ -439,7 +590,10 @@ impl App {
                             }
                         }
                     }
-                    r.checkpoint = r.carry.clone();
+                    if checkpoint_at(p.game.wave) || r.checkpoint.is_none() {
+                        r.checkpoint = r.carry.clone();
+                    }
+                    setup_heroes(&mut p.game, &p.panels, &r.carry, &r.heroes);
                     p.game.friendly_fire = r.prefs.multiplayer;
                     p.game.crystals = r.progress.crystals;
                     p.game.garg_items = r.progress.garg_items;
@@ -449,6 +603,11 @@ impl App {
                     p.game.set_legend_held(r.progress.legend);
                     if let Some(dir) = p.game.boss_model_dir() {
                         let imgs = hud::boss_meter_images(fs, &dir);
+                        p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
+                    } else if p.game.realm() == Some(12) {
+                        // A secret level has no boss: its overlay bank holds the
+                        // coin icons.
+                        let imgs = hud::coin_images(fs);
                         p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
                     }
                     match p.game.wave {
@@ -530,6 +689,80 @@ impl App {
                 .into_iter()
                 .map(|s| (s, r.input.read(s)))
                 .collect();
+            if reset_held(&mut r.reset_hold, &all) {
+                // OSResetSystem: the game boots again; only the memory card
+                // (and the options) remain.
+                r.reset_hold.clear();
+                r.audio.stop();
+                r.progress = Progress::default();
+                r.carry = None;
+                r.checkpoint = None;
+                r.suspended = None;
+                r.heroes = Default::default();
+                r.attract = Attract::new();
+                menu_shop = None;
+                next = Some(Screen::Legal(120));
+                escape = false;
+                r.input.end_frame();
+                r.acc -= TICK;
+                continue;
+            }
+            // ScreenSaver: any change in what a controller holds resets the
+            // idle count, or ends a running saver (ScreenSaverEnd).
+            let levels: Vec<(Source, u32)> =
+                all.iter().map(|(s, i)| (*s, held_levels(i))).collect();
+            let changed = levels != r.idle_levels;
+            r.idle_levels = levels;
+            if r.saver.is_some() {
+                if changed {
+                    r.saver = None;
+                    r.idle = 0;
+                    match &r.screen {
+                        Screen::Shop { shop, .. } => {
+                            if let Some(m) = shop.music() {
+                                r.audio.play_bank_music(fs, &m);
+                            }
+                        }
+                        Screen::Select(_) => r.audio.play_select_music(fs),
+                        Screen::Playing { play, .. } => {
+                            let streams = play
+                                .game
+                                .wave
+                                .map(|w| play.game.worlds.music(w))
+                                .unwrap_or_default();
+                            if !r.audio.play_streams(fs, &streams) {
+                                r.audio.play_level_music(fs, &play.game.level.name);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if let Some(s) = r.saver.as_mut() {
+                    s.tick(crate::camera::half_tans());
+                }
+                escape = false;
+                r.input.end_frame();
+                r.acc -= TICK;
+                continue;
+            }
+            r.idle = if !saver_counts(&r.screen) || changed {
+                0
+            } else {
+                r.idle + 1
+            };
+            if r.idle >= crate::screensaver::IDLE_TICKS {
+                // ScreenSaverStart: the music stops and the screen blanks.
+                r.idle = 0;
+                if r.saver_models.is_none() {
+                    match crate::screensaver::SaverModels::load(fs, &r.gpu) {
+                        Ok(m) => r.saver_models = Some(m),
+                        Err(e) => log::warn!("screen saver: {e:#}"),
+                    }
+                }
+                if r.saver_models.is_some() {
+                    r.audio.stop();
+                    r.saver = Some(crate::screensaver::Saver::new(time.to_bits()));
+                }
+            }
             match &mut r.screen {
                 Screen::Legal(t) => {
                     *t = t.saturating_sub(1);
@@ -609,7 +842,7 @@ impl App {
                         r.checkpoint = None;
                         r.suspended = None;
                         r.heroes = Default::default();
-                        let party = party_for(&r.card, &None, &r.heroes, &r.progress);
+                        let party = party_for(&r.card, &None, &r.heroes, &r.progress, &r.prefs);
                         next = Some(Screen::Select(Select::with_first(src).with_party(party)));
                     } else if t.timed_out {
                         r.audio.stop();
@@ -626,24 +859,28 @@ impl App {
                     }
                     if escape || sel.leave {
                         r.card = sel.card().clone();
+                        r.prefs.players = sel.controls();
                         next = Some(Screen::Title(Title::default()));
                     } else if sel.update(&all).is_some() {
                         r.sources = sel.sources();
                         let panels = sel.panels();
                         // New players start fresh; returning ones keep their stats,
-                        // and loaded heroes take their class's saved state.
+                        // and loaded heroes take their class's saved state. Each
+                        // comes into play invisible for a while (activate_player).
                         let mut carry: Carry = Default::default();
                         for info in &panels {
-                            carry[info.slot % 4] = Some(
-                                sel.carried(info.slot % 4)
-                                    .unwrap_or_else(crate::game::Carried::new_character),
-                            );
+                            let mut c = sel
+                                .carried(info.slot % 4)
+                                .unwrap_or_else(crate::game::Carried::new_character);
+                            c.activate(info.class);
+                            carry[info.slot % 4] = Some(c);
                         }
                         r.carry = Some(carry);
                         // A loaded hero's achievements join the party's.
                         sel.merge_progress(&mut r.progress);
                         r.heroes = sel.heroes();
                         r.card = sel.card().clone();
+                        r.prefs.players = sel.controls();
                         // Player select always leads into the tower.
                         next = Some(Screen::Loading {
                             level: "levelL1".into(),
@@ -682,6 +919,11 @@ impl App {
                                 play.game.crystals = r.progress.crystals;
                                 play.game.garg_items = r.progress.garg_items;
                                 play.game.shards = r.progress.shards;
+                                for (i, info) in play.panels.iter().enumerate() {
+                                    if let Some(h) = &r.heroes[info.slot % 4] {
+                                        play.game.msgs.set_help_disp(i, &h.help_disp);
+                                    }
+                                }
                                 let streams = play
                                     .game
                                     .wave
@@ -756,7 +998,7 @@ impl App {
                             }
                             None => {
                                 Screen::Select(Select::from_game(panels, &r.sources).with_party(
-                                    party_for(&r.card, &r.carry, &r.heroes, &r.progress),
+                                    party_for(&r.card, &r.carry, &r.heroes, &r.progress, &r.prefs),
                                 ))
                             }
                         });
@@ -802,7 +1044,8 @@ impl App {
                                 play.game.level_end = Some(LevelEnd::AllDead);
                             }
                             OptionsAction::ManageCharacter => {
-                                let party = party_in_game(play, &r.card, &r.heroes, &r.progress);
+                                let party =
+                                    party_in_game(play, &r.card, &r.heroes, &r.progress, &r.prefs);
                                 next = Some(Screen::Select(
                                     Select::from_game(&play.panels, &r.sources).with_party(party),
                                 ));
@@ -858,7 +1101,7 @@ impl App {
                     {
                         // check_active_players: a new pad joins in the tower, which
                         // opens player select for it (init_player_select(1)).
-                        let party = party_in_game(play, &r.card, &r.heroes, &r.progress);
+                        let party = party_in_game(play, &r.card, &r.heroes, &r.progress, &r.prefs);
                         let mut sel = Select::from_game(&play.panels, &r.sources).with_party(party);
                         sel.join(src);
                         next = Some(Screen::Select(sel));
@@ -876,7 +1119,10 @@ impl App {
                         *pause = Some(if play.game.wave == Some(TOWER_WAVE) {
                             Options::tower(owner)
                         } else {
-                            Options::game(owner)
+                            let mut o = Options::game(owner);
+                            // No "Quit Level" in the secret levels (realm 0xC).
+                            o.set_quit_level_enabled(!quit_level_disabled(play.game.wave));
+                            o
                         });
                     } else {
                         play.game.update(TICK, &inputs);
@@ -1084,6 +1330,12 @@ impl App {
                     &p.game,
                     &p.panels,
                 );
+                hud::build_coins(
+                    &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+                    &p.game,
+                    &p.panels,
+                    p.boss_bank.as_ref(),
+                );
                 hud::build_boss(
                     &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
                     &p.game,
@@ -1136,6 +1388,17 @@ impl App {
             ];
             c.draw(&r.gpu, &view, &r.depth, vp, at);
         }
+        if let (Some(s), Some(m)) = (&r.saver, r.saver_models.as_mut()) {
+            let (w, h) = (r.config.width as f32, r.config.height as f32);
+            let k = (w / 512.0).min(h / 384.0);
+            let vp = [
+                (w - 512.0 * k) / 2.0,
+                (h - 384.0 * k) / 2.0,
+                512.0 * k,
+                384.0 * k,
+            ];
+            m.draw(s, &r.gpu, &view, &r.depth, vp);
+        }
         frame.present();
 
         // A finished level: tower portals lead to their level (after its intro
@@ -1157,6 +1420,12 @@ impl App {
                 unreachable!()
             };
             play.game.level_end = None;
+            bank_heroes(&play.game, &play.panels, &mut r.heroes);
+            if to.is_none() {
+                if let Some(bank) = play.boss_bank.take() {
+                    r.hud.free_bank(bank);
+                }
+            }
             r.progress.crystals = play.game.crystals;
             r.progress.garg_items = play.game.garg_items;
             r.progress.shards = play.game.shards;
@@ -1191,6 +1460,7 @@ impl App {
         }
         if let Screen::Playing { play, .. } = &mut r.screen {
             if let Some(end) = play.game.level_end.take() {
+                bank_heroes(&play.game, &play.panels, &mut r.heroes);
                 // Crystals are kept whether or not the level was finished.
                 r.progress.crystals = play.game.crystals;
                 r.progress.garg_items = play.game.garg_items;
@@ -1401,6 +1671,7 @@ fn panels_for(players: &[(String, String)]) -> Vec<PanelInfo> {
             name: String::new(),
             colour: COLOURS.iter().position(|c| c == colour).unwrap_or(slot % 4),
             class: CLASSES.iter().position(|c| c == class).unwrap_or(0),
+            hidden: None,
         })
         .collect()
 }
@@ -1412,7 +1683,8 @@ fn start_game(
     panels: Vec<PanelInfo>,
     difficulty: usize,
 ) -> Result<Playing> {
-    // Sumner plays with the Wizard's model.
+    // Sumner is the Wizard (character 2) with hidden_code "sum"; a hidden
+    // character is its class with its own model.
     let classes: Vec<(&str, &str)> = panels
         .iter()
         .map(|p| {
@@ -1426,7 +1698,15 @@ fn start_game(
             )
         })
         .collect();
-    let game = Game::new_with(fs, level, &classes, difficulty)?;
+    let models: Vec<Option<&str>> = panels
+        .iter()
+        .map(|p| match p.hidden {
+            _ if p.class >= 16 => Some("SUM"),
+            Some(h) => crate::cheats::HIDDEN.get(h).map(|h| h.dir),
+            None => None,
+        })
+        .collect();
+    let game = Game::new_heroes(fs, level, &classes, &models, difficulty)?;
     let scene = Scene::new(gpu, &game)?;
     Ok(Playing {
         game,
@@ -1606,5 +1886,134 @@ fn attract_event(
             }
         }
         attract::Event::None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data() -> Option<GameFs> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        GameFs::open(&root).ok()
+    }
+
+    fn panel(slot: usize, name: &str, class: usize, hidden: Option<usize>) -> PanelInfo {
+        PanelInfo {
+            slot,
+            name: name.into(),
+            colour: slot,
+            class,
+            hidden,
+        }
+    }
+
+    /// The level's heroes: Sumner's loadout, a name cheat, a hidden
+    /// character without its cheats; and what they bring back.
+    #[test]
+    fn heroes_go_into_a_level_and_back() {
+        let Some(fs) = data() else { return };
+        let panels = [
+            panel(0, "BOB", 16, None),
+            panel(1, "10000K", 0, None),
+            panel(2, "ICE600", 4, Some(0)),
+        ];
+        let classes = [("WIZ", "YEL"), ("WAR", "BLU"), ("DWF", "RED")];
+        let models = [Some("SUM"), None, Some("GEI")];
+        let mut g = Game::new_heroes(&fs, "levelA1", &classes, &models, 1).unwrap();
+        let mut heroes: Heroes = Default::default();
+        let mut seen = HeroSave::new("10000K", 0, 1);
+        seen.help_disp[15] = crate::save::SEEN_EVER;
+        heroes[1] = Some(seen);
+        setup_heroes(&mut g, &panels, &None, &heroes);
+        let sumner = &g.players[0];
+        assert!(sumner.sumner);
+        assert_eq!((sumner.level, sumner.gold, sumner.keys), (99, 5000, 9));
+        let full = crate::stats::derived(2, crate::stats::atts(16, 99, Default::default()));
+        assert_eq!(sumner.derived, full, "999 in every attribute");
+        assert_eq!(g.players[1].gold, 10000, "10000K");
+        assert_eq!(g.players[2].gold, 0, "a hidden character gets no cheats");
+        assert_eq!(g.msgs.help_disp(1)[15], crate::save::SEEN_EVER);
+        // Back from the level: unlocks and seen messages go to the heroes.
+        g.players[2].class_unlock = 0x100;
+        bank_heroes(&g, &panels, &mut heroes);
+        assert_eq!(heroes[2].as_ref().unwrap().class_unlock, 0x100);
+        assert_eq!(
+            heroes[1].as_ref().unwrap().help_disp[15],
+            crate::save::SEEN_EVER
+        );
+        assert_eq!(heroes[0].as_ref().unwrap().class_unlock, 0);
+    }
+
+    /// The options block round-trips through the card's GameOpts.
+    #[test]
+    fn options_round_trip_through_the_card() {
+        let mut p = Prefs::default();
+        p.sfx_vol = 40;
+        p.music_vol = 200;
+        p.stereo = false;
+        p.difficulty = 2;
+        p.compass = true;
+        p.multiplayer = 1;
+        p.players[0].rumble = false;
+        let mut q = Prefs::default();
+        q.apply_game_opts(&p.game_opts());
+        assert_eq!((q.sfx_vol, q.music_vol, q.stereo), (40, 200, false));
+        assert_eq!((q.difficulty, q.compass, q.multiplayer), (2, true, 1));
+        // The pads' settings go with the heroes, not the options block.
+        assert!(q.players[0].rumble);
+        assert_eq!(
+            Prefs::default().game_opts().data,
+            [128, 128, 1, 0, 0, 1, 0, 0]
+        );
+    }
+
+    /// Start + X + B alone, held past half a second, resets; anything else
+    /// held with it, or letting go, starts the count again.
+    #[test]
+    fn start_x_b_held_resets() {
+        let combo = PlayerInput {
+            start: true,
+            magic: true,
+            turbo: true,
+            ..Default::default()
+        };
+        let mut t = Vec::new();
+        let all = [(Source::Keyboard, combo)];
+        let ticks = (0..60).take_while(|_| !reset_held(&mut t, &all)).count();
+        assert_eq!(ticks, 30, "fires on the tick past 500 ms");
+        let mut t = Vec::new();
+        let extra = PlayerInput {
+            attack: true,
+            ..combo
+        };
+        for _ in 0..120 {
+            assert!(!reset_held(&mut t, &[(Source::Keyboard, extra)]));
+        }
+        for _ in 0..20 {
+            reset_held(&mut t, &all);
+        }
+        reset_held(&mut t, &[(Source::Keyboard, PlayerInput::default())]);
+        for _ in 0..25 {
+            assert!(!reset_held(&mut t, &all));
+        }
+    }
+
+    #[test]
+    fn no_quit_level_in_the_secret_levels() {
+        assert!(quit_level_disabled(Some(0xC02)));
+        assert!(!quit_level_disabled(Some(0x102)));
+        assert!(!quit_level_disabled(None));
+    }
+
+    #[test]
+    fn checkpoints_skip_two_waves_and_the_secret_levels() {
+        assert!(checkpoint_at(Some(0x500)));
+        assert!(checkpoint_at(Some(0x502)));
+        assert!(!checkpoint_at(Some(0x501)));
+        assert!(!checkpoint_at(Some(0x601)));
+        assert!(!checkpoint_at(Some(0xC03)));
+        assert!(checkpoint_at(Some(0xD00)));
+        assert!(checkpoint_at(None));
     }
 }
