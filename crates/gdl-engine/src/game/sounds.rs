@@ -908,8 +908,8 @@ mod tests {
         assert!(g.snd.compass_model.is_some(), "no COMPASS");
         assert!(g.item_models.get("DEATH_ICON").copied().flatten().is_some());
         // MBWindowTo3D's point projects back to (64, 128).
-        let at = crate::scene::unproject(&g, 64.0, 128.0, 10.0);
-        let (x, y) = crate::scene::project(&g, at).unwrap();
+        let at = crate::camera::unproject(&g, 64.0, 128.0, 10.0);
+        let (x, y) = crate::camera::project(&g, at).unwrap();
         assert!((x - 64.0).abs() < 0.5 && (y - 128.0).abs() < 0.5, "{x} {y}");
     }
 
@@ -1025,7 +1025,7 @@ mod tests {
         ] {
             reqs.push(s.into());
         }
-        let missing: Vec<String> = crate::audio::check_sounds(&fs, &reqs)
+        let missing: Vec<String> = crate::soundlib::check_sounds(&fs, &reqs)
             .into_iter()
             .filter(|(_, f)| f.as_ref().is_none_or(|f| f.1 <= 0.0))
             .map(|(r, _)| r)

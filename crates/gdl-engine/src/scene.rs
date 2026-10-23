@@ -7,10 +7,7 @@ use anyhow::Result;
 use glam::{Mat4, Vec3, Vec4};
 use std::collections::HashMap;
 
-/// The game is left-handed; mirror X so it looks right in a right-handed renderer.
-pub fn mirror() -> Mat4 {
-    Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0))
-}
+pub use crate::camera::{mirror, project, unproject};
 
 pub const CLEAR: [f64; 3] = [0.02, 0.02, 0.04];
 
@@ -79,34 +76,6 @@ const DYNAMIC_KEY: u64 = 1 << 55;
 /// invAlpha = 255 - alpha.
 const XRAY_CHEST_ALPHA: f32 = 63.0 / 255.0;
 const COMPASS_ALPHA: f32 = 127.0 / 255.0;
-
-/// Where a world point lands on the game's 512x384 screen (the 3D view is 4:3),
-/// or None behind the camera.
-pub fn project(game: &Game, pos: Vec3) -> Option<(f32, f32)> {
-    let (eye, at, near) = game.camera_view();
-    let m = mirror();
-    let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
-    let proj = crate::camera::projection(4.0 / 3.0, near, 1500.0);
-    let c = proj * view * m.transform_point3(pos).extend(1.0);
-    if c.w <= 0.0 {
-        return None;
-    }
-    let (x, y) = (c.x / c.w, c.y / c.w);
-    Some(((x + 1.0) * 256.0, (1.0 - y) * 192.0))
-}
-
-/// MBWindowTo3D: the world point at view depth `depth` under a point of the
-/// 512x384 screen.
-pub fn unproject(game: &Game, sx: f32, sy: f32, depth: f32) -> Vec3 {
-    let (eye, at, near) = game.camera_view();
-    let m = mirror();
-    let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
-    let proj = crate::camera::projection(4.0 / 3.0, near, 1500.0);
-    let ndc = Vec3::new(sx / 256.0 - 1.0, 1.0 - sy / 192.0, 0.5);
-    let v = proj.inverse().project_point3(ndc);
-    let v = v * (depth / -v.z);
-    m.transform_point3(view.inverse().transform_point3(v))
-}
 
 impl Scene {
     pub fn new(gpu: &Gpu, game: &Game) -> Result<Scene> {

@@ -22,7 +22,7 @@ mod particles;
 mod rule_tests;
 pub mod savestate;
 pub mod sounds;
-pub(crate) mod unlock;
+pub mod unlock;
 pub(crate) mod walls;
 pub mod worn;
 
@@ -1078,6 +1078,21 @@ impl MonsterClass {
             .or(self.gen_models[0])
             .or(self.gen_models[2])
     }
+}
+
+/// A joined player's place on the HUD.
+#[derive(Clone, Debug, Default)]
+pub struct PanelInfo {
+    /// Column 0..3 (the player's slot).
+    pub slot: usize,
+    /// The name typed on the select screen.
+    pub name: String,
+    /// Costume colour, as class_id (0 yellow, 1 blue, 2 red, 3 green).
+    pub colour: usize,
+    /// Character class id (WAR 0 .. HYE 15, SUM 16).
+    pub class: usize,
+    /// A hidden character's row in `cheats::HIDDEN` (hidden_code).
+    pub hidden: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -2225,7 +2240,7 @@ impl Game {
 
     /// Whether a point is on the 4:3 screen, give or take `margin` units.
     pub(crate) fn on_screen(&self, pos: Vec3, margin: f32) -> bool {
-        match crate::scene::project(self, pos) {
+        match crate::camera::project(self, pos) {
             Some((x, y)) => {
                 let m = margin * 4.0;
                 (-m..512.0 + m).contains(&x) && (-m..384.0 + m).contains(&y)
@@ -9253,7 +9268,7 @@ mod tests {
         }
         names.sort();
         names.dedup();
-        let found = crate::audio::check_sounds(&fs, &names);
+        let found = crate::soundlib::check_sounds(&fs, &names);
         let missing: Vec<_> = found
             .iter()
             .filter(|(_, f)| f.is_none())
@@ -10223,7 +10238,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        for (req, found) in crate::audio::check_sounds(&fs, &reqs) {
+        for (req, found) in crate::soundlib::check_sounds(&fs, &reqs) {
             let (alt, len) = found.unwrap_or_else(|| panic!("{req} did not resolve"));
             assert!(len > 0.1, "{alt} is empty");
             eprintln!("{req} -> {alt} {len:.2}s");
@@ -10256,7 +10271,7 @@ mod tests {
             let fx = g.pdata[0].damage[b].fxidx as usize;
             assert!(g.psfx[0][fx].model.is_some(), "{class} power B model");
             let sounds: Vec<String> = g.psfx[0].iter().filter_map(|s| s.sound.clone()).collect();
-            for (req, found) in crate::audio::check_sounds(&fs, &sounds) {
+            for (req, found) in crate::soundlib::check_sounds(&fs, &sounds) {
                 assert!(found.is_some(), "{class}: {req} did not resolve");
             }
         }

@@ -3,7 +3,7 @@
 //! The simulation runs at a fixed 60 Hz (every original timing is in ticks);
 //! a faster or uneven display draws each frame between the last two ticks'
 //! poses, `alpha = acc / TICK` of the way from the previous to the current
-//! one. [`crate::scene::Scene`] keeps a [`Pose`] per instance for both ticks
+//! one. The scene keeps a [`Pose`] per instance for both ticks
 //! and the camera, and [`Interp`] decides what blends and what snaps:
 //!
 //! - anything new this tick (spawned, or the scene was rebuilt) snaps;

@@ -27,8 +27,8 @@
 //! `key=value` fields), versioned; unknown keys are ignored and missing ones
 //! take defaults, so older and newer builds read each other's states.
 
+use super::PanelInfo;
 use super::*;
-use crate::hud::PanelInfo;
 use crate::powerups::{MiniInv, Slot};
 use crate::progress::Progress;
 use glam::Mat4;

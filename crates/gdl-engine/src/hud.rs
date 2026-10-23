@@ -446,20 +446,7 @@ pub const PLAYER_RGB: [[f32; 3]; 4] = [
     [0.3, 0.9, 0.35],
 ];
 
-/// A joined player's place on the HUD.
-#[derive(Clone, Debug, Default)]
-pub struct PanelInfo {
-    /// Column 0..3 (the player's slot).
-    pub slot: usize,
-    /// The name typed on the select screen.
-    pub name: String,
-    /// Costume colour, as class_id (0 yellow, 1 blue, 2 red, 3 green).
-    pub colour: usize,
-    /// Character class id (WAR 0 .. HYE 15, SUM 16).
-    pub class: usize,
-    /// A hidden character's row in `cheats::HIDDEN` (hidden_code).
-    pub hidden: Option<usize>,
-}
+pub use crate::game::PanelInfo;
 
 /// player_pal: text colours per costume colour.
 const PLAYER_PAL: [u32; 4] = [0xFFFF80, 0x87CEEB, 0xFFC0E0, 0x80FF80];
@@ -1230,5 +1217,28 @@ impl Hud {
             }
         }
         queue.submit([enc.finish()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn data() -> Option<crate::fs::GameFs> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        crate::fs::GameFs::open(&root).ok()
+    }
+
+    /// do_got_it's icons come from the secret levels' item bank.
+    #[test]
+    fn coin_icons_exist() {
+        let Some(fs) = data() else { return };
+        let imgs = crate::hud::coin_images(&fs);
+        for c in crate::game::unlock::SECRET_CLASS {
+            let name = if c < 16 {
+                format!("16_{}COIN", crate::heroes::CLASSES[c])
+            } else {
+                "16_SUM".into()
+            };
+            assert!(imgs.iter().any(|(n, _)| *n == name), "{name}");
+        }
     }
 }

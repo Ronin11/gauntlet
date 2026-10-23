@@ -128,19 +128,4 @@ mod tests {
         assert_eq!(g.players[0].class_unlock, 0x100);
         assert_eq!(g.coin_counter(0).unwrap().0, "16_SUM");
     }
-
-    /// do_got_it's icons come from the secret levels' item bank.
-    #[test]
-    fn coin_icons_exist() {
-        let Some(fs) = data() else { return };
-        let imgs = crate::hud::coin_images(&fs);
-        for c in SECRET_CLASS {
-            let name = if c < 16 {
-                format!("16_{}COIN", crate::select::CLASSES[c])
-            } else {
-                "16_SUM".into()
-            };
-            assert!(imgs.iter().any(|(n, _)| *n == name), "{name}");
-        }
-    }
 }

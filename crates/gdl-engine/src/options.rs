@@ -29,8 +29,8 @@ const SLIDER_DXR: f32 = -24.0;
 const VOL_WIDTH: i32 = 264;
 /// The burn overlay rect shared by every menu that has one.
 const BURN_RECT: (f32, f32, f32, f32) = (290.0, 142.0, 224.0, 172.0);
-/// Control-style names at 0x8011F048. `% 3` in DoOptions keeps "One Handed" out of reach.
-pub const CONTROL_STYLES: [&str; 4] = ["Default", "Arcade", "Robotron", "One Handed"];
+pub use crate::input::{PlayerPrefs, CONTROL_STYLES};
+
 /// ctl_blits at 0x8011FAF8: the controller diagram, each at its natural size.
 /// ctl_label_pos (0x8011FA38): {mode, dx, dy} per label.
 const CTL_LABELS: [(i32, f32, f32); 16] = [
@@ -458,27 +458,6 @@ static MENUS: [Def; MENU_COUNT] = [
 
 fn menu_def(id: MenuId) -> &'static Def {
     &MENUS[id as usize]
-}
-
-/// One player's control settings (PlayerControl[p]; controls.c defaults).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PlayerPrefs {
-    /// 0 Default, 1 Arcade, 2 Robotron (see [`CONTROL_STYLES`]).
-    pub control_style: usize,
-    pub rumble: bool,
-    pub auto_aim: bool,
-    pub auto_attack: bool,
-}
-
-impl Default for PlayerPrefs {
-    fn default() -> Self {
-        PlayerPrefs {
-            control_style: 0,
-            rumble: true,
-            auto_aim: true,
-            auto_attack: true,
-        }
-    }
 }
 
 /// The settings the menus edit (optglobals, init_prefs defaults) plus each

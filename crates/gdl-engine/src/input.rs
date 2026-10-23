@@ -197,6 +197,30 @@ impl PlayerInput {
     }
 }
 
+/// Control-style names at 0x8011F048. `% 3` in DoOptions keeps "One Handed" out of reach.
+pub const CONTROL_STYLES: [&str; 4] = ["Default", "Arcade", "Robotron", "One Handed"];
+
+/// One player's control settings (PlayerControl[p]; controls.c defaults).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayerPrefs {
+    /// 0 Default, 1 Arcade, 2 Robotron (see [`CONTROL_STYLES`]).
+    pub control_style: usize,
+    pub rumble: bool,
+    pub auto_aim: bool,
+    pub auto_attack: bool,
+}
+
+impl Default for PlayerPrefs {
+    fn default() -> Self {
+        PlayerPrefs {
+            control_style: 0,
+            rumble: true,
+            auto_aim: true,
+            auto_attack: true,
+        }
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 pub type PadId = gilrs::GamepadId;
 #[cfg(target_os = "android")]

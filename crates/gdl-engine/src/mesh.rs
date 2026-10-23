@@ -386,3 +386,16 @@ fn find_bitmap(objects: &Objects, name: &str) -> Option<u16> {
         .find(|d| d.name.eq_ignore_ascii_case(name))
         .map(|d| d.tex_index)
 }
+
+/// Per-part effects of an instance's sequence texmods and texmod nodes
+/// (`DoTexModSeqSub` on the part's node).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PartFx {
+    /// `MBTreeSetAltTex`: show frame `.1` of sequence flipbook `.0` (an index
+    /// into `MeshData::seq_anims`) on batches using that flipbook's texture.
+    pub alt: Option<(usize, usize)>,
+    /// `MBTreeSetUVScaleAdd`: uScale, uAdd, vScale, vAdd.
+    pub uv: Option<[f32; 4]>,
+    /// `MBTreeSetAlpha`: opacity 0..=255.
+    pub alpha: Option<u8>,
+}

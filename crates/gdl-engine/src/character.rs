@@ -2,8 +2,7 @@
 //! object animations that swap whole meshes per frame (grunts, barrels, ...).
 
 use crate::fs::GameFs;
-use crate::gpu::PartFx;
-use crate::mesh::{MeshBuilder, MeshData, TexBank};
+use crate::mesh::{MeshBuilder, MeshData, PartFx, TexBank};
 use crate::texanim::{self, SeqState};
 use anyhow::{Context, Result};
 use gdl_formats::anim::{ATree, Anim, Pose, TexMod, ANIM_OBJECT};
