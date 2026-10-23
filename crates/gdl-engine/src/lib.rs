@@ -14,6 +14,7 @@ pub mod enemies;
 pub mod flyby;
 pub mod fs;
 pub mod game;
+pub(crate) use game::items;
 pub mod gpu;
 pub mod hints;
 pub mod hud;

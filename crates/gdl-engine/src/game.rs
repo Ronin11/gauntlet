@@ -13,6 +13,7 @@ use gdl_formats::Objects;
 use glam::{Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 
+pub(crate) mod items;
 mod magic;
 
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
@@ -279,6 +280,9 @@ struct Spawn {
     generator: u64,
     /// Every slot is taken: recycle the farthest monster off screen.
     recycle: bool,
+    /// The generator's ai and height (generate_enemy's spew and ang).
+    ai: i32,
+    height: f32,
 }
 
 thread_local! {
@@ -733,6 +737,14 @@ pub enum Kind {
         drained: f32,
         /// The Warlock's blink: seconds left seen (> 0) or unseen (< 0).
         blink: f32,
+        /// Enemy.algorithm: the AI routine (init_enemy, after fn_8004F87C):
+        /// a placed monster's or generator's params[2] override, else
+        /// sEnemyDefaultAlgorithm by type. Set by the item code; the movement
+        /// AI reads it (items::algorithm).
+        ai: i32,
+        /// Enemy.dest: where a logic-12 generator sent it (place_logic12),
+        /// for the AI to walk to; None otherwise.
+        dest: Option<Vec3>,
     },
     Generator {
         class: usize,
@@ -752,6 +764,13 @@ pub enum Kind {
         always: bool,
         /// Temple / Hell SPECIAL generators: which list they cycle through.
         special: Option<&'static [usize; 4]>,
+        /// gendata ai (params[2], else sEnemyDefaultAlgorithm): handed to
+        /// generate_enemy; 12 sends spawns to either side (place_logic12).
+        ai: i32,
+        /// The item's height: how far in front monsters appear (+ their radius).
+        height: f32,
+        /// place_logic12's side (data[4]): 0 left, 1 right, then in place.
+        side: u8,
     },
     Pickup {
         kind: PickupKind,
@@ -762,7 +781,11 @@ pub enum Kind {
         hp: f32,
         drop: Option<usize>,
         chest: bool,
+        /// The item's armour; -1 (walls, signs, chests) turns hits away.
         armor: f32,
+        /// The item-info subtype (0x2B barrel, 0x2C explosive barrel or trap
+        /// chest, 0x2D poison barrel; 0 for the boss's spouts).
+        sub: i32,
     },
     Door {
         radius: f32,
@@ -1022,6 +1045,8 @@ pub struct Game {
     /// Potion effects in flight or spreading (start_magic).
     pub(crate) magic: Vec<magic::MagicFx>,
     pub(crate) magic_models: magic::MagicModels,
+    /// Item damage state: blasts, bags, carried items (items.rs).
+    pub(crate) items: items::ItemsState,
     /// randpottype: the colour a colourless potion takes next.
     randpottype: u32,
     /// Lightning-shield strikes waiting out their second, by (player, monster).
@@ -1570,6 +1595,7 @@ impl Game {
             special_counter: 0,
             it_holder: None,
             magic: Vec::new(),
+            items: Default::default(),
             magic_models: Default::default(),
             randpottype: 0,
             shield_cooldown: HashMap::new(),
@@ -2030,17 +2056,25 @@ impl Game {
                 None => return,
             }
         }
-        // Medium and large monsters only use front and +-45 degrees.
+        // fn_8004F87C: the spew the monster's algorithm comes from; logic 12
+        // spawns straight ahead only.
+        let spew = crate::items::resolve_spew(etype, sp.strength as i32, sp.ai);
+        let (ndirs, mask) = crate::items::gen_dirs(etype, spew);
+        // gendir_8004FBC8's eight directions, from a random one round, the
+        // masked ones skipped; the item's height + the monster's radius out.
         const OCTANTS: [f32; 8] = [0.0, 180.0, -90.0, 90.0, 45.0, -45.0, 135.0, -135.0];
-        let dirs: &[usize] = if crate::enemies::is_small(etype) {
-            &[0, 1, 2, 3, 4, 5, 6, 7]
+        let dist = if etype == 17 {
+            0.0
         } else {
-            &[0, 4, 5]
+            sp.height + t.radius
         };
-        let dist = if etype == 17 { 0.0 } else { 5.0 + t.radius };
-        let start = self.rng.next_u32() as usize % dirs.len();
-        for k in 0..dirs.len() {
-            let a = sp.yaw + OCTANTS[dirs[(start + k) % dirs.len()]].to_radians();
+        let start = self.rng.next_u32() as usize % ndirs;
+        for k in 0..ndirs {
+            let d = (start + k) % ndirs;
+            if mask & (1 << d) != 0 {
+                continue;
+            }
+            let a = sp.yaw + OCTANTS[d].to_radians();
             let p = sp.pos + Vec3::new(a.sin(), 0.0, a.cos()) * dist;
             let from = sp.pos + Vec3::Y * 2.0;
             if dist > 0.0 && self.collision.raycast(from, p + Vec3::Y * 2.0).is_some() {
@@ -2053,8 +2087,14 @@ impl Game {
                 continue;
             }
             let model = self.classes[sp.class].model(sp.strength);
-            let kind = self.new_enemy(sp.class, sp.strength, EnemyState::Spawning);
+            let mut kind = self.new_enemy(sp.class, sp.strength, EnemyState::Spawning);
+            if let Kind::Enemy { ai, .. } = &mut kind {
+                *ai = crate::items::algorithm(etype, spew);
+            }
             let id = self.spawn(kind, model, Vec3::new(p.x, g, p.z), a);
+            if spew == 12 {
+                self.place_logic12(sp.generator, id);
+            }
             if let Some(start) = model
                 .and_then(|m| self.monster_seqs.get(&m))
                 .and_then(|s| s.start)
@@ -2094,6 +2134,8 @@ impl Game {
             reload: 0.0,
             drained: 0.0,
             blink: 0.0,
+            ai: crate::items::DEFAULT_AI[etype.min(33)],
+            dest: None,
         }
     }
 
@@ -2261,11 +2303,16 @@ impl Game {
 
         let instances = self.level.worlds.item_instances.clone();
         let infos = self.level.worlds.item_infos.clone();
+        let items_option = items::items_option();
+        // Golems, gargoyles and generals placed, for what they carry.
+        let mut carriers: Vec<(u64, Vec3)> = Vec::new();
         for inst in &instances {
-            if inst.min_players as usize > num_players.max(1) {
+            // ItemVisible: placed for this many players.
+            if !items::item_visible(inst.min_players, num_players.max(1), items_option) {
                 continue;
             }
-            let Some(mut info) = infos.get(inst.item_index as usize).cloned() else {
+            let mut info_idx = inst.item_index as usize;
+            let Some(mut info) = infos.get(info_idx).cloned() else {
                 continue;
             };
             // Random items pick one of their candidates.
@@ -2273,10 +2320,14 @@ impl Game {
                 let pick =
                     info.random_indices[self.rng.next_u32() as usize % info.random_indices.len()];
                 match infos.get(pick as usize) {
-                    Some(i) => info = i.clone(),
+                    Some(i) => {
+                        info = i.clone();
+                        info_idx = pick as usize;
+                    }
                     None => continue,
                 }
             }
+            let first_id = self.next_id;
             let pos = Vec3::from(inst.pos);
             // Placement rotations use the game's pitch/yaw/roll convention; items stand
             // upright, so reduce to the yaw that the rotation turns +z towards.
@@ -2319,21 +2370,39 @@ impl Game {
                             let name = format!("GARG{}", kind.to_ascii_uppercase());
                             self.item_model(fs, &mut cache, &mut known, &dirs, &name);
                         }
-                        self.spawn_critter(fs, &wad, variant.as_deref(), pos, yaw, num_players);
+                        if let Some(id) =
+                            self.spawn_critter(fs, &wad, variant.as_deref(), pos, yaw, num_players)
+                        {
+                            carriers.push((id, pos));
+                        }
                         continue;
                     }
                     let ty = self.roster.resolve(ty, strength as i32);
                     if let Some(c) = self.monster_class(fs, &mut cache, ty) {
                         let model = self.classes[c].model(strength.max(1));
-                        let state = if strength == 0 && ty != crate::enemies::DEATH {
+                        // fn_80060114: strength 0 lies dormant (not Death or IT);
+                        // otherwise below 4 it starts stunned for 30 ticks.
+                        let asleep = strength == 0
+                            && ty != crate::enemies::DEATH
+                            && ty != crate::enemies::IT;
+                        let state = if asleep {
                             EnemyState::Asleep
                         } else {
                             EnemyState::Idle
                         };
                         let mut kind = self.new_enemy(c, strength.max(1), state);
-                        if let Kind::Enemy { cooldown, .. } = &mut kind {
-                            // A half-second freeze as it appears.
-                            *cooldown = if strength < 4 { 0.5 } else { 0.0 };
+                        if let Kind::Enemy { cooldown, ai, .. } = &mut kind {
+                            *cooldown = if !asleep && strength < 4 { 0.5 } else { 0.0 };
+                            // SetItem case 4: params[2] picks the AI (-1: the
+                            // type's own), through generate_enemy's fn_8004F87C.
+                            let spew = match p16(2) {
+                                a if a < 0 => items::DEFAULT_AI[ty.min(33)],
+                                a => a as i32,
+                            };
+                            *ai = items::algorithm(
+                                ty,
+                                items::resolve_spew(ty, strength as i32, spew),
+                            );
                         }
                         // fn_80060114: it appears once it comes into view.
                         self.pending_enemies.push(PendingEnemy {
@@ -2397,6 +2466,12 @@ impl Game {
                                 genratio: 0.0,
                                 always: inst.flags & 1 != 0,
                                 special,
+                                ai: match p16(2) {
+                                    a if a < 0 => crate::items::DEFAULT_AI[ty.min(33)],
+                                    a => a as i32,
+                                },
+                                height: info.height,
+                                side: 0,
                             },
                             model,
                             pos,
@@ -2478,12 +2553,18 @@ impl Game {
                         .then(|| i32::from_le_bytes(inst.params[0..4].try_into().unwrap()))
                         .filter(|&i| i >= 0)
                         .map(|i| i as usize);
+                    // fn_8005C1DC goes by the info's subtype (not SetItem case
+                    // 10's params[0], which barrels set to 0x2B). A type-2
+                    // barrel breaks rather than opening.
+                    let sub = info.subtype;
                     let id = self.spawn(
                         Kind::Container {
                             hp: info.hit_points.max(1) as f32,
                             drop,
-                            chest: info.item_type == ItemType::Container,
-                            armor: info.armor.max(0) as f32,
+                            chest: info.item_type == ItemType::Container
+                                && sub != crate::items::SUB_BARREL,
+                            armor: info.armor as f32,
+                            sub,
                         },
                         model,
                         pos,
@@ -2659,7 +2740,18 @@ impl Game {
                 }
                 _ => {}
             }
+            // Remember which info each power-up, container and generator is.
+            for e in self.entities.iter().filter(|e| e.id >= first_id) {
+                if matches!(
+                    e.kind,
+                    Kind::Pickup { .. } | Kind::Container { .. } | Kind::Generator { .. }
+                ) {
+                    self.items.info.insert(e.id, info_idx);
+                }
+            }
         }
+        self.link_carried(&carriers);
+        self.load_item_fx(fs, &mut cache, &mut known, &dirs);
         // The boss, its coins and key, and the good wizard (boss levels).
         self.merge_item_models(std::mem::take(&mut known));
         self.spawn_boss(fs, num_players);
@@ -3016,6 +3108,7 @@ impl Game {
         self.update_magic(dt);
         self.spawn_placed_enemies();
         self.update_entities(dt);
+        self.update_items(dt);
         self.update_critters(dt);
         self.update_waves(dt);
         self.update_spews(dt);
@@ -3752,9 +3845,17 @@ impl Game {
             }
             pt1 = pt0;
         }
-        // fn_8005ED44: a barrel or generator in the sweep is hit at once.
+        // fn_8005ED44: a barrel, generator or potion in the sweep is hit at once.
         let item = (0..self.entities.len()).find(|&i| {
             let e = &self.entities[i];
+            if matches!(e.kind, Kind::Pickup { .. }) {
+                let (a, b) = (Vec2::new(pt0.x, pt0.z), Vec2::new(pt1.x, pt1.z));
+                let q = Vec2::new(e.pos.x, e.pos.z);
+                let ab = b - a;
+                let k = ((q - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                let at = pt0 + (pt1 - pt0) * k;
+                return self.missile_hits_potion(e, at, r);
+            }
             if !e.alive
                 || !matches!(
                     e.kind,
@@ -3773,9 +3874,13 @@ impl Game {
             (a + ab * k).distance(q) < reach + r && (e.pos.y + 2.0 - hand.y).abs() < 3.5
         });
         if let Some(i) = item {
-            self.hit_from = Some(pt1);
-            self.hit_entity(pi, i, damage, push, false);
-            self.hit_from = None;
+            if matches!(self.entities[i].kind, Kind::Pickup { .. }) {
+                self.damage_item(i, damage, flags, Some(pi));
+            } else {
+                self.hit_from = Some(pt1);
+                self.hit_entity(pi, i, damage, push, false);
+                self.hit_from = None;
+            }
             if flags & m::DMG_SUPER == 0 {
                 return 0;
             }
@@ -4663,6 +4768,8 @@ impl Game {
             };
             self.add_exp(pi, amount, melee);
         }
+        // A barrel knocks, breaks, explodes or gasses.
+        self.barrel_hit(t);
         if let Some((pos, item)) = r.drop {
             self.spawn_content(pos, item);
         }
@@ -4873,6 +4980,8 @@ impl Game {
             Kind::Enemy { .. } => "S_WEAPONHITMETA".into(),
             Kind::Generator { .. } if destroyed => format!("S_GEN{w}CHIT1|S_WEAPONHITSTON"),
             Kind::Generator { .. } => "S_WEAPONHITSTON".into(),
+            // Barrels and walls sound in barrel_hit.
+            Kind::Container { sub, .. } if *sub != 0 => return None,
             Kind::Container { .. } if destroyed => "S_CHEST".into(),
             Kind::Container { .. } => "S_WEAPONHITWOOD".into(),
             _ => return None,
@@ -4932,13 +5041,18 @@ impl Game {
                     r.killed = true;
                 }
             }
-            // Breakables lose the damage less their armour, at least 1 a hit.
+            // Breakables lose the damage less their armour, at least 1 a hit
+            // (fn_8005C1DC); armour -1 turns it away.
             Kind::Container {
                 hp,
                 drop,
                 chest: false,
                 armor,
+                ..
             } => {
+                if *armor < 0.0 || !e.alive {
+                    return r;
+                }
                 *hp -= (dmg - *armor).round().max(1.0);
                 if *hp <= 0.0 {
                     e.alive = false;
@@ -4992,7 +5106,7 @@ impl Game {
             .copied()
             .flatten()
             .or_else(|| self.pickup_model(&kind));
-        self.spawn(
+        let id = self.spawn(
             Kind::Pickup {
                 kind,
                 radius: info.radius.max(1.0) + 1.0,
@@ -5001,6 +5115,9 @@ impl Game {
             pos + Vec3::Y * 0.5,
             0.0,
         );
+        if let Some(i) = item {
+            self.items.info.insert(id, i);
+        }
     }
 
     fn update_entities(&mut self, dt: f32) {
@@ -5129,8 +5246,11 @@ impl Game {
                     genratio,
                     always,
                     special,
+                    ai,
+                    height,
                     ..
                 } => {
+                    let (ai, height) = (*ai, *height);
                     let on = visible[ei];
                     // generate_enemy refuses everything once the boss is dying.
                     if (*always || on) && spawned.len() < *max && !boss_dying {
@@ -5159,6 +5279,8 @@ impl Game {
                                     yaw: e.yaw,
                                     generator: e.id,
                                     recycle: full,
+                                    ai,
+                                    height,
                                 });
                                 // 0.1 s x interval x (1..2), growing over 2 x max
                                 // spawns and starting again.
@@ -5916,6 +6038,10 @@ impl Game {
                     let cp = c.coll_pos(0, e.pos, e.yaw);
                     return surf < 0.4 && (node.is_some() || (ppos.y - cp.y).abs() < t0.hht + 2.0);
                 }
+                // fn_8005EE18: of the power-ups only potions stop missiles.
+                if matches!(e.kind, Kind::Pickup { .. }) {
+                    return self.missile_hits_potion(e, ppos, mr);
+                }
                 let flat = Vec2::new(e.pos.x - ppos.x, e.pos.z - ppos.z).length();
                 if let Kind::Enemy { state, etype, .. } = &e.kind {
                     let ty = &crate::enemies::TYPES[(*etype).min(33)];
@@ -5933,7 +6059,10 @@ impl Game {
                 e.alive && flat < r && (e.pos.y + 2.0 - ppos.y).abs() < 3.5
             });
             if let Some(t) = target {
-                if owner < self.players.len() {
+                if matches!(self.entities[t].kind, Kind::Pickup { .. }) {
+                    // fn_8005C1DC: a shot potion sets off its magic.
+                    self.damage_item(t, dmg, 0, Some(owner));
+                } else if owner < self.players.len() {
                     self.hit_from = Some(ppos);
                     self.hit_entity(owner, t, dmg, dir, false);
                     self.hit_from = None;
@@ -6371,33 +6500,6 @@ impl Game {
         {
             self.spawn(Kind::Effect { life }, Some(model), pos, yaw);
         }
-    }
-
-    /// CritterDropItem for gargoyles: the level's GARG<kind> item.
-    pub(crate) fn spawn_garg_item(&mut self, kind: &str, pos: Vec3) {
-        let name = format!("GARG{}", kind.to_ascii_uppercase());
-        let info = self
-            .level
-            .worlds
-            .item_infos
-            .iter()
-            .find(|i| i.name.eq_ignore_ascii_case(&name))
-            .cloned();
-        let kind = match &info {
-            Some(i) => pickup_kind(i, &[0u8; 16]),
-            None => PickupKind::Gargoyle(match kind {
-                "serp" => 0,
-                "eagl" => 1,
-                _ => 2,
-            }),
-        };
-        let model = self.item_model_named(&name);
-        self.spawn(
-            Kind::Pickup { kind, radius: 2.0 },
-            model,
-            pos + Vec3::Y * 0.5,
-            0.0,
-        );
     }
 }
 
