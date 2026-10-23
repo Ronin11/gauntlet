@@ -6,3 +6,4 @@
 *.gcm
 /dist
 .claude/
+tripo-out/

@@ -1,0 +1,11 @@
+[package]
+name = "gdl-modern"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Skinned glTF characters driven by Gauntlet Dark Legacy's rigid-part animations"
+
+[dependencies]
+anyhow.workspace = true
+glam = "0.30"
+gltf = { version = "1", default-features = false, features = ["import", "utils", "names"] }
