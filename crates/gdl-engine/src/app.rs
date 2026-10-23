@@ -1116,10 +1116,11 @@ impl App {
                         // OptionsStart: a playing player's Start opens the Game
                         // Menu, or the Tower Menu in the tower.
                         r.audio.play(fs, "S_OPTMENUSEL");
+                        let slot = play.panels.get(owner).map_or(owner, |p| p.slot);
                         *pause = Some(if play.game.wave == Some(TOWER_WAVE) {
-                            Options::tower(owner)
+                            Options::tower(owner).with_slot(slot)
                         } else {
-                            let mut o = Options::game(owner);
+                            let mut o = Options::game(owner).with_slot(slot);
                             // No "Quit Level" in the secret levels (realm 0xC).
                             o.set_quit_level_enabled(!quit_level_disabled(play.game.wave));
                             o

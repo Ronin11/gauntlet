@@ -750,6 +750,9 @@ const FIRE_FRAMES: i32 = 21;
 pub struct Options {
     kind: Kind,
     player: usize,
+    /// PlayerControl index for the Controls options: the player's panel
+    /// slot (as select, saves and do_vibe use), by default the player.
+    slot: usize,
     stack: Vec<Menu>,
     /// The menu just popped off the top, still fading (stack[level + 1]).
     popped: Option<Menu>,
@@ -781,6 +784,7 @@ impl Options {
         Options {
             kind,
             player: player.min(3),
+            slot: player.min(3),
             stack: vec![Menu::new(root)],
             popped: None,
             scroll: None,
@@ -809,6 +813,12 @@ impl Options {
     /// The in-game "Game Menu" opened by `player`'s START.
     pub fn game(player: usize) -> Options {
         Options::new(Kind::Game, player, MenuId::Game)
+    }
+
+    /// Edit the Controls options of panel slot `slot`.
+    pub fn with_slot(mut self, slot: usize) -> Options {
+        self.slot = slot % 4;
+        self
     }
 
     /// The tower's "Tower Menu" opened by `player`'s START.
@@ -1013,7 +1023,7 @@ impl Options {
             .items
             .get(sel)
             .map_or(OPT_NONE, |i| i.1);
-        let p = self.player;
+        let p = self.slot;
         match id {
             MenuId::Tower => match choice {
                 OPT_OPTIONS => self.push(MenuId::TowerSettings, prefs),
@@ -1245,7 +1255,7 @@ impl Options {
     /// The per-frame item state DoOptions writes: radio checks, Mono/Stereo,
     /// the control-style name.
     fn refresh(&mut self, prefs: &Prefs) {
-        let p = prefs.players[self.player];
+        let p = prefs.players[self.slot];
         let style = self.control_style;
         let Some(m) = self.stack.last_mut() else {
             return;
