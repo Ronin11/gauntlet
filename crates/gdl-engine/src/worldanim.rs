@@ -883,12 +883,29 @@ mod tests {
             .position(|w| w.name == "G2RAIL1")
             .unwrap();
         assert!(g.world_anim.flags[o] & NODE != 0);
+        // Let it get going, then stand the hero on it: on the largest deck
+        // triangle clear of the cart's walls (its handle bars would push a
+        // hero standing under them, and the invisible G2BLOCKER1 box around
+        // the cart faces outward, so it only keeps heroes from walking in).
+        for _ in 0..10 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        }
+        let mid = |t: &crate::collision::Tri| (t.v[0] + t.v[1] + t.v[2]) / 3.0;
         let tri = g
             .collision
             .tris
             .iter()
             .enumerate()
             .filter(|(_, t)| t.owner == o as i32 && t.n.y > 0.95)
+            .filter(|(_, t)| {
+                let (_, wall) = g.collision.resolve_walls_hit(
+                    mid(t),
+                    crate::game::PLAYER_RADIUS,
+                    crate::game::PLAYER_HEIGHT,
+                    crate::game::STEP_HEIGHT,
+                );
+                wall.is_none()
+            })
             .max_by(|(_, a), (_, b)| {
                 let area =
                     |t: &crate::collision::Tri| (t.v[1] - t.v[0]).cross(t.v[2] - t.v[0]).length();
@@ -896,14 +913,7 @@ mod tests {
             })
             .map(|(i, _)| i)
             .expect("the deck");
-        let centre = |g: &crate::game::Game| {
-            let v = g.collision.tris[tri].v;
-            (v[0] + v[1] + v[2]) / 3.0
-        };
-        // Let it get going, then stand the hero on it.
-        for _ in 0..10 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
-        }
+        let centre = |g: &crate::game::Game| mid(&g.collision.tris[tri]);
         let c0 = centre(&g);
         g.players[0].pos = c0;
         g.players[0].on_ground = true;

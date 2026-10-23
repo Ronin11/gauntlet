@@ -291,6 +291,13 @@ impl Collision {
                 }
                 let probe_y = ((tmin + tmax) * 0.5).clamp(lo, hi);
                 let probe = Vec3::new(pos.x, probe_y, pos.z);
+                // Walls are one-sided (BTriLineCol returns no hit when the
+                // query starts behind the triangle's plane): a hero walks in
+                // through the back of the Lich arena's fence lines, which
+                // then keep the party (and the Lich) inside.
+                if (probe - t.v[0]).dot(t.n) < 0.0 {
+                    continue;
+                }
                 let c = closest_point_on_tri(probe, t);
                 let d = Vec2::new(probe.x - c.x, probe.z - c.z);
                 let dist = d.length();

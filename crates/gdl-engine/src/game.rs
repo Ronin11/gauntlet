@@ -9462,6 +9462,48 @@ mod tests {
         );
     }
 
+    /// The Lich (Town gate 5, levelG5): its tower portal opens once the Town's
+    /// four levels are beaten, and a hero walks from the start into the
+    /// arena through the back of the one-sided fence line (G5FENCE_LINE#2),
+    /// which then keeps the party in.
+    #[test]
+    fn lich_arena_can_be_entered() {
+        let Some(fs) = data() else { return };
+        let mut tower = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
+        let mut progress = crate::progress::Progress::default();
+        for w in 0x700..0x704 {
+            progress.record_beaten(w, 0, 0);
+        }
+        tower.close_portals(|w| progress.portal_open(w));
+        assert!(tower.entities.iter().any(|e| matches!(
+            e.kind,
+            Kind::Exit {
+                dest: Some(0x704),
+                open: true,
+                ..
+            }
+        )));
+
+        let mut g = Game::new(&fs, "levelG5", &[("WAR", "RED")]).unwrap();
+        assert_eq!(g.wave, Some(0x704));
+        let walk = |g: &mut Game, y: f32, ticks: usize| {
+            let inp = PlayerInput {
+                stick: Vec2::new(0.0, y),
+                ..Default::default()
+            };
+            for _ in 0..ticks {
+                g.update(1.0 / 60.0, &[inp]);
+            }
+        };
+        g.players[0].pos = Vec3::new(0.0, 0.0, 55.0);
+        walk(&mut g, 1.0, 400);
+        let z = g.players[0].pos.z;
+        assert!(z < 30.0, "stopped outside the arena at z {z}");
+        walk(&mut g, -1.0, 400);
+        let z = g.players[0].pos.z;
+        assert!(z < 42.5, "walked back out of the arena to z {z}");
+    }
+
     #[test]
     fn tower_portals_follow_progress() {
         let Some(fs) = data() else { return };
