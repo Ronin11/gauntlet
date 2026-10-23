@@ -840,14 +840,14 @@ impl Bot {
             return Ok(());
         }
         // Moving platforms by the edge of the reachable area: wait by one
-        // for it to come round (up to 40 s each, 3 minutes in all).
-        if self.platform_wait < 180.0 {
+        // for it to come round (up to 20 s each, a minute in all).
+        if self.platform_wait < 60.0 {
             let start = self.nav.start_node(g, g.players[i].pos);
             let reach_set = start.map(|s| self.nav.reachable(g, s, 400_000)).unwrap_or_default();
             let mut best: Option<(f32, u64, Vec3)> = None;
             for (o, c, ext) in self.nav.volatile(g) {
                 let key = Obj::Wait(o.max(0) as u64);
-                if o < 0 || self.waited.get(&(o as u64)).copied().unwrap_or(0.0) > 40.0 || self.failed.contains(&key) {
+                if o < 0 || self.waited.get(&(o as u64)).copied().unwrap_or(0.0) > 20.0 || self.failed.contains(&key) {
                     continue;
                 }
                 for &n in &reach_set {
