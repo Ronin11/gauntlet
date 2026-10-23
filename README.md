@@ -44,6 +44,30 @@ counts as a controller (Enter). In the tower, a new controller can join with Sta
 Other options: `--level levelB1` to start elsewhere, `--players WAR,VAL/BLU` to skip the
 join screen, `--mute`. See `gauntlet --help`.
 
+## Debug menu (developer tool)
+
+Not part of the original. **F1** on the keyboard, or on a gamepad **hold L + R + Z and
+press Start** (LT + RT + RB), opens it from the title screen, the tower or a level; the
+game is frozen while it is open. Up/down choose, left/right change a value, A / Enter
+applies, B goes back a page, Esc or F1 closes. Pages:
+
+- **Warp to level**: any level of any realm (secret levels, bosses, the tower) with the
+  current party (from the title: one Warrior on the controller that opened it).
+- **Progress**: open everything; per realm levels beaten; boss runes, runestones,
+  crystals per colour, gargoyle items, legend weapons; reset. Changes go into the party's
+  progress (and the level's copy), so saving afterwards keeps them; values stay in the
+  game's own ranges. Changed in the tower, the tower reloads on closing.
+- **Unlocks and cheats**: secret heroes (all, or one by one; also offered on player
+  select this session), and the name cheats given to the party.
+- **Party**: per player or all: level, experience, gold, keys, potions, full health,
+  any power-up, clear power-ups, god mode (no damage; "GOD" shows while on), class and
+  hidden skin (the level reloads).
+- **Level**: kill every monster, destroy every generator, kill the boss, finish the
+  level, X-ray and Compass.
+
+`gauntlet --screen debug[:main|warp|progress|unlocks|party|level[:row]] --snapshot out.png`
+renders it headless over `--level`.
+
 ## Android / tablets
 
 ```sh

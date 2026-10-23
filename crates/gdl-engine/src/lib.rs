@@ -12,6 +12,7 @@ pub mod cheats;
 pub mod collision;
 pub mod critter;
 pub mod cursor;
+pub mod debugmenu;
 pub mod enemies;
 pub mod flyby;
 pub mod fs;
