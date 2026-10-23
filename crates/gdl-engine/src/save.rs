@@ -269,6 +269,11 @@ impl MemCard {
         card
     }
 
+    /// The card file (None for a card kept in memory).
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// The desktop save directory: $XDG_DATA_HOME/gauntlet-rs, or
     /// ~/.local/share/gauntlet-rs.
     pub fn default_dir() -> Option<PathBuf> {

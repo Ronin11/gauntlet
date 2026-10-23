@@ -195,6 +195,8 @@ pub enum Page {
     Unlocks,
     Party,
     Level,
+    /// File a bug report (bugreport.rs): quick tags, then save.
+    Bug,
 }
 
 impl Page {
@@ -206,6 +208,7 @@ impl Page {
             Page::Unlocks => "DEBUG: UNLOCKS",
             Page::Party => "DEBUG: PARTY",
             Page::Level => "DEBUG: LEVEL",
+            Page::Bug => "DEBUG: FILE BUG REPORT",
         }
     }
 }
@@ -249,6 +252,9 @@ pub enum Item {
     FinishLevel,
     XRay,
     Compass,
+    /// A quick tag for the bug report (bugreport::TAGS index), on or off.
+    BugTag(usize),
+    SaveBug,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -277,6 +283,9 @@ pub enum Action {
     /// Load this level (directory name, "levelA1") with the party (the
     /// context's panels, which may have been changed).
     Warp(String),
+    /// Write a bug report with these tags; the app answers with
+    /// [`DebugMenu::bug_filed`].
+    FileBug(Vec<&'static str>),
 }
 
 /// The game state the menu reads and changes.
@@ -334,6 +343,9 @@ pub struct DebugMenu {
     status: Option<(String, u32)>,
     rows: Vec<Row>,
     hold: [u32; 4],
+    /// The bug page's tags picked (bugreport::TAGS), and the last report's folder.
+    bug_tags: [bool; crate::bugreport::TAGS.len()],
+    last_bug: Option<String>,
 }
 
 impl Default for DebugMenu {
@@ -367,6 +379,8 @@ impl DebugMenu {
             status: None,
             rows: Vec::new(),
             hold: [0; 4],
+            bug_tags: [false; crate::bugreport::TAGS.len()],
+            last_bug: None,
         }
     }
 
@@ -428,6 +442,21 @@ impl DebugMenu {
 
     fn say(&mut self, s: impl Into<String>) {
         self.status = Some((s.into(), STATUS_TICKS));
+    }
+
+    /// The app wrote the bug report asked for (its folder) or failed.
+    pub fn bug_filed(&mut self, result: Result<std::path::PathBuf, String>) {
+        match result {
+            Ok(dir) => {
+                let name = dir.file_name().map_or(dir.display().to_string(), |n| {
+                    n.to_string_lossy().into_owned()
+                });
+                self.say(format!("Bug report saved: {name}"));
+                self.last_bug = Some(dir.display().to_string());
+                self.bug_tags = [false; crate::bugreport::TAGS.len()];
+            }
+            Err(e) => self.say(format!("Bug report failed: {e}")),
+        }
     }
 
     fn nav(&mut self, inputs: &[PlayerInput]) -> Nav {
@@ -503,6 +532,20 @@ impl DebugMenu {
             };
             if let Some(d) = d {
                 if r.enabled {
+                    crate::bugreport::event(
+                        "debug",
+                        format!(
+                            "{} / {} {} ({})",
+                            self.page.title(),
+                            r.label.trim(),
+                            r.value,
+                            match d {
+                                0 => "A",
+                                -1 => "left",
+                                _ => "right",
+                            }
+                        ),
+                    );
                     action = self.apply(r.item, d, ctx);
                 } else if d == 0 {
                     self.say("Not available here");
@@ -789,6 +832,20 @@ impl DebugMenu {
                 *ctx.compass = !*ctx.compass;
                 Action::None
             }
+            Item::BugTag(i) => {
+                if let Some(t) = self.bug_tags.get_mut(i) {
+                    *t = !*t;
+                }
+                Action::None
+            }
+            Item::SaveBug => {
+                if d == 0 {
+                    self.say("Saving bug report...");
+                    Action::FileBug(self.picked_tags())
+                } else {
+                    Action::None
+                }
+            }
         };
         if progress_changed {
             match ctx.game.as_deref_mut() {
@@ -863,6 +920,16 @@ impl DebugMenu {
         }
     }
 
+    /// The bug page's tags picked.
+    pub fn picked_tags(&self) -> Vec<&'static str> {
+        crate::bugreport::TAGS
+            .iter()
+            .zip(&self.bug_tags)
+            .filter(|(_, &on)| on)
+            .map(|(t, _)| *t)
+            .collect()
+    }
+
     fn level_dir(&self, wave: u32) -> Option<String> {
         self.realms
             .iter()
@@ -896,7 +963,33 @@ impl DebugMenu {
                 let mut r = row(Item::Open(Page::Level), "Level", ">");
                 r.enabled = in_game;
                 rows.push(r);
+                rows.push(row(Item::Open(Page::Bug), "File bug report", ">"));
                 rows.push(row(Item::Close, "Close", ""));
+            }
+            Page::Bug => {
+                rows.push(row(Item::SaveBug, "Save bug report now (A)", ""));
+                for (i, t) in crate::bugreport::TAGS.iter().enumerate() {
+                    rows.push(row(
+                        Item::BugTag(i),
+                        format!("  Tag: {t}"),
+                        if self.bug_tags[i] { "[x]" } else { "[ ]" },
+                    ));
+                }
+                let info = |label: String| Row {
+                    enabled: false,
+                    ..row(Item::SaveBug, label, "")
+                };
+                rows.push(info("Pick tags with A or left/right, then save.".into()));
+                rows.push(info("Saves the screen, nearby things, the last".into()));
+                rows.push(info("2 minutes of events and the save, to:".into()));
+                let dir = crate::bugreport::shown_dir();
+                for chunk in dir.as_bytes().chunks(50) {
+                    rows.push(info(format!("  {}", String::from_utf8_lossy(chunk))));
+                }
+                if let Some(last) = &self.last_bug {
+                    let name = last.rsplit(['/', '\\']).next().unwrap_or(last);
+                    rows.push(info(format!("Last: {name}")));
+                }
             }
             Page::Warp => {
                 let Some(realm) = self.realms.get(self.warp_realm) else {
@@ -1549,6 +1642,35 @@ mod tests {
             out.push(m.update(&[PlayerInput::default()], &mut w.ctx()));
         }
         out
+    }
+
+    #[test]
+    fn filing_a_bug_report_with_tags() {
+        let mut m = DebugMenu::new(realms());
+        let mut w = World::new();
+        m.show(None, &mut w.ctx());
+        m.update(&[PlayerInput::default()], &mut w.ctx());
+        // Main: Warp, Progress, Unlocks, Party, Level, File bug report, Close.
+        assert_eq!(m.rows()[5].item, Item::Open(Page::Bug));
+        drive(&mut m, &mut w, &["up", "up", "a"]);
+        assert_eq!(m.page(), Page::Bug);
+        // Tag "stuck" with A, "wrong look" with right; save from the top row.
+        drive(&mut m, &mut w, &["down", "a", "down", "down", "right"]);
+        assert_eq!(m.picked_tags(), vec!["stuck", "wrong look"]);
+        let acts = drive(&mut m, &mut w, &["up", "up", "up", "a"]);
+        assert!(
+            acts.contains(&Action::FileBug(vec!["stuck", "wrong look"])),
+            "{acts:?}"
+        );
+        assert!(m.open, "the menu stays open");
+        m.bug_filed(Ok("/x/bugs/20261023-120000-levelA1".into()));
+        assert_eq!(
+            m.status(),
+            Some("Bug report saved: 20261023-120000-levelA1")
+        );
+        assert!(m.picked_tags().is_empty(), "tags cleared for the next one");
+        m.bug_filed(Err("disk full".into()));
+        assert_eq!(m.status(), Some("Bug report failed: disk full"));
     }
 
     #[test]

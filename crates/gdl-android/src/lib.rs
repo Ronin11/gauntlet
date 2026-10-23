@@ -5,11 +5,23 @@
 #[no_mangle]
 fn android_main(app: winit::platform::android::activity::AndroidApp) {
     use gdl_engine::{app, fs::GameFs};
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
-            .with_tag("gauntlet"),
+    // logcat, with the bug reports' event ring beside it.
+    gdl_engine::bugreport::install_logger(
+        Box::new(android_logger::AndroidLogger::new(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Info)
+                .with_tag("gauntlet"),
+        )),
+        log::LevelFilter::Info,
     );
+    // Bug reports (debug menu) go where adb can pull them:
+    // /sdcard/Android/data/com.gauntletrs.game/files/bugs.
+    if let Some(d) = app
+        .external_data_path()
+        .or_else(|| app.internal_data_path())
+    {
+        gdl_engine::bugreport::set_dir(d.join("bugs"));
+    }
     let dirs: Vec<std::path::PathBuf> = [app.external_data_path(), app.internal_data_path()]
         .into_iter()
         .flatten()

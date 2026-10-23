@@ -65,8 +65,41 @@ applies, B goes back a page, Esc or F1 closes. Pages:
 - **Level**: kill every monster, destroy every generator, kill the boss, finish the
   level, X-ray and Compass.
 
-`gauntlet --screen debug[:main|warp|progress|unlocks|party|level[:row]] --snapshot out.png`
+- **File bug report**: optionally tick quick tags with A or left/right ("stuck", "can't
+  reach", "wrong look", "wrong sound", "crash-ish", "other"), then **Save bug report now**.
+  The menu answers "Bug report saved: <folder>".
+
+`gauntlet --screen debug[:main|warp|progress|unlocks|party|level|bug[:row]] --snapshot out.png`
 renders it headless over `--level`.
+
+### Bug reports
+
+Each report is a folder `<YYYYMMDD-HHMMSS>-<level>` (UTC) of plain text and PNG, written to
+`$XDG_DATA_HOME/gauntlet-rs/bugs/` (default `~/.local/share/gauntlet-rs/bugs/`) on desktop,
+and to the app's external files folder on Android, pulled with
+`adb pull /sdcard/Android/data/com.gauntletrs.game/files/bugs`. Code: `bugreport.rs`.
+
+- `report.md`: time, build (`git describe`), screen, tags, level/wave/realm, every player
+  (class, colour, slot, level, health, gold, keys, potions, power-ups, state, position,
+  yaw, floor triangle and the object it belongs to, animation), camera eye/at, progress,
+  options and control styles, tick count, and a headless command that reproduces the spot
+  (`gauntlet --level .. --players .. --spawn x,y,z --eye .. --at .. --snapshot out.png`).
+- `nearby.txt`: within 40 units of each hero: entities (kind, the placed item they came
+  from with its info name/type/subtype, position, animation and frame, health, model,
+  state), placed item instances, movers (elevators, bridges, barricades: active, held,
+  offset, shown) with the triggers that drive them, transporter pads, world objects with
+  collision (flags, hidden, triangles enabled/disabled), the nearest locators and camera
+  locators, and every exit and generator in the level.
+- `events.log`: the last 2 minutes, kept all the time while playing: log lines, messages
+  (msgPost index and text), sounds, trigger presses and mover changes, pickups, health
+  changes, kills, player state changes (deaths, exits), level starts/ends, debug menu
+  actions, and a per-second input summary per player.
+- `screenshot.png` (the level with its HUD, without the menu), `save.txt` (heroes and
+  progress as text) and a copy of the memory card file.
+
+Headless: `GDL_BUGREPORT=<frame> [GDL_BUGTAGS=stuck,other] gauntlet --level levelA1 --bot
+--simulate 3000 --snapshot out.png` stops the simulation at that frame and files a report
+(the snapshot is its screenshot).
 
 ## Android / tablets
 
