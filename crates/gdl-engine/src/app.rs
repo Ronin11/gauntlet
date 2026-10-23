@@ -1132,6 +1132,10 @@ impl App {
                             let slot = play.panels.get(i).map_or(i, |p| p.slot);
                             play.game.controls[i] = r.prefs.players[slot % 4];
                         }
+                        if r.acc < 2.0 * TICK {
+                            // interp.rs: the tick being left, if not yet drawn.
+                            play.scene.pre_tick(&r.gpu, &play.game);
+                        }
                         play.game.update(TICK, &inputs);
                         play.intro += TICK;
                         // do_vibe: only for players with the Vibration option on.
@@ -1313,6 +1317,8 @@ impl App {
                 // fn_80052134: the compass hides while the options are open.
                 p.game.snd.show_compass = r.prefs.compass && pause.is_none();
                 p.scene.sync(&r.gpu, &p.game);
+                // Smooth at any refresh: between the last two ticks (interp.rs).
+                p.scene.blend(&p.game, r.acc / TICK);
                 // The game draws a 4:3 picture; keep it, centred, in any window.
                 let (w, h) = (r.config.width as f32, r.config.height as f32);
                 let k = (w / 512.0).min(h / 384.0);
