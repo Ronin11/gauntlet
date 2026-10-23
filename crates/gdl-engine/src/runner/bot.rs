@@ -7,7 +7,8 @@ use super::nav::{xz, Goal, Nav};
 use crate::game::{EnemyState, Game, Kind, LevelEnd, PickupKind, PlayerState, PLAYER_RADIUS};
 use crate::input::PlayerInput;
 use glam::{Vec2, Vec3};
-use std::collections::{HashMap, HashSet, VecDeque};
+use super::nav::{HashMap, HashSet};
+use std::collections::VecDeque;
 
 /// What a hero is after.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,6 +23,9 @@ pub enum Obj {
     Boss,
     Lectern,
     Portal(u64),
+    /// A rotator (items.c type 12, subtype 2) a touch sets turning: its
+    /// target world object.
+    Rotator(u64),
     Follow,
     /// Nothing to do: stand (and fight).
     Idle,
@@ -40,6 +44,7 @@ impl Obj {
             Obj::Boss => "boss".into(),
             Obj::Lectern => "lectern".into(),
             Obj::Portal(i) => format!("portal#{i}"),
+            Obj::Rotator(i) => format!("rotator#{i}"),
             Obj::Follow => "follow".into(),
             Obj::Idle => "idle".into(),
         }
@@ -122,6 +127,7 @@ pub struct Agent {
     pub on_pad_t: Option<f32>,
     pub hunt_t: f32,
     pub stuck_wp: usize,
+    pub plan_t: f32,
 }
 
 /// Something worth a bug report found on the way (not necessarily the end).
@@ -156,6 +162,7 @@ pub struct Bot {
     falls: u32,
     pub verbose: bool,
     giveup_t: Option<f32>,
+    boss_fail_t: f32,
     /// Wall seconds: inputs, planning, lookahead, nav refresh.
     pub timing: [f64; 4],
 }
@@ -211,8 +218,8 @@ impl Bot {
             agents: (0..g.players.len()).map(|_| Agent::default()).collect(),
             nav,
             opt: None,
-            tried: HashMap::new(),
-            failed: HashSet::new(),
+            tried: HashMap::default(),
+            failed: HashSet::default(),
             history: Vec::new(),
             trail: VecDeque::new(),
             god_at: None,
@@ -230,6 +237,7 @@ impl Bot {
             falls: 0,
             verbose,
             giveup_t: None,
+            boss_fail_t: -100.0,
             timing: [0.0; 4],
         }
     }
@@ -271,7 +279,7 @@ impl Bot {
             },
             (Obj::Door(_), Some(e)) => match e.kind {
                 Kind::Door { radius, .. } => {
-                    (vec![Goal::new(e.pos, (radius - 0.6).max(1.5), 2.5)], e.pos)
+                    (vec![Goal::new(e.pos, radius + 1.0, 2.5)], e.pos)
                 }
                 _ => return None,
             },
@@ -309,6 +317,14 @@ impl Bot {
                     _ => 2.0,
                 };
                 (vec![Goal::new(e.pos, r, 3.5)], e.pos)
+            }
+            (Obj::Rotator(t), _) => {
+                let (at, r, _) = g
+                    .world_anim
+                    .untouched_rotators()
+                    .into_iter()
+                    .find(|x| x.2 as u64 == t)?;
+                (vec![Goal::new(at, (r + PLAYER_RADIUS - 0.3).max(1.0), 2.5)], at)
             }
             (Obj::Boss, _) => {
                 let (at, r) = boss_point(g, g.players[0].pos)?;
@@ -376,6 +392,7 @@ impl Bot {
         a.last_adv = g.time;
         a.best_d = f32::MAX;
         a.replan = false;
+        a.plan_t = g.time;
         if !same {
             a.obj_t = g.time;
             a.stucks = 0;
@@ -406,9 +423,18 @@ impl Bot {
                 let c = self.goals_of(g, Obj::Boss);
                 if let Some((gl, at)) = c {
                     let cands = vec![(Obj::Boss, gl, at)];
-                    match self.plan_any(g, i, &cands) {
+                    // A boss out of walking reach (flying, in a pit) is steered
+                    // at directly; the search is retried only now and then.
+                    let retry = g.time - self.boss_fail_t > 15.0;
+                    let r = if retry { self.plan_any(g, i, &cands) } else { None };
+                    match r {
                         Some((o, path, cost)) => self.set_obj(g, i, o, path, cost),
-                        None => self.set_obj(g, i, Obj::Boss, Vec::new(), 0.0),
+                        None => {
+                            if retry {
+                                self.boss_fail_t = g.time;
+                            }
+                            self.set_obj(g, i, Obj::Boss, Vec::new(), 0.0)
+                        }
                     }
                     return Ok(());
                 }
@@ -695,6 +721,19 @@ impl Bot {
                 return Ok(());
             }
         }
+        // Rotators a touch sets turning.
+        let rots: Vec<_> = g
+            .world_anim
+            .untouched_rotators()
+            .into_iter()
+            .map(|r| Obj::Rotator(r.2 as u64))
+            .filter(|o| !self.failed.contains(o))
+            .filter_map(|o| self.goals_of(g, o).map(|(gl, at)| (o, gl, at)))
+            .collect();
+        if let Some((o, path, cost)) = self.plan_any(g, i, &rots) {
+            self.set_obj(g, i, o, path, cost);
+            return Ok(());
+        }
         // Levers and pads not tried since the area last grew.
         let trigs: Vec<_> = self
             .cands(g, |e| match e.kind {
@@ -774,19 +813,38 @@ impl Bot {
             .map(|o| o.name())
             .collect();
         let cracks = self.frontier_cracks(g);
-        let crack_note = if cracks.is_empty() {
+        // Would the exit be reachable if floor seams were bridged (the
+        // original's floor test sweeps a sphere of the hero's radius)?
+        let (bridged, breach) = {
+            let mut bn = Nav::new(g);
+            bn.bridge = true;
+            let exit_goals: Vec<Goal> = exits.iter().flat_map(|c| c.1.iter().copied()).collect();
+            let st = bn.start_node(g, g.players[i].pos);
+            let ok = st
+                .and_then(|s| bn.path(g, s, &exit_goals, g.time, MAX_EXPAND))
+                .is_some();
+            (ok, st.map_or(0, |s| bn.reachable(g, s, 400_000).len()))
+        };
+        let eg = cracks
+            .iter()
+            .take(3)
+            .map(|c| format!("({:.1},{:.1},{:.1})", c.x, c.y, c.z))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let crack_note = if bridged {
+            format!(
+                "; the exit WOULD be reachable if floor seams were bridged ({} seams at the edge of the reachable area, e.g. {eg})",
+                cracks.len()
+            )
+        } else if breach > reach + reach / 5 + 50 {
+            format!(
+                "; bridging floor seams would grow the reachable area from {reach} to {breach} nodes ({} seams at its edge, e.g. {eg})",
+                cracks.len()
+            )
+        } else if cracks.is_empty() {
             String::new()
         } else {
-            format!(
-                "; {} floor seams stop walks at the edge of the reachable area, e.g. {}",
-                cracks.len(),
-                cracks
-                    .iter()
-                    .take(3)
-                    .map(|c| format!("({:.1},{:.1},{:.1})", c.x, c.y, c.z))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
+            format!("; {} possible floor seams at the edge of the reachable area, e.g. {eg}", cracks.len())
         };
         Err(if exits_failed.is_empty() {
             Outcome::Unreachable(format!(
@@ -844,8 +902,8 @@ impl Bot {
     /// Doors, breakable walls, breakable containers and generators: what
     /// the optimistic graph walks through. With the collision triangles of
     /// doors and walls.
-    fn removable(g: &Game) -> (std::collections::HashSet<u64>, Vec<usize>) {
-        let mut ids = std::collections::HashSet::new();
+    fn removable(g: &Game) -> (HashSet<u64>, Vec<usize>) {
+        let mut ids = super::nav::HashSet::default();
         let mut tris = Vec::new();
         for e in g.entities.iter().filter(|e| e.alive) {
             match &e.kind {
@@ -1089,7 +1147,23 @@ impl Bot {
                     return Some(true);
                 }
                 let keys: u32 = g.players.iter().map(|p| p.keys).sum();
-                (keys == 0 || a.arrived.is_some_and(|t| now - t > 4.0)).then_some(false)
+                let pushed = a.arrived.is_some_and(|t| now - t > 4.0);
+                if pushed && keys > 0 {
+                    // Pushed against it with a key and it stayed shut.
+                    let (dpos, r) = Self::ent(g, id)
+                        .map(|e| match e.kind {
+                            Kind::Door { radius, .. } => (e.pos, radius),
+                            _ => (e.pos, 0.0),
+                        })
+                        .unwrap_or_default();
+                    let hp = g.players[i].pos;
+                    let msg = format!(
+                        "door#{id} at ({:.1},{:.1},{:.1}) did not open: hero {i} with {} keys pushed against it for 4 s from ({:.2},{:.2},{:.2}), {:.3} from its centre (opens within {:.3})",
+                        dpos.x, dpos.y, dpos.z, keys, hp.x, hp.y, hp.z, (hp - dpos).length(), r
+                    );
+                    self.anomalies.push(Anomaly { what: msg, tags: vec!["can't reach"], capture: true });
+                }
+                (keys == 0 || pushed).then_some(false)
             }
             Obj::Trigger(_) => {
                 let t = a.arrived?;
@@ -1131,6 +1205,10 @@ impl Bot {
             Obj::Follow => (now - a.obj_t > 1.0 || a.path.is_empty()).then_some(true),
             Obj::Idle => (now - a.obj_t > 2.0).then_some(true),
             Obj::Exit(id) | Obj::Portal(id) => gone(id).then_some(false),
+            Obj::Rotator(t) => {
+                let left = g.world_anim.untouched_rotators().iter().any(|x| x.2 as u64 == t);
+                (!left).then_some(true)
+            }
         }
     }
 
@@ -1182,7 +1260,8 @@ impl Bot {
                 }
                 self.agents[i].obj = None;
             }
-            if self.agents[i].obj.is_none() || self.agents[i].replan {
+            let throttled = self.agents[i].obj.is_some() && g.time - self.agents[i].plan_t < 2.0;
+            if self.agents[i].obj.is_none() || (self.agents[i].replan && !throttled) {
                 let keep = self.agents[i].obj;
                 if i == lead {
                     // A replan keeps the objective when it still has a path.
@@ -1260,7 +1339,15 @@ impl Bot {
         if obj == Obj::Boss {
             if let Some((at, r)) = boss_point(g, pos) {
                 let d = xz(at - pos).length() - r;
-                if d < 4.0 {
+                // In reach: swing. Out of walking reach (no path, or the walk
+                // has stalled) but in sight: throw at it.
+                let a = &self.agents[i];
+                let stalled = a.path.is_empty() || now - a.last_adv > 1.5;
+                let seen = g
+                    .collision
+                    .raycast(pos + Vec3::Y * 2.5, at)
+                    .is_none_or(|t| t > 0.95);
+                if d < 4.0 || (stalled && d < 30.0 && seen) {
                     self.boss_fight_t += 1.0 / 60.0;
                     self.agents[i].last_adv = now;
                     return self.attack_toward(g, i, at, true);
@@ -1417,6 +1504,7 @@ impl Bot {
                 ignore: &self.nav.ignore,
                 min_y: g.level.worlds.min_bounds[1],
                 cracks: Default::default(),
+                bridge: false,
             };
             let far = (a.wp + 4).min(a.path.len() - 1);
             for k in (a.wp + 1..=far).rev() {

@@ -27,7 +27,10 @@ bin=target/release/gauntlet
 levels=("$@")
 if [ ${#levels[@]} -eq 0 ]; then
   for d in game-data/files/Gauntlet/LEVELS/level*/; do
-    levels+=("$(basename "$d")")
+    l=$(basename "$d")
+    # levelT*: unused test levels.
+    case $l in levelT*) continue ;; esac
+    levels+=("$l")
   done
 fi
 mkdir -p "$out"

@@ -303,7 +303,7 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
         // (recorded), so the wizard and the level's end still get checked.
         if g.boss.as_ref().is_some_and(|b| !b.dead && !b.dying)
             && !bot.boss_killed_debug
-            && (bot.boss_fight_t > 300.0 || g.time > o.timeout * 0.75)
+            && (bot.boss_fight_t > 240.0 || g.time > (o.timeout * 0.75).min(480.0))
         {
             bot.boss_killed_debug = true;
             let msg = format!(
@@ -321,6 +321,17 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
             g.kill_boss();
         }
         if dbg_from.is_some_and(|t| g.time >= t) && g.frame % 30 == 0 {
+            if let Some(b) = &g.boss {
+                let crit = bot::boss_point(&g, g.players[0].pos);
+                println!(
+                    "dbg boss active {} dying {} dead {} legend {} wizard {:?} point {crit:?}",
+                    b.active,
+                    b.dying,
+                    b.dead,
+                    b.legend_state,
+                    b.wizard.as_ref().map(|w| (w.state, w.exit_timer, w.idle))
+                );
+            }
             let p = &g.players[0];
             println!(
                 "dbg t={:.1} pos {:?} stick {:?} act {} motion {} transport {:?} touch {:?} state {:?}",
@@ -394,7 +405,7 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
 
 /// Walk hero 0 from `from` to `to` in the game and in the nav simulation.
 fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
-    let ignore = std::collections::HashSet::new();
+    let ignore = nav::HashSet::default();
     g.players[0].pos = from;
     g.update(1.0 / 60.0, &vec![PlayerInput::default(); g.players.len()]);
     let start = g.players[0].pos;
@@ -404,6 +415,7 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
         ignore: &ignore,
         min_y: g.level.worlds.min_bounds[1],
         cracks: Default::default(),
+                bridge: false,
     };
     // GDL_NAV_NODES=r: the nav nodes within r of the target and their edges.
     if let Some(r) = std::env::var("GDL_NAV_NODES").ok().and_then(|v| v.parse::<f32>().ok()) {

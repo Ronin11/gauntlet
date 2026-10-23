@@ -10,7 +10,13 @@ use crate::collision::Collision;
 use crate::game::{Entity, Game, Shape, PLAYER_HEIGHT, PLAYER_RADIUS, STAIR_RISE, STEP_HEIGHT};
 use glam::{Vec2, Vec3};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
+
+/// Maps and sets with a fixed hasher: the runner's choices (and so its
+/// runs) come out the same every time.
+pub type Fixed = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+pub type HashMap<K, V> = std::collections::HashMap<K, V, Fixed>;
+pub type HashSet<K> = std::collections::HashSet<K, Fixed>;
 
 /// Grid spacing of the floor samples.
 pub const CELL: f32 = 2.0;
@@ -75,6 +81,10 @@ pub struct WalkWorld<'a> {
     /// Where a step was refused for want of floor although floor goes on
     /// just beyond (a seam between floor objects narrower than a step).
     pub cracks: std::cell::RefCell<Vec<Vec3>>,
+    /// Analysis only (not the game's rule): a floor within half a unit of
+    /// the step counts, as the original's sphere-swept floor test
+    /// (FloorCollide with the hero's radius) would find it across a seam.
+    pub bridge: bool,
 }
 
 impl WalkWorld<'_> {
@@ -138,7 +148,17 @@ impl WalkWorld<'_> {
         let col = self.col;
         let p = h.pos;
         let target = p + Vec3::new(dir.x, 0.0, dir.y) * s;
-        let probe = col.ground_hit(target, p.y + STEP_HEIGHT);
+        let mut probe = col.ground_hit(target, p.y + STEP_HEIGHT);
+        if probe.is_none() && self.bridge {
+            let side = Vec3::new(-dir.y, 0.0, dir.x);
+            let fwd = Vec3::new(dir.x, 0.0, dir.y);
+            for o in [fwd * 0.5, fwd * -0.5, side * 0.5, side * -0.5, fwd * 0.25, fwd * -0.25] {
+                if let Some(h) = col.ground_hit(target + o, p.y + STEP_HEIGHT) {
+                    probe = Some(h);
+                    break;
+                }
+            }
+        }
         let under = col.ground_hit(p, p.y + 0.1).map(|(_, o)| o);
         let ok = probe.is_some_and(|(g, o)| {
             p.y - g <= STAIR_RISE + if Some(o) == under { 1.0 } else { 0.0 }
@@ -167,7 +187,10 @@ impl WalkWorld<'_> {
         // snap_to_ground.
         let mut vy = h.vy - 60.0 * DT;
         pos.y += vy * DT;
-        let g = col.ground_height(pos, pos.y + STEP_HEIGHT);
+        let mut g = col.ground_height(pos, pos.y + STEP_HEIGHT);
+        if g.is_none() && self.bridge && h.on_ground {
+            g = probe.map(|p| p.0).filter(|y| (pos.y - y).abs() < 1.5);
+        }
         let on_ground = match g {
             Some(g) if pos.y <= g || (pos.y - g < 0.3 && vy <= 0.0) => {
                 pos.y = g;
@@ -246,6 +269,8 @@ pub struct Nav {
     last_enabled: Vec<bool>,
     last_solids: HashMap<u64, Vec3>,
     pub ignore: HashSet<u64>,
+    /// See WalkWorld::bridge.
+    pub bridge: bool,
     min_y: f32,
     /// Floor seams that stopped an edge walk (see WalkWorld::cracks).
     pub cracks: Vec<Vec3>,
@@ -284,14 +309,15 @@ impl Nav {
             nx,
             nz,
             nodes: Vec::new(),
-            cells: HashMap::new(),
+            cells: HashMap::default(),
             edges: Vec::new(),
-            blocked: HashMap::new(),
+            blocked: HashMap::default(),
             pads: Vec::new(),
             last_verts: g.collision.tris.iter().map(|t| t.v).collect(),
             last_enabled: g.collision.enabled.clone(),
             last_solids: solid_set(g),
-            ignore: HashSet::new(),
+            ignore: HashSet::default(),
+            bridge: false,
             min_y: w.min_bounds[1],
             cracks: Vec::new(),
             checks: 0,
@@ -333,6 +359,7 @@ impl Nav {
             ignore: &self.ignore,
             min_y: self.min_y,
             cracks: Default::default(),
+            bridge: self.bridge,
         }
     }
 
@@ -545,7 +572,7 @@ impl Nav {
             if self.streak.len() != col.tris.len() {
                 self.streak = vec![0; col.tris.len()];
             }
-            let mut per: HashMap<i32, (Vec2, Vec2, bool)> = HashMap::new();
+            let mut per: HashMap<i32, (Vec2, Vec2, bool)> = HashMap::default();
             let mut changed: Vec<usize> = Vec::new();
             for (i, t) in col.tris.iter().enumerate() {
                 let was = &self.last_verts[i];
@@ -669,8 +696,8 @@ impl Nav {
                 .fold(f32::MAX, f32::min)
         };
         let mut open = BinaryHeap::new();
-        let mut came: HashMap<u32, (u32, f32)> = HashMap::new();
-        let mut closed: HashSet<u32> = HashSet::new();
+        let mut came: HashMap<u32, (u32, f32)> = HashMap::default();
+        let mut closed: HashSet<u32> = HashSet::default();
         came.insert(start, (u32::MAX, 0.0));
         open.push(Open {
             f: h(self.nodes[start as usize].pos),
@@ -720,7 +747,7 @@ impl Nav {
 
     /// Every node reachable from `start` (up to `max`).
     pub fn reachable(&mut self, g: &Game, start: u32, max: usize) -> HashSet<u32> {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut stack = vec![start];
         seen.insert(start);
         while let Some(n) = stack.pop() {
