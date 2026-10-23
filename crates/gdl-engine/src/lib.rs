@@ -36,6 +36,7 @@ pub mod save;
 pub mod scene;
 pub mod screen;
 pub mod select;
+pub mod shadow;
 pub mod shop;
 pub mod stats;
 pub mod texanim;

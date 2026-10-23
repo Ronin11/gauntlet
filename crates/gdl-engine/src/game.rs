@@ -945,6 +945,8 @@ pub struct MonsterClass {
     pub etype: usize,
     /// <PREFIX>_ARROW, _BOMB and _FBALL missile models.
     missiles: [Option<usize>; 3],
+    /// SetEnemyObj's SHADOW1L1..SHADOW3L1 (lbl_8011BFF8), by tier.
+    pub(crate) shadows: [Option<usize>; 3],
 }
 
 impl MonsterClass {
@@ -978,6 +980,9 @@ pub struct Game {
     pub models: Vec<Model>,
     pub player_seqs: Vec<PlayerSeqs>,
     monster_seqs: HashMap<usize, MonsterSeqs>,
+    /// A hero's or critter's shadow object (load_player_geo's SHADOWL1,
+    /// CritterInitGeo's SHADOW<n>L1), by its body model.
+    pub(crate) shadow_models: HashMap<usize, usize>,
     pub classes: Vec<MonsterClass>,
     pub players: Vec<Player>,
     pub entities: Vec<Entity>,
@@ -1571,6 +1576,7 @@ impl Game {
             models: Vec::new(),
             player_seqs: Vec::new(),
             monster_seqs: HashMap::new(),
+            shadow_models: HashMap::new(),
             classes: Vec::new(),
             players: Vec::new(),
             entities: Vec::new(),
@@ -1713,6 +1719,13 @@ impl Game {
                     .unwrap_or_default(),
             );
             game.models.push(m);
+        }
+        // load_player_geo: each hero's SHADOWL1, from its own model bank.
+        for (i, (class, color)) in classes.iter().enumerate() {
+            if let Some(m) = crate::shadow::load_player(fs, class, color) {
+                let idx = game.add_model(m);
+                game.shadow_models.insert(i, idx);
+            }
         }
         let starts = game.level.start_positions();
         let _ = &starts;
@@ -1952,12 +1965,19 @@ impl Game {
                 .filter(|m| !m.mesh.indices.is_empty())
                 .map(|m| self.add_model(m));
         }
+        let mut shadows = [None; 3];
+        for (slot, name) in crate::shadow::ENEMY_SHADOWS.iter().enumerate() {
+            if let Some(m) = crate::shadow::load(&asset.objects, &asset.textures, name) {
+                shadows[slot] = Some(self.add_model(m));
+            }
+        }
         self.classes.push(MonsterClass {
             name: dir,
             models,
             gen_models,
             etype,
             missiles,
+            shadows,
         });
         Some(self.classes.len() - 1)
     }

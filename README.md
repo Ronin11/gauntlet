@@ -134,7 +134,7 @@ gauntlet --snapshot out.png --simulate 600 --bot   # headless test run + screens
 ```
 
 Headless test hooks (environment variables): `GDL_MUTE=1` (no audio), `GDL_FUZZ=seed`
-(random inputs), `GDL_LEGEND=1` (the party holds the realm's Item of Legend), `GDL_INV=1`
+(random inputs), `GDL_LEGEND=1` (the party holds the realm's Item of Legend), `GDL_INV=1`, `GDL_PUP=9:80,lvl:85` (power-ups switched on by type:hex flags, hero level)
 (power-up inventory), `GDL_SUMNER=welcome|runes=..|shards=..|exp=N`, `GDL_FLYBY=1`,
 `GDL_NO_BOSS_CAMERA=1`, `GDL_DEBUG_CAM=1`.
 

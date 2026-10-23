@@ -210,8 +210,15 @@ impl Collision {
 
     /// The highest floor and its triangle's owner.
     pub fn ground_hit(&self, pos: Vec3, max_y: f32) -> Option<(f32, i32)> {
+        self.ground_tri(pos, max_y)
+            .map(|(y, i)| (y, self.tris[i].owner))
+    }
+
+    /// [`Collision::ground_hit`], giving the floor triangle's index (its
+    /// normal is `tris[i].n`).
+    pub fn ground_tri(&self, pos: Vec3, max_y: f32) -> Option<(f32, usize)> {
         let p = Vec2::new(pos.x, pos.z);
-        let mut best: Option<(f32, i32)> = None;
+        let mut best: Option<(f32, usize)> = None;
         for i in self.cells_around(p, 0.0) {
             let t = &self.tris[i as usize];
             if t.n.y < FLOOR_NY || !point_in_tri_xz(p, t) {
@@ -220,7 +227,7 @@ impl Collision {
             // Plane: n . (x - v0) = 0 -> y = v0.y - (n.x (x - v0.x) + n.z (z - v0.z)) / n.y
             let y = t.v[0].y - (t.n.x * (p.x - t.v[0].x) + t.n.z * (p.y - t.v[0].z)) / t.n.y;
             if y <= max_y && best.is_none_or(|b| y > b.0) {
-                best = Some((y, t.owner));
+                best = Some((y, i as usize));
             }
         }
         best
