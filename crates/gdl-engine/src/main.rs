@@ -459,7 +459,8 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 None => inp,
             })
             .collect();
-        // GDL_FX=<row|GENHIT|GENDIE>[:frame]: start an effect in front of
+        // GDL_FX=<row|GENHIT|GENDIE|EXP<type>>[:frame]: start an effect (or
+        // a StartExplosion) in front of
         // player 0 (default on the first frame).
         if let Ok(v) = std::env::var("GDL_FX") {
             let (what, at) = v.split_once(':').unwrap_or((&v, "1"));

@@ -274,6 +274,18 @@ impl Game {
     /// Testing aid (GDL_FX): start effect row `what` (a number, or GENHIT /
     /// GENDIE of the first monster type that has one) 4 ahead of player 0.
     pub fn debug_fx(&mut self, what: &str) -> bool {
+        // EXP<type>: StartExplosion of that type (25 the poison barrel) 6
+        // ahead on the floor, with its damage (10 x trap_damage).
+        if let Some(ty) = what
+            .strip_prefix("EXP")
+            .and_then(|t| t.parse::<usize>().ok())
+        {
+            let p = &self.players[0];
+            let at = p.pos + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * 6.0;
+            let dmg = 10.0 * self.tuning.trap_damage;
+            self.start_explosion(at, ty, dmg);
+            return true;
+        }
         let row = match what {
             "GENHIT" => self.effects.hitfx.iter().copied().find(|&r| r >= 0),
             "GENDIE" => self.effects.deathfx.iter().copied().find(|&r| r >= 0),
