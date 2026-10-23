@@ -64,12 +64,14 @@ applies, B goes back a page, Esc or F1 closes. Pages:
   hidden skin (the level reloads).
 - **Level**: kill every monster, destroy every generator, kill the boss, finish the
   level, X-ray and Compass.
+- **Save / load state**: save the running level to slot 1-3, or load slot 1-3 or the
+  autosave (also from the title screen). See below.
 
 - **File bug report**: optionally tick quick tags with A or left/right ("stuck", "can't
   reach", "wrong look", "wrong sound", "crash-ish", "other"), then **Save bug report now**.
   The menu answers "Bug report saved: <folder>".
 
-`gauntlet --screen debug[:main|warp|progress|unlocks|party|level|bug[:row]] --snapshot out.png`
+`gauntlet --screen debug[:main|warp|progress|unlocks|party|level|bug|states[:row]] --snapshot out.png`
 renders it headless over `--level`.
 
 ### Bug reports
@@ -100,6 +102,52 @@ and to the app's external files folder on Android, pulled with
 Headless: `GDL_BUGREPORT=<frame> [GDL_BUGTAGS=stuck,other] gauntlet --level levelA1 --bot
 --simulate 3000 --snapshot out.png` stops the simulation at that frame and files a report
 (the snapshot is its screenshot).
+
+## Save states (developer tool)
+
+Not part of the original: a quick save for testing that a **new build** can load, so a
+fix can be swapped in and play continued where it was. The easy path:
+
+```sh
+# play; quit the game (close the window, Esc on the title, or Quit Level / Quit Game)
+cargo build --release
+target/release/gauntlet --load-state autosave
+```
+
+The `autosave` slot is written when a level is quit or the game is closed from a level,
+and every minute of play. The debug menu's **Save / load state** page writes and reads
+slots `1`-`3`. `--load-state` takes a slot name or a `.state` file; states live in
+`$XDG_DATA_HOME/gauntlet-rs/states/` (`~/.local/share/gauntlet-rs/states/`; on Android
+the app's files folder). The file is plain text, so it can be read and edited.
+
+A state is not a byte-exact snapshot: loading starts the level fresh and applies what
+changed, matching placed items by their instance in the level file (not by code-made
+ids), so it survives code changes. Unknown or missing fields are ignored or defaulted.
+
+- **Kept**: the level and difficulty; each hero's slot, controller (by pad order),
+  class, colour, skin, name, level, experience, shop bonuses, health, turbo, gold, keys,
+  potions, power-ups (with time left and on/off), inventory box, totals, place and
+  facing; the progress (levels beaten, runes, shards, crystals, gargoyle items, legend
+  weapons, Sumner's bank); placed items taken, broken or opened (doors, chests,
+  barrels, killed placed monsters, destroyed generators) with their collision;
+  placed monsters' and generators' health, tier and place; triggers pressed; trigger
+  targets (elevators, bridges, gates) on/off and height; world animations' frames and
+  rotators' turns; items lying loose; the level clock. A hero saved inside geometry
+  is moved to the nearest floor.
+- **Not kept**: monsters made by generators (the generators make new ones), missiles
+  and effects, monster AI and critter (golem, boss) health, exits half open, fallen
+  rocks, the camera (it starts on the heroes), messages already seen in the level, and
+  the level a secret level was entered from (a state saved in a secret level loads
+  just that secret level).
+
+Headless: `--save-state [N:]<slot|file>` (or `GDL_SAVE_STATE`) saves during
+`--simulate` on frame N (default: at the end), and `--load-state` starts the snapshot
+from a state, e.g.
+
+```sh
+GDL_MUTE=1 gauntlet --level levelA1 --bot --simulate 3600 --save-state a1.state --snapshot a.png
+GDL_MUTE=1 gauntlet --load-state a1.state --simulate 2 --snapshot b.png
+```
 
 ## Android / tablets
 

@@ -1,6 +1,6 @@
 use gdl_engine::{
-    app, audio, character, fs, game, gpu, hud, input, mapscreen, menu, options, progress, scene,
-    screen, select, shop, stats, ui,
+    app, audio, character, fs, game, gpu, hud, input, mapscreen, menu, options, progress,
+    savestate, scene, screen, select, shop, stats, ui,
 };
 
 use anyhow::{Context, Result};
@@ -30,6 +30,11 @@ struct Args {
     legend: bool,
     bot: bool,
     mute: bool,
+    /// --load-state: a debug save state (slot name or file) to start from.
+    load_state: Option<String>,
+    /// --save-state / GDL_SAVE_STATE: [frame:]slot-or-file to save during
+    /// --simulate (at the end without a frame).
+    save_state: Option<String>,
 }
 
 fn parse_vec3(s: &str) -> Result<Vec3> {
@@ -60,7 +65,7 @@ Testing:
   --snapshot <png>      Render one frame headless and exit
   --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
                         select:load|save|result|char (memory card screens),
-                        debug[:main|warp|progress|unlocks|party|level|bug[:row]]
+                        debug[:main|warp|progress|unlocks|party|level|bug|states[:row]]
                         (the developer debug menu over --level),
                         map:<level>[:ticks] (e.g. map:A6:300),
                         shop[:after|menu|inv|final[:ticks[:events]]] with a fake
@@ -77,6 +82,10 @@ Testing:
   --kill-boss-at <f>    Boss levels: the boss dies on that frame (its death, the
                         coins and the good wizard follow)
   --legend              Boss levels: the party carries this boss's legend weapon
+  --load-state <s>      Start from a debug save state: a slot (1, 2, 3, autosave)
+                        or a .state file; works with and without --snapshot
+  --save-state [N:]<s>  With --snapshot: save a state on simulated frame N (default:
+                        after the simulation) to slot or file <s> (GDL_SAVE_STATE)
   --char CLASS/COLOR    Snapshot a single character (or monster/NAME)
   --seq NAME --frame F  Animation sequence and frame for --char
   --eye x,y,z --at x,y,z --size WxH   Snapshot camera";
@@ -104,6 +113,10 @@ fn parse_args() -> Result<Args> {
         legend: false,
         bot: false,
         mute: std::env::var_os("GDL_MUTE").is_some(),
+        load_state: None,
+        save_state: std::env::var("GDL_SAVE_STATE")
+            .ok()
+            .filter(|v| !v.is_empty()),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -137,6 +150,8 @@ fn parse_args() -> Result<Args> {
             "--kill-boss-at" => a.kill_boss_at = Some(val()?.parse()?),
             "--legend" => a.legend = true,
             "--bot" => a.bot = true,
+            "--load-state" => a.load_state = Some(val()?),
+            "--save-state" => a.save_state = Some(val()?),
             "--mute" => a.mute = true,
             "--hold" => {
                 let v = val()?;
@@ -259,7 +274,30 @@ fn snapshot_game(args: &Args) -> Result<()> {
         .iter()
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
-    let mut g = game::Game::new(&fs, &args.level, &classes)?;
+    let save_dir = gdl_engine::save::MemCard::default_dir();
+    let mut g = match &args.load_state {
+        Some(spec) => {
+            let path = savestate::resolve(spec, save_dir.as_deref());
+            let st = savestate::SaveState::read(&path)?;
+            println!("loaded state {}: {}", path.display(), st.summary());
+            st.load_game(&fs)?
+        }
+        None => game::Game::new(&fs, &args.level, &classes)?,
+    };
+    // --save-state [frame:]spec: when, and where to.
+    let save_at: Option<(Option<u32>, PathBuf)> = args.save_state.as_ref().map(|v| {
+        let (f, spec) = match v.split_once(':') {
+            Some((f, s)) if f.parse::<u32>().is_ok() => (f.parse().ok(), s),
+            _ => (None, v.as_str()),
+        };
+        (f, savestate::resolve(spec, save_dir.as_deref()))
+    });
+    let save_state = |g: &game::Game, path: &PathBuf| -> Result<()> {
+        let st = savestate::SaveState::capture(g, &[], &[], &[], &progress::Progress::default());
+        st.write(path)?;
+        println!("saved state {}: {}", path.display(), st.summary());
+        Ok(())
+    };
     if std::env::var("GDL_DEBUG_DOORS").is_ok() {
         for e in &g.entities {
             if let game::Kind::Door { .. } | game::Kind::Trigger { .. } = e.kind {
@@ -428,6 +466,11 @@ fn snapshot_game(args: &Args) -> Result<()> {
     let mut bugs = gdl_engine::bugreport::Recorder::new();
     gdl_engine::bugreport::use_tick_clock();
     for f in 0..simulate {
+        if let Some((Some(at), path)) = &save_at {
+            if *at == f {
+                save_state(&g, path)?;
+            }
+        }
         if let Some(cam) = &mut flyby {
             if f % 2 == 1 {
                 cam.update(2);
@@ -520,6 +563,9 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 g.stats()
             );
         }
+    }
+    if let Some((None, path)) = &save_at {
+        save_state(&g, path)?;
     }
     // Debugging aid: GDL_HIDE=OBJ1,OBJ2 leaves world objects out of the render.
     if let Ok(list) = std::env::var("GDL_HIDE") {
@@ -757,6 +803,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 "party" => Page::Party,
                 "level" => Page::Level,
                 "bug" => Page::Bug,
+                "states" => Page::States,
                 p => anyhow::bail!("--screen debug: unknown page {p}"),
             };
             let row: usize = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -1030,6 +1077,7 @@ fn main() -> Result<()> {
         players: args.players,
         mute: args.mute,
         save_dir: gdl_engine::save::MemCard::default_dir(),
+        load_state: args.load_state,
     })
 }
 

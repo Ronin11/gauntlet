@@ -267,6 +267,50 @@ impl WorldAnims {
         }
     }
 
+    /// A debug save state's view of the world machinery (savestate.rs):
+    /// each animation's object, state and frame, and each rotator's target,
+    /// turn so far, set-off / done and node matrix.
+    pub fn save_state(&self) -> (Vec<(usize, u16, f32)>, Vec<(usize, f32, bool, bool, Mat4)>) {
+        let anims = self
+            .anims
+            .iter()
+            .map(|a| (a.obj, a.state, a.curframe))
+            .collect();
+        let rots = self
+            .rotators
+            .iter()
+            .map(|r| (r.target, r.curang, r.on, r.done, self.node[r.target]))
+            .collect();
+        (anims, rots)
+    }
+
+    /// Put an animation (by its object) back at a saved state and frame.
+    pub fn restore_anim(&mut self, obj: usize, state: u16, curframe: f32) {
+        if let Some(a) = self.anims.iter_mut().find(|a| a.obj == obj) {
+            a.state = state;
+            a.curframe = curframe.clamp(0.0, (a.nframes.max(1) - 1) as f32);
+        }
+    }
+
+    /// Put a rotator (by its target) back at a saved turn and node matrix.
+    pub fn restore_rotator(
+        &mut self,
+        target: usize,
+        curang: f32,
+        on: bool,
+        done: bool,
+        node: Mat4,
+    ) {
+        if let Some(r) = self.rotators.iter_mut().find(|r| r.target == target) {
+            r.curang = curang;
+            r.on = on;
+            r.done = done;
+            if let Some(n) = self.node.get_mut(target) {
+                *n = node;
+            }
+        }
+    }
+
     /// Whether world object `o` has an animation (FindWobjWanim).
     pub fn has_anim(&self, o: usize) -> bool {
         self.anims.iter().any(|a| a.obj == o)
