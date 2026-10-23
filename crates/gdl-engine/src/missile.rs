@@ -71,6 +71,8 @@ pub const BOSS_ACID_MISSILE_INFO: MissileInfo = MissileInfo {
 pub const POJO_AIM: [f32; 3] = [0.0, -0.5, -1.25];
 
 /// DMG_TYPE bits PlayerStartMissile tests.
+/// (effect.h) An explosion: items are reached 1.5 short of it.
+pub const DMG_EXPLODE: u32 = 0x400;
 pub const DMG_3WAY: u32 = 0x80000;
 pub const DMG_SUPER: u32 = 0x100000;
 pub const DMG_REFLECT: u32 = 0x200000;

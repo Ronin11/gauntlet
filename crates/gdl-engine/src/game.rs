@@ -4752,6 +4752,10 @@ impl Game {
             let q = Vec2::new(e.pos.x, e.pos.z);
             let ab = b - a;
             let k = ((q - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            if matches!(e.kind, Kind::Generator { .. }) {
+                // fn_8005F0F4 against the generator's info cylinder.
+                return self.hits_item_cylinder(e, pt0 + (pt1 - pt0) * k, r, r);
+            }
             (a + ab * k).distance(q) < reach + r && (e.pos.y + 2.0 - hand.y).abs() < 3.5
         });
         if let Some(i) = item {
@@ -4876,6 +4880,34 @@ impl Game {
             Kind::Critter(c) if c.hittable() => Some(c.wad.types[c.parts[0].ty].rad),
             _ => None,
         }
+    }
+
+    /// A generator's collision cylinder (fn_8005F0F4, coltype 1): its
+    /// coll_pos (the placement plus the info's collision offset), the info's
+    /// radius and height. None for anything else.
+    pub(crate) fn item_cylinder(&self, e: &Entity) -> Option<(Vec3, f32, f32)> {
+        if !matches!(e.kind, Kind::Generator { .. }) {
+            return None;
+        }
+        let info = self
+            .items
+            .info
+            .get(&e.id)
+            .and_then(|&i| self.level.worlds.item_infos.get(i));
+        Some(match info {
+            Some(i) => (e.pos + Vec3::from(i.coll_offset), i.radius, i.height),
+            None => (e.pos, Self::target_radius(e).unwrap_or(1.0), 5.0),
+        })
+    }
+
+    /// fn_8005F0F4 for a missile or effect of radius `r` at `p`: inside the
+    /// item's cylinder widened by `r` across, and within its height plus
+    /// `b` of its coll_pos up and down.
+    pub(crate) fn hits_item_cylinder(&self, e: &Entity, p: Vec3, r: f32, b: f32) -> bool {
+        let Some((c, rad, h)) = self.item_cylinder(e) else {
+            return false;
+        };
+        Vec2::new(c.x - p.x, c.z - p.z).length() <= r + rad && (p.y - c.y).abs() <= h + b
     }
 
     /// Where an attack from `from` aims at entity `e`: the point and its
@@ -5442,6 +5474,26 @@ impl Game {
                     && !self.damg_cooldown.contains_key(&(pi, e.id))
             })
             .filter_map(|(i, e)| {
+                // ProcessEffects' item pass (sfx.c:3297): a generator is
+                // reached across its info radius (less 1.5 for DMG_EXPLODE)
+                // and must be within its cylinder's height of the effect
+                // (fn_8005F0F4); poison gas does it no harm (fn_8005C1DC).
+                if let Some((c, rad, _)) = self.item_cylinder(e) {
+                    let reach = if row.dmgtype & m::DMG_EXPLODE != 0 {
+                        (row.radius - 1.5).max(0.0)
+                    } else {
+                        row.radius
+                    };
+                    let d = Vec2::new(c.x - at.x, c.z - at.z);
+                    let n = d.normalize_or_zero();
+                    let in_arc = row.arc == 0.0 || n.dot(Vec2::new(fwd.x, fwd.z)) >= row.arc;
+                    let hit = reach > 0.0
+                        && row.dmgtype & DmgType::POISON_GAS == 0
+                        && d.length() <= reach + rad
+                        && in_arc
+                        && self.hits_item_cylinder(e, at, reach, reach);
+                    return hit.then_some((i, n));
+                }
                 let (pt, r) = match &e.kind {
                     Kind::Critter(_) => Self::aim_point(e, at)?,
                     _ => (e.pos, 0.0),
@@ -7862,12 +7914,16 @@ impl Game {
                         && flat < mr + ty.radius
                         && (e.pos.y + hht - ppos.y).abs() < mr + hht;
                 }
-                let r = match &e.kind {
-                    Kind::Generator { .. } => 2.2,
-                    Kind::Container { chest: false, .. } => 1.6,
-                    _ => return false,
-                };
-                e.alive && flat < r && (e.pos.y + 2.0 - ppos.y).abs() < 3.5
+                // fn_8005ED44 / fn_8005F0F4: a generator within the missile's
+                // radius of its info cylinder (so a turbo wave's hitrad 10
+                // reaches it as it does monsters).
+                match &e.kind {
+                    Kind::Generator { .. } => e.alive && self.hits_item_cylinder(e, ppos, mr, mr),
+                    Kind::Container { chest: false, .. } => {
+                        e.alive && flat < 1.6 && (e.pos.y + 2.0 - ppos.y).abs() < 3.5
+                    }
+                    _ => false,
+                }
             });
             if let Some(t) = target {
                 if matches!(self.entities[t].kind, Kind::Pickup { .. }) {
@@ -10217,6 +10273,100 @@ mod tests {
         let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
         assert!(dirs[0].dot(fwd).abs() < 0.05, "first goes out sideways");
         assert!(dirs.last().unwrap().dot(fwd) > 0.9, "last nearly ahead");
+    }
+
+    /// levelA1 with only its first tier-3 generator, moved to `at` from the
+    /// settled hero (who faces +z), with `hp` health.
+    fn hero_and_generator(fs: &GameFs, class: &str, at: Vec3, hp: f32) -> (Game, u64) {
+        let mut g = Game::new(fs, "levelA1", &[(class, "RED")]).unwrap();
+        let gid = g
+            .entities
+            .iter()
+            .find(|e| matches!(e.kind, Kind::Generator { strength: 3, .. }))
+            .map(|e| e.id)
+            .unwrap();
+        g.entities.retain(|e| e.id == gid);
+        g.pending_enemies.clear();
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = g.players[0].pos;
+        let e = g.entities.iter_mut().find(|e| e.id == gid).unwrap();
+        e.pos = p + at;
+        if let Kind::Generator { hp: h, timer, .. } = &mut e.kind {
+            *h = hp;
+            // (It spawns nothing in the way.)
+            *timer = 1e9;
+        }
+        g.players[0].yaw = 0.0;
+        (g, gid)
+    }
+
+    fn generator_hp(g: &Game, id: u64) -> Option<f32> {
+        g.entities
+            .iter()
+            .find(|e| e.id == id && e.alive)
+            .map(|e| match e.kind {
+                Kind::Generator { hp, .. } => hp,
+                _ => unreachable!(),
+            })
+    }
+
+    /// The turbo moves reach generators across the generator's radius
+    /// (fn_8005F0F4, rad 2 h 5): the turbo-C wave (hitrad 10) as it does
+    /// monsters, from any class's launch height, and the PWRB / PWRC blasts
+    /// out to their radius plus 2. Played through the pad, B held + A wrecks
+    /// a tier-3 generator beside the hero.
+    #[test]
+    fn turbo_moves_hurt_generators() {
+        let Some(fs) = data() else { return };
+        // The wave passing 6 to the side (outside the old 2.2), for the
+        // Jester's launched 6 up too.
+        for class in ["WAR", "JES"] {
+            let (mut g, gid) = hero_and_generator(&fs, class, Vec3::new(6.0, 0.0, 14.0), 1000.0);
+            let row = g.pdata[0].damage[g.pdata[0].rows.turbo_c2 as usize].clone();
+            assert_eq!((row.kind, row.hitrad), (2, 10.0));
+            let sf = row.startframe as f32;
+            g.fire_damage_row(0, &row, sf - 1.0, sf, None);
+            for _ in 0..60 {
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            }
+            let hp = generator_hp(&g, gid).unwrap();
+            assert!(
+                hp < 1000.0 - row.amount * 0.9,
+                "{class}: the wave missed ({hp})"
+            );
+        }
+        // PWRB (radius 12) reaches a generator 13 away; one 15 away is out.
+        for (d, hit) in [(13.0, true), (15.0, false)] {
+            let (mut g, gid) = hero_and_generator(&fs, "WAR", Vec3::new(0.0, 0.0, d), 1000.0);
+            let row = g.pdata[0].damage[g.pdata[0].rows.turbo_b as usize].clone();
+            assert_eq!(row.radius, 12.0);
+            g.fire_damage_row(0, &row, -1.0, 0.0, None);
+            let hurt = generator_hp(&g, gid).unwrap() < 1000.0;
+            assert_eq!(hurt, hit, "PWRB at {d}");
+        }
+        // The pad: B held, A pressed, the generator 4 ahead.
+        use crate::paction::p as pa;
+        for (power, act) in [(100.0, pa::PWRC), (50.0, pa::PWRB)] {
+            let (mut g, gid) = hero_and_generator(&fs, "WAR", Vec3::new(0.5, 0.0, 4.0), 30.0);
+            g.players[0].power = power;
+            let mut acts = Vec::new();
+            for f in 0..90 {
+                let inp = PlayerInput {
+                    turbo: f < 10,
+                    attack: f == 5,
+                    attack_pressed: f == 5,
+                    ..Default::default()
+                };
+                g.update(1.0 / 60.0, &[inp]);
+                acts.push(g.players[0].act.cur);
+            }
+            assert!(acts.contains(&act), "turbo move {act} played");
+            assert!(g.players[0].power < power, "the meter was spent");
+            assert_eq!(generator_hp(&g, gid), None, "turbo {act} destroyed it");
+            assert_eq!(g.players[0].stats.generators_destroyed, 1);
+        }
     }
 
     #[test]

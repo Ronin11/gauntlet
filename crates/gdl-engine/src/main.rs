@@ -25,6 +25,9 @@ struct Args {
     hold: Vec2,
     attack_at: Vec<u32>,
     block_at: Option<u32>,
+    turbo_at: Option<u32>,
+    power: Option<f32>,
+    yaw: Option<f32>,
     magic_at: Option<u32>,
     kill_boss_at: Option<u32>,
     legend: bool,
@@ -78,6 +81,12 @@ Testing:
   --attack-at <f,...>   Press attack on those frames (a comma list)
   --block-at <frame>    Press B (block) on that frame and hold it after
   --magic-at <frame>    Use a potion on that frame (one is given if none)
+  --turbo-at <frame>    Hold turbo (B) around that frame and press attack on it:
+                        the turbo move (PWRB at 40+ meter, PWRC at 100)
+  --power <n>           Player 0's turbo meter at the start (e.g. 50 or 100)
+  --yaw <radians>       Player 0's facing at the start (0 faces +z)
+                        (GDL_GENS=1 prints the generators near player 0 as
+                        their health changes)
   --bot                 Let a simple bot play every player during simulation
   --kill-boss-at <f>    Boss levels: the boss dies on that frame (its death, the
                         coins and the good wizard follow)
@@ -108,6 +117,9 @@ fn parse_args() -> Result<Args> {
         hold: Vec2::ZERO,
         attack_at: Vec::new(),
         block_at: None,
+        turbo_at: None,
+        power: None,
+        yaw: None,
         magic_at: None,
         kill_boss_at: None,
         legend: false,
@@ -147,6 +159,9 @@ fn parse_args() -> Result<Args> {
             }
             "--block-at" => a.block_at = Some(val()?.parse()?),
             "--magic-at" => a.magic_at = Some(val()?.parse()?),
+            "--turbo-at" => a.turbo_at = Some(val()?.parse()?),
+            "--power" => a.power = Some(val()?.parse()?),
+            "--yaw" => a.yaw = Some(val()?.parse()?),
             "--kill-boss-at" => a.kill_boss_at = Some(val()?.parse()?),
             "--legend" => a.legend = true,
             "--bot" => a.bot = true,
@@ -347,6 +362,31 @@ fn snapshot_game(args: &Args) -> Result<()> {
         g.players[0].pos = p;
         g.cam_focus = p;
     }
+    if let Some(y) = args.yaw {
+        g.players[0].yaw = y;
+    }
+    if let Some(n) = args.power {
+        g.players[0].power = n;
+    }
+    let gen_log = std::env::var_os("GDL_GENS").is_some();
+    let gens_near = |g: &game::Game| -> Vec<(u64, f32, usize, bool)> {
+        let p = g.players[0].pos;
+        g.entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                game::Kind::Generator { hp, strength, .. } if (e.pos - p).length() < 20.0 => {
+                    Some((e.id, *hp, *strength, e.alive))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut gens_seen = gens_near(&g);
+    if gen_log {
+        for (id, hp, tier, alive) in &gens_seen {
+            println!("t=0 generator {id}: hp {hp:.1} tier {tier} alive {alive}");
+        }
+    }
     // GDL_LEGEND=1: the party holds this realm's Item of Legend.
     if std::env::var_os("GDL_LEGEND").is_some() {
         let realm = g.wave.map_or(0, |w| w >> 8);
@@ -507,11 +547,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 }
             }
         }
+        let turbo = args.turbo_at.is_some_and(|t| f + 5 >= t && f <= t + 5);
+        let turbo_press = args.turbo_at == Some(f);
         let inp = input::PlayerInput {
             stick: args.hold,
-            attack_pressed: args.attack_at.contains(&f),
+            attack: turbo_press,
+            attack_pressed: args.attack_at.contains(&f) || turbo_press,
             // --block-at F: press B (block) on frame F and hold it after.
-            turbo: args.block_at.is_some_and(|b| f >= b),
+            turbo: turbo || args.block_at.is_some_and(|b| f >= b),
             b_pressed: args.block_at == Some(f),
             magic: args.magic_at == Some(f),
             magic_pressed: args.magic_at == Some(f),
@@ -549,6 +592,23 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
         }
         sfx_seen.extend(g.sfx.drain(..));
+        if gen_log {
+            let now = gens_near(&g);
+            for (id, hp, tier, alive) in &now {
+                if !gens_seen.iter().any(|s| s == &(*id, *hp, *tier, *alive)) {
+                    println!(
+                        "t={f} generator {id}: hp {hp:.1} tier {tier} alive {alive} (hero act {}, turbo {:.0})",
+                        g.players[0].act.cur, g.players[0].power
+                    );
+                }
+            }
+            for (id, ..) in &gens_seen {
+                if !g.entities.iter().any(|e| e.id == *id) {
+                    println!("t={f} generator {id}: destroyed");
+                }
+            }
+            gens_seen = now;
+        }
         if f % 600 == 0 {
             let p = &g.players[0];
             println!(
