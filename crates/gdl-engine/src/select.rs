@@ -855,18 +855,16 @@ impl Select {
                     _ => {}
                 }
             }
-            State::Selecting(Motion::CardLoad) => match ev(sfx, p.menu.update(inp, 1, true)) {
-                Event::Back => p.back_to_save(),
-                // setup_file_entries(pl, 1): no Gauntlet file is "no data".
-                Event::Chose(ENTRY) if card.has_save_file() => {
-                    p.goto_files(Motion::PickLoad, &card.names(), &claimed, true)
-                }
-                Event::Chose(ENTRY) => {
-                    p.state = State::Selecting(Motion::NoData);
-                    p.step = 1;
-                }
-                _ => {}
-            },
+            // Not in the original: no memory card list (" SLOT  1"), the one
+            // card is picked at once. setup_file_entries(pl, 1): no Gauntlet
+            // file is "no data".
+            State::Selecting(Motion::CardLoad) if card.has_save_file() => {
+                p.goto_files(Motion::PickLoad, &card.names(), &claimed, true)
+            }
+            State::Selecting(Motion::CardLoad) => {
+                p.state = State::Selecting(Motion::NoData);
+                p.step = 1;
+            }
             State::Selecting(Motion::NoData) => {
                 p.step += 1;
                 if p.step >= 120 {
@@ -877,7 +875,7 @@ impl Select {
             State::Selecting(Motion::PickLoad) => {
                 p.file_enables(&card.names(), &claimed, true);
                 match ev(sfx, p.menu.update(inp, 1, true)) {
-                    Event::Back => p.goto_card(Motion::CardLoad),
+                    Event::Back => p.back_to_save(),
                     Event::Chose(c) if c >= ENTRY && !claimed.contains(&((c - ENTRY) as usize)) => {
                         p.state = State::Selecting(Motion::Loading);
                         p.save_file = (c - ENTRY) as usize;
@@ -921,18 +919,15 @@ impl Select {
                     }
                 }
             },
-            State::Selecting(Motion::CardSave) => match ev(sfx, p.menu.update(inp, 1, true)) {
-                Event::Back => p.back_to_save(),
-                Event::Chose(ENTRY) if card.has_save_file() => {
-                    p.goto_files(Motion::PickSave, &card.names(), &claimed, false)
-                }
-                Event::Chose(ENTRY) => {
-                    p.state = State::Selecting(Motion::Create);
-                    p.step = 0;
-                    p.yes_no();
-                }
-                _ => {}
-            },
+            // Not in the original: no card list, and the save file is
+            // created without asking.
+            State::Selecting(Motion::CardSave) if card.has_save_file() => {
+                p.goto_files(Motion::PickSave, &card.names(), &claimed, false)
+            }
+            State::Selecting(Motion::CardSave) => {
+                p.state = State::Selecting(Motion::Create);
+                p.step = 1;
+            }
             State::Selecting(Motion::Create) => match p.step {
                 0 => {
                     let mut e = p.menu.update(inp, 1, true);
@@ -941,7 +936,7 @@ impl Select {
                     }
                     match ev(sfx, e) {
                         Event::Chose(YES) => p.step = 1,
-                        Event::Chose(NO) | Event::Back => p.goto_card(Motion::CardSave),
+                        Event::Chose(NO) | Event::Back => p.back_to_save(),
                         _ => {}
                     }
                 }
@@ -963,11 +958,9 @@ impl Select {
                     }
                 }
                 t if t >= 0 => {
-                    p.step += 1;
-                    if p.step >= 120 {
-                        p.step = 0;
-                        p.goto_files(Motion::PickSave, &card.names(), &claimed, false);
-                    }
+                    // Not in the original: straight on to the file list.
+                    p.step = 0;
+                    p.goto_files(Motion::PickSave, &card.names(), &claimed, false);
                 }
                 _ => {
                     p.step -= 1;
@@ -980,7 +973,7 @@ impl Select {
             State::Selecting(Motion::PickSave) => {
                 p.file_enables(&card.names(), &claimed, false);
                 match ev(sfx, p.menu.update(inp, 1, true)) {
-                    Event::Back => p.goto_card(Motion::CardSave),
+                    Event::Back => p.back_to_save(),
                     Event::Chose(c) if c >= ENTRY && *debounce == 0 => {
                         let k = (c - ENTRY) as usize;
                         p.state = State::Selecting(Motion::Writing);
@@ -1585,34 +1578,9 @@ impl Player {
                 }
             }
         };
-        const DO_NOT_TOUCH: [Option<&str>; 5] = [
-            Some("Do not touch"),
-            Some("the POWER"),
-            Some("button"),
-            Some("or the"),
-            Some("Memory Card!"),
-        ];
-        let card_text = |s: &mut Scr| {
-            // Mode 10's text, 3 lines above the card list's y 70 (less 8).
-            let ls = [
-                "The",
-                "Memory",
-                "Card",
-                "in Slot A",
-                "will now be",
-                "accessed.",
-                "Do not touch",
-                "the",
-                "POWER Button",
-                "or the",
-                "Memory Card",
-            ];
-            lines(s, 70.0 - 8.0 - 30.0, &ls.map(Some));
-        };
         // Progress / result screens (modes 9, 12 and 14 past their prompts).
         let working = |s: &mut Scr, head: [&str; 3]| {
             lines(s, 100.0, &head.map(Some));
-            lines(s, 140.0, &DO_NOT_TOUCH);
         };
         match self.state {
             State::Selecting(Motion::Top) | State::Selecting(Motion::Character) => {
@@ -1646,13 +1614,9 @@ impl Player {
                 self.menu.draw(s, 0);
                 footer(s, x, false);
             }
-            State::Selecting(Motion::CardLoad) | State::Selecting(Motion::CardSave) => {
-                self.menu.draw(s, 0);
-                card_text(s);
-                footer(s, x, true);
-            }
+            State::Selecting(Motion::CardLoad) | State::Selecting(Motion::CardSave) => {}
             State::Selecting(Motion::NoData) => {
-                let ls = ["No Gauntlet", "save data on", "Memory", "Card."];
+                let ls = ["No saved", "heroes."];
                 lines(s, 100.0, &ls.map(Some));
                 footer(s, x, false);
             }
@@ -1672,7 +1636,7 @@ impl Player {
                 footer(s, x, true);
             }
             State::Selecting(Motion::Loading) => match self.step {
-                0..=3 => working(s, ["Loading from", "Memory", "Card..."]),
+                0..=3 => working(s, ["Loading...", "", ""]),
                 t if t >= 4 => lines(s, 100.0, &[Some("Load"), Some("Complete")]),
                 -1 => {}
                 _ => lines(s, 100.0, &[Some("Load"), Some("Failed!")]),
@@ -1689,7 +1653,7 @@ impl Player {
                     }
                     footer(s, x, false);
                 }
-                1..=3 => working(s, ["Writing to", "Memory", "Card..."]),
+                1..=3 => working(s, ["Saving...", "", ""]),
                 t if t >= 4 => lines(s, 100.0, &[Some("Save"), Some("Complete")]),
                 -1 => {}
                 _ => lines(s, 100.0, &[Some("Save"), Some("Failed!")]),
@@ -2047,28 +2011,16 @@ mod tests {
     }
 
     /// From the character menu (Done selected) up to Save, then through the
-    /// card list, the create prompt and the file list to a written file.
+    /// file list to a written file.
     fn save_to(sel: &mut Select, file: usize) {
         for _ in 0..4 {
             tick(sel, stick(0.0, 1.0));
         }
         assert_eq!(pl(sel, 0).menu.items[pl(sel, 0).menu.sel].code, SAVE);
         tick(sel, a());
-        assert_eq!(motion(sel, 0), State::Selecting(Motion::CardSave));
-        assert_eq!(pl(sel, 0).menu.items[0].text, " SLOT  1");
-        tick(sel, a());
-        if !sel.card.has_save_file() {
-            // "No Gauntlet save data ... Create 15 Blocks Save File?" No is
-            // preselected.
-            assert_eq!(motion(sel, 0), State::Selecting(Motion::Create));
-            assert_eq!(pl(sel, 0).menu.sel, 1);
-            tick(sel, stick(0.0, 1.0));
-            tick(sel, a());
-            assert!((1..4).contains(&pl(sel, 0).step), "Creating...");
-            idle(sel, 30);
-            assert!(sel.card.has_save_file());
-            assert!(pl(sel, 0).step >= 4, "Save File Created.");
-        }
+        // No card list or create prompt: the save file is made if missing.
+        idle(sel, 5);
+        assert!(sel.card.has_save_file());
         idle(sel, 35);
         assert_eq!(motion(sel, 0), State::Selecting(Motion::PickSave));
         for _ in 0..file {
@@ -2103,8 +2055,7 @@ mod tests {
         });
         tick(&mut sel, stick(0.0, -1.0));
         tick(&mut sel, a());
-        assert_eq!(motion(&sel, 0), State::Selecting(Motion::CardLoad));
-        tick(&mut sel, a());
+        // No card list: straight to the files.
         assert_eq!(motion(&sel, 0), State::Selecting(Motion::PickLoad));
         let menu = &pl(&sel, 0).menu;
         assert_eq!(menu.items.len(), crate::save::FILES);
@@ -2150,11 +2101,7 @@ mod tests {
         assert_eq!(motion(&sel, 0), State::Selecting(Motion::NoData));
         idle(&mut sel, 15);
         assert_eq!(motion(&sel, 0), State::Selecting(Motion::Top));
-        // B from the card list goes back too.
-        tick(&mut sel, stick(0.0, -1.0));
-        tick(&mut sel, a());
-        tick(&mut sel, b());
-        assert_eq!(motion(&sel, 0), State::Selecting(Motion::Top));
+
     }
 
     #[test]
@@ -2190,8 +2137,8 @@ mod tests {
         tick(&mut sel, a());
         tick(&mut sel, stick(0.0, 1.0));
         tick(&mut sel, a());
-        assert_eq!(pl(&sel, 0).step, 1);
-        assert_eq!(pl(&sel, 0).menu.items[0].text, " SLOT  1");
+        tick(&mut sel, Default::default());
+        assert_eq!(motion(&sel, 0), State::Selecting(Motion::NoData), "no card list");
     }
 
     #[test]
