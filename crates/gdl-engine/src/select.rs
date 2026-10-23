@@ -2074,7 +2074,6 @@ mod tests {
         assert_eq!(motion(&sel, 0), State::Selecting(Motion::NoData));
         idle(&mut sel, 15);
         assert_eq!(motion(&sel, 0), State::Selecting(Motion::Top));
-
     }
 
     #[test]
@@ -2111,7 +2110,11 @@ mod tests {
         tick(&mut sel, stick(0.0, 1.0));
         tick(&mut sel, a());
         tick(&mut sel, Default::default());
-        assert_eq!(motion(&sel, 0), State::Selecting(Motion::NoData), "no card list");
+        assert_eq!(
+            motion(&sel, 0),
+            State::Selecting(Motion::NoData),
+            "no card list"
+        );
     }
 
     #[test]

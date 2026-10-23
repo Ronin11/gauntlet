@@ -224,7 +224,7 @@ mod tests {
     fn hidden_models_load() {
         let Some(fs) = data() else { return };
         for h in &HIDDEN {
-            let class = crate::select::CLASSES[h.class];
+            let class = crate::heroes::CLASSES[h.class];
             crate::character::Model::load_player(&fs, class, h.dir)
                 .unwrap_or_else(|e| panic!("{}: {e:#}", h.name));
         }

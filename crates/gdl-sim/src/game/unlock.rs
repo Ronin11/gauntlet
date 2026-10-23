@@ -64,7 +64,7 @@ impl Game {
         }
         let class = *SECRET_CLASS.get((self.wave? & 0xFF) as usize)?;
         let icon = if class < 16 {
-            format!("16_{}COIN", crate::select::CLASSES[class])
+            format!("16_{}COIN", crate::heroes::CLASSES[class])
         } else {
             "16_SUM".to_string()
         };

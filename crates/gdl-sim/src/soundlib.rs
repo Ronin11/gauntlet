@@ -38,17 +38,17 @@ pub fn music_candidates(level: &str) -> Vec<String> {
     v
 }
 
-pub(crate) type Pcm = Arc<Vec<i16>>;
+pub type Pcm = Arc<Vec<i16>>;
 
 /// Lazily loaded sound banks and decoded samples.
-pub(crate) struct SoundLib {
-    pub(crate) names: HashMap<String, (usize, usize, f32)>,
-    pub(crate) banks: HashMap<usize, Option<(Vec<u8>, Vbk)>>,
-    pub(crate) cache: HashMap<(usize, usize), (Pcm, u32)>,
+pub struct SoundLib {
+    pub names: HashMap<String, (usize, usize, f32)>,
+    pub banks: HashMap<usize, Option<(Vec<u8>, Vbk)>>,
+    pub cache: HashMap<(usize, usize), (Pcm, u32)>,
 }
 
 impl SoundLib {
-    pub(crate) fn load(fs: &GameFs) -> Option<Self> {
+    pub fn load(fs: &GameFs) -> Option<Self> {
         let rom = fs.read("AUDIO/AUDATPS2.ROM").ok()?;
         let mut names = parse_sound_names(&rom);
         log::info!("sound effects: {} names", names.len());
@@ -65,12 +65,12 @@ impl SoundLib {
         })
     }
 
-    pub(crate) fn has(&self, name: &str) -> bool {
+    pub fn has(&self, name: &str) -> bool {
         self.names.contains_key(name)
     }
 
     /// Resolve a sound name to its clips and volume.
-    pub(crate) fn resolve(&mut self, fs: &GameFs, name: &str) -> Option<(Vec<(Pcm, u32)>, f32)> {
+    pub fn resolve(&mut self, fs: &GameFs, name: &str) -> Option<(Vec<(Pcm, u32)>, f32)> {
         let &(bank, idx, dur) = self.names.get(name)?;
         let entry = self.banks.entry(bank).or_insert_with(|| {
             let file = format!("AUDIO/{}.VBK", BANKS.get(bank)?);
@@ -112,7 +112,7 @@ impl SoundLib {
 }
 
 /// A request's `@N` volume suffix: (the request, N / 127), 1 without one.
-pub(crate) fn split_volume(req: &str) -> (&str, f32) {
+pub fn split_volume(req: &str) -> (&str, f32) {
     match req.rsplit_once('@') {
         Some((name, v)) => match v.parse::<u32>() {
             Ok(v) => (name, v as f32 / 127.0),

@@ -634,64 +634,13 @@ impl Game {
     }
 }
 
-fn source_name(s: &crate::input::Source, pads: &[crate::input::PadId]) -> String {
-    use crate::input::Source;
-    match s {
-        Source::Keyboard => "keyboard".into(),
-        Source::Pad(id) => match pads.iter().position(|p| p == id) {
-            Some(n) => format!("pad {n}"),
-            None => "pad".into(),
-        },
-        Source::Device(_) => "device".into(),
-    }
-}
-
-/// Controllers for a loaded state's heroes: the saved pad where it is still
-/// connected, else a free pad, else the keyboard.
-pub fn bind_sources(
-    heroes: &[HeroState],
-    pads: &[crate::input::PadId],
-    current: &[crate::input::Source],
-) -> Vec<crate::input::Source> {
-    use crate::input::Source;
-    let mut out: Vec<Option<Source>> = vec![None; heroes.len()];
-    let mut taken: Vec<Source> = Vec::new();
-    // Saved bindings first.
-    for (i, h) in heroes.iter().enumerate() {
-        let mut t = h.source.split_whitespace();
-        let want = match (t.next(), t.next().and_then(|n| n.parse::<usize>().ok())) {
-            (Some("keyboard"), _) => Some(Source::Keyboard),
-            (Some("pad"), Some(n)) => pads.get(n).map(|&p| Source::Pad(p)),
-            _ => None,
-        };
-        if let Some(s) = want.filter(|s| !taken.contains(s)) {
-            taken.push(s);
-            out[i] = Some(s);
-        }
-    }
-    // Then the controllers playing now, then any pad, then the keyboard.
-    let mut spare: Vec<Source> = current.to_vec();
-    spare.extend(pads.iter().map(|&p| Source::Pad(p)));
-    spare.push(Source::Keyboard);
-    for o in out.iter_mut().filter(|o| o.is_none()) {
-        if let Some(s) = spare.iter().copied().find(|s| !taken.contains(s)) {
-            taken.push(s);
-            *o = Some(s);
-        }
-    }
-    out.into_iter()
-        .map(|o| o.unwrap_or(Source::Keyboard))
-        .collect()
-}
-
 impl SaveState {
     /// The running level and party. `panels`, `sources` and `pads` give each
-    /// hero's panel and controller (empty: from the heroes themselves).
+    /// hero's panel and controller name (empty: from the heroes themselves).
     pub fn capture(
         g: &Game,
         panels: &[PanelInfo],
-        sources: &[crate::input::Source],
-        pads: &[crate::input::PadId],
+        source_names: &[String],
         progress: &Progress,
     ) -> SaveState {
         let level = g
@@ -706,17 +655,14 @@ impl SaveState {
                 panel: panels.get(i).cloned().unwrap_or_else(|| PanelInfo {
                     slot: i,
                     name: String::new(),
-                    colour: crate::select::COLOURS
+                    colour: crate::heroes::COLOURS
                         .iter()
                         .position(|c| *c == p.color)
                         .unwrap_or(i % 4),
                     class: p.class_id,
                     hidden: None,
                 }),
-                source: sources
-                    .get(i)
-                    .map(|s| source_name(s, pads))
-                    .unwrap_or_default(),
+                source: source_names.get(i).cloned().unwrap_or_default(),
                 pos: p.pos,
                 yaw: p.yaw,
                 state: match p.state {
@@ -770,7 +716,7 @@ impl SaveState {
                 let class = if p.class >= 16 {
                     "WIZ"
                 } else {
-                    crate::select::CLASSES
+                    crate::heroes::CLASSES
                         .get(p.class)
                         .copied()
                         .unwrap_or("WAR")
@@ -782,7 +728,7 @@ impl SaveState {
                 };
                 (
                     class.to_string(),
-                    crate::select::COLOURS[p.colour % 4].to_string(),
+                    crate::heroes::COLOURS[p.colour % 4].to_string(),
                     model,
                 )
             })
@@ -1681,12 +1627,12 @@ mover root=2 active=1
         }
         g.players[0].gold = 777;
         g.players[0].keys = 4;
-        let s = SaveState::capture(&g, &[], &[], &[], &Progress::default());
+        let s = SaveState::capture(&g, &[], &[], &Progress::default());
         assert!(!s.world.gone.is_empty());
         let text = s.to_text();
         let back = SaveState::from_text(&text).unwrap();
         let g2 = back.load_game(&fs).unwrap();
-        let s2 = SaveState::capture(&g2, &[], &[], &[], &Progress::default());
+        let s2 = SaveState::capture(&g2, &[], &[], &Progress::default());
         println!("saved  {}\nloaded {}", s.summary(), s2.summary());
         let (a, b) = (&s.heroes[0], &s2.heroes[0]);
         assert_eq!((b.gold, b.keys, b.level, b.exp), (777, 4, a.level, a.exp));

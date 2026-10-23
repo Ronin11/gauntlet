@@ -310,7 +310,7 @@ pub(crate) fn food_kind(name: &str) -> usize {
 
 impl Game {
     /// sMusicTrackHi: the level's realm.
-    pub(crate) fn realm(&self) -> Option<u32> {
+    pub fn realm(&self) -> Option<u32> {
         self.wave.map(|w| w >> 8)
     }
 

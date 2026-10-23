@@ -1894,7 +1894,12 @@ fn write_state(
     save_dir: &Option<std::path::PathBuf>,
     slot: &str,
 ) -> Result<std::path::PathBuf> {
-    let st = SaveState::capture(&play.game, &play.panels, sources, &input.pads(), progress);
+    let pads = input.pads();
+    let names: Vec<String> = sources
+        .iter()
+        .map(|s| crate::input::source_name(s, &pads))
+        .collect();
+    let st = SaveState::capture(&play.game, &play.panels, &names, progress);
     let path = savestate::resolve(slot, save_dir.as_deref());
     st.write(&path)?;
     Ok(path)
@@ -1942,7 +1947,7 @@ fn begin_state(r: &mut Running, st: SaveState) -> Screen {
             r.hud.free_bank(bank);
         }
     }
-    r.sources = savestate::bind_sources(&st.heroes, &r.input.pads(), &r.sources);
+    r.sources = crate::input::bind_sources(&st.heroes, &r.input.pads(), &r.sources);
     r.progress = st.progress.clone();
     let mut carry: Carry = Default::default();
     for h in &st.heroes {

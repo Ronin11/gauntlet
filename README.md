@@ -229,7 +229,9 @@ in `~/.android/gauntlet-rs.keystore`.
 crates/gcdisc       GameCube disc image reader (ISO/GCM/NKit)
 crates/gdl-formats  Game file formats: objects/meshes, textures, worlds, animations, audio
 crates/gdl-cli      `gdl` tool: ls/extract the disc, inspect and convert assets, read DOL data
-crates/gdl-engine   The game: renderer (wgpu), simulation, input, audio, HUD
+crates/gdl-sim      The simulation: game rules, levels, heroes, monsters, the camera and
+                    save data; deterministic, with no window, GPU or audio
+crates/gdl-engine   The game: renderer (wgpu), screens, input devices, audio, HUD, on gdl-sim
 ```
 
 Useful tools while developing:

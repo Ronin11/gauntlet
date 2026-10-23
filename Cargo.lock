@@ -795,6 +795,7 @@ dependencies = [
  "font8x8",
  "gcdisc",
  "gdl-formats",
+ "gdl-sim",
  "gilrs",
  "glam",
  "log",
@@ -811,6 +812,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "png",
+]
+
+[[package]]
+name = "gdl-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "gcdisc",
+ "gdl-formats",
+ "glam",
+ "log",
 ]
 
 [[package]]

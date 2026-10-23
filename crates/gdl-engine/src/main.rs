@@ -308,7 +308,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         (f, savestate::resolve(spec, save_dir.as_deref()))
     });
     let save_state = |g: &game::Game, path: &PathBuf| -> Result<()> {
-        let st = savestate::SaveState::capture(g, &[], &[], &[], &progress::Progress::default());
+        let st = savestate::SaveState::capture(g, &[], &[], &progress::Progress::default());
         st.write(path)?;
         println!("saved state {}: {}", path.display(), st.summary());
         Ok(())

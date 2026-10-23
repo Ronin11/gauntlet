@@ -1,56 +1,30 @@
 //! Gauntlet Dark Legacy engine: rendering, simulation, input and audio on top of the
 //! original game data. The desktop binary (`gauntlet`) and the Android app both use it.
 
-pub mod ai;
+pub use gdl_sim::{
+    ai, boss, camera, character, cheats, collision, critter, enemies, fs, game, heroes, hints,
+    interp, level, mesh, messages, missile, paction, powerups, progress, psys, save, savestate,
+    shadow, soundlib, stats, texanim, tower, transport, triggers, worldanim,
+};
+
 pub mod app;
 pub mod attract;
 pub mod audio;
-pub mod boss;
 pub mod bugreport;
-pub mod camera;
-pub mod character;
-pub mod cheats;
-pub mod collision;
-pub mod critter;
 pub mod cursor;
 pub mod debugmenu;
-pub mod enemies;
 pub mod flyby;
-pub mod fs;
-pub mod game;
-pub(crate) use game::items;
-pub use game::savestate;
 pub mod gpu;
-pub mod heroes;
-pub mod hints;
 pub mod hud;
 pub mod input;
-pub mod interp;
-pub mod level;
 pub mod mapscreen;
 pub mod menu;
-pub mod mesh;
-pub mod messages;
-pub mod missile;
 pub mod movie;
 pub mod options;
 pub mod optmenu;
-pub mod paction;
-pub mod powerups;
-pub mod progress;
-pub mod psys;
-pub mod save;
 pub mod scene;
 pub mod screen;
 pub mod screensaver;
 pub mod select;
-pub mod shadow;
 pub mod shop;
-pub mod soundlib;
-pub mod stats;
-pub mod texanim;
-pub mod tower;
-pub mod transport;
-pub mod triggers;
 pub mod ui;
-pub mod worldanim;

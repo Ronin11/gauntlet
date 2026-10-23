@@ -443,7 +443,7 @@ impl Game {
             .and_then(|m| self.models[m].node_index("BODY1_HE#1"));
         for (i, (_, color)) in classes.iter().enumerate() {
             let ct = self.players[i].class_id;
-            let base = crate::select::CLASSES[if (8..16).contains(&ct) { ct - 8 } else { ct }];
+            let base = crate::heroes::CLASSES[if (8..16).contains(&ct) { ct - 8 } else { ct }];
             let dir = [format!(
                 "PLAYERS/{base}/SFX{}",
                 color.get(..3).unwrap_or(color)

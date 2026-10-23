@@ -1145,7 +1145,7 @@ pub struct Game {
     pub trigger_cam: Option<crate::triggers::TriggerCamera>,
     /// Each player's control settings (PlayerControl scheme / autoaim /
     /// autoattack), by player index.
-    pub controls: [crate::options::PlayerPrefs; 4],
+    pub controls: [crate::input::PlayerPrefs; 4],
     /// Locked tower barriers touched this frame (crystal colour or 101-103).
     pub barrier_touches: Vec<usize>,
     /// World objects were hidden or shown: the scene's world mesh must be rebuilt.
@@ -1978,7 +1978,7 @@ impl Game {
                 health: max_health(1),
                 level: 1,
                 exp: 0,
-                class_id: crate::select::CLASSES
+                class_id: crate::heroes::CLASSES
                     .iter()
                     .position(|c| *c == classes[i].0)
                     .unwrap_or(0)
@@ -2000,7 +2000,7 @@ impl Game {
                 tower_choice: false,
                 quit: false,
                 proj_model: None,
-                name: crate::select::HEROES
+                name: crate::heroes::HEROES
                     .iter()
                     .find(|(k, _)| *k == classes[i].0)
                     .map(|(_, n)| n.to_string())
@@ -2065,7 +2065,7 @@ impl Game {
         let mut cache: BTreeMap<String, Option<AssetFile>> = BTreeMap::new();
         for (i, (_, color)) in classes.iter().enumerate() {
             let ct = game.players[i].class_id;
-            let base = crate::select::CLASSES[if (8..16).contains(&ct) { ct - 8 } else { ct }];
+            let base = crate::heroes::CLASSES[if (8..16).contains(&ct) { ct - 8 } else { ct }];
             let dirs = [
                 format!("PLAYERS/{base}/SFX{}", color.get(..3).unwrap_or(color)),
                 "WEAPONS".to_string(),
@@ -5686,7 +5686,7 @@ impl Game {
 
     /// Damage entity `t` on player `pi`'s behalf: sounds, experience (more for
     /// melee, which also charges the turbo meter) and anything it drops.
-    pub(crate) fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
+    pub fn hit_entity(&mut self, pi: usize, t: usize, dmg: f32, push: Vec2, melee: bool) {
         // lbl_803447E4: a hero fighting (damage_enemy, or a swing at a
         // generator or obstacle) holds off the Follow nag.
         if matches!(

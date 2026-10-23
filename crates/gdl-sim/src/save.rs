@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::game::Carried;
-use crate::options::PlayerPrefs;
+use crate::input::PlayerPrefs;
 use crate::progress::Progress;
 
 /// GameOpts: the 32-byte options block at the front of the save record
@@ -592,7 +592,7 @@ pub fn parse(text: &str) -> Result<CardFile, String> {
                 "controls" => {
                     let [style, rumble, attack, aim] = nums::<u8, 4>(rest)?;
                     h.controls = PlayerPrefs {
-                        control_style: style as usize % crate::options::CONTROL_STYLES.len(),
+                        control_style: style as usize % crate::input::CONTROL_STYLES.len(),
                         rumble: rumble != 0,
                         auto_attack: attack != 0,
                         auto_aim: aim != 0,
