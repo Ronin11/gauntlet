@@ -439,7 +439,13 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 println!("GDL_FX: no effect {what}");
             }
         }
+        let ended = g.level_end.is_some();
         g.update(1.0 / 60.0, &inputs);
+        if !ended {
+            if let Some(end) = &g.level_end {
+                println!("t={f} level end {end:?}");
+            }
+        }
         sfx_seen.extend(g.sfx.drain(..));
         if f % 600 == 0 {
             let p = &g.players[0];
