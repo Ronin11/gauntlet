@@ -55,6 +55,19 @@ struct Playing {
 /// Indexed by slot (column), so players keep their stats whoever joins.
 type Carry = [Option<crate::game::Carried>; 4];
 
+/// Whether a level start refreshes the players' checkpoint (save_backup):
+/// start_level skips PlayerSaveState in the secret levels (realm 12), and
+/// PlayerSaveState(i, 1) keeps the old backup in waves 5/1 and 6/1.
+fn checkpoint_at(wave: Option<u32>) -> bool {
+    !matches!(wave, Some(0x501 | 0x601)) && wave.is_none_or(|w| w >> 8 != 12)
+}
+
+/// OptionsStart: "Quit Level" is greyed out (value -1) while
+/// sMusicTrackHi == 0xC.
+fn quit_level_disabled(wave: Option<u32>) -> bool {
+    wave.is_some_and(|w| w >> 8 == 0xC)
+}
+
 /// Each column's save image (Player.save), kept between visits to player
 /// select.
 type Heroes = [Option<HeroSave>; 4];
@@ -439,7 +452,9 @@ impl App {
                             }
                         }
                     }
-                    r.checkpoint = r.carry.clone();
+                    if checkpoint_at(p.game.wave) || r.checkpoint.is_none() {
+                        r.checkpoint = r.carry.clone();
+                    }
                     p.game.friendly_fire = r.prefs.multiplayer;
                     p.game.crystals = r.progress.crystals;
                     p.game.garg_items = r.progress.garg_items;
@@ -876,7 +891,10 @@ impl App {
                         *pause = Some(if play.game.wave == Some(TOWER_WAVE) {
                             Options::tower(owner)
                         } else {
-                            Options::game(owner)
+                            let mut o = Options::game(owner);
+                            // No "Quit Level" in the secret levels (realm 0xC).
+                            o.set_quit_level_enabled(!quit_level_disabled(play.game.wave));
+                            o
                         });
                     } else {
                         play.game.update(TICK, &inputs);
@@ -1606,5 +1624,28 @@ fn attract_event(
             }
         }
         attract::Event::None => None,
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::{checkpoint_at, quit_level_disabled};
+
+    #[test]
+    fn no_quit_level_in_the_secret_levels() {
+        assert!(quit_level_disabled(Some(0xC02)));
+        assert!(!quit_level_disabled(Some(0x102)));
+        assert!(!quit_level_disabled(None));
+    }
+
+    #[test]
+    fn checkpoints_skip_two_waves_and_the_secret_levels() {
+        assert!(checkpoint_at(Some(0x500)));
+        assert!(checkpoint_at(Some(0x502)));
+        assert!(!checkpoint_at(Some(0x501)));
+        assert!(!checkpoint_at(Some(0x601)));
+        assert!(!checkpoint_at(Some(0xC03)));
+        assert!(checkpoint_at(Some(0xD00)));
+        assert!(checkpoint_at(None));
     }
 }
