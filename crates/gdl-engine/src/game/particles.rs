@@ -58,32 +58,35 @@ impl Game {
             self.psys_texture("particle2_xp", None),
         ];
         self.particles.streak_tex = self.psys_texture("WEP_STREAK", None);
+        let starts: Vec<usize> = (self.level.worlds.world_objects.iter().enumerate())
+            .filter(|(_, o)| o.flags & WO_PSYS != 0 && o.flags & WO_PSYS_OFF == 0)
+            .map(|(i, _)| i)
+            .collect();
+        for i in starts {
+            self.world_psys_activate(i);
+        }
+    }
+
+    /// WorldPsysActivate: object `i`'s `PSYS<id>` template, aimed down its
+    /// collision triangle's (negated) normal, running forever.
+    fn world_psys_activate(&mut self, i: usize) {
         let w = &self.level.worlds;
-        let mut world = Vec::new();
-        for (i, o) in w.world_objects.iter().enumerate() {
-            if o.flags & WO_PSYS == 0 || o.flags & WO_PSYS_OFF != 0 {
-                continue;
-            }
-            let Some(rec) = w.psys_for(o) else {
-                log::debug!("WorldPsysActivate: no psys for {}", o.name);
-                continue;
-            };
-            // A collision triangle's (negated) normal aims it.
-            let over = (o.coll_tri_count > 0)
-                .then(|| w.coll_tris.get(o.coll_tri_index as usize))
-                .flatten()
-                .map(|t| t.norm.map(|v| -v));
-            let d = (o.flags & WO_DYNAMIC) as i32;
-            world.push((i, rec.clone(), over, d));
+        let o = &w.world_objects[i];
+        let Some(rec) = w.psys_for(o).cloned() else {
+            log::debug!("WorldPsysActivate: no psys for {}", o.name);
+            return;
+        };
+        let over = (o.coll_tri_count > 0)
+            .then(|| w.coll_tris.get(o.coll_tri_index as usize))
+            .flatten()
+            .map(|t| t.norm.map(|v| -v));
+        let d = (o.flags & WO_DYNAMIC) as i32;
+        let mut p = Psys::from_record(&rec, &self.particles.presets, over, d, true);
+        if rec.enables & enables::TEXTURE != 0 {
+            p.tex = self.psys_texture(&rec.tex_name, None);
         }
-        for (i, rec, over, d) in world {
-            let mut p = Psys::from_record(&rec, &self.particles.presets, over, d, true);
-            if rec.enables & enables::TEXTURE != 0 {
-                p.tex = self.psys_texture(&rec.tex_name, None);
-            }
-            p.node = self.world_object_matrix(i);
-            self.particles.add(Owner::World(i), p);
-        }
+        p.node = self.world_object_matrix(i);
+        self.particles.add(Owner::World(i), p);
     }
 
     /// A world object's node matrix (its animated placement when it moves).
@@ -345,6 +348,29 @@ impl Game {
                 model,
                 node,
             });
+        }
+        // fn_80062A00: a trigger's PSYS target burns while it is triggered
+        // (WorldPsysActivate / WorldPsysDeActivate).
+        let toggles: Vec<(usize, bool)> = self
+            .movers
+            .iter()
+            .filter(|m| {
+                self.level
+                    .worlds
+                    .world_objects
+                    .get(m.root)
+                    .is_some_and(|o| o.flags & WO_PSYS != 0)
+            })
+            .map(|m| (m.root, m.active))
+            .collect();
+        for (o, on) in toggles {
+            let owner = Owner::World(o);
+            let live = self.particles.systems.iter().any(|(w, _)| *w == owner);
+            if on && !live {
+                self.world_psys_activate(o);
+            } else if !on && live {
+                self.particles.remove_owner(&owner);
+            }
         }
         // Node matrices: each owner's tree posed once.
         let mut posed: HashMap<u64, (Mat4, Vec<Mat4>)> = HashMap::new();
