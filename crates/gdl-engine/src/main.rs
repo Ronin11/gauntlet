@@ -59,6 +59,8 @@ Testing:
   --snapshot <png>      Render one frame headless and exit
   --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
                         select:load|save|result|char (memory card screens),
+                        debug[:main|warp|progress|unlocks|party|level[:row]]
+                        (the developer debug menu over --level),
                         map:<level>[:ticks] (e.g. map:A6:300),
                         shop[:after|menu|inv|final[:ticks[:events]]] with a fake
                         2-player party after A1; events are <tick><key>[<player>]
@@ -689,6 +691,40 @@ fn snapshot_game(args: &Args) -> Result<()> {
             hidden: None,
         })
         .collect();
+    // --screen debug[:page[:row]]: the debug menu over --level (pages main,
+    // warp, progress, unlocks, party, level).
+    let debug_menu = match args.screen.as_deref() {
+        Some(s) if s == "debug" || s.starts_with("debug:") => {
+            use gdl_engine::debugmenu::{realm_table, Ctx, DebugMenu, Page};
+            let mut parts = s.split(':').skip(1);
+            let page = match parts.next().unwrap_or("main") {
+                "main" => Page::Main,
+                "warp" => Page::Warp,
+                "progress" => Page::Progress,
+                "unlocks" => Page::Unlocks,
+                "party" => Page::Party,
+                "level" => Page::Level,
+                p => anyhow::bail!("--screen debug: unknown page {p}"),
+            };
+            let row: usize = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            let mut m = DebugMenu::new(realm_table(&g.worlds));
+            let mut progress = progress::Progress::default();
+            let mut heroes = Default::default();
+            let mut compass = false;
+            let mut dpanels = panels.clone();
+            let mut ctx = Ctx {
+                progress: &mut progress,
+                game: Some(&mut g),
+                panels: Some(&mut dpanels),
+                heroes: &mut heroes,
+                compass: &mut compass,
+            };
+            m.show(None, &mut ctx);
+            m.goto(page, row, &mut ctx);
+            Some(m)
+        }
+        _ => None,
+    };
     let boss_bank = match g.boss_model_dir() {
         Some(d) => Some(hud.load_images(&gpu.device, &gpu.queue, &hud::boss_meter_images(&fs, &d))),
         None if g.wave.is_some_and(|w| w >> 8 == 12) => {
@@ -758,6 +794,13 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 hud::build(&mut s, &g, &panels);
                 if let Some(o) = options::Options::demo(name, demo_ticks) {
                     o.draw(&mut s);
+                }
+            }
+            Some(name) if name.starts_with("debug") => {
+                let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
+                hud::build(&mut s, &g, &panels);
+                if let Some(m) = &debug_menu {
+                    m.draw(&mut s);
                 }
             }
             // hintmenu[:path]: Sumner's menu with the town open (GDL_HINT_FACTS
@@ -850,7 +893,8 @@ fn snapshot_game(args: &Args) -> Result<()> {
         Some(name)
             if name.starts_with("gamemenu")
                 || name.starts_with("towermenu")
-                || name.starts_with("hintmenu") =>
+                || name.starts_with("hintmenu")
+                || name.starts_with("debug") =>
         {
             gpu.render_to_image(
                 w,

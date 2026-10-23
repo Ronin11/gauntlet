@@ -21,7 +21,7 @@ mod particles;
 #[cfg(test)]
 mod rule_tests;
 pub mod sounds;
-mod unlock;
+pub(crate) mod unlock;
 pub mod worn;
 
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
@@ -1215,6 +1215,8 @@ pub struct Game {
     /// Legend weapons the party carries: bit = the item's value (the realm of
     /// the boss it is for). One is used up when its boss fight uses it.
     pub legend_held: u16,
+    /// The debug menu's god mode (not in the original): heroes take no damage.
+    pub debug_god: bool,
     /// Event-sound timers, the got-it ticker, rumble, X-ray and compass.
     pub snd: sounds::SoundState,
     /// Items flying out of a dying boss.
@@ -1812,6 +1814,7 @@ impl Game {
             boss: None,
             boss_runes: 0,
             legend_held: 0,
+            debug_god: false,
             snd: Default::default(),
             spews: Vec::new(),
             crit_waves: Vec::new(),
@@ -5791,6 +5794,9 @@ impl Game {
     /// hero grunts in pain.
     pub fn damage_player(&mut self, pi: usize, dmg: f32, flags: u32) {
         let mode = self.snd.mode.take().unwrap_or(1);
+        if self.debug_god {
+            return;
+        }
         let damagemul = self.damage_mul();
         // A hit with a direction (dir != NULL): where it came from.
         let directed = self.damage_from.is_some();

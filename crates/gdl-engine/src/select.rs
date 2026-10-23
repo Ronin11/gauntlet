@@ -334,6 +334,12 @@ impl Select {
         self
     }
 
+    /// The debug menu's session unlocks (debugmenu.rs, not in the original):
+    /// secret classes offered as if a save had them.
+    pub fn set_debug_unlock(&mut self, class_unlock: u16) {
+        self.progress.class_unlock = class_unlock;
+    }
+
     /// The state each column's player takes into the game (their class's
     /// slot of their save, or what they carried in); None for a new
     /// character.

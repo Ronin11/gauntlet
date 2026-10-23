@@ -328,6 +328,8 @@ struct Running {
     idle_levels: Vec<(Source, u32)>,
     saver: Option<crate::screensaver::Saver>,
     saver_models: Option<crate::screensaver::SaverModels>,
+    /// The developer debug menu (F1 / L+R+Z+Start; not in the original).
+    debug: crate::debugmenu::DebugMenu,
     last: Instant,
     acc: f32,
     window: Arc<Window>,
@@ -450,6 +452,7 @@ impl App {
             idle_levels: Vec::new(),
             saver: None,
             saver_models: None,
+            debug: Default::default(),
             last: Instant::now(),
             acc: 0.0,
             window,
@@ -707,6 +710,14 @@ impl App {
                 r.acc -= TICK;
                 continue;
             }
+            // The debug menu, while open, has the tick (the game is frozen).
+            if let Some(s) = debug_tick(r, fs, &all, escape) {
+                next = s;
+                escape = false;
+                r.input.end_frame();
+                r.acc -= TICK;
+                continue;
+            }
             // ScreenSaver: any change in what a controller holds resets the
             // idle count, or ends a running saver (ScreenSaverEnd).
             let levels: Vec<(Source, u32)> =
@@ -836,8 +847,9 @@ impl App {
                     }
                     if let Some(src) = picked {
                         // A new game from the title: a new party with nothing done
-                        // (loaded heroes bring theirs in player select).
-                        r.progress = Progress::default();
+                        // (loaded heroes bring theirs in player select), or
+                        // what the debug menu set on the title.
+                        r.progress = r.debug.new_game_progress();
                         r.carry = None;
                         r.checkpoint = None;
                         r.suspended = None;
@@ -1132,6 +1144,7 @@ impl App {
                             let slot = play.panels.get(i).map_or(i, |p| p.slot);
                             play.game.controls[i] = r.prefs.players[slot % 4];
                         }
+                        play.game.debug_god = r.debug.god;
                         play.game.update(TICK, &inputs);
                         play.intro += TICK;
                         // do_vibe: only for players with the Vibration option on.
@@ -1364,6 +1377,11 @@ impl App {
                 }
             }
         }
+        {
+            let mut s = Scr::new(&mut canvas, &r.hud.ui, ticks);
+            r.debug.draw_overlay(&mut s);
+            r.debug.draw(&mut s);
+        }
         if !in_game {
             r.gpu.render(
                 &view,
@@ -1379,6 +1397,7 @@ impl App {
             let mut scratch = hud::Canvas::new(r.config.width, r.config.height);
             let s = Scr::new(&mut scratch, &r.hud.ui, ticks);
             match &r.screen {
+                _ if r.debug.open => None,
                 Screen::Title(t) => t.cursor(&s),
                 Screen::Playing { pause: Some(m), .. } => m.cursor(&s),
                 _ => None,
@@ -1669,6 +1688,113 @@ impl App {
 }
 
 /// HUD panels for players given on the command line: slots in order, no names.
+/// The developer debug menu's tick (debugmenu.rs; not in the original).
+/// None: the menu is shut and stays shut, the screen runs as usual.
+/// Some(next): the menu had this tick (and may change the screen).
+fn debug_tick(
+    r: &mut Running,
+    fs: &GameFs,
+    all: &[(Source, PlayerInput)],
+    escape: bool,
+) -> Option<Option<Screen>> {
+    use crate::debugmenu::{self, Action, Ctx};
+    let f1 = r.input.just_pressed(KeyCode::F1);
+    let mut opening = None;
+    if !r.debug.open {
+        if let Screen::Select(sel) = &mut r.screen {
+            sel.set_debug_unlock(r.debug.class_unlock);
+        }
+        if !matches!(r.screen, Screen::Title(_) | Screen::Playing { .. }) {
+            return None;
+        }
+        opening = Some(if f1 {
+            Source::Keyboard
+        } else {
+            all.iter().find(|(_, i)| debugmenu::open_combo(i))?.0
+        });
+        if !r.debug.has_levels() {
+            match gdl_formats::wdata::Worlds::load(|p| fs.read(p)) {
+                Ok(w) => r.debug.set_levels(debugmenu::realm_table(&w)),
+                Err(e) => log::warn!("debug menu levels: {e:#}"),
+            }
+        }
+        r.audio.play(fs, "S_OPTMENUSEL");
+    }
+    r.idle = 0;
+    let (game, panels) = match &mut r.screen {
+        Screen::Playing { play, .. } => (Some(&mut play.game), Some(&mut play.panels)),
+        _ => (None, None),
+    };
+    let mut ctx = Ctx {
+        progress: &mut r.progress,
+        game,
+        panels,
+        heroes: &mut r.heroes,
+        compass: &mut r.prefs.compass,
+    };
+    if opening.is_some() {
+        r.debug.show(opening, &mut ctx);
+        return Some(None);
+    }
+    let action = if f1 || escape {
+        r.debug.close();
+        Action::Close
+    } else {
+        let inputs: Vec<PlayerInput> = all.iter().map(|(_, i)| *i).collect();
+        r.debug.update(&inputs, &mut ctx)
+    };
+    let dirty = std::mem::take(&mut r.debug.tower_dirty);
+    match action {
+        Action::None => {
+            r.debug.tower_dirty = dirty;
+            Some(None)
+        }
+        Action::Close => {
+            let tower = matches!(&r.screen,
+                Screen::Playing { play, .. } if play.game.wave == Some(TOWER_WAVE));
+            // The tower is reloaded so its portals and barriers follow the
+            // progress set.
+            Some((dirty && tower).then(|| debug_warp(r, "levelL1".into())))
+        }
+        Action::Warp(level) => {
+            r.debug.close();
+            Some(Some(debug_warp(r, level)))
+        }
+    }
+}
+
+/// The debug menu's warp: the party (as it is now) into `level`; from the
+/// title, a Warrior on the controller that opened the menu.
+fn debug_warp(r: &mut Running, level: String) -> Screen {
+    r.audio.stop();
+    r.suspended = None;
+    let panels = match std::mem::replace(&mut r.screen, Screen::Legal(0)) {
+        Screen::Playing { mut play, .. } => {
+            bank_heroes(&play.game, &play.panels, &mut r.heroes);
+            let mut carry: Carry = Default::default();
+            for (p, info) in play.game.players.iter().zip(&play.panels) {
+                carry[info.slot % 4] = Some(p.carried());
+            }
+            r.carry = Some(carry);
+            if let Some(bank) = play.boss_bank.take() {
+                r.hud.free_bank(bank);
+            }
+            play.panels.clone()
+        }
+        _ => {
+            r.sources = vec![r.debug.owner.unwrap_or(Source::Keyboard)];
+            r.carry = None;
+            r.checkpoint = None;
+            panels_for(&[("WAR".into(), "RED".into())])
+        }
+    };
+    Screen::Loading {
+        level,
+        panels,
+        shown: false,
+    }
+}
+
 fn panels_for(players: &[(String, String)]) -> Vec<PanelInfo> {
     players
         .iter()
