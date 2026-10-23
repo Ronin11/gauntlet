@@ -1122,6 +1122,8 @@ pub struct Game {
     pub crit_waves: Vec<crate::critter::Wave>,
     /// player.fxhittime: a critter's melee and cones skip a player until then.
     pub crit_hit_until: [f32; 4],
+    /// CritterPlayerNTargets: critter parts aiming at each player this frame.
+    pub crit_ntargets: [f32; 4],
     /// Parsed CRITTER WADs by file name.
     pub critter_wads: HashMap<String, std::sync::Arc<gdl_formats::critter::CritterWad>>,
     /// The good wizard's model (atree WIZARD in the level's item file).
@@ -1658,6 +1660,7 @@ impl Game {
             spews: Vec::new(),
             crit_waves: Vec::new(),
             crit_hit_until: [0.0; 4],
+            crit_ntargets: [0.0; 4],
             critter_wads: HashMap::new(),
             wizard_model: None,
             hit_from: None,

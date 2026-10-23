@@ -3088,4 +3088,87 @@ mod tests {
         let f = woke.expect("the Chimera never woke");
         assert!((115..=125).contains(&f), "woke on frame {f}");
     }
+
+    /// CritterLookAtPlayer: a boss's head node turns toward its target
+    /// beyond what the animation does (the Dragon's neck, the Lich's head).
+    #[test]
+    fn boss_heads_turn_toward_their_target() {
+        let Some(fs) = data() else { return };
+        for lvl in ["B6", "G5", "A5"] {
+            let mut g = Game::new(&fs, &format!("level{lvl}"), &[("WAR", "RED")]).unwrap();
+            face_boss(&mut g, 25.0);
+            wake(&mut g);
+            let mut best = f32::MAX;
+            let mut turned = 0;
+            for f in 0..900 {
+                // Keep the hero off to one side.
+                if f == 0 {
+                    let (bp, yaw) = g.boss_critter().map(|(e, _)| (e.pos, e.yaw)).unwrap();
+                    let side = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+                    let p = g.players[0].pos + side * 12.0;
+                    if let Some(gy) = g.collision.ground_height(p, bp.y + 30.0) {
+                        g.players[0].pos = Vec3::new(p.x, gy, p.z);
+                    }
+                }
+                g.players[0].health = 999.0;
+                g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                let (e, c) = g.boss_critter().unwrap();
+                let model = &g.models[e.model.unwrap()];
+                let body = glam::Mat4::from_translation(e.pos) * glam::Mat4::from_rotation_y(e.yaw);
+                for p in &c.parts {
+                    let (Some(n), true) = (p.head_node, p.tgt >= 0) else {
+                        continue;
+                    };
+                    if !c.look.iter().any(|l| l.0 == n) {
+                        continue;
+                    }
+                    let to = g.players[p.tgt as usize].pos + Vec3::Y * 2.5;
+                    let err = |m: glam::Mat4| {
+                        let w = body * m;
+                        let f = w.z_axis.truncate();
+                        let d = to - w.w_axis.truncate();
+                        let a = f.x.atan2(f.z) - d.x.atan2(d.z);
+                        a.sin().atan2(a.cos()).abs()
+                    };
+                    let looked = err(c.pose(model)[n]);
+                    let plain = err(model.pose_layers(&c.layers())[n]);
+                    best = best.min(looked - plain);
+                    turned += 1;
+                }
+            }
+            assert!(turned > 0, "{lvl}: no head looked");
+            assert!(
+                best < -0.05,
+                "{lvl}: the head never turned toward the hero ({best})"
+            );
+        }
+    }
+
+    /// CritterResolveMultipleTargets: a lone hero who hasn't hurt the
+    /// Chimera (invanger 11) is aimed at by two of its four parts; the
+    /// other heads, farthest first, let it go.
+    #[test]
+    fn chimera_heads_spread_their_targets() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA5", &[("WAR", "RED")]).unwrap();
+        face_boss(&mut g, 20.0);
+        wake(&mut g);
+        let mut checked = 0;
+        for _ in 0..10 {
+            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            let (_, c) = g.boss_critter().unwrap();
+            let aiming = c.parts.iter().filter(|p| !p.targets.is_empty()).count();
+            if c.parts[0].pattern < 0 && !c.parts[0].targets.is_empty() {
+                assert_eq!(
+                    aiming,
+                    2,
+                    "{:?}",
+                    c.parts.iter().map(|p| p.targets.len()).collect::<Vec<_>>()
+                );
+                assert_eq!(g.crit_ntargets[0], 2.0);
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
 }

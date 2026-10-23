@@ -391,7 +391,7 @@ impl Game {
                         let e = &self.entities[i];
                         let m = &self.models[model];
                         let nodes = match &e.kind {
-                            Kind::Critter(c) => m.pose_layers(&c.layers()),
+                            Kind::Critter(c) => c.pose(m),
                             _ => m.pose_layers(&[(None, e.animator.seq, e.animator.frame)]),
                         };
                         (self.entity_xform(e), nodes)
