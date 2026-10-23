@@ -468,6 +468,16 @@ impl Game {
         for (i, push) in targets {
             self.magic_damage(fx, i, fx.damage * scale, fade, push);
         }
+        // fn_8005BA1C on the breakable walls the ring reaches (DMG_HEAL
+        // magic of a hero); SfxSkipItem then keeps the magic off them.
+        if let Some(pi) = fx.owner.filter(|&pi| fx.heal && pi < self.players.len()) {
+            let walls: Vec<usize> = (0..self.entities.len())
+                .filter(|&i| self.effect_reaches_wall(&self.entities[i], pos, radius))
+                .collect();
+            for t in walls {
+                self.wall_magic(pi, t);
+            }
+        }
     }
 
     /// The point missile's target: a live monster within `r` of its

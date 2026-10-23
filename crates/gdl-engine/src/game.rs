@@ -22,6 +22,7 @@ mod particles;
 mod rule_tests;
 pub mod sounds;
 pub(crate) mod unlock;
+pub(crate) mod walls;
 pub mod worn;
 
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
@@ -987,6 +988,8 @@ pub enum Kind {
         height: f32,
         tris: Option<(usize, usize)>,
     },
+    /// items.c obstacle 0x2A: a breakable (secret) wall (walls.rs).
+    Wall(walls::Wall),
 }
 
 /// Sound ids by realm (sMusicTrackHi): lbl_80123AAC (fn_8009D91C, a rock
@@ -3131,6 +3134,33 @@ impl Game {
                         0.0,
                     );
                 }
+                // SetItem case 10, subtype 0x2A: a breakable wall, the object
+                // the instance names (ItemFindMBObjectL1), none with flag 2.
+                ItemType::Obstacle
+                    if walls::obstacle_subtype(&info, &inst.params) == walls::SUB_WALL =>
+                {
+                    let name = if inst.name.is_empty() {
+                        info.name.clone()
+                    } else {
+                        inst.name.clone()
+                    };
+                    let model = if inst.flags & 2 != 0 || name.is_empty() {
+                        None
+                    } else {
+                        [name.clone(), format!("{name}L1"), format!("{name}L1ROOT")]
+                            .iter()
+                            .find_map(|n| {
+                                Model::from_objects(
+                                    &self.level.objects,
+                                    &self.level.textures_file,
+                                    &[n],
+                                )
+                            })
+                            .map(|m| self.add_model(m))
+                            .or_else(|| self.item_model(fs, &mut cache, &mut known, &dirs, &name))
+                    };
+                    self.place_wall(inst, &info, model, pos, yaw);
+                }
                 ItemType::Container | ItemType::Obstacle => {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     if model.is_none() {
@@ -3751,6 +3781,7 @@ impl Game {
         self.spawn_placed_enemies();
         self.update_entities(dt);
         self.update_items(dt);
+        self.update_walls(dt);
         self.update_effects(dt);
         self.update_critters(dt);
         self.update_waves(dt);
@@ -4662,10 +4693,19 @@ impl Game {
         let r = desc.collision_radius;
         let push = Vec2::new(dir.x, dir.z).normalize_or_zero();
         // Only a wall faced from the sweep's start counts (not one at the back).
-        let wall = self
+        let hit = self
             .collision
-            .sweep(pt0, pt1, r)
-            .is_some_and(|(_, n)| n.dot(pt1 - pt0) < 0.0);
+            .sweep_tri(pt0, pt1, r)
+            .filter(|(_, n, _)| n.dot(pt1 - pt0) < 0.0);
+        // A breakable wall is an item to fn_8005ED44 (WeaponWallCollide
+        // doesn't see it): hit at once, and only a super shot goes on.
+        if let Some(w) = hit.and_then(|(_, _, i)| self.wall_of_tri(i)) {
+            self.damage_wall(w, damage, flags, Some(pi));
+            if flags & m::DMG_SUPER == 0 {
+                return 0;
+            }
+        }
+        let wall = hit.is_some_and(|(_, _, i)| self.wall_of_tri(i).is_none());
         if flags & m::DMG_SUPER == 0 && wall {
             if flags & m::DMG_REFLECT == 0 {
                 return 0;
@@ -5048,6 +5088,14 @@ impl Game {
     /// 3.5, for the melee damage times `mult` (x2 slow / step, x3 power).
     fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, bits: u32) {
         let dir = Vec2::new(yaw.sin(), yaw.cos());
+        // PlayerGetTarget: the breakable wall the hero touches (its collision
+        // item) comes before any monster.
+        if let Some(w) = self.melee_wall(pi, pos, dir) {
+            let dmg = self.melee_damage(pi, mult);
+            let dtype = self.players[pi].fx.weapon;
+            self.melee_hit_wall(pi, w, dmg, dtype);
+            return;
+        }
         let target = self
             .entities
             .iter()
@@ -5074,31 +5122,8 @@ impl Game {
             *hit = true;
             return;
         }
-        // PlayerMotion_HitTarget: a swing that lands on a nameless obstacle
-        // (the breakable walls) says it takes multiple hits (msg 20).
-        if let Kind::Container {
-            chest: false,
-            armor,
-            sub,
-            ..
-        } = self.entities[t].kind
-        {
-            let nameless = self.level.worlds.item_infos.iter().any(|i| {
-                i.item_type == ItemType::Obstacle && i.subtype == sub && i.name.is_empty()
-            });
-            if nameless && armor >= 0.0 && self.entities[t].alive {
-                self.post(20, Some(pi), &[]);
-            }
-        }
+        let dmg = self.melee_damage(pi, mult);
         let p = &self.players[pi];
-        let mut dmg = p.derived.damage * mult;
-        // Growth doubles melee; an amulet gives every hit its element.
-        if p.fx.special & crate::powerups::S_GROWTH != 0 {
-            dmg *= 2.0;
-        }
-        if p.fx.weapon & crate::powerups::W_ELEMENT != 0 {
-            dmg *= ELEMENT_BONUS;
-        }
         // The hit streak counts critters and tall monsters: 3 for a kill (or
         // a blow that does nothing: damage_enemy's -1), else 1.
         let tall = match &self.entities[t].kind {
@@ -5131,6 +5156,20 @@ impl Game {
             let down = self.entities.get(t).is_none_or(Self::is_destroyed);
             self.streak_hit(pi, was_down || down);
         }
+    }
+
+    /// A swing's damage: the hero's melee damage times `mult`, doubled by
+    /// Growth, with an amulet's element bonus.
+    fn melee_damage(&self, pi: usize, mult: f32) -> f32 {
+        let p = &self.players[pi];
+        let mut dmg = p.derived.damage * mult;
+        if p.fx.special & crate::powerups::S_GROWTH != 0 {
+            dmg *= 2.0;
+        }
+        if p.fx.weapon & crate::powerups::W_ELEMENT != 0 {
+            dmg *= ELEMENT_BONUS;
+        }
+        dmg
     }
 
     /// PlayerMotion_FindClosestPlayer (Multiplayer option 2, Shots Hurt): a
@@ -6487,6 +6526,19 @@ impl Game {
         let mut proj_hits: Vec<(usize, usize, f32, Vec2, f32)> = Vec::new();
         // Hero missiles that burst on the world: (id, where, yaw, scale).
         let mut missile_walls: Vec<(u64, Vec3, f32, f32)> = Vec::new();
+        // ProcessEffects' fn_8005ED44 in flight: the breakable walls' own
+        // triangles (entity, id, first, count), and the hits on them (wall,
+        // owner, damage).
+        let breakables: Vec<(usize, u64, usize, usize)> = self
+            .entities
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match &e.kind {
+                Kind::Wall(w) if e.alive => w.tris.map(|(s, n)| (i, e.id, s, n)),
+                _ => None,
+            })
+            .collect();
+        let mut wall_hits: Vec<(usize, usize, f32)> = Vec::new();
 
         // do_enemies: what the monsters' routines share this frame.
         self.ai_paths.update_players(&player_pos);
@@ -7487,6 +7539,7 @@ impl Game {
                     wall_sound,
                     hold,
                     morph,
+                    pierced,
                     ..
                 } => {
                     // ProcessEffects: move by the velocity, then fall.
@@ -7505,7 +7558,26 @@ impl Game {
                     // A wall or floor (within half the radius) bursts it, or
                     // turns it back with DMG_REFLECT (rising at 0.4), its time
                     // cut to 10 s or by 1 s.
-                    if let Some((at, n)) = self.collision.sweep(from, to, 0.5 * *radius) {
+                    let swept = self.collision.sweep_tri(from, to, 0.5 * *radius);
+                    let breakable = swept.and_then(|(_, _, i)| {
+                        breakables.iter().find(|b| (b.2..b.2 + b.3).contains(&i))
+                    });
+                    if let Some(&(w, wid, ..)) = breakable {
+                        // An item to the missile: hit, and gone unless it
+                        // is a super shot (which hits each thing once).
+                        match pierced {
+                            Some(done) => {
+                                if !done.contains(&wid) {
+                                    done.push(wid);
+                                    wall_hits.push((w, *owner, *dmg));
+                                }
+                            }
+                            None => {
+                                wall_hits.push((w, *owner, *dmg));
+                                gone = true;
+                            }
+                        }
+                    } else if let Some((at, n, _)) = swept {
                         if *reflect {
                             to = at;
                             *vel -= 2.0 * vel.dot(n) * n;
@@ -7677,6 +7749,12 @@ impl Game {
                     *v += d;
                 }
             }
+        }
+        // fn_8005C1DC for the hero missiles that reached a breakable wall,
+        // with the thrower's element.
+        for (w, owner, dmg) in wall_hits {
+            let dtype = self.players.get(owner).map_or(0, |p| p.fx.weapon & 0xF);
+            self.damage_wall(w, dmg, dtype, Some(owner));
         }
         // ProcessEffects: a missile that hit the world becomes its hit row.
         for (id, at, yaw, scale) in missile_walls {
@@ -8840,26 +8918,25 @@ mod tests {
         g.players[0].power = 100.0;
         g.update(1.0 / 60.0, &[PlayerInput::default()]);
         assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(110));
-        // A swing at a breakable wall (the nameless obstacle 0x2A, which the
-        // port doesn't place yet): it takes multiple hits (20).
+        // A swing at a breakable wall (the nameless obstacle 0x2A) the hero
+        // stands against (A1SHOOTW#1, to the +x): it takes multiple hits (20).
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
-        g.entities.clear();
-        let at = g.players[0].pos;
-        g.spawn(
-            Kind::Container {
-                hp: 25.0,
-                drop: None,
-                chest: false,
-                armor: 1.0,
-                sub: 0x2A,
-            },
-            None,
-            at + Vec3::Z * 2.0,
-            0.0,
-        );
+        g.entities
+            .retain(|e| matches!(e.kind, Kind::Wall(_)) && e.pos.x > 56.0 && e.pos.x < 57.0);
+        assert_eq!(g.entities.len(), 1);
+        let at = Vec3::new(54.5, -7.04, -0.2);
+        g.players[0].pos = at;
         g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
-        g.player_attack(0, at, 0.0, 1.0, 0);
+        g.player_attack(0, at, std::f32::consts::FRAC_PI_2, 1.0, 0);
         assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(20));
+        assert!(matches!(&g.entities[0].kind, Kind::Wall(w) if w.health < 25));
+        // Facing away, the swing misses it.
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        g.entities
+            .retain(|e| matches!(e.kind, Kind::Wall(_)) && e.pos.x > 56.0 && e.pos.x < 57.0);
+        g.players[0].pos = at;
+        g.player_attack(0, at, -std::f32::consts::FRAC_PI_2, 1.0, 0);
+        assert!(matches!(&g.entities[0].kind, Kind::Wall(w) if w.health == 25));
     }
 
     #[test]

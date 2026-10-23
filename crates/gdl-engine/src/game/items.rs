@@ -812,6 +812,9 @@ impl Game {
             (Kind::Pickup { .. } | Kind::Container { .. }, _) => {
                 self.damage_item(t, dmg, dtype, owner);
             }
+            (Kind::Wall(_), _) => {
+                self.damage_wall(t, dmg, dtype, owner);
+            }
             (_, Some(pi)) if pi < self.players.len() => {
                 self.effects.hit_dtype = Some(dtype);
                 self.hit_entity(pi, t, dmg, push, false);
@@ -1136,6 +1139,7 @@ impl Game {
         if r <= 0.0 {
             return;
         }
+        self.blast_walls(b, r, dmg, age);
         let mut hits = Vec::new();
         for (i, e) in self.entities.iter().enumerate() {
             if !e.alive

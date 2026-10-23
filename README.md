@@ -130,7 +130,9 @@ in `~/.android/gauntlet-rs.keystore`.
 - **Items** as in items.c: food heals its value (spoiled food poisons; it stays put at full
   health), gold adds its value, keys and potions (coloured) stop at 9, chests open with a
   key, barrels break, gates take a key, scrolls show the level's hints, crystals open the
-  tower's barriers.
+  tower's barriers. Breakable walls (291 in 46 levels) hide secret rooms: swings, shots
+  and explosions wear them down, and an Archer's potion shows them (level 25) or brings
+  them down (level 50).
 - **Levers and pressure pads**: walk into a lever or onto a pad to raise elevators, sink
   spiked barricades and reveal bridges, with the original's latch/toggle/hold rules.
 - **Up to 4 players** on gamepads and keyboard, with the original's status panels. No

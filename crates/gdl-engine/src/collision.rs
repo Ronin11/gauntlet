@@ -325,14 +325,52 @@ impl Collision {
     /// (WeaponWallCollide, as a ray reaching `r` past the move): where its
     /// centre stops, and the surface normal.
     pub fn sweep(&self, from: Vec3, to: Vec3, r: f32) -> Option<(Vec3, Vec3)> {
+        self.sweep_tri(from, to, r).map(|(at, n, _)| (at, n))
+    }
+
+    /// [`Collision::sweep`], also giving the triangle hit.
+    pub fn sweep_tri(&self, from: Vec3, to: Vec3, r: f32) -> Option<(Vec3, Vec3, usize)> {
         let d = (to - from).normalize_or_zero();
-        let (t, n) = self.raycast_hit(from, to + d * r)?;
+        let (t, n, i) = self.raycast_tri(from, to + d * r)?;
         let len = (to - from).length() + r;
-        Some((from + d * (t * len - r).max(0.0), n))
+        Some((from + d * (t * len - r).max(0.0), n, i))
+    }
+
+    /// Whether an upright cylinder at `pos` (`radius`, `height` above it)
+    /// touches one of the enabled triangles in `range`.
+    pub fn touches(
+        &self,
+        range: std::ops::Range<usize>,
+        pos: Vec3,
+        radius: f32,
+        height: f32,
+    ) -> bool {
+        let end = range.end.min(self.tris.len());
+        (range.start..end).any(|i| {
+            if !self.enabled[i] {
+                return false;
+            }
+            let t = &self.tris[i];
+            let tmin = t.v[0].y.min(t.v[1].y).min(t.v[2].y);
+            let tmax = t.v[0].y.max(t.v[1].y).max(t.v[2].y);
+            let (lo, hi) = (pos.y, pos.y + height);
+            if tmax < lo || tmin > hi {
+                return false;
+            }
+            let probe = Vec3::new(pos.x, ((tmin + tmax) * 0.5).clamp(lo, hi), pos.z);
+            let c = closest_point_on_tri(probe, t);
+            Vec2::new(probe.x - c.x, probe.z - c.z).length() <= radius
+                && (c.y - probe.y).abs() <= height
+        })
     }
 
     /// raycast, also giving the hit triangle's normal.
     pub fn raycast_hit(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+        self.raycast_tri(from, to).map(|(t, n, _)| (t, n))
+    }
+
+    /// raycast, also giving the hit triangle's normal and index.
+    pub fn raycast_tri(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3, usize)> {
         let dir = to - from;
         let len = dir.length();
         if len < 1e-4 {
@@ -349,7 +387,7 @@ impl Collision {
                 }
             }
         }
-        let mut best: Option<(f32, Vec3)> = None;
+        let mut best: Option<(f32, Vec3, usize)> = None;
         for i in cands {
             let t = &self.tris[i as usize];
             // Moller-Trumbore, double-sided.
@@ -373,7 +411,7 @@ impl Collision {
             }
             let tt = e2.dot(q) * inv;
             if (0.0..=1.0).contains(&tt) && best.is_none_or(|b| tt < b.0) {
-                best = Some((tt, t.n));
+                best = Some((tt, t.n, i as usize));
             }
         }
         best

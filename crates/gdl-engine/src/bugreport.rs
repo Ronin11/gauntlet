@@ -447,6 +447,7 @@ pub fn kind_tag(k: &Kind) -> &'static str {
         Kind::Trigger { .. } => "Trigger",
         Kind::Prop => "Prop",
         Kind::Faller { .. } => "Faller",
+        Kind::Wall(_) => "Wall",
     }
 }
 

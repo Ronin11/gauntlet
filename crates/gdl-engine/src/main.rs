@@ -23,7 +23,7 @@ struct Args {
     frame: f32,
     simulate: u32,
     hold: Vec2,
-    attack_at: Option<u32>,
+    attack_at: Vec<u32>,
     block_at: Option<u32>,
     magic_at: Option<u32>,
     kill_boss_at: Option<u32>,
@@ -70,7 +70,7 @@ Testing:
                         (GDL_BUGREPORT=<frame>: stop there and file a bug report,
                         GDL_BUGTAGS=stuck,other its tags)
   --hold <x,y>          Stick input held during simulation
-  --attack-at <frame>   Press attack on that frame
+  --attack-at <f,...>   Press attack on those frames (a comma list)
   --block-at <frame>    Press B (block) on that frame and hold it after
   --magic-at <frame>    Use a potion on that frame (one is given if none)
   --bot                 Let a simple bot play every player during simulation
@@ -97,7 +97,7 @@ fn parse_args() -> Result<Args> {
         frame: 0.0,
         simulate: 0,
         hold: Vec2::ZERO,
-        attack_at: None,
+        attack_at: Vec::new(),
         block_at: None,
         magic_at: None,
         kill_boss_at: None,
@@ -126,7 +126,12 @@ fn parse_args() -> Result<Args> {
             "--seq" => a.seq = val()?,
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
-            "--attack-at" => a.attack_at = Some(val()?.parse()?),
+            "--attack-at" => {
+                a.attack_at = val()?
+                    .split(',')
+                    .map(|f| f.trim().parse())
+                    .collect::<Result<_, _>>()?
+            }
             "--block-at" => a.block_at = Some(val()?.parse()?),
             "--magic-at" => a.magic_at = Some(val()?.parse()?),
             "--kill-boss-at" => a.kill_boss_at = Some(val()?.parse()?),
@@ -461,7 +466,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
         let inp = input::PlayerInput {
             stick: args.hold,
-            attack_pressed: args.attack_at == Some(f),
+            attack_pressed: args.attack_at.contains(&f),
             // --block-at F: press B (block) on frame F and hold it after.
             turbo: args.block_at.is_some_and(|b| f >= b),
             b_pressed: args.block_at == Some(f),
