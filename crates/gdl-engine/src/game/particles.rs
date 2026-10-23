@@ -286,6 +286,10 @@ impl Game {
             self.start_explosion(at, ty, dmg);
             return true;
         }
+        // BLOCK: StartBlockFX on player 0, as a full-strength clank.
+        if what == "BLOCK" {
+            return self.start_block_fx(0, 100.0).is_some();
+        }
         let row = match what {
             "GENHIT" => self.effects.hitfx.iter().copied().find(|&r| r >= 0),
             "GENDIE" => self.effects.deathfx.iter().copied().find(|&r| r >= 0),

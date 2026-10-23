@@ -24,6 +24,7 @@ struct Args {
     simulate: u32,
     hold: Vec2,
     attack_at: Option<u32>,
+    block_at: Option<u32>,
     magic_at: Option<u32>,
     kill_boss_at: Option<u32>,
     legend: bool,
@@ -68,6 +69,7 @@ Testing:
   --simulate <frames>   Simulate N 60 Hz frames before the snapshot
   --hold <x,y>          Stick input held during simulation
   --attack-at <frame>   Press attack on that frame
+  --block-at <frame>    Press B (block) on that frame and hold it after
   --magic-at <frame>    Use a potion on that frame (one is given if none)
   --bot                 Let a simple bot play every player during simulation
   --kill-boss-at <f>    Boss levels: the boss dies on that frame (its death, the
@@ -94,6 +96,7 @@ fn parse_args() -> Result<Args> {
         simulate: 0,
         hold: Vec2::ZERO,
         attack_at: None,
+        block_at: None,
         magic_at: None,
         kill_boss_at: None,
         legend: false,
@@ -122,6 +125,7 @@ fn parse_args() -> Result<Args> {
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
             "--attack-at" => a.attack_at = Some(val()?.parse()?),
+            "--block-at" => a.block_at = Some(val()?.parse()?),
             "--magic-at" => a.magic_at = Some(val()?.parse()?),
             "--kill-boss-at" => a.kill_boss_at = Some(val()?.parse()?),
             "--legend" => a.legend = true,
@@ -444,6 +448,9 @@ fn snapshot_game(args: &Args) -> Result<()> {
         let inp = input::PlayerInput {
             stick: args.hold,
             attack_pressed: args.attack_at == Some(f),
+            // --block-at F: press B (block) on frame F and hold it after.
+            turbo: args.block_at.is_some_and(|b| f >= b),
+            b_pressed: args.block_at == Some(f),
             magic: args.magic_at == Some(f),
             magic_pressed: args.magic_at == Some(f),
             ..Default::default()
@@ -459,7 +466,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 None => inp,
             })
             .collect();
-        // GDL_FX=<row|GENHIT|GENDIE|EXP<type>>[:frame]: start an effect (or
+        // GDL_FX=<row|GENHIT|GENDIE|EXP<type>|BLOCK>[:frame]: start an effect (or
         // a StartExplosion) in front of
         // player 0 (default on the first frame).
         if let Ok(v) = std::env::var("GDL_FX") {
