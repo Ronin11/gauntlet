@@ -257,10 +257,6 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
         }
     }
-    if let Some(p) = args.spawn {
-        g.players[0].pos = p;
-        g.cam_focus = p;
-    }
     // GDL_SUMNER=welcome | runes=..,shards=..,banked_runes=..,banked_shards=..,
     // beaten=..,exp=..: the tower with Sumner, as the app would enter it (masks
     // in hex, exp in decimal).
@@ -294,6 +290,11 @@ fn snapshot_game(args: &Args) -> Result<()> {
         g.set_start(progress.tower_start());
         let s = gdl_engine::tower::Sumner::new(&fs, &mut g, entry);
         g.sumner = Some(Box::new(s));
+    }
+    // After GDL_SUMNER, whose tower start would move the party.
+    if let Some(p) = args.spawn {
+        g.players[0].pos = p;
+        g.cam_focus = p;
     }
     // GDL_LEGEND=1: the party holds this realm's Item of Legend.
     if std::env::var_os("GDL_LEGEND").is_some() {
