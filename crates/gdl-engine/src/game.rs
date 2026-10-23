@@ -3334,6 +3334,16 @@ impl Game {
                 }
                 _ => {}
             }
+            // SetItem: an instance with flag 2 gets no geometry (SetItemGeo is
+            // skipped) - an invisible trigger pad, chain link or hidden item that
+            // still works. Placed monsters get theirs from the enemy code.
+            if !items::attach_geometry(inst.flags) {
+                for e in self.entities.iter_mut().filter(|e| e.id >= first_id) {
+                    if !matches!(e.kind, Kind::Enemy { .. }) {
+                        e.model = None;
+                    }
+                }
+            }
             // Remember which info each power-up, container and generator is.
             for e in self.entities.iter().filter(|e| e.id >= first_id) {
                 if matches!(

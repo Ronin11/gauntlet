@@ -203,6 +203,12 @@ pub(crate) fn item_visible(min_players: i8, num_players: usize, items: usize) ->
     }
 }
 
+/// SetItem: `SetItemGeo` runs only when the instance's flag 2 is clear; with
+/// it set the item works but has no geometry (hidden trigger pads and chains).
+pub(crate) fn attach_geometry(inst_flags: u8) -> bool {
+    inst_flags & 2 == 0
+}
+
 /// fn_8004F87C: the spew (AI) generate_enemy hands init_enemy for a type and
 /// level. RandInt(1) is always 0, so the small types' 2-or-4 is 2.
 pub(crate) fn resolve_spew(etype: usize, level: i32, spew: i32) -> i32 {

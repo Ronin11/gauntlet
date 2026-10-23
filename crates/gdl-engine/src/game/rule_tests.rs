@@ -180,3 +180,38 @@ fn heroes_from_player_select_come_in_invisible() {
     assert_eq!((s.kind, s.flags), (pu::SPECIAL, pu::S_INVISIBLE));
     assert_eq!(s.time, 5.0 * crate::stats::powerup_time(0));
 }
+
+#[test]
+fn placements_with_flag_2_get_no_geometry() {
+    // SetItem skips SetItemGeo for an instance with flag 2: the tower's chained
+    // activator pads and levelA1's two hidden switches work but aren't drawn.
+    let Some(fs) = data() else { return };
+    for level in ["levelL1", "levelA1"] {
+        let g = Game::new(&fs, level, &[("WAR", "RED")]).unwrap();
+        let infos = &g.level.worlds.item_infos;
+        let (mut hidden, mut shown) = (0, 0);
+        for inst in &g.level.worlds.item_instances {
+            let Some(info) = infos.get(inst.item_index as usize) else {
+                continue;
+            };
+            if info.item_type != ItemType::Trigger || inst.min_players > 1 {
+                continue;
+            }
+            let pos = Vec3::from(inst.pos);
+            let geo = items::attach_geometry(inst.flags);
+            // Hidden and shown pads can share a spot: look for one that fits.
+            let fits = g.entities.iter().any(|e| {
+                matches!(e.kind, Kind::Trigger { .. })
+                    && e.pos.distance(pos) < 1e-3
+                    && e.model.is_some() == geo
+            });
+            assert!(fits, "{level}: trigger at {pos} flags {}", inst.flags);
+            if geo {
+                shown += 1;
+            } else {
+                hidden += 1;
+            }
+        }
+        assert!(hidden > 0 && shown > 0, "{level}: {hidden} hidden, {shown} shown");
+    }
+}
