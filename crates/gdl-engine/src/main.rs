@@ -23,7 +23,7 @@ struct Args {
     frame: f32,
     simulate: u32,
     hold: Vec2,
-    attack_at: Option<u32>,
+    attack_at: Vec<u32>,
     magic_at: Option<u32>,
     kill_boss_at: Option<u32>,
     legend: bool,
@@ -67,7 +67,7 @@ Testing:
                         joined by commas, keys a b x u d (e.g. shop:after:900:600a)
   --simulate <frames>   Simulate N 60 Hz frames before the snapshot
   --hold <x,y>          Stick input held during simulation
-  --attack-at <frame>   Press attack on that frame
+  --attack-at <f,...>   Press attack on those frames (a comma list)
   --magic-at <frame>    Use a potion on that frame (one is given if none)
   --bot                 Let a simple bot play every player during simulation
   --kill-boss-at <f>    Boss levels: the boss dies on that frame (its death, the
@@ -93,7 +93,7 @@ fn parse_args() -> Result<Args> {
         frame: 0.0,
         simulate: 0,
         hold: Vec2::ZERO,
-        attack_at: None,
+        attack_at: Vec::new(),
         magic_at: None,
         kill_boss_at: None,
         legend: false,
@@ -121,7 +121,12 @@ fn parse_args() -> Result<Args> {
             "--seq" => a.seq = val()?,
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
-            "--attack-at" => a.attack_at = Some(val()?.parse()?),
+            "--attack-at" => {
+                a.attack_at = val()?
+                    .split(',')
+                    .map(|f| f.trim().parse())
+                    .collect::<Result<_, _>>()?
+            }
             "--magic-at" => a.magic_at = Some(val()?.parse()?),
             "--kill-boss-at" => a.kill_boss_at = Some(val()?.parse()?),
             "--legend" => a.legend = true,
@@ -443,7 +448,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
         let inp = input::PlayerInput {
             stick: args.hold,
-            attack_pressed: args.attack_at == Some(f),
+            attack_pressed: args.attack_at.contains(&f),
             magic: args.magic_at == Some(f),
             magic_pressed: args.magic_at == Some(f),
             ..Default::default()

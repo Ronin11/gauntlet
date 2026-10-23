@@ -479,6 +479,8 @@ impl Scene {
                     state: EnemyState::Dying { timer },
                     ..
                 } => Vec4::new(1.0, 0.3, 0.3, (timer * 2.0).min(1.0)),
+                // A breakable wall's flash (MBTreeSetAltTex whitetex).
+                Kind::Wall(ref w) if w.white => Vec4::new(8.0, 8.0, 8.0, 1.0),
                 _ => match look.and_then(|l| l.tint) {
                     Some([r, g, b]) => Vec4::new(r, g, b, 1.0),
                     None => Vec4::ONE,
