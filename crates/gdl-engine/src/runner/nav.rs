@@ -85,6 +85,8 @@ pub struct WalkWorld<'a> {
     /// the step counts, as the original's sphere-swept floor test
     /// (FloorCollide with the hero's radius) would find it across a seam.
     pub bridge: bool,
+    /// The step a hero walks up (STEP_HEIGHT; analysis may try others).
+    pub step_up: f32,
 }
 
 impl WalkWorld<'_> {
@@ -148,12 +150,12 @@ impl WalkWorld<'_> {
         let col = self.col;
         let p = h.pos;
         let target = p + Vec3::new(dir.x, 0.0, dir.y) * s;
-        let mut probe = col.ground_hit(target, p.y + STEP_HEIGHT);
+        let mut probe = col.ground_hit(target, p.y + self.step_up);
         if probe.is_none() && self.bridge {
             let side = Vec3::new(-dir.y, 0.0, dir.x);
             let fwd = Vec3::new(dir.x, 0.0, dir.y);
             for o in [fwd * 0.5, fwd * -0.5, side * 0.5, side * -0.5, fwd * 0.25, fwd * -0.25] {
-                if let Some(h) = col.ground_hit(target + o, p.y + STEP_HEIGHT) {
+                if let Some(h) = col.ground_hit(target + o, p.y + self.step_up) {
                     probe = Some(h);
                     break;
                 }
@@ -166,7 +168,7 @@ impl WalkWorld<'_> {
         if probe.is_none() && h.on_ground && s > 0.0 {
             let beyond = |d: f32| {
                 let t = p + Vec3::new(dir.x, 0.0, dir.y) * d;
-                col.ground_height(t, p.y + STEP_HEIGHT).is_some_and(|g| p.y - g <= STAIR_RISE)
+                col.ground_height(t, p.y + self.step_up).is_some_and(|g| p.y - g <= STAIR_RISE)
             };
             if beyond(s + 0.25) || beyond(s + 0.5) {
                 self.cracks.borrow_mut().push(target);
@@ -174,7 +176,7 @@ impl WalkWorld<'_> {
         }
         let q = if ok || !h.on_ground { target } else { p };
         let (mut pos, wall_hit) =
-            col.resolve_walls_stairs(q, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT, STAIR_RISE);
+            col.resolve_walls_stairs(q, PLAYER_RADIUS, PLAYER_HEIGHT, self.step_up, STAIR_RISE);
         if h.on_ground {
             if let Some((y, t)) = col.ground_tri(pos, pos.y + STAIR_RISE) {
                 if col.stairs[t] && y > pos.y {
@@ -187,7 +189,7 @@ impl WalkWorld<'_> {
         // snap_to_ground.
         let mut vy = h.vy - 60.0 * DT;
         pos.y += vy * DT;
-        let mut g = col.ground_height(pos, pos.y + STEP_HEIGHT);
+        let mut g = col.ground_height(pos, pos.y + self.step_up);
         if g.is_none() && self.bridge && h.on_ground {
             g = probe.map(|p| p.0).filter(|y| (pos.y - y).abs() < 1.5);
         }
@@ -271,6 +273,8 @@ pub struct Nav {
     pub ignore: HashSet<u64>,
     /// See WalkWorld::bridge.
     pub bridge: bool,
+    /// See WalkWorld::step_up.
+    pub step_up: f32,
     min_y: f32,
     /// Floor seams that stopped an edge walk (see WalkWorld::cracks).
     pub cracks: Vec<Vec3>,
@@ -318,6 +322,7 @@ impl Nav {
             last_solids: solid_set(g),
             ignore: HashSet::default(),
             bridge: false,
+            step_up: STEP_HEIGHT,
             min_y: w.min_bounds[1],
             cracks: Vec::new(),
             checks: 0,
@@ -360,6 +365,7 @@ impl Nav {
             min_y: self.min_y,
             cracks: Default::default(),
             bridge: self.bridge,
+            step_up: self.step_up,
         }
     }
 
@@ -531,7 +537,11 @@ impl Nav {
                         }
                         if ok {
                             let d = (mn.pos - node.pos).length();
-                            let cost = if mn.hurts { d * 12.0 + 20.0 } else { d };
+                            let mut cost = if mn.hurts { d * 12.0 + 20.0 } else { d };
+                            // A drop off an edge is one way: only when nothing else goes.
+                            if dy < -(STAIR_RISE + 1.0) {
+                                cost += 60.0;
+                            }
                             out.push(Edge {
                                 to: m,
                                 cost,
@@ -769,6 +779,28 @@ impl Nav {
             .iter()
             .find(|&&(_, x, y)| x == a && y == b)
             .map(|p| p.0)
+    }
+
+    /// World objects whose collision keeps moving (moving platforms,
+    /// spinners): owner, centre and xz extent.
+    pub fn volatile(&self, g: &Game) -> Vec<(i32, Vec3, f32)> {
+        let mut per: HashMap<i32, (Vec3, Vec3)> = HashMap::default();
+        for (i, &s) in self.streak.iter().enumerate() {
+            if s >= 4 {
+                let t = &g.collision.tris[i];
+                let e = per.entry(t.owner).or_insert((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)));
+                for v in t.v {
+                    e.0 = e.0.min(v);
+                    e.1 = e.1.max(v);
+                }
+            }
+        }
+        let mut v: Vec<(i32, Vec3, f32)> = per
+            .into_iter()
+            .map(|(o, (lo, hi))| (o, (lo + hi) * 0.5, xz(hi - lo).length() * 0.5))
+            .collect();
+        v.sort_by_key(|x| x.0);
+        v
     }
 
     pub fn live_nodes(&self) -> usize {

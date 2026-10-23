@@ -493,23 +493,20 @@ impl Mover {
     }
 
     /// For the level runner's lookahead (runner/bot.rs), read only: the
-    /// collision this target would have once it reaches its other end — the
-    /// moved triangles and how far it rises — or, for a fading target, its
-    /// triangles and whether they would be solid. None for animated targets.
-    pub(crate) fn other_end(&self) -> Option<(Vec<(usize, [Vec3; 3])>, f32, Option<bool>)> {
+    /// collision this target would have once triggered (`active`) or not
+    /// and settled — the moved triangles and how far it rises — or, for a
+    /// fading target, its triangles and whether they would be solid. None
+    /// for animated targets.
+    pub(crate) fn end_state(&self, active: bool) -> Option<(Vec<(usize, [Vec3; 3])>, f32, Option<bool>)> {
         if self.fades() {
-            let solid = !(if self.flags8 & 0x20 != 0 {
-                !self.active
-            } else {
-                self.active
-            });
+            let shown = if self.flags8 & 0x20 != 0 { !active } else { active };
             let tris = self.owned.iter().map(|&i| (i, [Vec3::ZERO; 3])).collect();
-            return Some((tris, 0.0, Some(solid)));
+            return Some((tris, 0.0, Some(shown)));
         }
         if self.animated || self.node {
             return None;
         }
-        let target = if self.active { self.off } else { self.on };
+        let target = if active { self.on } else { self.off };
         let tris = self
             .tris
             .iter()

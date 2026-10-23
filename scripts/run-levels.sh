@@ -3,7 +3,7 @@
 # one process per level, a few at a time, at low priority; then merge the
 # per-level results into <out>/summary.md (and .tsv / .json).
 #
-#   scripts/run-levels.sh [-j N] [-o OUT] [-p WAR,VAL] [-t SECS] [levels...]
+#   scripts/run-levels.sh [-j N] [-o OUT] [-p WAR,VAL] [-t SECS] [-b BINARY] [levels...]
 #
 # Levels default to every level folder (game-data/files/Gauntlet/LEVELS/level*).
 set -euo pipefail
@@ -12,17 +12,18 @@ jobs=4
 out=runner-out
 party=WAR
 timeout=1800
-while getopts "j:o:p:t:" opt; do
+bin=target/release/gauntlet
+while getopts "j:o:p:t:b:" opt; do
   case $opt in
     j) jobs=$OPTARG ;;
     o) out=$OPTARG ;;
     p) party=$OPTARG ;;
     t) timeout=$OPTARG ;;
+    b) bin=$OPTARG ;;
     *) exit 2 ;;
   esac
 done
 shift $((OPTIND - 1))
-bin=target/release/gauntlet
 [ -x "$bin" ] || cargo build --release
 levels=("$@")
 if [ ${#levels[@]} -eq 0 ]; then

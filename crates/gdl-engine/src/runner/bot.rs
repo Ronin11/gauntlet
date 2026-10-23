@@ -26,6 +26,10 @@ pub enum Obj {
     /// A rotator (items.c type 12, subtype 2) a touch sets turning: its
     /// target world object.
     Rotator(u64),
+    /// Wait by a moving platform (world object) for it to come round.
+    Wait(u64),
+    /// Run for what a held pad (trigger id) opens before it shuts again.
+    Run(u64),
     Follow,
     /// Nothing to do: stand (and fight).
     Idle,
@@ -45,6 +49,8 @@ impl Obj {
             Obj::Lectern => "lectern".into(),
             Obj::Portal(i) => format!("portal#{i}"),
             Obj::Rotator(i) => format!("rotator#{i}"),
+            Obj::Wait(i) => format!("wait-platform#{i}"),
+            Obj::Run(i) => format!("run-from-trigger#{i}"),
             Obj::Follow => "follow".into(),
             Obj::Idle => "idle".into(),
         }
@@ -162,6 +168,11 @@ pub struct Bot {
     falls: u32,
     pub verbose: bool,
     giveup_t: Option<f32>,
+    /// Seconds spent waiting by moving platforms, in all and per object.
+    platform_wait: f32,
+    run_to: HashMap<u64, Vec3>,
+    ran: HashSet<u64>,
+    waited: HashMap<u64, f32>,
     boss_fail_t: f32,
     /// Wall seconds: inputs, planning, lookahead, nav refresh.
     pub timing: [f64; 4],
@@ -237,6 +248,10 @@ impl Bot {
             falls: 0,
             verbose,
             giveup_t: None,
+            platform_wait: 0.0,
+            run_to: HashMap::default(),
+            ran: HashSet::default(),
+            waited: HashMap::default(),
             boss_fail_t: -100.0,
             timing: [0.0; 4],
         }
@@ -317,6 +332,10 @@ impl Bot {
                     _ => 2.0,
                 };
                 (vec![Goal::new(e.pos, r, 3.5)], e.pos)
+            }
+            (Obj::Run(t), _) => {
+                let at = *self.run_to.get(&t)?;
+                (vec![Goal::new(at, 2.0, 2.5)], at)
             }
             (Obj::Rotator(t), _) => {
                 let (at, r, _) = g
@@ -740,6 +759,8 @@ impl Bot {
                 Kind::Trigger { gate: None, id, mode, pressed, mover, .. }
                     if id != crate::tower::LECTERN
                         && !(mode == crate::triggers::TriggerMode::Latch && pressed)
+                        // A release only switches its target off: not blindly.
+                        && mode != crate::triggers::TriggerMode::Release
                         && !(mode == crate::triggers::TriggerMode::Latch
                             && mover.and_then(|m| g.movers.get(m)).is_some_and(|m| m.active)) =>
                 {
@@ -749,6 +770,8 @@ impl Bot {
             })
             .into_iter()
             .filter(|c| tried(&c.0) == 0)
+            // Not one the lookahead says shuts part of the level off.
+            .filter(|c| !looks.iter().any(|l| l.0 == c.0 && l.2 < -20))
             .collect();
         if let Some((o, path, cost)) = self.plan_any(g, i, &trigs) {
             self.set_obj(g, i, o, path, cost);
@@ -801,6 +824,35 @@ impl Bot {
             self.set_obj(g, i, o, path, cost);
             return Ok(());
         }
+        // Moving platforms by the edge of the reachable area: wait by one
+        // for it to come round (up to 40 s each, 3 minutes in all).
+        if self.platform_wait < 180.0 {
+            let start = self.nav.start_node(g, g.players[i].pos);
+            let reach_set = start.map(|s| self.nav.reachable(g, s, 400_000)).unwrap_or_default();
+            let mut best: Option<(f32, u64, Vec3)> = None;
+            for (o, c, ext) in self.nav.volatile(g) {
+                let key = Obj::Wait(o.max(0) as u64);
+                if o < 0 || self.waited.get(&(o as u64)).copied().unwrap_or(0.0) > 40.0 || self.failed.contains(&key) {
+                    continue;
+                }
+                for &n in &reach_set {
+                    let p = self.nav.nodes[n as usize].pos;
+                    let d = (xz(p - c).length() - ext).max(0.0);
+                    if d < 5.0 && (p.y - c.y).abs() < 12.0 && best.is_none_or(|b| d < b.0) {
+                        best = Some((d, o as u64, p));
+                    }
+                }
+            }
+            if let Some((_, o, p)) = best {
+                let cands = vec![(Obj::Wait(o), vec![Goal::new(p, 1.2, 2.0)], p)];
+                if let Some((ob, path, cost)) = self.plan_any(g, i, &cands) {
+                    self.set_obj(g, i, ob, path, cost);
+                    self.agents[i].goals = cands[0].1.clone();
+                    self.agents[i].target = Some(p);
+                    return Ok(());
+                }
+            }
+        }
         // Movers may still be on their way: wait for them before giving up.
         if g.movers.iter().any(|m| m.moving) {
             self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
@@ -815,37 +867,7 @@ impl Bot {
         let cracks = self.frontier_cracks(g);
         // Would the exit be reachable if floor seams were bridged (the
         // original's floor test sweeps a sphere of the hero's radius)?
-        let (bridged, breach) = {
-            let mut bn = Nav::new(g);
-            bn.bridge = true;
-            let exit_goals: Vec<Goal> = exits.iter().flat_map(|c| c.1.iter().copied()).collect();
-            let st = bn.start_node(g, g.players[i].pos);
-            let ok = st
-                .and_then(|s| bn.path(g, s, &exit_goals, g.time, MAX_EXPAND))
-                .is_some();
-            (ok, st.map_or(0, |s| bn.reachable(g, s, 400_000).len()))
-        };
-        let eg = cracks
-            .iter()
-            .take(3)
-            .map(|c| format!("({:.1},{:.1},{:.1})", c.x, c.y, c.z))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let crack_note = if bridged {
-            format!(
-                "; the exit WOULD be reachable if floor seams were bridged ({} seams at the edge of the reachable area, e.g. {eg})",
-                cracks.len()
-            )
-        } else if breach > reach + reach / 5 + 50 {
-            format!(
-                "; bridging floor seams would grow the reachable area from {reach} to {breach} nodes ({} seams at its edge, e.g. {eg})",
-                cracks.len()
-            )
-        } else if cracks.is_empty() {
-            String::new()
-        } else {
-            format!("; {} possible floor seams at the edge of the reachable area, e.g. {eg}", cracks.len())
-        };
+        let crack_note = self.what_if(g, i, &exits, reach, &cracks);
         Err(if exits_failed.is_empty() {
             Outcome::Unreachable(format!(
                 "no path to any exit; enablers exhausted (reachable {reach} nodes, keys {keys}, tried {}){crack_note}",
@@ -1043,10 +1065,25 @@ impl Bot {
         let saved: Vec<([Vec3; 3], Vec3)> = g.collision.tris.iter().map(|t| (t.v, t.n)).collect();
         let saved_on = g.collision.enabled.clone();
         let m = g.movers.get(mi)?;
+        // What a press does: latches and sets switch the target on, a
+        // release switches it off, a toggle flips it.
+        let mode = match Self::ent(g, tid).map(|e| &e.kind) {
+            Some(Kind::Trigger { mode, .. }) => *mode,
+            _ => return None,
+        };
+        use crate::triggers::TriggerMode as TM;
+        let want = match mode {
+            TM::Latch | TM::Set => true,
+            TM::Release => false,
+            TM::Toggle => !m.active,
+        };
+        if want == m.active && !m.moving {
+            return Some((false, 0));
+        }
         if m.animated && !m.fades() {
             // Its world animation at the other end.
             let mut wa = g.world_anim.clone();
-            let to_end = !m.active;
+            let to_end = want;
             let mut any = false;
             for &o in &m.objects {
                 if wa.has_anim(o) {
@@ -1063,7 +1100,7 @@ impl Bot {
             }
             wa.update(&mut g.collision, 0.0);
         } else {
-            let (tris, _, solid) = m.other_end()?;
+            let (tris, _, solid) = m.end_state(want)?;
             for (i, v) in tris {
                 match solid {
                     Some(on) => g.collision.enabled[i] = on,
@@ -1102,6 +1139,20 @@ impl Bot {
             let exit_ok = r
                 .iter()
                 .any(|&n| exits.iter().any(|gl| gl.holds(self.nav.nodes[n as usize].pos)));
+            // Where to run for if the target only stays switched while held:
+            // the newly reachable spot nearest an exit, else farthest away.
+            let pts: Vec<Vec3> = r.iter().map(|&n| self.nav.nodes[n as usize].pos).collect();
+            let pick = if exits.is_empty() {
+                pts.iter().copied().max_by(|a, b| xz(*a - stand_pos).length().total_cmp(&xz(*b - stand_pos).length()))
+            } else {
+                pts.iter().copied().min_by(|a, b| {
+                    let d = |p: Vec3| exits.iter().map(|gl| xz(p - gl.pos).length()).fold(f32::MAX, f32::min);
+                    d(*a).total_cmp(&d(*b))
+                })
+            };
+            if let Some(p) = pick {
+                self.run_to.insert(tid, p);
+            }
             Some((exit_ok, r.len() as i64 - base as i64))
         };
         for (i, t) in g.collision.tris.iter_mut().enumerate() {
@@ -1130,6 +1181,8 @@ impl Bot {
             Obj::Exit(_) | Obj::Portal(_) => 300.0,
             Obj::Boss | Obj::Idle | Obj::Follow => f32::MAX,
             Obj::Key(_) | Obj::Pickup(_) | Obj::Food(_) => 60.0,
+            Obj::Wait(_) => 30.0,
+            Obj::Run(_) => 20.0,
             _ => 120.0,
         };
         if now - a.obj_t > cap && !o.entity().is_some_and(gone) {
@@ -1209,6 +1262,16 @@ impl Bot {
                 let left = g.world_anim.untouched_rotators().iter().any(|x| x.2 as u64 == t);
                 (!left).then_some(true)
             }
+            // Standing by: look again every second.
+            Obj::Wait(_) => a.arrived.is_some_and(|t| now - t > 1.0).then_some(true),
+            Obj::Run(_) => {
+                let inside = a.goals.iter().any(|gl| gl.holds(g.players[i].pos));
+                if inside {
+                    Some(true)
+                } else {
+                    (now - a.obj_t > 15.0).then_some(false)
+                }
+            }
         }
     }
 
@@ -1255,6 +1318,11 @@ impl Bot {
                     }
                 }
                 *self.tried.entry(o).or_default() += 1;
+                if let Obj::Wait(w) = o {
+                    let dt = g.time - self.agents[i].obj_t;
+                    self.platform_wait += dt;
+                    *self.waited.entry(w).or_default() += dt;
+                }
                 if !done {
                     self.failed.insert(o);
                 }
@@ -1373,6 +1441,63 @@ impl Bot {
                         return self.attack_toward(g, i, t, false);
                     }
                 }
+                // A toggle flips again while stood on once its target stops
+                // (and its 2 s cooldown runs out): step off it, staying on
+                // the same floor (a lift's pad rides the lift).
+                let toggle = matches!(
+                    Self::ent(g, id).map(|e| &e.kind),
+                    Some(Kind::Trigger { mode: crate::triggers::TriggerMode::Toggle, .. })
+                );
+                if let (true, Some(t)) = (toggle, target) {
+                    let reach = match Self::ent(g, id).map(|e| &e.kind) {
+                        Some(Kind::Trigger { radius, .. }) => radius + PLAYER_RADIUS + 0.6,
+                        _ => 2.8,
+                    };
+                    if now - a.arrived.unwrap() > 0.8 && xz(pos - t).length() < reach + 0.5 {
+                        let under = g.collision.ground_hit(pos, pos.y + 0.5).map(|h| h.1);
+                        let away = (0..16)
+                            .map(|k| {
+                                let ang = k as f32 * std::f32::consts::TAU / 16.0;
+                                Vec2::new(ang.sin(), ang.cos())
+                            })
+                            .filter(|d| {
+                                let spot = t + Vec3::new(d.x, 0.0, d.y) * (reach + 1.0);
+                                g.collision.ground_hit(spot, pos.y + 1.0).is_some_and(|h| {
+                                    Some(h.1) == under && (h.0 - pos.y).abs() < 1.0
+                                })
+                            })
+                            .min_by(|a, b| {
+                                let pa = xz(t) + *a * (reach + 1.0);
+                                let pb = xz(t) + *b * (reach + 1.0);
+                                (pa - xz(pos)).length().total_cmp(&(pb - xz(pos)).length())
+                            });
+                        if let Some(d) = away {
+                            let spot = xz(t) + d * (reach + 1.0);
+                            return PlayerInput {
+                                stick: g.stick_toward((spot - xz(pos)).normalize_or_zero()) * 0.7,
+                                ..Default::default()
+                            };
+                        }
+                    }
+                }
+                // A pad whose effect lasts only while held (a release, or a
+                // set pad): once its target moves, run for the far side.
+                let held_pad = matches!(
+                    Self::ent(g, id).map(|e| &e.kind),
+                    Some(Kind::Trigger { mode: crate::triggers::TriggerMode::Release | crate::triggers::TriggerMode::Set, .. })
+                );
+                if held_pad && now - a.arrived.unwrap() > 0.6 && self.run_to.contains_key(&id) && !self.ran.contains(&id) {
+                    self.ran.insert(id);
+                    let line = format!("hero {i}: pad trigger#{id} held, running for the far side");
+                    self.log(g, line);
+                    let o = Obj::Run(id);
+                    if let Some((gl, at)) = self.goals_of(g, o) {
+                        let path = self.plan_any(g, i, &[(o, gl, at)]).map(|p| p.1).unwrap_or_default();
+                        self.set_obj(g, i, o, path, 0.0);
+                    }
+                    return PlayerInput::default();
+                }
+                let a = &mut self.agents[i];
                 // Step onto it fully, then hold still (fights still happen).
                 if let Some(t) = target {
                     let d = xz(t - pos);
@@ -1419,6 +1544,11 @@ impl Bot {
                 return PlayerInput::default();
             }
             Obj::Idle => {
+                a.last_adv = now;
+                return fight.take().unwrap_or_default();
+            }
+            Obj::Wait(_) if in_goal || a.arrived.is_some() => {
+                a.arrived.get_or_insert(now);
                 a.last_adv = now;
                 return fight.take().unwrap_or_default();
             }
@@ -1505,6 +1635,7 @@ impl Bot {
                 min_y: g.level.worlds.min_bounds[1],
                 cracks: Default::default(),
                 bridge: false,
+                step_up: crate::game::STEP_HEIGHT,
             };
             let far = (a.wp + 4).min(a.path.len() - 1);
             for k in (a.wp + 1..=far).rev() {
@@ -1983,5 +2114,58 @@ impl Bot {
             }
         }
         out
+    }
+}
+
+impl Bot {
+    /// Would the port's two suspect walking rules explain an unreachable
+    /// exit? Plans again with (a) floor seams bridged as the original's
+    /// sphere-swept floor test would (FloorCollide with the hero's radius),
+    /// (b) the original's 1.875 step (walls tested from lbl_80347BD0 above
+    /// the feet in DoPlayerMotion) instead of STEP_HEIGHT 1.2, (c) both.
+    fn what_if(
+        &mut self,
+        g: &Game,
+        i: usize,
+        exits: &[(Obj, Vec<Goal>, Vec3)],
+        reach: usize,
+        cracks: &[Vec3],
+    ) -> String {
+        let exit_goals: Vec<Goal> = exits.iter().flat_map(|c| c.1.iter().copied()).collect();
+        let mut out = Vec::new();
+        for (name, bridge, step) in [
+            ("floor seams bridged", true, crate::game::STEP_HEIGHT),
+            ("a 1.5 step (the original sweeps a radius-1.5 sphere for the floor)", false, 1.5),
+            ("both", true, 1.5),
+        ] {
+            let mut bn = Nav::new(g);
+            bn.bridge = bridge;
+            bn.step_up = step;
+            let st = bn.start_node(g, g.players[i].pos);
+            let ok = st
+                .and_then(|s| bn.path(g, s, &exit_goals, g.time, MAX_EXPAND))
+                .is_some();
+            let n = st.map_or(0, |s| bn.reachable(g, s, 400_000).len());
+            if ok {
+                out.push(format!("with {name} the exit WOULD be reachable ({reach} -> {n} nodes)"));
+                break;
+            } else if n > reach + reach / 5 + 50 {
+                out.push(format!("with {name} the reachable area grows {reach} -> {n} nodes"));
+            }
+        }
+        let eg = cracks
+            .iter()
+            .take(3)
+            .map(|c| format!("({:.1},{:.1},{:.1})", c.x, c.y, c.z))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !cracks.is_empty() {
+            out.push(format!("{} possible floor seams at the edge of the reachable area, e.g. {eg}", cracks.len()));
+        }
+        if out.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", out.join("; "))
+        }
     }
 }
