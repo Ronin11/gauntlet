@@ -13,6 +13,8 @@ use gdl_formats::Objects;
 use glam::{Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 
+mod magic;
+
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
 pub const PLAYER_COLORS: [&str; 4] = ["RED", "BLU", "YEL", "GRE"];
 
@@ -27,9 +29,6 @@ const TARGET_RANGE: f32 = 30.0;
 const MELEE_REACH: f32 = 2.0 + PLAYER_RADIUS;
 /// The aim cone: dot >= 0.707 (0.5 on Easy).
 const AIM_CONE: f32 = 0.707;
-/// The potion ring's damage at full strength, and how long it spreads (s).
-const MAGIC_DAMAGE: f32 = 40.0;
-const MAGIC_TIME: f32 = 1.0;
 /// Turbo meter: fill per second, and the costs of the PWRB / PWRC moves.
 const TURBO_FILL: f32 = 2.0;
 /// player_max_health: 100 per level above 1 plus 500, at most 9999. A new
@@ -224,19 +223,6 @@ impl DmgType {
 /// potion, turbo move and amulet hit has an element; monsters here are neutral.
 const ELEMENT_BONUS: f32 = 1.5;
 
-/// A spreading potion blast.
-#[derive(Clone, Debug)]
-pub struct Ring {
-    pub owner: usize,
-    pub pos: Vec3,
-    pub radius: f32,
-    pub damage: f32,
-    pub colour: u8,
-    pub time: f32,
-    /// Entities already hit.
-    hit: Vec<u64>,
-}
-
 /// A monster's missile to launch.
 #[derive(Clone, Copy, Debug)]
 /// A missile launch this tick (pmotion.c's missile block).
@@ -296,8 +282,9 @@ struct Spawn {
 }
 
 thread_local! {
-    /// Set while a potion's ring is dealing its damage (DMG_MAGIC).
-    static MAGIC_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while a potion's effect is dealing its damage (DMG_MAGIC): its
+    /// element (1-4), else 0.
+    static MAGIC_HIT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// What one hit did.
@@ -1032,8 +1019,11 @@ pub struct Game {
     pub it_holder: Option<usize>,
     /// Round-robin counter for the Temple / Hell SPECIAL generators.
     special_counter: u32,
-    /// Potion blasts spreading out.
-    pub rings: Vec<Ring>,
+    /// Potion effects in flight or spreading (start_magic).
+    pub(crate) magic: Vec<magic::MagicFx>,
+    pub(crate) magic_models: magic::MagicModels,
+    /// randpottype: the colour a colourless potion takes next.
+    randpottype: u32,
     /// Lightning-shield strikes waiting out their second, by (player, monster).
     shield_cooldown: HashMap<(usize, u64), f32>,
     /// Damage-row re-hits waiting out their delay, by (player, target).
@@ -1579,7 +1569,9 @@ impl Game {
             max_enemies: 25,
             special_counter: 0,
             it_holder: None,
-            rings: Vec::new(),
+            magic: Vec::new(),
+            magic_models: Default::default(),
+            randpottype: 0,
             shield_cooldown: HashMap::new(),
             damg_cooldown: HashMap::new(),
             difficulty,
@@ -1785,6 +1777,7 @@ impl Game {
                 .collect();
             game.psfx.push(res);
         }
+        game.load_magic_models(fs, &mut cache);
         game.cam_focus = game.players.first().map(|p| p.pos).unwrap_or(Vec3::ZERO);
         for p in &mut game.players {
             p.refresh_stats();
@@ -3020,7 +3013,7 @@ impl Game {
         self.update_players(dt, &inputs);
         self.update_music_area();
         self.legend_face_boss();
-        self.update_rings(dt);
+        self.update_magic(dt);
         self.spawn_placed_enemies();
         self.update_entities(dt);
         self.update_critters(dt);
@@ -3038,7 +3031,16 @@ impl Game {
         // potion blasts, breath and hammer power-ups, damage rows firing.
         let mut swings: Vec<(usize, f32, bool)> = Vec::new();
         let mut throws: Vec<Throw> = Vec::new();
-        let mut rings: Vec<(usize, Vec3, u8)> = Vec::new();
+        // Potions released: (player, where, colour, start_magic mode), and
+        // the heroes starting the MAGICFX.
+        let mut rings: Vec<(usize, Vec3, u8, u8)> = Vec::new();
+        let mut magic_fx: Vec<usize> = Vec::new();
+        // pmotion.c:2800: no magic while the legend sequence (lbl_8034489C
+        // 1..4) runs; the holder's own bits go to the legend weapon.
+        let magic_ok = self
+            .boss
+            .as_ref()
+            .is_none_or(|b| b.legend_state == 0 || b.legend_state >= 5);
         let mut breaths: Vec<usize> = Vec::new();
         let mut hammers: Vec<usize> = Vec::new();
         let mut damg: Vec<DamgFire> = Vec::new();
@@ -3412,13 +3414,21 @@ impl Game {
                     since_swing: self.time - p.combo_fade,
                 });
             }
-            if bits_now & act::USE_MAGIC != 0 && p.potions > 0 {
-                p.potions -= 1;
-                self.sfx.push("S_POTION1".into());
+            // USE_MAGIC and THROW_MAGIC each start a MAGICFX on the hero.
+            if bits_now & act::USE_MAGIC != 0 {
+                magic_fx.push(i);
             }
-            if bits_now & (act::MAGIC_RELEASE | act::THROW_MAGIC_RELEASE) != 0 {
-                let colour = p.potion_colours.pop().unwrap_or(0);
-                rings.push((i, p.pos, colour));
+            // The release uses the last potion picked up (none: a random
+            // colour) in the mode the release chose.
+            if bits_now & (act::MAGIC_RELEASE | act::THROW_MAGIC_RELEASE) != 0 && magic_ok {
+                let mode = magic::magic_mode(bits_now, levels, false);
+                let colour = if p.potions > 0 {
+                    p.potions -= 1;
+                    p.potion_colours.pop().unwrap_or(0)
+                } else {
+                    0
+                };
+                rings.push((i, p.pos, colour, mode));
             }
             if bits_now & act::BREATHE != 0 {
                 breaths.push(i);
@@ -3627,18 +3637,11 @@ impl Game {
         }
         self.update_fx_follow();
         self.shield_contact(dt);
-        // start_magic: the potion's ring spreads out from where it was used.
-        for (pi, pos, colour) in rings {
-            let power = self.players[pi].derived.magic_power;
-            self.rings.push(Ring {
-                owner: pi,
-                pos,
-                radius: power,
-                damage: MAGIC_DAMAGE,
-                colour,
-                time: 0.0,
-                hit: Vec::new(),
-            });
+        for pi in magic_fx {
+            self.start_magic_player_fx(pi);
+        }
+        for (pi, pos, colour, mode) in rings {
+            self.start_magic(Some(pi), pos, colour as u32, mode, 1.0);
         }
         for t in throws {
             self.player_start_missile(t);
@@ -4577,7 +4580,7 @@ impl Game {
         let r = Self::apply_hit(&mut self.entities[t], dmg, push);
         // The monster staggers (HIT1) or dies (DEATH / HIT2).
         if r.hit
-            && !MAGIC_HIT.with(|m| m.get())
+            && MAGIC_HIT.with(|m| m.get()) == 0
             && matches!(
                 self.entities[t].kind,
                 Kind::Enemy {
@@ -4684,9 +4687,15 @@ impl Game {
         }
         let (_, node) = c.surface(from, pos, yaw);
         let (part, colnode) = node.unwrap_or((0, usize::MAX));
-        let magic = MAGIC_HIT.with(|m| m.get());
-        let mut flags = if magic { crate::critter::DMG_MAGIC } else { 0 };
-        let mut dmg = dmg;
+        let element = MAGIC_HIT.with(|m| m.get());
+        let magic = element != 0;
+        let mut flags = if magic {
+            // The potion's element, for this critter's own affinity.
+            crate::critter::DMG_MAGIC | element
+        } else {
+            0
+        };
+        let mut dmg = if magic { dmg / ELEMENT_BONUS } else { dmg };
         let elem = self
             .players
             .get(pi)
@@ -4824,52 +4833,6 @@ impl Game {
         }
     }
 
-    /// Advance the potion rings: each grows from a third of its radius to the
-    /// whole of it, hitting each monster once as it passes, harder near the start.
-    fn update_rings(&mut self, dt: f32) {
-        let mut hits = Vec::new();
-        for ring in &mut self.rings {
-            ring.time += dt;
-            let phase = 1.0 - ring.time / MAGIC_TIME;
-            if phase <= 0.33 {
-                continue;
-            }
-            let radius = ring.radius * (0.33 + (1.0 - phase));
-            let dmg = ring.damage * 1.5 * (phase - 0.33) * ELEMENT_BONUS;
-            for (i, e) in self.entities.iter().enumerate() {
-                if !e.alive || ring.hit.contains(&e.id) {
-                    continue;
-                }
-                if !matches!(
-                    e.kind,
-                    Kind::Enemy { .. } | Kind::Generator { .. } | Kind::Critter(_)
-                ) {
-                    continue;
-                }
-                let (at, r) = match &e.kind {
-                    Kind::Critter(_) => match Self::aim_point(e, ring.pos) {
-                        Some(a) => a,
-                        None => continue,
-                    },
-                    _ => (e.pos, 0.0),
-                };
-                let d = Vec2::new(at.x - ring.pos.x, at.z - ring.pos.z);
-                if d.length() - r < radius {
-                    ring.hit.push(e.id);
-                    hits.push((ring.owner, i, dmg, d.normalize_or_zero()));
-                }
-            }
-        }
-        self.rings.retain(|r| r.time < MAGIC_TIME);
-        MAGIC_HIT.with(|m| m.set(true));
-        for (pi, i, dmg, push) in hits {
-            if self.entities.get(i).is_some_and(|e| e.alive) {
-                self.hit_entity(pi, i, dmg, push, false);
-            }
-        }
-        MAGIC_HIT.with(|m| m.set(false));
-    }
-
     pub(crate) fn world_letter(&self) -> char {
         self.level
             .name
@@ -4941,7 +4904,7 @@ impl Game {
                 if *etype == crate::enemies::IT {
                     return r;
                 }
-                let dmg = if *etype == crate::enemies::DEATH && !MAGIC_HIT.with(|m| m.get()) {
+                let dmg = if *etype == crate::enemies::DEATH && MAGIC_HIT.with(|m| m.get()) == 0 {
                     1.0
                 } else if *etype == crate::enemies::DEATH {
                     999.0

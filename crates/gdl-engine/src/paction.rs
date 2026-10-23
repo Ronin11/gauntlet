@@ -1184,12 +1184,15 @@ impl Action {
             FIREL => act = FIREL_R,
             FIRER => act = FIRER_R,
             USE_MAGIC => {
-                // (field_956 & 4, the magic-shield hold, is never set here.)
+                // action.c:1168: on to the throw unless field_956 & 4 holds
+                // the magic in place, which nothing sets: every potion is
+                // thrown (0x800ACDC0: lha 0x956; rlwinm. 0,29,29).
                 if next == THROW_MAGIC {
                     act = THROW_MAGIC;
                     mode = 2;
                 } else {
-                    act = MAGIC_RELEASE;
+                    act = THROW_MAGIC;
+                    mode = 0;
                 }
             }
             THROW_MAGIC => act = THROW_MAGIC_RELEASE,
