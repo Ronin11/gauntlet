@@ -622,7 +622,7 @@ impl Nav {
                     self.streak[i] = 0;
                 }
             }
-            let due = self.checks % 20 == 0;
+            let due = self.checks % 120 == 0;
             // ...or when a hero is close by (riding it, say).
             let near = |lo: Vec2, hi: Vec2| {
                 g.players.iter().any(|p| {
@@ -640,8 +640,21 @@ impl Nav {
                     self.last_enabled[i] = col.enabled[i];
                 }
             }
-            for (o, (lo, hi, _)) in per {
-                if take[&o] {
+            for (o, (lo, hi, volatile)) in per {
+                if !take[&o] {
+                    continue;
+                }
+                if volatile && !due {
+                    // Only around the heroes: a big object that never stops
+                    // (water, a spinning room) would rebuild half the level.
+                    for p in &g.players {
+                        let c = xz(p.pos);
+                        let (l, h) = (lo.max(c - Vec2::splat(14.0)), hi.min(c + Vec2::splat(14.0)));
+                        if l.x <= h.x && l.y <= h.y {
+                            boxes.push((l, h));
+                        }
+                    }
+                } else {
                     boxes.push((lo, hi));
                 }
             }

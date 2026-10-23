@@ -149,6 +149,45 @@ GDL_MUTE=1 gauntlet --level levelA1 --bot --simulate 3600 --save-state a1.state 
 GDL_MUTE=1 gauntlet --load-state a1.state --simulate 2 --snapshot b.png
 ```
 
+## Level runner (developer tool)
+
+Not part of the original: a bot that reads the game state (not pixels) and plays a level
+headless at full simulation speed from its start to its exit, then says where and why it
+failed. Code: `crates/gdl-engine/src/runner/`.
+
+```sh
+GDL_MUTE=1 gauntlet --run-level levelA1 [--runner-party WAR,VAL] [--runner-timeout 1800] \
+    [--runner-out runner-out] [--runner-verbose]
+GDL_MUTE=1 gauntlet --run-level A            # a realm; `all` for every level
+scripts/run-levels.sh -j 4 -o runner-out     # every level, one process each, niced
+gauntlet --runner-merge runner-out           # rebuild runner-out/summary.md
+```
+
+- **Navigation**: floor samples on a 2-unit grid, joined where the hero's own movement
+  rules (ledge limit, one-sided walls, stairs, solid items, falling) walk from one to the
+  next; refreshed as movers, doors and walls change; A* to goals; transporter pads.
+- **Objectives**, as a player would: the exit; else what stands in the way (a door and a
+  key for it, a breakable wall, barrel or generator on the way), levers and pads judged by
+  what their target would open up (a lookahead that moves the target), rotators, keys,
+  anything else to pick up; fights what comes near, hunts generators that keep spawning,
+  drinks potions; in the tower collects the crystals, opens the first barrier, visits the
+  lectern and walks into a portal; on boss levels fights the boss (a debug kill after a
+  few minutes, recorded) and waits for the good wizard; timed levels are played out.
+  With several heroes the others follow the first and gather on the exit.
+- **God mode** (`Game::debug_god`) goes on when a hero drops below 20% health, and the
+  result says so (`completed_god`).
+- **On failure** (stuck, unreachable, timeout, exit reached but no end, NaN, a door that
+  won't open to a hero with a key, falling out of the world): a bug report with a
+  `runner.md` note (objective, path, last positions, objectives so far), a `stuck.state`
+  save state and a top-down `navmap.png` (reachable floor green, the rest grey, possible
+  floor seams pink). An unreachable exit is re-planned with the floor seams bridged and
+  with a 1.5 step, to show whether those walking rules explain it.
+- Results: `<out>/summary.md`, `summary.tsv`, `summary.json`; per level `<out>/<level>/`.
+  Debugging aids: `--runner-state <file>` starts from a save state, `--runner-probe
+  x,y,z:x,y,z` walks the hero between two spots in the game and in the nav's simulation,
+  `GDL_NAV_HMAP=x0,z0,x1,z1` prints a floor height map, `GDL_RUNNER_SAVE=<secs>:<file>`
+  saves a state during a run, `GDL_RUNNER_DEBUG=<secs>` prints the hero's state.
+
 ## Android / tablets
 
 ```sh
