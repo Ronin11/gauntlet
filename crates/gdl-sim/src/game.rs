@@ -7456,14 +7456,19 @@ impl Game {
                     }
                 }
                 // fn_8005D730 case 7: a door opens (or says it needs a key,
-                // msg 1) only for a hero not moving away from it.
+                // msg 1) only for a hero not moving away from it. The door's
+                // own cylinder holds a hero's centre exactly `radius` away
+                // (its radius plus the hero's), so contact is `<=`, with a
+                // little slack for the collision push-out's rounding; a
+                // strict `<` left the levelE1 altar door shut to a hero
+                // with a key.
                 Kind::Door { radius, coll } => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                         let mv = self.players[pi].trial_move;
                         let toward = Vec2::new(mv.x, mv.z)
                             .dot(Vec2::new(e.pos.x - pp.x, e.pos.z - pp.z))
                             >= 0.0;
-                        let touching = *alive && toward && (*pp - e.pos).length() < *radius;
+                        let touching = *alive && toward && (*pp - e.pos).length() <= *radius + 0.05;
                         if touching && self.players[pi].keys == 0 {
                             posts.push((1, pi));
                         }

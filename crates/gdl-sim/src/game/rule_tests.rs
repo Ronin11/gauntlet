@@ -147,6 +147,41 @@ fn a_door_opens_only_for_a_hero_walking_toward_it() {
 }
 
 #[test]
+fn the_altar_door_opens_to_a_hero_held_at_its_edge() {
+    // levelE1's door (bug report 20261023-233135): its cylinder keeps a hero's
+    // centre exactly its open radius away, so a strict `<` never opened it.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelE1", &[("JAC", "BLU")]).unwrap();
+    g.entities.retain(|e| matches!(e.kind, Kind::Door { .. }));
+    g.pending_enemies.clear();
+    let door = g.entities[0].pos;
+    let shut = |g: &Game| {
+        g.entities
+            .iter()
+            .any(|e| matches!(e.kind, Kind::Door { .. }))
+    };
+    g.players[0].pos = Vec3::new(-0.37, 0.02, 86.79);
+    g.players[0].keys = 1;
+    for _ in 0..120 {
+        let to = Vec2::new(door.x - g.players[0].pos.x, door.z - g.players[0].pos.z);
+        let input = PlayerInput {
+            stick: g.stick_toward(to.normalize()),
+            ..Default::default()
+        };
+        g.update(1.0 / 60.0, &[input]);
+        if !shut(&g) {
+            break;
+        }
+    }
+    let d = (g.players[0].pos - door).length();
+    assert!(
+        !shut(&g),
+        "the door stayed shut with the hero {d:.3} from it"
+    );
+    assert_eq!(g.players[0].keys, 0, "the key was used");
+}
+
+#[test]
 fn melee_hurts_heroes_only_when_the_option_says() {
     let Some(fs) = data() else { return };
     let mut g = bare(&fs, &[("WAR", "RED"), ("VAL", "BLU")]);
