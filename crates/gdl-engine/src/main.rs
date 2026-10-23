@@ -759,6 +759,28 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 gdl_engine::attract::Attract::credits_demo(&fs, scroll)
                     .draw(&mut screen::Scr::new(&mut canvas, &hud.ui, 100), None);
             }
+            // saver[:ticks]: the screen saver's weapons after that many ticks.
+            Some(name) if name == "saver" || name.starts_with("saver:") => {
+                let ticks = name
+                    .strip_prefix("saver:")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(300);
+                let mut s = gdl_engine::screensaver::Saver::new(1);
+                for _ in 0..ticks {
+                    s.tick(gdl_engine::camera::half_tans());
+                }
+                if let Ok(mut m) = gdl_engine::screensaver::SaverModels::load(&fs, &gpu) {
+                    let k = (w as f32 / 512.0).min(h as f32 / 384.0);
+                    let vp = [
+                        (w as f32 - 512.0 * k) / 2.0,
+                        (h as f32 - 384.0 * k) / 2.0,
+                        512.0 * k,
+                        384.0 * k,
+                    ];
+                    m.draw(&s, &gpu, view, &gpu.depth_view(w, h), vp);
+                }
+                return;
+            }
             Some(name) if name == "shop" || name.starts_with("shop:") => {
                 if let Some((sh, ticks)) = &shop_screen {
                     sh.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, *ticks));

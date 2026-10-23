@@ -36,6 +36,7 @@ pub mod psys;
 pub mod save;
 pub mod scene;
 pub mod screen;
+pub mod screensaver;
 pub mod select;
 pub mod shadow;
 pub mod shop;

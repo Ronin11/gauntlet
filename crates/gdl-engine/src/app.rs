@@ -102,6 +102,45 @@ fn reset_held(timers: &mut Vec<(Source, f32)>, all: &[(Source, PlayerInput)]) ->
     fire
 }
 
+/// PlayerControl[].levels: the buttons a source holds (and the stick and
+/// d-pad directions), as ScreenSaver compares them from tick to tick.
+fn held_levels(i: &PlayerInput) -> u32 {
+    let bits = [
+        i.attack,
+        i.turbo,
+        i.slow,
+        i.magic,
+        i.strafe,
+        i.combo,
+        i.start,
+        i.stick.x > 0.5,
+        i.stick.x < -0.5,
+        i.stick.y > 0.5,
+        i.stick.y < -0.5,
+        i.dpad.x > 0.5,
+        i.dpad.x < -0.5,
+        i.dpad.y > 0.5,
+        i.dpad.y < -0.5,
+    ];
+    bits.iter()
+        .enumerate()
+        .fold(0, |m, (k, &b)| m | (u32::from(b) << k))
+}
+
+/// ScreenSaver counts idle time except in the attract loop (title screen
+/// included), the movies (MG_GAMEMOVIE) and the ending.
+fn saver_counts(screen: &Screen) -> bool {
+    matches!(
+        screen,
+        Screen::Select(_)
+            | Screen::Loading { .. }
+            | Screen::Map { .. }
+            | Screen::Shop { .. }
+            | Screen::Playing { .. }
+            | Screen::GameOver { .. }
+    )
+}
+
 /// OptionsStart: "Quit Level" is greyed out (value -1) while
 /// sMusicTrackHi == 0xC.
 fn quit_level_disabled(wave: Option<u32>) -> bool {
@@ -244,6 +283,12 @@ struct Running {
     escape: bool,
     /// Each input source's reset-combo hold (ms).
     reset_hold: Vec<(Source, f32)>,
+    /// ScreenSaver: ticks with no change in the held buttons (lbl_80344A48),
+    /// each source's held buttons last tick, the running saver and its models.
+    idle: u32,
+    idle_levels: Vec<(Source, u32)>,
+    saver: Option<crate::screensaver::Saver>,
+    saver_models: Option<crate::screensaver::SaverModels>,
     last: Instant,
     acc: f32,
     window: Arc<Window>,
@@ -355,6 +400,10 @@ impl App {
             sources,
             escape: false,
             reset_hold: Vec::new(),
+            idle: 0,
+            idle_levels: Vec::new(),
+            saver: None,
+            saver_models: None,
             last: Instant::now(),
             acc: 0.0,
             window,
@@ -605,6 +654,62 @@ impl App {
                 r.input.end_frame();
                 r.acc -= TICK;
                 continue;
+            }
+            // ScreenSaver: any change in what a controller holds resets the
+            // idle count, or ends a running saver (ScreenSaverEnd).
+            let levels: Vec<(Source, u32)> =
+                all.iter().map(|(s, i)| (*s, held_levels(i))).collect();
+            let changed = levels != r.idle_levels;
+            r.idle_levels = levels;
+            if r.saver.is_some() {
+                if changed {
+                    r.saver = None;
+                    r.idle = 0;
+                    match &r.screen {
+                        Screen::Shop { shop, .. } => {
+                            if let Some(m) = shop.music() {
+                                r.audio.play_bank_music(fs, &m);
+                            }
+                        }
+                        Screen::Select(_) => r.audio.play_select_music(fs),
+                        Screen::Playing { play, .. } => {
+                            let streams = play
+                                .game
+                                .wave
+                                .map(|w| play.game.worlds.music(w))
+                                .unwrap_or_default();
+                            if !r.audio.play_streams(fs, &streams) {
+                                r.audio.play_level_music(fs, &play.game.level.name);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if let Some(s) = r.saver.as_mut() {
+                    s.tick(crate::camera::half_tans());
+                }
+                escape = false;
+                r.input.end_frame();
+                r.acc -= TICK;
+                continue;
+            }
+            r.idle = if !saver_counts(&r.screen) || changed {
+                0
+            } else {
+                r.idle + 1
+            };
+            if r.idle >= crate::screensaver::IDLE_TICKS {
+                // ScreenSaverStart: the music stops and the screen blanks.
+                r.idle = 0;
+                if r.saver_models.is_none() {
+                    match crate::screensaver::SaverModels::load(fs, &r.gpu) {
+                        Ok(m) => r.saver_models = Some(m),
+                        Err(e) => log::warn!("screen saver: {e:#}"),
+                    }
+                }
+                if r.saver_models.is_some() {
+                    r.audio.stop();
+                    r.saver = Some(crate::screensaver::Saver::new(time.to_bits()));
+                }
             }
             match &mut r.screen {
                 Screen::Legal(t) => {
@@ -1214,6 +1319,17 @@ impl App {
                 384.0 * k,
             ];
             c.draw(&r.gpu, &view, &r.depth, vp, at);
+        }
+        if let (Some(s), Some(m)) = (&r.saver, r.saver_models.as_mut()) {
+            let (w, h) = (r.config.width as f32, r.config.height as f32);
+            let k = (w / 512.0).min(h / 384.0);
+            let vp = [
+                (w - 512.0 * k) / 2.0,
+                (h - 384.0 * k) / 2.0,
+                512.0 * k,
+                384.0 * k,
+            ];
+            m.draw(s, &r.gpu, &view, &r.depth, vp);
         }
         frame.present();
 
