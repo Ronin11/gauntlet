@@ -555,12 +555,12 @@ impl Game {
                 }
             }
             None => {
-                // A generic blast (owner 0) still hurts.
-                let e = &mut self.entities[t];
-                let r = Self::apply_hit(e, dmg * ELEMENT_BONUS, push);
-                if let Some((pos, item)) = r.drop {
-                    self.spawn_content(pos, item);
-                }
+                // A generic blast (owner 0) still hurts, with the reactions
+                // and item rules of any owner-less hit.
+                self.hit_from = Some(fx.pos);
+                let dtype = DmgType::MAGIC | (fx.colour as u32 & 0xF);
+                self.world_hit(None, t, dmg * ELEMENT_BONUS, push, dtype);
+                self.hit_from = None;
             }
         }
     }
