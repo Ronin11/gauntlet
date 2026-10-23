@@ -7220,6 +7220,12 @@ impl Game {
                         101..=103 => self.garg_items[c - 101] >= 0,
                         c => !crystals_met(&self.crystals, c),
                     });
+                    // Item collision case 5: a met crystal barrier reaches twice as far.
+                    let reach = if gate.is_some_and(|c| c < 100) && !locked {
+                        *radius * 2.0
+                    } else {
+                        *radius
+                    };
                     // Walking into a lever or onto a pad sets it off; wall levers sit in
                     // the wall, so allow for the player's own radius.
                     let root = mover.and_then(|m| self.movers.get(m)).map(|m| m.root);
@@ -7229,7 +7235,7 @@ impl Game {
                         if *shoot
                             || !*alive
                             || Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
-                                >= *radius + PLAYER_RADIUS + 0.6
+                                >= reach + PLAYER_RADIUS + 0.6
                             || (pp.y - pos.y).abs() >= 4.0
                         {
                             continue;
@@ -9267,6 +9273,77 @@ mod tests {
             })
             .count();
         assert_eq!(barriers, 8, "one crystal barrier per crystal realm");
+    }
+
+    /// The tower's crystal barriers (target flags 0x10|0x20) stand, solid,
+    /// until their colour's crystals are found and a hero walks up; then they
+    /// fade out and lose their collision (fn_80062A00: `on` = st & 0x2F).
+    #[test]
+    fn crystal_barriers_open_when_met() {
+        let Some(fs) = data() else { return };
+        let barrier = |g: &Game, c: usize| {
+            let (pos, m) = g
+                .entities
+                .iter()
+                .find_map(|e| match e.kind {
+                    Kind::Trigger {
+                        gate: Some(gc),
+                        mover: Some(m),
+                        ..
+                    } if gc == c => Some((e.pos, m)),
+                    _ => None,
+                })
+                .unwrap();
+            let mv = &g.movers[m];
+            let solid = g.collision.tris.iter().enumerate().any(|(i, t)| {
+                t.owner >= 0 && mv.objects.contains(&(t.owner as usize)) && g.collision.enabled[i]
+            });
+            (pos, mv.shown, solid)
+        };
+        let step = |g: &mut Game, n: usize| {
+            for _ in 0..n {
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            }
+        };
+        let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
+        g.crystals[1] = CRYSTALS_NEEDED[1] - 1;
+        step(&mut g, 5);
+        for c in 1..=8 {
+            let (_, shown, solid) = barrier(&g, c);
+            assert!(shown && solid, "barrier {c} stands while locked");
+        }
+        // One orange short: walking up to the orange barrier leaves it up.
+        let (orange, ..) = barrier(&g, 1);
+        g.players[0].pos = orange + Vec3::Y * 0.5;
+        step(&mut g, 2);
+        assert!(g.barrier_touches.contains(&1), "it says what it needs");
+        step(&mut g, 60);
+        let (_, shown, solid) = barrier(&g, 1);
+        assert!(shown && solid, "locked barrier stays");
+        // All 15: it opens (fades out, no collision); red stays.
+        g.crystals[1] = CRYSTALS_NEEDED[1];
+        g.players[0].pos = orange + Vec3::Y * 0.5;
+        step(&mut g, 60);
+        let (_, shown, solid) = barrier(&g, 1);
+        assert!(!shown && !solid, "orange barrier opens");
+        let (red, shown, solid) = barrier(&g, 2);
+        assert!(shown && solid, "red barrier stays");
+        g.players[0].pos = red + Vec3::Y * 0.5;
+        step(&mut g, 60);
+        let (_, shown, solid) = barrier(&g, 2);
+        assert!(shown && solid, "red barrier stays when walked into");
+        assert!(!barrier(&g, 1).1, "orange stays open");
+        // Entering with orange done (-1) starts it open.
+        let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
+        g.crystals[1] = -1;
+        g.enter_tower();
+        step(&mut g, 5);
+        let (_, shown, solid) = barrier(&g, 1);
+        assert!(!shown && !solid, "done barrier starts open");
+        for c in 2..=8 {
+            let (_, shown, solid) = barrier(&g, c);
+            assert!(shown && solid, "barrier {c} still up");
+        }
     }
 
     #[test]

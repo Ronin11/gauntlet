@@ -302,7 +302,9 @@ impl Mover {
             held: false,
             flags8,
             moving: false,
-            shown: flags8 & 0x10 == 0,
+            // A fade target with flag 0x20 starts shown (fn_80062A00's
+            // `on` is st & 0x2F); one without it starts hidden.
+            shown: flags8 & 0x10 == 0 || flags8 & 0x20 != 0,
             pos: Vec3::from(level.world_pos[root]),
             animated: false,
             node: false,
@@ -331,6 +333,17 @@ impl Mover {
     /// Fades in and out instead of sliding (target flag 0x10).
     pub fn fades(&self) -> bool {
         self.flags8 & 0x10 != 0
+    }
+
+    /// fn_80062A00's fade branch: `on` (faded out, nocol) is st & 0x2F with
+    /// target flag 0x20 (triggered or held: the tower's crystal barriers
+    /// vanish once opened), else !(st & 0xF) (shown while held).
+    fn fade_shown(&self) -> bool {
+        if self.flags8 & 0x20 != 0 {
+            !(self.active || self.held)
+        } else {
+            self.active || self.held
+        }
     }
 
     /// Momentary targets forget their state every frame unless a trigger holds them.
@@ -392,7 +405,7 @@ impl Mover {
             return (false, was_moving);
         }
         if self.fades() {
-            self.shown = self.active || self.held;
+            self.shown = self.fade_shown();
             for &(i, _) in &self.tris {
                 collision.enabled[i] = self.shown;
             }
