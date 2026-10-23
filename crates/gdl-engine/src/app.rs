@@ -62,6 +62,46 @@ fn checkpoint_at(wave: Option<u32>) -> bool {
     !matches!(wave, Some(0x501 | 0x601)) && wave.is_none_or(|w| w >> 8 != 12)
 }
 
+/// padUpdate's gPadResetHoldTimer: a pad holding exactly Start + X + B
+/// (PAD_RESET_COMBO_B, 0x1600) counts up; past 500 ms sysPollResetButton
+/// fires and the system resets (OSResetSystem).
+const RESET_HOLD_MS: f32 = 500.0;
+
+/// Start + X + B with no other button (stick moves don't count).
+fn reset_combo(i: &PlayerInput) -> bool {
+    i.start
+        && i.magic
+        && i.turbo
+        && !i.attack
+        && !i.slow
+        && !i.strafe
+        && !i.combo
+        && i.dpad == glam::Vec2::ZERO
+}
+
+/// Advance each source's reset hold timer by one tick; true when one is past
+/// [`RESET_HOLD_MS`].
+fn reset_held(timers: &mut Vec<(Source, f32)>, all: &[(Source, PlayerInput)]) -> bool {
+    timers.retain(|(s, _)| all.iter().any(|(a, _)| a == s));
+    let mut fire = false;
+    for (src, inp) in all {
+        let t = match timers.iter_mut().find(|(s, _)| s == src) {
+            Some((_, t)) => t,
+            None => {
+                timers.push((*src, 0.0));
+                &mut timers.last_mut().unwrap().1
+            }
+        };
+        *t = if reset_combo(inp) {
+            *t + TICK * 1000.0
+        } else {
+            0.0
+        };
+        fire |= *t > RESET_HOLD_MS;
+    }
+    fire
+}
+
 /// OptionsStart: "Quit Level" is greyed out (value -1) while
 /// sMusicTrackHi == 0xC.
 fn quit_level_disabled(wave: Option<u32>) -> bool {
@@ -202,6 +242,8 @@ struct Running {
     sources: Vec<Source>,
     /// Escape was pressed this frame.
     escape: bool,
+    /// Each input source's reset-combo hold (ms).
+    reset_hold: Vec<(Source, f32)>,
     last: Instant,
     acc: f32,
     window: Arc<Window>,
@@ -312,6 +354,7 @@ impl App {
             input,
             sources,
             escape: false,
+            reset_hold: Vec::new(),
             last: Instant::now(),
             acc: 0.0,
             window,
@@ -545,6 +588,24 @@ impl App {
                 .into_iter()
                 .map(|s| (s, r.input.read(s)))
                 .collect();
+            if reset_held(&mut r.reset_hold, &all) {
+                // OSResetSystem: the game boots again; only the memory card
+                // (and the options) remain.
+                r.reset_hold.clear();
+                r.audio.stop();
+                r.progress = Progress::default();
+                r.carry = None;
+                r.checkpoint = None;
+                r.suspended = None;
+                r.heroes = Default::default();
+                r.attract = Attract::new();
+                menu_shop = None;
+                next = Some(Screen::Legal(120));
+                escape = false;
+                r.input.end_frame();
+                r.acc -= TICK;
+                continue;
+            }
             match &mut r.screen {
                 Screen::Legal(t) => {
                     *t = t.saturating_sub(1);
@@ -1628,8 +1689,40 @@ fn attract_event(
 }
 
 #[cfg(test)]
-mod checkpoint_tests {
-    use super::{checkpoint_at, quit_level_disabled};
+mod tests {
+    use super::{checkpoint_at, quit_level_disabled, reset_held, Source};
+    use crate::input::PlayerInput;
+
+    /// Start + X + B alone, held past half a second, resets; anything else
+    /// held with it, or letting go, starts the count again.
+    #[test]
+    fn start_x_b_held_resets() {
+        let combo = PlayerInput {
+            start: true,
+            magic: true,
+            turbo: true,
+            ..Default::default()
+        };
+        let mut t = Vec::new();
+        let all = [(Source::Keyboard, combo)];
+        let ticks = (0..60).take_while(|_| !reset_held(&mut t, &all)).count();
+        assert_eq!(ticks, 30, "fires on the tick past 500 ms");
+        let mut t = Vec::new();
+        let extra = PlayerInput {
+            attack: true,
+            ..combo
+        };
+        for _ in 0..120 {
+            assert!(!reset_held(&mut t, &[(Source::Keyboard, extra)]));
+        }
+        for _ in 0..20 {
+            reset_held(&mut t, &all);
+        }
+        reset_held(&mut t, &[(Source::Keyboard, PlayerInput::default())]);
+        for _ in 0..25 {
+            assert!(!reset_held(&mut t, &all));
+        }
+    }
 
     #[test]
     fn no_quit_level_in_the_secret_levels() {
