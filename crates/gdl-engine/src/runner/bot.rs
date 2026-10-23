@@ -178,6 +178,7 @@ pub struct Bot {
     mover_wait: f32,
     unblocks: u32,
     rounds: u32,
+    anchor: (Vec3, f32),
     run_to: HashMap<u64, Vec3>,
     ran: HashSet<u64>,
     waited: HashMap<u64, f32>,
@@ -264,6 +265,7 @@ impl Bot {
             mover_wait: 0.0,
             unblocks: 0,
             rounds: 0,
+            anchor: (Vec3::splat(1e9), 0.0),
             run_to: HashMap::default(),
             ran: HashSet::default(),
             waited: HashMap::default(),
@@ -859,6 +861,9 @@ impl Bot {
                 }
             }
             if let Some((_, o, p)) = best {
+                // Each look counts 2 s against the budgets.
+                self.platform_wait += 2.0;
+                *self.waited.entry(o).or_default() += 2.0;
                 let cands = vec![(Obj::Wait(o), vec![Goal::new(p, 1.2, 2.0)], p)];
                 if let Some((ob, path, cost)) = self.plan_any(g, i, &cands) {
                     self.set_obj(g, i, ob, path, cost);
@@ -1357,11 +1362,6 @@ impl Bot {
                     }
                 }
                 *self.tried.entry(o).or_default() += 1;
-                if let Obj::Wait(w) = o {
-                    let dt = g.time - self.agents[i].obj_t;
-                    self.platform_wait += dt;
-                    *self.waited.entry(w).or_default() += dt;
-                }
                 if !done {
                     self.failed.insert(o);
                 }
@@ -1959,6 +1959,26 @@ impl Bot {
         }
         if g.players.iter().any(|p| matches!(p.state, PlayerState::Dead { .. })) && g.debug_god {
             return Some(Outcome::Died("a hero died in god mode".into()));
+        }
+        // Pinned: hero 0 hasn't got 3 units from one spot in 150 s (outside
+        // boss fights, timed levels and the exit wait).
+        if let Some(p) = g.players.first().filter(|p| p.state.active()) {
+            if (p.pos - self.anchor.0).length() > 3.0 {
+                self.anchor = (p.pos, g.time);
+            } else if g.time - self.anchor.1 > 150.0
+                && g.boss.is_none()
+                && g.secret_timer.is_none()
+                && p.exit.touch.is_none()
+            {
+                return Some(Outcome::Stuck(format!(
+                    "hero 0 has not got 3 units from ({:.1},{:.1},{:.1}) in {:.0} s (last objective {})",
+                    self.anchor.0.x,
+                    self.anchor.0.y,
+                    self.anchor.0.z,
+                    g.time - self.anchor.1,
+                    self.agents.first().and_then(|a| a.obj).map_or("-".into(), |o| o.name())
+                )));
+            }
         }
         // On the exit for long with nothing happening.
         let on_exit = g.players.iter().filter(|p| p.state.active()).all(|p| p.exit.touch.is_some());

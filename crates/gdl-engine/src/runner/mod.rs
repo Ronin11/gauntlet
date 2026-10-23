@@ -707,3 +707,89 @@ pub fn merge(out: &Path) -> Result<PathBuf> {
     std::fs::write(&p, md)?;
     Ok(p)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data() -> Option<GameFs> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        GameFs::open(&root).ok()
+    }
+
+    fn opts(out: &Path, party: &[&str]) -> Opts {
+        Opts {
+            levels: Vec::new(),
+            party: party
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.to_string(), crate::game::PLAYER_COLORS[i % 4].to_string()))
+                .collect(),
+            timeout: 600.0,
+            out: out.to_path_buf(),
+            verbose: false,
+            data: None,
+            capture: false,
+            state: None,
+            probe: None,
+        }
+    }
+
+    /// The nav's walking simulation steps the hero the way the game does: a
+    /// straight run across levelB1's start ends where the game's run ends.
+    #[test]
+    fn the_walk_check_matches_the_game() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelB1", &[("WAR", "RED")]).unwrap();
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let from = g.players[0].pos;
+        let to = from + glam::Vec3::new(6.0, 0.0, 0.0);
+        let ignore = nav::HashSet::default();
+        let w = nav::WalkWorld {
+            col: &g.collision,
+            ents: &g.entities,
+            ignore: &ignore,
+            min_y: g.level.worlds.min_bounds[1],
+            cracks: Default::default(),
+            bridge: false,
+            step_up: crate::game::STEP_HEIGHT,
+        };
+        let sim = w.walk(from, to);
+        for _ in 0..120 {
+            let d = nav::xz(to - g.players[0].pos);
+            if d.length() < 0.2 {
+                break;
+            }
+            let inp = PlayerInput {
+                stick: g.stick_toward(d.normalize_or_zero()),
+                ..Default::default()
+            };
+            g.update(1.0 / 60.0, &[inp]);
+        }
+        let game = g.players[0].pos;
+        assert!(
+            nav::xz(sim - game).length() < 0.6,
+            "simulated {sim:?}, game {game:?}"
+        );
+    }
+
+    /// levelB1 is short: one hero, and two (who gather on the exit), play it
+    /// to its end.
+    #[test]
+    fn the_runner_finishes_levelb1() {
+        let Some(fs) = data() else { return };
+        let out = std::env::temp_dir().join(format!("gdl-runner-test-{}", std::process::id()));
+        for party in [&["WAR"][..], &["WAR", "VAL"][..]] {
+            let r = run_level(&fs, &opts(&out, party), "levelB1").unwrap();
+            assert!(
+                matches!(r.outcome, Outcome::Completed),
+                "{party:?}: {:?} after {:.0} s",
+                r.outcome,
+                r.game_time
+            );
+        }
+        let _ = std::fs::remove_dir_all(&out);
+    }
+}
