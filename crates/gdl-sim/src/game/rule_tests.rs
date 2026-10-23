@@ -199,10 +199,11 @@ fn placements_with_flag_2_get_no_geometry() {
             }
             let pos = Vec3::from(inst.pos);
             let geo = items::attach_geometry(inst.flags);
-            // Hidden and shown pads can share a spot: look for one that fits.
+            // Hidden and shown pads can share a spot: look for one that fits
+            // (AddItemSub has put them on the floor).
             let fits = g.entities.iter().any(|e| {
                 matches!(e.kind, Kind::Trigger { .. })
-                    && e.pos.distance(pos) < 1e-3
+                    && (e.pos - pos).with_y(0.0).length() < 1e-3
                     && e.model.is_some() == geo
             });
             assert!(fits, "{level}: trigger at {pos} flags {}", inst.flags);

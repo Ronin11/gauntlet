@@ -7,7 +7,7 @@
 //! walls, items) invalidate the cells they touch.
 
 use crate::collision::Collision;
-use crate::game::{Entity, Game, Shape, PLAYER_HEIGHT, PLAYER_RADIUS, STAIR_RISE, STEP_HEIGHT};
+use crate::game::{Entity, Game, Shape, PLAYER_COL_HEIGHT, PLAYER_RADIUS, STAIR_RISE};
 use glam::{Vec2, Vec3};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -81,12 +81,6 @@ pub struct WalkWorld<'a> {
     /// Where a step was refused for want of floor although floor goes on
     /// just beyond (a seam between floor objects narrower than a step).
     pub cracks: std::cell::RefCell<Vec<Vec3>>,
-    /// Analysis only (not the game's rule): a floor within half a unit of
-    /// the step counts, as the original's sphere-swept floor test
-    /// (FloorCollide with the hero's radius) would find it across a seam.
-    pub bridge: bool,
-    /// The step a hero walks up (STEP_HEIGHT; analysis may try others).
-    pub step_up: f32,
 }
 
 impl WalkWorld<'_> {
@@ -149,55 +143,27 @@ impl WalkWorld<'_> {
         const DT: f32 = 1.0 / 60.0;
         let col = self.col;
         let p = h.pos;
-        let target = p + Vec3::new(dir.x, 0.0, dir.y) * s;
-        let mut probe = col.ground_hit(target, p.y + self.step_up);
-        if probe.is_none() && self.bridge {
-            let side = Vec3::new(-dir.y, 0.0, dir.x);
-            let fwd = Vec3::new(dir.x, 0.0, dir.y);
-            for o in [fwd * 0.5, fwd * -0.5, side * 0.5, side * -0.5, fwd * 0.25, fwd * -0.25] {
-                if let Some(h) = col.ground_hit(target + o, p.y + self.step_up) {
-                    probe = Some(h);
-                    break;
-                }
-            }
-        }
-        let under = col.ground_hit(p, p.y + 0.1).map(|(_, o)| o);
-        let ok = probe.is_some_and(|(g, o)| {
-            p.y - g <= STAIR_RISE + if Some(o) == under { 1.0 } else { 0.0 }
-        });
+        let fwd = Vec3::new(dir.x, 0.0, dir.y);
+        let target = p + fwd * s;
+        let probe = if h.on_ground {
+            Game::player_step(col, p, target - p)
+        } else {
+            None
+        };
         if probe.is_none() && h.on_ground && s > 0.0 {
             let beyond = |d: f32| {
-                let t = p + Vec3::new(dir.x, 0.0, dir.y) * d;
-                col.ground_height(t, p.y + self.step_up).is_some_and(|g| p.y - g <= STAIR_RISE)
+                Game::player_step(col, p, fwd * d).is_some_and(|(m, _)| xz(m).dot(dir) > 0.0)
             };
             if beyond(s + 0.25) || beyond(s + 0.5) {
                 self.cracks.borrow_mut().push(target);
             }
         }
-        let mut q = if ok || !h.on_ground { target } else { p };
-        // A seam narrower than a running step: a careful player creeps up
-        // to its edge, then one full step clears it.
-        if probe.is_none() && h.on_ground && s > 0.0 {
-            let fwd = Vec3::new(dir.x, 0.0, dir.y);
-            let mut edge = 0.0;
-            let mut k = 0.02;
-            while k < s {
-                if col.ground_hit(p + fwd * k, p.y + self.step_up).is_some() {
-                    edge = k;
-                } else {
-                    break;
-                }
-                k += 0.02;
-            }
-            let leap = p + fwd * (edge + STEP);
-            if let Some((g, o)) = col.ground_hit(leap, p.y + self.step_up) {
-                if p.y - g <= STAIR_RISE + if Some(o) == under { 1.0 } else { 0.0 } {
-                    q = leap;
-                }
-            }
-        }
-        let (mut pos, wall_hit) =
-            col.resolve_walls_stairs(q, PLAYER_RADIUS, PLAYER_HEIGHT, self.step_up, STAIR_RISE);
+        let q = match probe {
+            Some((d, _)) => p + d,
+            None if !h.on_ground => target,
+            None => p,
+        };
+        let (mut pos, wall_hit) = Game::player_walls(col, q);
         if h.on_ground {
             if let Some((y, t)) = col.ground_tri(pos, pos.y + STAIR_RISE) {
                 if col.stairs[t] && y > pos.y {
@@ -207,24 +173,12 @@ impl WalkWorld<'_> {
         }
         let walled = pos;
         pos = self.solids(pos);
-        // snap_to_ground.
-        let mut vy = h.vy - 60.0 * DT;
-        pos.y += vy * DT;
-        let mut g = col.ground_height(pos, pos.y + self.step_up);
-        if g.is_none() && self.bridge && h.on_ground {
-            g = probe.map(|p| p.0).filter(|y| (pos.y - y).abs() < 1.5);
-        }
-        let on_ground = match g {
-            Some(g) if pos.y <= g || (pos.y - g < 0.3 && vy <= 0.0) => {
-                pos.y = g;
-                vy = 0.0;
-                true
-            }
-            _ => false,
-        };
+        let mut vy = h.vy;
+        let g = Game::player_snap(col, &mut pos, &mut vy, DT);
+        let on_ground = g.is_some();
         if std::env::var_os("GDL_NAV_DEBUG").is_some() {
             println!(
-                "    step {p:?} -> target {target:?} probe {probe:?} under {under:?} ok {ok} walls {walled:?} solids {pos:?} ground {g:?} on {on_ground} wall {wall_hit:?}",
+                "    step {p:?} -> target {target:?} probe {probe:?} walls {walled:?} solids {pos:?} ground {g:?} on {on_ground} wall {wall_hit:?}",
             );
         }
         (pos.y > self.min_y).then_some(Hero { pos, vy, on_ground })
@@ -292,10 +246,6 @@ pub struct Nav {
     last_enabled: Vec<bool>,
     last_solids: HashMap<u64, Vec3>,
     pub ignore: HashSet<u64>,
-    /// See WalkWorld::bridge.
-    pub bridge: bool,
-    /// See WalkWorld::step_up.
-    pub step_up: f32,
     min_y: f32,
     /// Floor seams that stopped an edge walk (see WalkWorld::cracks).
     pub cracks: Vec<Vec3>,
@@ -342,8 +292,6 @@ impl Nav {
             last_enabled: g.collision.enabled.clone(),
             last_solids: solid_set(g),
             ignore: HashSet::default(),
-            bridge: false,
-            step_up: STEP_HEIGHT,
             min_y: w.min_bounds[1],
             cracks: Vec::new(),
             checks: 0,
@@ -387,8 +335,6 @@ impl Nav {
             ignore: &self.ignore,
             min_y: self.min_y,
             cracks: Default::default(),
-            bridge: self.bridge,
-            step_up: self.step_up,
         }
     }
 
@@ -426,12 +372,15 @@ impl Nav {
                     continue;
                 }
                 let p0 = Vec3::new(q.x, y, q.y);
-                let (p1, _) = col.resolve_walls_stairs(p0, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT, STAIR_RISE);
-                let (p2, _) = col.resolve_walls_stairs(p1, PLAYER_RADIUS, PLAYER_HEIGHT, STEP_HEIGHT, STAIR_RISE);
+                let (p1, _) = Game::player_walls(col, p0);
+                let (p2, _) = Game::player_walls(col, p1);
                 if xz(p2 - p1).length() > 0.05 || xz(p2 - ctr3(ctr, y)).length() > CELL * 0.75 {
                     continue;
                 }
-                let Some((y2, owner)) = col.ground_hit(p2, y + STEP_HEIGHT) else {
+                let Some((y2, owner)) = col
+                    .player_floor(p2, PLAYER_RADIUS, PLAYER_COL_HEIGHT, true)
+                    .map(|h| (h.at.y, h.owner))
+                else {
                     continue;
                 };
                 if (y2 - y).abs() > 1.5 {

@@ -37,6 +37,9 @@ pub const STAIR_RISE: f32 = 3.0;
 /// PDATA width and height (col_radius 1.5, height 5).
 pub const PLAYER_RADIUS: f32 = 1.5;
 pub const PLAYER_HEIGHT: f32 = 5.0;
+/// col_height (player.c:4029, half the PDATA height): effectpos, the body
+/// centre the motion collision starts from, is this far above the feet.
+pub const PLAYER_COL_HEIGHT: f32 = PLAYER_HEIGHT * 0.5;
 /// PlayerGetTarget: the farthest a target is looked for, and the melee reach
 /// (2 plus the player's radius, from the target's surface).
 const TARGET_RANGE: f32 = 30.0;
@@ -978,6 +981,10 @@ pub enum Kind {
         cam: Option<(Vec3, Vec3, u8)>,
         /// A door_switch (subtype 0x17): it posts the traps hint (message 5).
         door_switch: bool,
+        /// AddItemSub parented it to the moving floor object it was put on
+        /// (flag 0x1000): that object, the height it was put at and the
+        /// offset then of the mover sliding the object (if one does).
+        ride: Option<(i32, f32, f32)>,
     },
     Prop,
     /// items.c obstacles 0x28/0x31/0x34/0x35: a rock that falls (or sinks)
@@ -1784,10 +1791,12 @@ impl Game {
         // fn_80088714: a wall of a world object flagged 0x38 (the STAIRS and
         // RAMP objects) doesn't slide or stop the player.
         for (i, t) in collision.tris.iter().enumerate() {
-            collision.stairs[i] = usize::try_from(t.owner)
+            let flags = usize::try_from(t.owner)
                 .ok()
                 .and_then(|o| level.worlds.world_objects.get(o))
-                .is_some_and(|o| o.flags & 0x38 != 0);
+                .map_or(0, |o| o.flags);
+            collision.stairs[i] = flags & 0x38 != 0;
+            collision.obj_flags[i] = flags;
         }
         let world_anim = crate::worldanim::WorldAnims::new(&level, &mut collision);
 
@@ -2852,6 +2861,8 @@ impl Game {
         let mut carriers: Vec<(u64, Vec3)> = Vec::new();
         // (instance, first entity id) of the item placed last (savestate.rs).
         let mut placing: (u32, u64) = (0, self.next_id);
+        // Triggers AddItemSub puts on the floor.
+        let mut on_floor: Vec<u64> = Vec::new();
         for (inst_idx, inst) in instances.iter().enumerate() {
             self.note_placed(placing);
             placing = (inst_idx as u32, self.next_id);
@@ -3360,7 +3371,7 @@ impl Game {
                                 self.add_mover(m)
                             })
                     });
-                    self.spawn(
+                    let id = self.spawn(
                         Kind::Trigger {
                             mover,
                             mode,
@@ -3385,11 +3396,15 @@ impl Game {
                             })
                             .flatten(),
                             door_switch: info.subtype == 0x17,
+                            ride: None,
                         },
                         model,
                         pos,
                         yaw,
                     );
+                    if info.coll_flags & 1 == 0 {
+                        on_floor.push(id);
+                    }
                 }
                 // SetItem case 13: a sound item with a music area selects it
                 // while a hero is within its radius.
@@ -3448,6 +3463,7 @@ impl Game {
             }
         }
         self.note_placed(placing);
+        self.put_triggers_on_floor(&on_floor);
         self.link_carried(&carriers);
         self.load_item_fx(fs, &mut cache, &mut known, &dirs);
         self.append_bigape_powerups(fs, &mut cache, &mut known);
@@ -3705,6 +3721,45 @@ impl Game {
         if knock == DmgType::KNOCKDOWN {
             let id = self.realm_sound(&WORLD_HIT_SFX);
             self.sfx_id(id);
+        }
+    }
+
+    /// PlayerCollideFloor for a grounded hero's step `dpos` from `feet`
+    /// (pmotion.c:4318, with the hero's radius and col_height): the
+    /// displacement to make and the floor's height, or None (refused).
+    pub fn player_step(collision: &Collision, feet: Vec3, dpos: Vec3) -> Option<(Vec3, f32)> {
+        let under = collision
+            .player_floor(feet, PLAYER_RADIUS, PLAYER_COL_HEIGHT, true)
+            .map(|h| h.owner);
+        collision.player_collide_floor(feet, dpos, feet.y, under, PLAYER_RADIUS, PLAYER_COL_HEIGHT)
+    }
+
+    /// DoPlayerMotion's wall test (pmotion.c:1195, fn_80088714): a sphere
+    /// of the hero's radius at the body centre raised lbl_80347BD0 (1), so
+    /// walls up to 2 above the feet don't stop a hero; stairs' walls only
+    /// above STAIR_RISE.
+    pub fn player_walls(collision: &Collision, feet: Vec3) -> (Vec3, Option<(i32, Vec3)>) {
+        collision.resolve_player_walls(feet, PLAYER_RADIUS, PLAYER_COL_HEIGHT + 1.0, STAIR_RISE)
+    }
+
+    /// Gravity, then the hero lands on (or stays on) the floor that
+    /// PlayerCollideFloor finds with the hero's radius. The floor's owner
+    /// when on the ground.
+    pub fn player_snap(
+        collision: &Collision,
+        pos: &mut Vec3,
+        vy: &mut f32,
+        dt: f32,
+    ) -> Option<i32> {
+        *vy -= GRAVITY * dt;
+        pos.y += *vy * dt;
+        match collision.player_floor(*pos, PLAYER_RADIUS, PLAYER_COL_HEIGHT, true) {
+            Some(h) if pos.y <= h.at.y || (pos.y - h.at.y < 0.3 && *vy <= 0.0) => {
+                pos.y = h.at.y;
+                *vy = 0.0;
+                Some(h.owner)
+            }
+            _ => None,
         }
     }
 
@@ -4486,20 +4541,18 @@ impl Game {
                         }
                     }
                 }
-                // PlayerCollideFloor: a step whose floor is more than
-                // lbl_80347BF8 (3) from the one stood on, 4 onto the floor
-                // object already underfoot, or that finds no floor, doesn't
-                // move the hero: heroes don't walk off ledges (into a
-                // lowered lift's shaft, say).
-                let probe = self.collision.ground_hit(target, p.pos.y + STEP_HEIGHT);
-                let under = self
-                    .collision
-                    .ground_hit(p.pos, p.pos.y + 0.1)
-                    .map(|(_, o)| o);
-                let ledge = |(g, o): (f32, i32)| {
-                    p.pos.y - g <= STAIR_RISE + if Some(o) == under { 1.0 } else { 0.0 }
-                };
-                if probe.is_some_and(ledge) || !p.on_ground {
+                // PlayerCollideFloor: a step whose floor (found with the
+                // hero's radius, so across seams between floor objects) is
+                // more than lbl_80347BF8 (3) from the one stood on, 4 onto
+                // the floor object already underfoot, or that finds no
+                // floor, doesn't move the hero: heroes don't walk off
+                // ledges (into a lowered lift's shaft, say).
+                if p.on_ground {
+                    if let Some((d, _)) = Self::player_step(&self.collision, p.pos, target - p.pos)
+                    {
+                        p.pos += d;
+                    }
+                } else {
                     p.pos = target;
                 }
             }
@@ -4512,13 +4565,7 @@ impl Game {
                 p.pos += p.knock_vel * dt;
                 p.knock_vel *= 0.667f32.powf(dt * 30.0);
                 p.trial_move = p.pos - start;
-                let (mut pos, wall) = self.collision.resolve_walls_stairs(
-                    p.pos,
-                    PLAYER_RADIUS,
-                    PLAYER_HEIGHT,
-                    STEP_HEIGHT,
-                    STAIR_RISE,
-                );
+                let (mut pos, wall) = Self::player_walls(&self.collision, p.pos);
                 // PlayerCollideFloor: a stairs floor up to 3 above the feet is
                 // stepped straight onto (floor_base follows it).
                 if p.on_ground {
@@ -4529,15 +4576,14 @@ impl Game {
                     }
                 }
                 p.pos = Self::resolve_solids(&self.entities, pos, PLAYER_RADIUS, 0);
-                p.on_ground = Self::snap_to_ground(&self.collision, &mut p.pos, &mut p.vy, dt);
+                let floor = Self::player_snap(&self.collision, &mut p.pos, &mut p.vy, dt);
+                p.on_ground = floor.is_some();
                 // PlayerMotion_FloorFX: the wall touched, then the floor stood on.
                 if let Some((owner, at)) = wall {
                     floor_fx.push((i, owner, p.pos - at));
                 }
-                if p.on_ground {
-                    if let Some((_, owner)) = self.collision.ground_hit(p.pos, p.pos.y + 0.1) {
-                        floor_fx.push((i, owner, Vec3::ZERO));
-                    }
+                if let Some(owner) = floor {
+                    floor_fx.push((i, owner, Vec3::ZERO));
                 }
             }
             // Below the world: get_player_pos puts the hero back.
@@ -8152,6 +8198,7 @@ impl Game {
                 self.sfx.push(format!("S_ELVSTONESTP{w}|S_STONEGATESTOP"));
             }
         }
+        self.slide_riding_triggers();
 
         for pi in chest_used {
             self.players[pi].keys -= 1;

@@ -872,4 +872,76 @@ mod tests {
             "the statue is gone"
         );
     }
+
+    /// levelA6's start landing: the stair ramp (object 1085) ends at x
+    /// -33.0 and A6FLOOR#51 starts at -33.31, with no floor between. The
+    /// hero's floor test has his radius (PlayerCollideFloor ->
+    /// FloorCollide), so he walks on across the seam.
+    #[test]
+    fn levela6_start_seam_is_crossed() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA6", &[("WAR", "RED")]).unwrap();
+        g.entities.clear();
+        assert!(g
+            .collision
+            .ground_height(Vec3::new(-33.2, 36.0, -54.0), 36.0)
+            .is_none_or(|y| y < 30.0));
+        walk(
+            &mut g,
+            Vec3::new(-32.0, 35.7, -54.0),
+            glam::Vec2::new(-1.0, 0.0),
+            90,
+        );
+        let p = g.players[0].pos;
+        assert!(p.x < -35.0 && p.y > 30.0, "crossed the seam: {p}");
+    }
+
+    /// levelG1's lift G1ELEV1 starts 8 down, its deck 1.78 above the floor:
+    /// a hero steps onto it (walls count from 2 above the feet, the body
+    /// centre plus lbl_80347BD0). Its lift pad, modelled at the top, was put
+    /// on the lowered deck by AddItemSub and parented to it: standing on it
+    /// sends the lift up, pad and hero with it.
+    #[test]
+    fn levelg1_lift_pad_rides_the_lowered_lift() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelG1", &[("WAR", "RED")]).unwrap();
+        let m = g
+            .movers
+            .iter()
+            .position(|m| g.level.worlds.world_objects[m.root].name == "G1ELEV1")
+            .unwrap();
+        assert_eq!(g.movers[m].offset, -8.0);
+        let pad = g
+            .entities
+            .iter()
+            .find(|e| {
+                matches!(e.kind, Kind::Trigger { mover: Some(k), flags, .. }
+                    if k == m && flags & tflags::ON_TARGET != 0)
+            })
+            .expect("the lift's pad")
+            .pos;
+        assert!(pad.y > 11.0 && pad.y < 12.0, "on the lowered deck: {pad}");
+        g.entities
+            .retain(|e| matches!(e.kind, Kind::Trigger { .. }));
+        let ti = g.entities.iter().position(|e| e.pos == pad).unwrap();
+        walk(
+            &mut g,
+            Vec3::new(40.0, 10.1, -85.0),
+            glam::Vec2::new(1.0, 0.0),
+            50,
+        );
+        let p = g.players[0].pos;
+        assert!(p.y > 11.0 && p.x > 46.0, "on the deck: {p}");
+        tick(&mut g, 600);
+        assert!(
+            g.movers[m].offset.abs() < 0.01,
+            "raised: {}",
+            g.movers[m].offset
+        );
+        let (p, pad) = (g.players[0].pos, g.entities[ti].pos);
+        assert!(
+            p.y > 19.0 && (pad.y - p.y).abs() < 0.5,
+            "rode up: {p} pad {pad}"
+        );
+    }
 }

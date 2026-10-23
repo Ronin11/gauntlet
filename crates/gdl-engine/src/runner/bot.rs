@@ -909,9 +909,7 @@ impl Bot {
             .map(|o| o.name())
             .collect();
         let cracks = self.frontier_cracks(g);
-        // Would the exit be reachable if floor seams were bridged (the
-        // original's floor test sweeps a sphere of the hero's radius)?
-        let crack_note = self.what_if(g, i, &exits, reach, &cracks);
+        let crack_note = self.what_if(&cracks);
         Err(if exits_failed.is_empty() {
             Outcome::Unreachable(format!(
                 "no path to any exit; enablers exhausted (reachable {reach} nodes, keys {keys}, tried {}){crack_note}",
@@ -1683,8 +1681,6 @@ impl Bot {
                 ignore: &self.nav.ignore,
                 min_y: g.level.worlds.min_bounds[1],
                 cracks: Default::default(),
-                bridge: false,
-                step_up: crate::game::STEP_HEIGHT,
             };
             let far = (a.wp + 4).min(a.path.len() - 1);
             for k in (a.wp + 1..=far).rev() {
@@ -2236,41 +2232,10 @@ impl Bot {
 }
 
 impl Bot {
-    /// Would the port's two suspect walking rules explain an unreachable
-    /// exit? Plans again with (a) floor seams bridged as the original's
-    /// sphere-swept floor test would (FloorCollide with the hero's radius),
-    /// (b) the original's 1.875 step (walls tested from lbl_80347BD0 above
-    /// the feet in DoPlayerMotion) instead of STEP_HEIGHT 1.2, (c) both.
-    fn what_if(
-        &mut self,
-        g: &Game,
-        i: usize,
-        exits: &[(Obj, Vec<Goal>, Vec3)],
-        reach: usize,
-        cracks: &[Vec3],
-    ) -> String {
-        let exit_goals: Vec<Goal> = exits.iter().flat_map(|c| c.1.iter().copied()).collect();
+    /// Notes on an unreachable exit: floor seams that stopped the nav's
+    /// walks at the edge of the reachable area.
+    fn what_if(&mut self, cracks: &[Vec3]) -> String {
         let mut out = Vec::new();
-        for (name, bridge, step) in [
-            ("floor seams bridged", true, crate::game::STEP_HEIGHT),
-            ("a 1.5 step (the original sweeps a radius-1.5 sphere for the floor)", false, 1.5),
-            ("both", true, 1.5),
-        ] {
-            let mut bn = Nav::new(g);
-            bn.bridge = bridge;
-            bn.step_up = step;
-            let st = bn.start_node(g, g.players[i].pos);
-            let ok = st
-                .and_then(|s| bn.path(g, s, &exit_goals, g.time, MAX_EXPAND))
-                .is_some();
-            let n = st.map_or(0, |s| bn.reachable(g, s, 400_000).len());
-            if ok {
-                out.push(format!("with {name} the exit WOULD be reachable ({reach} -> {n} nodes)"));
-                break;
-            } else if n > reach + reach / 5 + 50 {
-                out.push(format!("with {name} the reachable area grows {reach} -> {n} nodes"));
-            }
-        }
         let eg = cracks
             .iter()
             .take(3)
