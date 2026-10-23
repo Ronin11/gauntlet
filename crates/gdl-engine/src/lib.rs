@@ -8,6 +8,7 @@ pub mod audio;
 pub mod boss;
 pub mod camera;
 pub mod character;
+pub mod cheats;
 pub mod collision;
 pub mod critter;
 pub mod cursor;

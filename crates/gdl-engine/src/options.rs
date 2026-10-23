@@ -517,6 +517,38 @@ impl Default for Prefs {
     }
 }
 
+impl Prefs {
+    /// The save record's options block (optionsAudioAndPrefs30): sfx_vol,
+    /// music_vol, sound_mode, screen_dx, screen_dy, style, vibration,
+    /// subtitles. The pads' settings are saved with each hero instead.
+    pub fn game_opts(&self) -> crate::save::GameOpts {
+        crate::save::GameOpts {
+            data: [
+                self.sfx_vol,
+                self.music_vol,
+                self.stereo as i32,
+                0,
+                0,
+                self.difficulty as i32,
+                self.compass as i32,
+                self.multiplayer as i32,
+            ],
+        }
+    }
+
+    /// check_prefs_loaded: the options as saved on the card (the menus'
+    /// remembered selections and the pads' settings stay as they are).
+    pub fn apply_game_opts(&mut self, o: &crate::save::GameOpts) {
+        let d = o.data;
+        self.sfx_vol = d[0].clamp(0, 255);
+        self.music_vol = d[1].clamp(0, 255);
+        self.stereo = d[2] != 0;
+        self.difficulty = d[5].clamp(0, 2) as usize;
+        self.compass = d[6] != 0;
+        self.multiplayer = d[7].clamp(0, 2) as usize;
+    }
+}
+
 /// What the menus want the caller to do after a tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OptionsAction {
