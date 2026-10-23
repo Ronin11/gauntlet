@@ -214,20 +214,20 @@ pub struct ItemsState {
     pub blasts: Vec<Blast>,
     pub bags: Vec<Bag>,
     /// The item info each placed item came from, by entity id.
-    pub(crate) info: HashMap<u64, usize>,
+    pub(crate) info: BTreeMap<u64, usize>,
     /// Item health (Item.health) where it isn't kept on the entity.
-    health: HashMap<u64, i32>,
+    health: BTreeMap<u64, i32>,
     /// gotitem: what a monster or critter carries, by its entity id, and
     /// where it was last (its attention point).
-    pub(crate) carried: HashMap<u64, (Carry, Option<Vec3>)>,
+    pub(crate) carried: BTreeMap<u64, (Carry, Option<Vec3>)>,
     /// fxhittime of monsters and items against owner-less effects.
-    fxhit: HashMap<u64, f32>,
+    fxhit: BTreeMap<u64, f32>,
     /// The debris models above.
-    models: HashMap<&'static str, Option<usize>>,
+    models: BTreeMap<&'static str, Option<usize>>,
     /// Opened chests, by entity id.
-    pub(crate) chests: HashMap<u64, ChestOpen>,
+    pub(crate) chests: BTreeMap<u64, ChestOpen>,
     /// Broken barrels' shells, by entity id.
-    pub(crate) broken: HashMap<u64, BrokenBarrel>,
+    pub(crate) broken: BTreeMap<u64, BrokenBarrel>,
 }
 
 /// gGameOptions.items (a debug option; GDL_ITEMS): a player count every item
@@ -332,8 +332,8 @@ impl Game {
     pub(super) fn load_item_fx(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
-        known: &mut HashMap<String, Option<usize>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
+        known: &mut BTreeMap<String, Option<usize>>,
         dirs: &[String],
     ) {
         let needed = !self.items.carried.is_empty()
@@ -1588,7 +1588,7 @@ mod tests {
     }
 
     fn grunt(g: &mut Game, fs: &GameFs, at: Vec3) -> u64 {
-        let mut cache = HashMap::new();
+        let mut cache = BTreeMap::new();
         let c = g
             .monster_class(fs, &mut cache, crate::enemies::GRUNT)
             .unwrap();
@@ -2003,7 +2003,7 @@ mod tests {
         let Some(fs) = data() else { return };
         let mut g = quiet(&fs, &[]);
         let at = g.players[0].pos;
-        let mut cache = HashMap::new();
+        let mut cache = BTreeMap::new();
         let c = g
             .monster_class(&fs, &mut cache, crate::enemies::GRUNT)
             .unwrap();
@@ -2057,7 +2057,7 @@ mod tests {
     /// A grunt generator with gendata ai `ai` 8 in front of the hero.
     fn generator(g: &mut Game, fs: &GameFs, ai: i32) -> (u64, usize) {
         let at = g.players[0].pos;
-        let mut cache = HashMap::new();
+        let mut cache = BTreeMap::new();
         let c = g
             .monster_class(fs, &mut cache, crate::enemies::GRUNT)
             .unwrap();

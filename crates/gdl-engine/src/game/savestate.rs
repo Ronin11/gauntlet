@@ -236,8 +236,8 @@ impl Game {
         };
         w.hidden = self.hidden.iter().copied().collect();
         w.hidden.sort_unstable();
-        let mut present: HashSet<u32> = HashSet::new();
-        let model_names: HashMap<usize, &String> = self
+        let mut present: BTreeSet<u32> = BTreeSet::new();
+        let model_names: BTreeMap<usize, &String> = self
             .item_models
             .iter()
             .filter_map(|(n, m)| m.map(|m| (m, n)))
@@ -356,14 +356,14 @@ impl Game {
         if self.secret_timer.is_some() {
             self.secret_timer = w.secret_timer.or(self.secret_timer);
         }
-        let hidden: HashSet<usize> = w.hidden.iter().copied().collect();
+        let hidden: BTreeSet<usize> = w.hidden.iter().copied().collect();
         if hidden != self.hidden {
             self.hidden = hidden;
             self.world_changed = true;
         }
 
-        let gone: HashSet<u32> = w.gone.iter().copied().collect();
-        let saved_insts: HashSet<u32> = w.placed.iter().map(|p| p.inst).collect();
+        let gone: BTreeSet<u32> = w.gone.iter().copied().collect();
+        let saved_insts: BTreeSet<u32> = w.placed.iter().map(|p| p.inst).collect();
         // Gone: the item and its collision.
         for e in &mut self.entities {
             let Some(&inst) = self.placed.get(&e.id) else {
@@ -387,7 +387,7 @@ impl Game {
             }
         }
         // Placed monsters killed before coming into view, or in view now.
-        let pending_saved: HashSet<u32> = w
+        let pending_saved: BTreeSet<u32> = w
             .placed
             .iter()
             .filter(|p| p.tag == "pending")
@@ -414,7 +414,7 @@ impl Game {
         }
 
         // Match each saved record to the fresh entity of the same instance and kind.
-        let mut by_inst: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut by_inst: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         for (i, e) in self.entities.iter().enumerate() {
             if !e.alive {
                 continue;
@@ -423,7 +423,7 @@ impl Game {
                 by_inst.entry(inst).or_default().push(i);
             }
         }
-        let mut used: HashSet<usize> = HashSet::new();
+        let mut used: BTreeSet<usize> = BTreeSet::new();
         for p in &w.placed {
             if p.tag == "pending" {
                 continue;

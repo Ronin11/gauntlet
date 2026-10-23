@@ -177,7 +177,7 @@ pub struct SoundState {
     taunt_rune: usize,
     taunt_shard: usize,
     /// Damage tiles' subtypes (rawSubtype, FLAMEH in realm 3 as 6), by entity.
-    pub(crate) tile_sub: HashMap<u64, (i32, i32)>,
+    pub(crate) tile_sub: BTreeMap<u64, (i32, i32)>,
 }
 
 /// The id ambient loop for Death's drain (AudioPlayEvt102Follow).

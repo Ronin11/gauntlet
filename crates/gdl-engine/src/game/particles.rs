@@ -308,7 +308,7 @@ impl Game {
     /// emitters with their nodes (MBRemovePsys when the owner goes), run the
     /// psys frame, and rebuild the streaks.
     pub(crate) fn update_particles(&mut self) {
-        let index: HashMap<u64, usize> = self
+        let index: BTreeMap<u64, usize> = self
             .entities
             .iter()
             .enumerate()
@@ -335,7 +335,7 @@ impl Game {
             self.start_entity_psys(id, m);
         }
         // The trees the heroes wear, placed as the scene draws them.
-        let mut worn: HashMap<(usize, usize), Vec<Mat4>> = HashMap::new();
+        let mut worn: BTreeMap<(usize, usize), Vec<Mat4>> = BTreeMap::new();
         for pi in 0..self.players.len() {
             for (m, xf, seq, frame, _) in self.worn_draws(pi) {
                 if self.models[m].psys.is_empty() || worn.contains_key(&(pi, m)) {
@@ -346,7 +346,7 @@ impl Game {
                 worn.insert((pi, m), nodes.into_iter().map(|n| base * n).collect());
             }
         }
-        let have: HashSet<(usize, usize)> = self
+        let have: BTreeSet<(usize, usize)> = self
             .particles
             .systems
             .iter()
@@ -389,7 +389,7 @@ impl Game {
             }
         }
         // Node matrices: each owner's tree posed once.
-        let mut posed: HashMap<u64, (Mat4, Vec<Mat4>)> = HashMap::new();
+        let mut posed: BTreeMap<u64, (Mat4, Vec<Mat4>)> = BTreeMap::new();
         let mut systems = std::mem::take(&mut self.particles.systems);
         for (owner, p) in &mut systems {
             match *owner {

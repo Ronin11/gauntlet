@@ -1495,12 +1495,12 @@ pub struct Particles {
     pub streak_tex: Option<usize>,
     pub streaks: Vec<StreakQuad>,
     /// Each live missile's streak, by entity id.
-    pub streak_of: std::collections::HashMap<u64, Streak>,
+    pub streak_of: std::collections::BTreeMap<u64, Streak>,
     /// Particle-node textures resolved per (model, node).
-    pub tex_cache: std::collections::HashMap<(usize, usize), Option<usize>>,
+    pub tex_cache: std::collections::BTreeMap<(usize, usize), Option<usize>>,
     /// Trees whose particle nodes were built (AtreeNodeInit runs once per
     /// instance, even when the pool was out): (entity id, model).
-    pub started: std::collections::HashSet<(u64, usize)>,
+    pub started: std::collections::BTreeSet<(u64, usize)>,
 }
 
 impl Default for Particles {

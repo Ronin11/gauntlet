@@ -147,7 +147,7 @@ impl Collision {
     /// (animated world objects). Call [`Collision::refit_dynamic`] after
     /// moving them.
     pub fn make_dynamic(&mut self, groups: Vec<Vec<usize>>) {
-        let moving: std::collections::HashSet<u32> =
+        let moving: std::collections::BTreeSet<u32> =
             groups.iter().flatten().map(|&i| i as u32).collect();
         if moving.is_empty() {
             return;

@@ -116,10 +116,10 @@ impl Game {
     pub(crate) fn load_magic_models(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
     ) {
         let dirs = ["WEAPONS".to_string(), "POWERUPS".to_string()];
-        let mut known = HashMap::new();
+        let mut known = BTreeMap::new();
         let mut get = |g: &mut Game, n: &str| g.item_model(fs, cache, &mut known, &dirs, n);
         let mut m = MagicModels::default();
         for c in 0..5 {

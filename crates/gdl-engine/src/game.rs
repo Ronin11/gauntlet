@@ -11,7 +11,7 @@ use gdl_formats::anim::Anim;
 use gdl_formats::worlds::ItemType;
 use gdl_formats::Objects;
 use glam::{Vec2, Vec3};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) mod effect;
 mod exits;
@@ -1088,10 +1088,10 @@ pub struct Game {
     obj_flags: Vec<u32>,
     pub models: Vec<std::sync::Arc<Model>>,
     pub player_seqs: Vec<PlayerSeqs>,
-    monster_seqs: HashMap<usize, MonsterSeqs>,
+    monster_seqs: BTreeMap<usize, MonsterSeqs>,
     /// A hero's or critter's shadow object (load_player_geo's SHADOWL1,
     /// CritterInitGeo's SHADOW<n>L1), by its body model.
-    pub(crate) shadow_models: HashMap<usize, usize>,
+    pub(crate) shadow_models: BTreeMap<usize, usize>,
     pub classes: Vec<MonsterClass>,
     pub players: Vec<Player>,
     pub entities: Vec<Entity>,
@@ -1176,9 +1176,9 @@ pub struct Game {
     /// randpottype: the colour a colourless potion takes next.
     randpottype: u32,
     /// Lightning-shield strikes waiting out their second, by (player, monster).
-    shield_cooldown: HashMap<(usize, u64), f32>,
+    shield_cooldown: BTreeMap<(usize, u64), f32>,
     /// Damage-row re-hits waiting out their delay, by (player, target).
-    damg_cooldown: HashMap<(usize, u64), f32>,
+    damg_cooldown: BTreeMap<(usize, u64), f32>,
     /// 0 Easy, 1 Medium, 2 Hard.
     pub difficulty: usize,
     /// The Multiplayer option: 0 Normal (shots pass heroes), 1 Shots Stun,
@@ -1193,7 +1193,7 @@ pub struct Game {
     psfx: Vec<Vec<PlyrSfx>>,
     fx_follow: Vec<FxFollow>,
     /// Item models loaded for the level, by item name.
-    item_models: HashMap<String, Option<usize>>,
+    item_models: BTreeMap<String, Option<usize>>,
     /// A secret level's countdown: (total, seconds left).
     pub secret_timer: Option<(f32, f32)>,
     /// sVisibleSumCoinCount: the gold pieces placed in the level.
@@ -1209,7 +1209,7 @@ pub struct Game {
     /// The crystal count to show on the HUD (colour, seconds left).
     pub crystal_shown: Option<(usize, f32)>,
     /// World objects hidden for good (closed tower portals).
-    pub hidden: HashSet<usize>,
+    pub hidden: BTreeSet<usize>,
     /// World-object animations, rotators and the floors they carry (worldanim.rs).
     pub world_anim: crate::worldanim::WorldAnims,
     /// Transporter pads and each hero's trip (transport.rs).
@@ -1241,7 +1241,7 @@ pub struct Game {
     /// CritterPlayerNTargets: critter parts aiming at each player this frame.
     pub crit_ntargets: [f32; 4],
     /// Parsed CRITTER WADs by file name.
-    pub critter_wads: HashMap<String, std::sync::Arc<gdl_formats::critter::CritterWad>>,
+    pub critter_wads: BTreeMap<String, std::sync::Arc<gdl_formats::critter::CritterWad>>,
     /// The good wizard's model (atree WIZARD in the level's item file).
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
@@ -1259,7 +1259,7 @@ pub struct Game {
     psys_banks: Vec<std::sync::Arc<(Objects, Vec<u8>)>>,
     /// Each entity made from a placed item: its instance index in the
     /// level file (savestate.rs matches saved state by it).
-    pub(crate) placed: HashMap<u64, u32>,
+    pub(crate) placed: BTreeMap<u64, u32>,
 }
 
 /// items.c's animated-item cycle (an item with an atree and active & 1): it
@@ -1782,8 +1782,8 @@ impl Game {
             collision,
             models: Vec::new(),
             player_seqs: Vec::new(),
-            monster_seqs: HashMap::new(),
-            shadow_models: HashMap::new(),
+            monster_seqs: BTreeMap::new(),
+            shadow_models: BTreeMap::new(),
             classes: Vec::new(),
             players: Vec::new(),
             entities: Vec::new(),
@@ -1829,8 +1829,8 @@ impl Game {
             worn_models: Default::default(),
             worn_fx: Vec::new(),
             randpottype: 0,
-            shield_cooldown: HashMap::new(),
-            damg_cooldown: HashMap::new(),
+            shield_cooldown: BTreeMap::new(),
+            damg_cooldown: BTreeMap::new(),
             difficulty,
             friendly_fire: 0,
             exit_state: Default::default(),
@@ -1838,7 +1838,7 @@ impl Game {
             pdata: Vec::new(),
             psfx: Vec::new(),
             fx_follow: Vec::new(),
-            item_models: HashMap::new(),
+            item_models: BTreeMap::new(),
             secret_timer: None,
             visible_coins: 0,
             shards: 0,
@@ -1846,7 +1846,7 @@ impl Game {
             welcome: 300,
             crystals: [0; 9],
             crystal_shown: None,
-            hidden: HashSet::new(),
+            hidden: BTreeSet::new(),
             world_anim,
             transport: Default::default(),
             level_end: None,
@@ -1861,7 +1861,7 @@ impl Game {
             crit_waves: Vec::new(),
             crit_hit_until: [0.0; 4],
             crit_ntargets: [0.0; 4],
-            critter_wads: HashMap::new(),
+            critter_wads: BTreeMap::new(),
             wizard_model: None,
             hit_from: None,
             gen_streak: [0; 4],
@@ -1869,7 +1869,7 @@ impl Game {
             effects: Default::default(),
             particles: Default::default(),
             psys_banks: Vec::new(),
-            placed: HashMap::new(),
+            placed: BTreeMap::new(),
         };
         game.ai_paths =
             crate::ai::Paths::new(&game.level.worlds.locators, game.level.start_positions()[0]);
@@ -2047,7 +2047,7 @@ impl Game {
         // PlayerSfxInitData: each record's effect from the hero's SFX tree
         // (players/<class>/sfx<colour>; a secret hero's base class), else
         // WEAPONS or POWERUPS (InitCustomEffectSub), and its sound.
-        let mut cache: HashMap<String, Option<AssetFile>> = HashMap::new();
+        let mut cache: BTreeMap<String, Option<AssetFile>> = BTreeMap::new();
         for (i, (_, color)) in classes.iter().enumerate() {
             let ct = game.players[i].class_id;
             let base = crate::select::CLASSES[if (8..16).contains(&ct) { ct - 8 } else { ct }];
@@ -2056,7 +2056,7 @@ impl Game {
                 "WEAPONS".to_string(),
                 "POWERUPS".to_string(),
             ];
-            let mut known = HashMap::new();
+            let mut known = BTreeMap::new();
             let recs = game.pdata[i].sfx.clone();
             let res = recs
                 .iter()
@@ -2081,8 +2081,8 @@ impl Game {
     fn resolve_plyr_sfx(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
-        known: &mut HashMap<String, Option<usize>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
+        known: &mut BTreeMap<String, Option<usize>>,
         dirs: &[String],
         r: &gdl_formats::pdata::SfxRecord,
     ) -> PlyrSfx {
@@ -2135,7 +2135,7 @@ impl Game {
     pub(crate) fn monster_class(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
         etype: usize,
     ) -> Option<usize> {
         let dir = self.roster.dir(etype);
@@ -2761,8 +2761,8 @@ impl Game {
     fn item_model(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
-        known: &mut HashMap<String, Option<usize>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
+        known: &mut BTreeMap<String, Option<usize>>,
         dirs: &[String],
         name: &str,
     ) -> Option<usize> {
@@ -2815,8 +2815,8 @@ impl Game {
 
     /// Create entities for the level's item placements.
     fn populate(&mut self, fs: &GameFs, num_players: usize) {
-        let mut cache: HashMap<String, Option<AssetFile>> = HashMap::new();
-        let mut known: HashMap<String, Option<usize>> = HashMap::new();
+        let mut cache: BTreeMap<String, Option<AssetFile>> = BTreeMap::new();
+        let mut known: BTreeMap<String, Option<usize>> = BTreeMap::new();
         let world_letter = self
             .level
             .name
@@ -6469,7 +6469,7 @@ impl Game {
     fn update_entities(&mut self, dt: f32) {
         // Where each monster stood before this frame's move (do_enemy_move
         // reverts a move that runs into another monster or a hero).
-        let before: HashMap<u64, Vec3> = self
+        let before: BTreeMap<u64, Vec3> = self
             .entities
             .iter()
             .filter(|e| matches!(e.kind, Kind::Enemy { .. }))
@@ -6527,7 +6527,7 @@ impl Game {
         let mut wall_sounds: Vec<WallSound> = Vec::new();
         let mut fallers_moved: Vec<((usize, usize), Vec3)> = Vec::new();
         // Which damage tiles are on screen (off-screen ones pause their cycle).
-        let hazard_vis: HashSet<u64> = self
+        let hazard_vis: BTreeSet<u64> = self
             .entities
             .iter()
             .filter(|e| matches!(e.kind, Kind::Hazard { .. }) && self.on_screen(e.pos, 8.0))
@@ -6677,7 +6677,7 @@ impl Game {
                 }
                 _ => None,
             });
-        let generators: HashMap<u64, bool> = self
+        let generators: BTreeMap<u64, bool> = self
             .entities
             .iter()
             .filter(|e| e.alive)
@@ -6690,7 +6690,7 @@ impl Game {
         let mut releases: Vec<u64> = Vec::new();
         // Each monster's move for do_enemy_move's report: (from, tried, walls
         // stopped it, touching this player).
-        let mut ai_moves: HashMap<u64, (Vec3, bool, bool, Option<Vec3>)> = HashMap::new();
+        let mut ai_moves: BTreeMap<u64, (Vec3, bool, bool, Option<Vec3>)> = BTreeMap::new();
         let exit_extra = self.exit_reach(0.0);
 
         for ei in 0..self.entities.len() {
@@ -8012,7 +8012,7 @@ impl Game {
             })
             .collect();
         // fn_8005D20C: what pushed it off a solid item stood there (coll_ip).
-        let mut item_hit: HashMap<u64, Vec3> = HashMap::new();
+        let mut item_hit: BTreeMap<u64, Vec3> = BTreeMap::new();
         for (i, p) in moved {
             let e = &mut self.entities[i];
             if (p - e.pos).length_squared() > 1e-8 {
@@ -8030,7 +8030,7 @@ impl Game {
                 self.entities[i].alive && matches!(self.entities[i].kind, Kind::Enemy { .. })
             })
             .collect();
-        let mut enemy_hit: HashMap<u64, Vec3> = HashMap::new();
+        let mut enemy_hit: BTreeMap<u64, Vec3> = BTreeMap::new();
         let size = |e: &Entity| match &e.kind {
             Kind::Enemy { etype, .. } => {
                 let t = &crate::enemies::TYPES[(*etype).min(33)];
@@ -8382,7 +8382,7 @@ impl Game {
             self.post(0x32, Some(pi), &[]);
         }
         // Forget dead spawns so generators can replace them.
-        let alive_ids: std::collections::HashSet<u64> = self
+        let alive_ids: std::collections::BTreeSet<u64> = self
             .entities
             .iter()
             .filter(|e| e.alive)
@@ -8447,15 +8447,15 @@ impl Game {
     pub(crate) fn item_model_pub(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
-        known: &mut HashMap<String, Option<usize>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
+        known: &mut BTreeMap<String, Option<usize>>,
         dirs: &[String],
         name: &str,
     ) -> Option<usize> {
         self.item_model(fs, cache, known, dirs, name)
     }
 
-    pub(crate) fn merge_item_models(&mut self, known: HashMap<String, Option<usize>>) {
+    pub(crate) fn merge_item_models(&mut self, known: BTreeMap<String, Option<usize>>) {
         for (k, v) in known {
             self.item_models.entry(k.to_ascii_uppercase()).or_insert(v);
         }
@@ -9714,7 +9714,7 @@ mod tests {
     fn powerup_items_match_the_spec() {
         let Some(fs) = data() else { return };
         // Find the power-up items across the levels and check their data.
-        let mut seen = std::collections::HashMap::new();
+        let mut seen = std::collections::BTreeMap::new();
         for dir in fs.list_dirs("LEVELS") {
             let Ok(level) = crate::level::Level::load(&fs, &dir) else {
                 continue;
@@ -10028,8 +10028,8 @@ mod tests {
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
         let hp = g.players[0].health;
         let mut algs: std::collections::BTreeMap<i32, usize> = Default::default();
-        let mut walked = HashSet::new();
-        let mut last: HashMap<u64, Vec3> = HashMap::new();
+        let mut walked = BTreeSet::new();
+        let mut last: BTreeMap<u64, Vec3> = BTreeMap::new();
         for _ in 0..900 {
             g.update(1.0 / 60.0, &[PlayerInput::default()]);
             for e in &g.entities {

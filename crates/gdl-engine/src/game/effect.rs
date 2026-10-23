@@ -267,7 +267,7 @@ pub(crate) struct Effects {
     /// lbl_80344BD0: alternates the BLOODFX rows.
     blood: u32,
     pub live: Vec<LiveFx>,
-    pub looks: HashMap<u64, FxLook>,
+    pub looks: BTreeMap<u64, FxLook>,
     /// Player.timer_1FE: block sparks wait this long (s).
     block_timer: [f32; 4],
     /// The held block shield on each hero (BLOCK_SHIELD_HELD; port addition).
@@ -275,12 +275,12 @@ pub(crate) struct Effects {
     /// lbl_803447B8 == 2: StartEnterFX has run.
     entered: bool,
     /// Enemy.specialfx / Player.death_effect: Death's drain arc.
-    pub death_fx: HashMap<u64, u64>,
+    pub death_fx: BTreeMap<u64, u64>,
     pub player_death_fx: [Option<u64>; 4],
     /// Players Death drained this frame (field_128 & 1).
     pub drained: [bool; 4],
     /// A started missile's fxhit (SfxSetHit) and damage type, by its id.
-    pub missiles: HashMap<u64, (i32, u32)>,
+    pub missiles: BTreeMap<u64, (i32, u32)>,
     /// The damage type of the hit hit_entity is about to deal (else the
     /// player's weapon element or the potion's).
     pub hit_dtype: Option<u32>,
@@ -299,14 +299,14 @@ impl Default for Effects {
             customs: 0,
             blood: 0,
             live: Vec::new(),
-            looks: HashMap::new(),
+            looks: BTreeMap::new(),
             block_timer: [0.0; 4],
             block_shield: [None; 4],
             entered: false,
-            death_fx: HashMap::new(),
+            death_fx: BTreeMap::new(),
             player_death_fx: [None; 4],
             drained: [false; 4],
-            missiles: HashMap::new(),
+            missiles: BTreeMap::new(),
             hit_dtype: None,
             hit_lift: None,
         }
@@ -318,7 +318,7 @@ impl Default for Effects {
 fn match_tree(
     g: &mut Game,
     asset: Option<&AssetFile>,
-    known: &mut HashMap<(usize, String), Option<(Option<usize>, f32)>>,
+    known: &mut BTreeMap<(usize, String), Option<(Option<usize>, f32)>>,
     key: usize,
     name: &str,
 ) -> Option<(Option<usize>, f32)> {
@@ -382,7 +382,7 @@ impl Game {
     pub(crate) fn init_effects(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
     ) {
         let letter = self.world_letter();
         let boss = self.boss.is_some();
@@ -413,7 +413,7 @@ impl Game {
             }
         }
         let asset = |i: usize| cache.get(&dirs[i]).and_then(|a| a.as_ref());
-        let mut known = HashMap::new();
+        let mut known = BTreeMap::new();
         let mut fx = Effects::default();
         let def = |t: Option<(Option<usize>, f32)>, zmod: i32, alpha: i32| {
             t.map(|(model, time)| FxDef {
@@ -432,7 +432,7 @@ impl Game {
         // wizard's and the level's items; a new FX_CUSTOM row each time.
         let custom = |g: &mut Game,
                       fx: &mut Effects,
-                      known: &mut HashMap<_, _>,
+                      known: &mut BTreeMap<_, _>,
                       first: Option<usize>,
                       name: &str|
          -> i32 {
@@ -1159,7 +1159,7 @@ impl Game {
             self.damage_player(pi, dmg, dtype);
             self.damage_from = None;
         }
-        let alive: HashSet<u64> = self
+        let alive: BTreeSet<u64> = self
             .entities
             .iter()
             .filter(|e| e.alive)

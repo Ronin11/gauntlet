@@ -403,13 +403,13 @@ impl Game {
     pub(super) fn load_worn_models(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
         classes: &[(&str, &str)],
     ) {
         let pups = ["POWERUPS".to_string()];
         let weapons = ["WEAPONS".to_string()];
         let both = ["POWERUPS".to_string(), "WEAPONS".to_string()];
-        let mut known = HashMap::new();
+        let mut known = BTreeMap::new();
         let mut get = |g: &mut Game, dirs: &[String], n: &str| {
             let m = g.item_model(fs, cache, &mut known, dirs, n);
             known.remove(n);
@@ -467,8 +467,8 @@ impl Game {
     pub(super) fn append_bigape_powerups(
         &mut self,
         fs: &GameFs,
-        cache: &mut HashMap<String, Option<AssetFile>>,
-        known: &mut HashMap<String, Option<usize>>,
+        cache: &mut BTreeMap<String, Option<AssetFile>>,
+        known: &mut BTreeMap<String, Option<usize>>,
     ) {
         let code = self.level.name.trim_start_matches("level").to_string();
         let dirs = ["POWERUPS".to_string()];
