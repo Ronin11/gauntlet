@@ -1065,6 +1065,10 @@ pub struct Game {
     pub crystal_shown: Option<(usize, f32)>,
     /// World objects hidden for good (closed tower portals).
     pub hidden: HashSet<usize>,
+    /// World-object animations, rotators and the floors they carry (worldanim.rs).
+    pub world_anim: crate::worldanim::WorldAnims,
+    /// Transporter pads and each hero's trip (transport.rs).
+    pub transport: crate::transport::Transport,
     /// Set once every player has left or died.
     pub level_end: Option<LevelEnd>,
     /// Help messages and announcements (msgPost).
@@ -1533,7 +1537,8 @@ impl Game {
         difficulty: usize,
     ) -> Result<Game> {
         let level = Level::load(fs, level_name)?;
-        let collision = Collision::new(build_collision(&level));
+        let mut collision = Collision::new(build_collision(&level));
+        let world_anim = crate::worldanim::WorldAnims::new(&level, &mut collision);
 
         let mut game = Game {
             obj_flags: level.worlds.all_flags(),
@@ -1596,6 +1601,8 @@ impl Game {
             crystals: [0; 9],
             crystal_shown: None,
             hidden: HashSet::new(),
+            world_anim,
+            transport: Default::default(),
             level_end: None,
             msgs: Default::default(),
             sfx: vec!["S_ENTRANCE".into()],
@@ -1921,7 +1928,7 @@ impl Game {
     }
 
     /// Whether a point is on the 4:3 screen, give or take `margin` units.
-    fn on_screen(&self, pos: Vec3, margin: f32) -> bool {
+    pub(crate) fn on_screen(&self, pos: Vec3, margin: f32) -> bool {
         match crate::scene::project(self, pos) {
             Some((x, y)) => {
                 let m = margin * 4.0;
@@ -2617,9 +2624,7 @@ impl Game {
                                     p16(8) as f32 * 0.1,
                                     p16(10) as f32 * 0.1,
                                 );
-                                m.place(&mut self.collision);
-                                self.movers.push(m);
-                                self.movers.len() - 1
+                                self.add_mover(m)
                             })
                     });
                     self.spawn(
@@ -2659,6 +2664,19 @@ impl Game {
                     }
                 }
                 ItemType::Transporter | ItemType::Rotator => {
+                    // SetItem case 11: the pad's id and its destination's.
+                    if info.item_type == ItemType::Transporter {
+                        let w = |k: usize| {
+                            i32::from_le_bytes(inst.params[k..k + 4].try_into().unwrap())
+                        };
+                        self.transport.pads.push(crate::transport::Pad {
+                            pos,
+                            radius: info.radius.max(0.5),
+                            id: w(0),
+                            dest_id: w(4),
+                            dest: None,
+                        });
+                    }
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     if model.is_some() {
                         self.spawn(Kind::Prop, model, pos, yaw);
@@ -2667,6 +2685,7 @@ impl Game {
                 _ => {}
             }
         }
+        self.transport.match_pads();
         // The boss, its coins and key, and the good wizard (boss levels).
         self.merge_item_models(std::mem::take(&mut known));
         self.spawn_boss(fs, num_players);
@@ -2787,7 +2806,7 @@ impl Game {
     }
 
     /// A realm sound table's entry for this level (sMusicTrackHi = realm).
-    fn realm_sound(&self, table: &[i32; 16]) -> i32 {
+    pub(crate) fn realm_sound(&self, table: &[i32; 16]) -> i32 {
         self.wave
             .and_then(|w| table.get((w >> 8) as usize))
             .copied()
@@ -2874,16 +2893,16 @@ impl Game {
     /// 0xF0000 material, and for 0x2000000 objects only while they move.
     pub(crate) fn hurting_surface(&self, owner: i32) -> Option<u32> {
         let o = usize::try_from(owner).ok()?;
-        let flags = *self.obj_flags.get(o)?;
+        let live = self
+            .world_anim
+            .flags
+            .get(o)
+            .map_or(0, |f| f & crate::worldanim::wflags::HAS_ANIM);
+        let flags = *self.obj_flags.get(o)? | live;
         if flags & 0xF0000 == 0 {
             return None;
         }
-        if flags & 0x2000000 != 0
-            && !self
-                .movers
-                .iter()
-                .any(|m| m.moving && m.objects.contains(&o))
-        {
+        if flags & 0x2000000 != 0 && !self.world_anim.animating(o) {
             return None;
         }
         Some(flags)
@@ -3017,7 +3036,10 @@ impl Game {
             self.sumner = Some(s);
         }
         let inputs = self.legend_freeze_inputs(inputs);
+        self.update_world_motion(dt);
+        let held = self.update_transporters(dt);
         self.update_players(dt, &inputs);
+        self.hold_transporting(held);
         self.update_music_area();
         self.legend_face_boss();
         self.update_rings(dt);
@@ -6074,8 +6096,11 @@ impl Game {
         }
 
         let w = self.world_letter();
+        let floors = self.world_anim.floors.clone();
         for m in &mut self.movers {
-            let (started, stopped) = m.update(&mut self.collision, dt);
+            let ridden = floors.iter().any(|f| *f == Some(m.root as i32));
+            let (started, stopped) =
+                m.update(&mut self.collision, &mut self.world_anim, ridden, dt);
             if started {
                 self.sfx.push(format!("S_ELVSTONE{w}|S_STONEGATE"));
             }

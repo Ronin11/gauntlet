@@ -21,6 +21,8 @@ pub struct Scene {
     world_inst: Instance,
     /// Geometry moved by triggers, by index into `Game::movers`.
     movers: Vec<Option<(GpuMesh, Instance)>>,
+    /// Animated and rotating world objects (`WorldAnims::dynamic`), one part each.
+    dynamic: Option<(GpuMesh, Instance)>,
     models: Vec<GpuMesh>,
     players: Vec<Instance>,
     entities: HashMap<u64, Instance>,
@@ -50,18 +52,16 @@ pub fn project(game: &Game, pos: Vec3) -> Option<(f32, f32)> {
 
 impl Scene {
     pub fn new(gpu: &Gpu, game: &Game) -> Result<Scene> {
-        let moving: std::collections::HashSet<usize> = game
-            .movers
-            .iter()
-            .flat_map(|m| m.objects.iter().copied())
-            .chain(game.hidden.iter().copied())
-            .collect();
-        let world = gpu.upload_mesh(&game.level.world_mesh(&moving))?;
+        let world = gpu.upload_mesh(&game.level.world_mesh(&Self::not_static(game)))?;
         let mut world_inst = gpu.new_instance(&world);
         world_inst.transform = mirror();
+        let animated: std::collections::HashSet<usize> =
+            game.world_anim.dynamic.iter().copied().collect();
         let mut movers = Vec::new();
         for m in &game.movers {
-            let (mesh, placed) = game.level.objects_mesh(|i| m.objects.contains(&i));
+            let (mesh, placed) = game
+                .level
+                .objects_mesh(|i| m.objects.contains(&i) && !animated.contains(&i));
             movers.push(if placed > 0 {
                 let mesh = gpu.upload_mesh(&mesh)?;
                 let inst = gpu.new_instance(&mesh);
@@ -70,6 +70,13 @@ impl Scene {
                 None
             });
         }
+        let dynamic = if game.world_anim.dynamic.is_empty() {
+            None
+        } else {
+            let mesh = gpu.upload_mesh(&game.level.parts_mesh(&game.world_anim.dynamic))?;
+            let inst = gpu.new_instance(&mesh);
+            Some((mesh, inst))
+        };
         let models = game
             .models
             .iter()
@@ -84,6 +91,7 @@ impl Scene {
             world,
             world_inst,
             movers,
+            dynamic,
             models,
             players,
             entities: HashMap::new(),
@@ -96,13 +104,7 @@ impl Scene {
         // World objects hidden during play (SafeRockSetup's dirt mound and
         // glow): rebuild the world mesh without them.
         if game.hidden.len() != self.hidden_count {
-            let skip: std::collections::HashSet<usize> = game
-                .movers
-                .iter()
-                .flat_map(|m| m.objects.iter().copied())
-                .chain(game.hidden.iter().copied())
-                .collect();
-            if let Ok(world) = gpu.upload_mesh(&game.level.world_mesh(&skip)) {
+            if let Ok(world) = gpu.upload_mesh(&game.level.world_mesh(&Self::not_static(game))) {
                 let mut inst = gpu.new_instance(&world);
                 inst.transform = mirror();
                 self.world = world;
@@ -124,14 +126,28 @@ impl Scene {
                 inst.visible = m.shown;
             }
         }
-        for (inst, p) in self.players.iter_mut().zip(&game.players) {
+        // DoWorldAnimation / rotators: each moving object's node.
+        if let Some((mesh, inst)) = &mut self.dynamic {
+            mesh.animate_textures(inf_frame);
+            let wa = &game.world_anim;
+            inst.transform = mirror();
+            inst.parts = wa.dynamic.iter().map(|&o| wa.delta(o)).collect();
+            inst.hidden = wa
+                .dynamic
+                .iter()
+                .map(|&o| wa.hidden[o] || game.hidden.contains(&o))
+                .collect();
+        }
+        for (pi, (inst, p)) in self.players.iter_mut().zip(&game.players).enumerate() {
             let model = &game.models[p.model];
             inst.transform =
                 mirror() * Mat4::from_translation(p.pos) * Mat4::from_rotation_y(p.yaw);
             (inst.parts, inst.hidden) = model.evaluate(p.animator.seq, p.animator.frame);
             inst.part_fx = model.texmod_fx(p.animator.seq, p.animator.frame);
             let flash = p.hurt_flash;
-            inst.tint = Vec4::new(1.0 + flash, 1.0 - flash * 0.5, 1.0 - flash * 0.5, 1.0);
+            // DoTransporter fades the hero out and in.
+            let alpha = game.transport.alpha(pi);
+            inst.tint = Vec4::new(1.0 + flash, 1.0 - flash * 0.5, 1.0 - flash * 0.5, alpha);
             inst.visible = match p.state {
                 PlayerState::Dead { timer } => !(timer < 2.0 && (timer * 8.0).fract() < 0.5),
                 PlayerState::Exited | PlayerState::InTower => false,
@@ -257,6 +273,17 @@ impl Scene {
         self.entities.retain(|id, _| live.contains(id));
     }
 
+    /// World objects left out of the static world mesh: trigger movers,
+    /// animated and rotating objects, and the hidden.
+    fn not_static(game: &Game) -> std::collections::HashSet<usize> {
+        game.movers
+            .iter()
+            .flat_map(|m| m.objects.iter().copied())
+            .chain(game.world_anim.dynamic.iter().copied())
+            .chain(game.hidden.iter().copied())
+            .collect()
+    }
+
     pub fn globals(&self, game: &Game, aspect: f32) -> gpu::Globals {
         let (eye, at, near) = game.camera_view();
         let m = mirror();
@@ -273,6 +300,7 @@ impl Scene {
     pub fn draws<'a>(&'a self, game: &Game) -> Vec<(&'a GpuMesh, &'a Instance)> {
         let mut d = vec![(&self.world, &self.world_inst)];
         d.extend(self.movers.iter().flatten().map(|(m, i)| (m, i)));
+        d.extend(self.dynamic.iter().map(|(m, i)| (m, i)));
         for (inst, p) in self.players.iter().zip(&game.players) {
             d.push((&self.models[p.model], inst));
         }
