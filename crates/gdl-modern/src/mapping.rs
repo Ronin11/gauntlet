@@ -48,3 +48,6 @@ pub const BIPED_AIM: &[(&str, &str)] = &[
 
 /// Two joints (heel, toe) that point the way a biped rig faces.
 pub const BIPED_FORWARD: (&str, &str) = ("L_Foot", "L_ToeBase");
+
+/// The root joint of each limb of a biped; see [`crate::ModernModel::separate_limbs`].
+pub const BIPED_LIMBS: &[&str] = &["L_Thigh", "R_Thigh", "L_Clavicle", "R_Clavicle"];

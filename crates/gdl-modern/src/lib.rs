@@ -178,6 +178,53 @@ impl ModernModel {
         })
     }
 
+    /// Stop a vertex being pulled by two limbs at once. Automatic skinning bleeds
+    /// weight between limbs that touch in the bind pose (a hand hanging beside a
+    /// thigh drags the thigh's skin along). Each joint belongs to the limb whose
+    /// root joint (`limb_roots`) it descends from; a vertex keeps only the limb
+    /// with the most weight on it (plus any joints outside every limb) and is
+    /// renormalised. Returns how many vertices changed.
+    pub fn separate_limbs(&mut self, limb_roots: &[&str]) -> usize {
+        let roots: Vec<usize> = limb_roots.iter().filter_map(|n| self.joint(n)).collect();
+        let limb_of: Vec<Option<usize>> = (0..self.joints.len())
+            .map(|mut j| loop {
+                if let Some(l) = roots.iter().position(|&r| r == j) {
+                    break Some(l);
+                }
+                match self.joints[j].parent {
+                    Some(p) => j = p,
+                    None => break None,
+                }
+            })
+            .collect();
+        let mut changed = 0;
+        for v in &mut self.vertices {
+            let mut per_limb = vec![0.0f32; roots.len()];
+            for k in 0..4 {
+                if let Some(l) = limb_of[v.joints[k] as usize] {
+                    per_limb[l] += v.weights[k];
+                }
+            }
+            if per_limb.iter().filter(|&&w| w > 0.0).count() < 2 {
+                continue;
+            }
+            let keep = (0..per_limb.len())
+                .max_by(|&a, &b| per_limb[a].total_cmp(&per_limb[b]))
+                .unwrap();
+            for k in 0..4 {
+                if limb_of[v.joints[k] as usize].is_some_and(|l| l != keep) {
+                    v.weights[k] = 0.0;
+                }
+            }
+            let sum: f32 = v.weights.iter().sum();
+            if sum > 0.0 {
+                v.weights.iter_mut().for_each(|w| *w /= sum);
+            }
+            changed += 1;
+        }
+        changed
+    }
+
     pub fn joint(&self, name: &str) -> Option<usize> {
         self.joints.iter().position(|j| j.name == name)
     }

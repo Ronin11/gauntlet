@@ -28,7 +28,8 @@ impl ModernHero {
         ref_seq: usize,
         ref_frame: f32,
     ) -> Result<Self> {
-        let model = ModernModel::load(path)?;
+        let mut model = ModernModel::load(path)?;
+        model.separate_limbs(mapping::BIPED_LIMBS);
         let game_ref = hero.node_world(ref_seq, ref_frame);
         let names: Vec<&str> = hero
             .skeleton

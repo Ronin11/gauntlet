@@ -53,3 +53,19 @@ fn rest_pose_skins_to_itself() {
         .fold(0.0, f32::max);
     assert!(worst < 1e-3, "rest pose moved a vertex by {worst}");
 }
+
+/// After separating limbs, no vertex is pulled by two limbs.
+#[test]
+fn limbs_do_not_share_vertices() {
+    let Ok(path) = std::env::var("GDL_MODERN_TEST_GLB") else {
+        return;
+    };
+    let mut m = ModernModel::load(path).unwrap();
+    let before = m.separate_limbs(mapping::BIPED_LIMBS);
+    assert!(before > 0, "expected the Tripo rig to need it");
+    assert_eq!(m.separate_limbs(mapping::BIPED_LIMBS), 0);
+    assert!(m
+        .vertices
+        .iter()
+        .all(|v| (v.weights.iter().sum::<f32>() - 1.0).abs() < 0.05));
+}
