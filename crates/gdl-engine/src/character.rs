@@ -42,13 +42,28 @@ pub fn pyr_matrix(a: [f32; 3]) -> Mat4 {
     ])
 }
 
-/// Mesh-swap frames of one object-animation node for one sequence.
+/// Mesh-swap frames of one object-animation node for one sequence (an
+/// `OANIM` entry, auxanim.c).
 #[derive(Clone, Debug)]
 struct FrameRun {
     node: usize,
-    frame_count: usize,
-    /// Part index per frame.
+    /// The sequence frame showing the first object (`OANIM.start`).
+    start: i32,
+    /// Part index per frame: frame `start + k` shows `parts[k]`.
     parts: Vec<u16>,
+}
+
+impl FrameRun {
+    /// DoObjAnimation: the object frame `f` of the sequence shows. A one-frame
+    /// run always shows its object; otherwise frames outside
+    /// `start..start + frames` show none.
+    fn part_at(&self, f: i32) -> Option<u16> {
+        if self.parts.len() == 1 {
+            return Some(self.parts[0]);
+        }
+        let k = usize::try_from(f - self.start).ok()?;
+        self.parts.get(k).copied()
+    }
 }
 
 pub struct Model {
@@ -401,9 +416,11 @@ impl Model {
             }
         }
 
-        // Object animations: every frame mesh becomes its own part.
+        // Object animations (InitOAnimList / DoObjAnimation): an entry's name
+        // finds its first frame's object (MBOX_ReallyFindObject) and frame k
+        // is the k-th object after it. Every frame mesh becomes its own part.
         let mut runs = vec![Vec::new(); skeleton.sequences.len()];
-        let mut by_prefix: std::collections::HashMap<String, Vec<u16>> = Default::default();
+        let mut by_first: std::collections::HashMap<(usize, usize), Vec<u16>> = Default::default();
         for (ni, node) in skeleton.nodes.iter().enumerate() {
             let Some(first) = node.obj_anim_first else {
                 continue;
@@ -412,32 +429,32 @@ impl Model {
                 let Some(oa) = skeleton.obj_anims.get(first + si) else {
                     continue;
                 };
-                let p = oa.prefix().to_string();
-                let parts = by_prefix
-                    .entry(p.clone())
+                if oa.name.is_empty() {
+                    continue;
+                }
+                let Some(d) = defs.iter().find(|d| name_matches(&d.name, &oa.name)) else {
+                    continue;
+                };
+                let key = (d.obj_index.max(0) as usize, oa.frame_count.max(1) as usize);
+                let parts = by_first
+                    .entry(key)
                     .or_insert_with(|| {
-                        let mut frames: Vec<(&str, usize)> = defs
-                            .iter()
-                            .filter(|d| d.name.len() > p.len() && d.name.starts_with(&p))
-                            .filter(|d| d.name[p.len()..].starts_with('F'))
-                            .map(|d| (d.name.as_str(), d.obj_index.max(0) as usize))
-                            .collect();
-                        frames.sort();
+                        // Glow/fire nodes use additive "fb_add" blending.
+                        b.additive = node.mb_flags & (1 << 23) != 0;
                         let mut parts = Vec::new();
-                        for (_, oi) in frames {
-                            if let Some(obj) = objects.objects.get(oi) {
-                                b.add_part(obj, Mat4::IDENTITY, next_part);
-                                parts.push(next_part);
-                                next_part += 1;
-                            }
+                        for obj in (key.0..key.0 + key.1).map_while(|i| objects.objects.get(i)) {
+                            b.add_part(obj, Mat4::IDENTITY, next_part);
+                            parts.push(next_part);
+                            next_part += 1;
                         }
+                        b.additive = false;
                         parts
                     })
                     .clone();
                 if !parts.is_empty() {
                     run.push(FrameRun {
                         node: ni,
-                        frame_count: oa.frame_count.max(1) as usize,
+                        start: oa.start_frame as i32,
                         parts,
                     });
                 }
@@ -680,13 +697,20 @@ impl Model {
                 }
             }
         }
-        if let Some(runs) = self.runs.get(seq) {
+        if let (Some(runs), Some(s)) = (self.runs.get(seq), self.skeleton.sequences.get(seq)) {
+            // AnimateNode's frame: (s32)(0.5 + frame), from the end for
+            // reversed sequences; kept within the sequence so a loop's last
+            // half frame does not round past its end.
+            let n = (s.frame_count as i32).max(1);
+            let mut f = ((0.5 + frame.max(0.0) as f64) as i32).min(n - 1);
+            if s.flags & 1 != 0 {
+                f = n - f - 1;
+            }
             for r in runs {
-                let f = (frame.max(0.0) as usize).min(r.frame_count - 1);
-                let idx = (f * r.parts.len() / r.frame_count).min(r.parts.len() - 1);
-                let p = r.parts[idx] as usize;
-                hidden[p] = false;
-                parts[p] = world[r.node];
+                if let Some(p) = r.part_at(f) {
+                    hidden[p as usize] = false;
+                    parts[p as usize] = world[r.node];
+                }
             }
         }
         for &(p, node) in &self.alt_parts {
@@ -817,6 +841,52 @@ mod tests {
             fs.read(&format!("{dir}/textures.ngc")).ok()?,
             Anim::parse(&fs.read(&format!("{dir}/ANIM.PS2")).ok()?).ok()?,
         ))
+    }
+
+    /// The parts of `m` shown at `frame` of sequence 0 among its frame runs.
+    fn shown_run_parts(m: &Model, frame: f32) -> Vec<u16> {
+        let (_, hidden) = m.evaluate(0, frame);
+        let mut run_parts: Vec<u16> = m
+            .runs
+            .iter()
+            .flatten()
+            .flat_map(|r| r.parts.clone())
+            .collect();
+        run_parts.sort();
+        run_parts.dedup();
+        run_parts
+            .into_iter()
+            .filter(|&p| !hidden[p as usize])
+            .collect()
+    }
+
+    #[test]
+    fn stained_glass_light_burst_plays_at_its_frames() {
+        let Some((objects, textures, anim)) = bank("ITEMS/levelL") else {
+            eprintln!("game data not found; skipping");
+            return;
+        };
+        // SHARD1's XPOANIMF_98 node: OANIM "SHAR20G48", 14 objects from frame
+        // 98 of ACTIVE (112 frames), drawn additively.
+        let m = Model::from_anim(&objects, &textures, &anim, Some("SHARD1")).unwrap();
+        let runs: Vec<_> = m.runs.iter().flatten().collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].start, runs[0].parts.len()), (98, 14));
+        let parts = runs[0].parts.clone();
+        assert!(shown_run_parts(&m, 0.0).is_empty());
+        assert!(shown_run_parts(&m, 97.0).is_empty());
+        assert_eq!(shown_run_parts(&m, 98.0), [parts[0]]);
+        assert_eq!(shown_run_parts(&m, 104.6), [parts[7]]);
+        // EnterTower's finished effect rests on the last frame.
+        assert_eq!(shown_run_parts(&m, 111.0), [parts[13]]);
+        // Runestones: RUNE1's "RUNE07D000" burst covers frames 38..54 of 82
+        // and is gone at the end.
+        let m = Model::from_anim(&objects, &textures, &anim, Some("RUNE1")).unwrap();
+        let run = &m.runs[0][0];
+        assert_eq!((run.start, run.parts.len()), (38, 17));
+        assert!(shown_run_parts(&m, 37.0).is_empty());
+        assert_eq!(shown_run_parts(&m, 54.0), [run.parts[16]]);
+        assert!(shown_run_parts(&m, 81.0).is_empty());
     }
 
     #[test]

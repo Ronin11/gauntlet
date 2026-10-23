@@ -214,6 +214,23 @@ fn main() -> Result<()> {
                     if let Some(tm) = &n.texmod {
                         println!("    node texmod {}", tm_line(tm));
                     }
+                    if let Some(first) = n.obj_anim_first {
+                        for (si, oa) in t
+                            .obj_anims
+                            .iter()
+                            .skip(first)
+                            .take(t.sequences.len())
+                            .enumerate()
+                        {
+                            println!(
+                                "    node oanim seq {si} {:?} frames {} start {}",
+                                oa.name, oa.frame_count, oa.start_frame
+                            );
+                        }
+                    }
+                    if let Some((k, dir)) = n.psys {
+                        println!("    node psys {k} dir {dir:?} {:?}", a.psys.get(k));
+                    }
                 }
                 for s in &t.sequences {
                     println!(
@@ -254,7 +271,13 @@ fn main() -> Result<()> {
                 w.locators.len()
             );
             let pos = w.world_positions();
-            for (o, p) in w.world_objects.iter().zip(&pos).take(40) {
+            // GDL_WO_ALL=1 lists every world object (default: first 40).
+            let wo_limit = if std::env::var_os("GDL_WO_ALL").is_some() {
+                usize::MAX
+            } else {
+                40
+            };
+            for (o, p) in w.world_objects.iter().zip(&pos).take(wo_limit) {
                 println!(
                     "wo {:16} flags {:#010x} pos {:?} abs {:?} child {} next {} tris {}@{}",
                     o.name,
