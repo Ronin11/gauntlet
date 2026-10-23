@@ -810,11 +810,12 @@ impl Game {
     /// (PlayerWallCollide, PlayerCollideFloor).
     fn slide_blocked(&self, coll: Vec3, pt: Vec3) -> bool {
         let feet = coll - Vec3::Y * COLL_Y + pt;
-        let pushed = self.collision.resolve_walls(
+        let (pushed, _) = self.collision.resolve_walls_stairs(
             feet,
             crate::game::PLAYER_RADIUS,
             crate::game::PLAYER_HEIGHT,
             crate::game::STEP_HEIGHT,
+            crate::game::STAIR_RISE,
         );
         let wall = Vec3::new(pushed.x - feet.x, 0.0, pushed.z - feet.z).length() > 1e-3;
         let floor = self

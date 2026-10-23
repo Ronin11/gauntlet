@@ -14,6 +14,10 @@ pub struct Tri {
 pub struct Collision {
     pub tris: Vec<Tri>,
     pub enabled: Vec<bool>,
+    /// The triangle's world object is stairs or a ramp (flags & 0x38): its
+    /// risers don't stop a walking player (fn_80088714), who climbs them by
+    /// the floor (PlayerCollideFloor).
+    pub stairs: Vec<bool>,
     min: Vec2,
     cell: f32,
     nx: usize,
@@ -123,9 +127,11 @@ impl Collision {
             }
         }
         let enabled = vec![true; tris.len()];
+        let stairs = vec![false; tris.len()];
         Collision {
             tris,
             enabled,
+            stairs,
             min,
             cell,
             nx,
@@ -242,10 +248,23 @@ impl Collision {
     /// contact point.
     pub fn resolve_walls_hit(
         &self,
+        pos: Vec3,
+        radius: f32,
+        height: f32,
+        step: f32,
+    ) -> (Vec3, Option<(i32, Vec3)>) {
+        self.resolve_walls_stairs(pos, radius, height, step, step)
+    }
+
+    /// [`Collision::resolve_walls_hit`] with stairs' walls (see
+    /// [`Collision::stairs`]) only solid above `stair_step`.
+    pub fn resolve_walls_stairs(
+        &self,
         mut pos: Vec3,
         radius: f32,
         height: f32,
         step: f32,
+        stair_step: f32,
     ) -> (Vec3, Option<(i32, Vec3)>) {
         let mut hit = None;
         for _ in 0..3 {
@@ -258,7 +277,12 @@ impl Collision {
                     continue;
                 }
                 // Test against the cylinder's axis segment above the step height.
-                let lo = pos.y + step;
+                let lo = pos.y
+                    + if self.stairs[i as usize] {
+                        stair_step
+                    } else {
+                        step
+                    };
                 let hi = pos.y + height;
                 let tmin = t.v[0].y.min(t.v[1].y).min(t.v[2].y);
                 let tmax = t.v[0].y.max(t.v[1].y).max(t.v[2].y);
