@@ -2,6 +2,7 @@
 
 use crate::game::{EnemyState, Game, Kind, PlayerState};
 use crate::gpu::{self, Gpu, GpuMesh, Instance, SpriteDraw, SpriteLayer, SpriteVertex};
+use crate::interp::{Cam, Interp, Pose};
 use anyhow::Result;
 use glam::{Mat4, Vec3, Vec4};
 use std::collections::HashMap;
@@ -36,6 +37,10 @@ pub struct Scene {
     shadow_models: HashMap<u64, usize>,
     /// This frame's particles and missile streaks.
     sprites: SpriteLayer,
+    /// The last two ticks' poses (interp.rs), and this frame's blended
+    /// camera (None: the game's own).
+    interp: Interp,
+    cam: Option<Cam>,
 }
 
 /// DrawPsysSub's screen limits on the GameCube's 640x480: both corners
@@ -65,6 +70,11 @@ const WORN_KEY: u64 = 1 << 58;
 /// Instance keys for a shadow: | the entity id, or | SHADOW_PLAYER | the hero.
 const SHADOW_KEY: u64 = 1 << 60;
 const SHADOW_PLAYER: u64 = 1 << 59;
+/// Interpolation keys for the heroes, trigger movers and world animations
+/// (which aren't in `entities`).
+const PLAYER_KEY: u64 = 1 << 57;
+const MOVER_KEY: u64 = 1 << 56;
+const DYNAMIC_KEY: u64 = 1 << 55;
 /// MBTreeSetAlpha's see-through chest (0xC0) and compass (lbl_80343C20 128):
 /// invAlpha = 255 - alpha.
 const XRAY_CHEST_ALPHA: f32 = 63.0 / 255.0;
@@ -148,6 +158,8 @@ impl Scene {
             worn: Vec::new(),
             shadow_models: HashMap::new(),
             sprites: gpu.new_sprite_layer(),
+            interp: Interp::default(),
+            cam: None,
         })
     }
 
@@ -255,6 +267,7 @@ impl Scene {
     }
 
     pub fn sync(&mut self, gpu: &Gpu, game: &Game) {
+        self.cam = None;
         // World objects hidden during play (SafeRockSetup's dirt mound and
         // glow): rebuild the world mesh without them.
         if game.hidden.len() != self.hidden_count {
@@ -535,6 +548,89 @@ impl Scene {
         self.entities.retain(|id, _| live.contains(id));
         self.shadow_models.retain(|id, _| live.contains(id));
         self.sync_sprites(gpu, game);
+        if self.interp.needs(game.frame) {
+            self.capture(game);
+        }
+    }
+
+    /// Before the last game tick of a display frame: keep the tick about to
+    /// be left behind, if the display hasn't drawn it (more than one tick
+    /// this frame), so the next frame blends from it.
+    pub fn pre_tick(&mut self, gpu: &Gpu, game: &Game) {
+        if self.interp.needs(game.frame) {
+            self.sync(gpu, game);
+        }
+    }
+
+    /// Keep this tick's poses: every instance's transform and parts, tagged
+    /// with the model and sequence its parts sample.
+    fn capture(&mut self, game: &Game) {
+        let ip = &mut self.interp;
+        ip.begin(game.frame, game.camera_view());
+        let pose = |i: &Instance, tag, frame| Pose {
+            transform: i.transform,
+            parts: i.parts.clone(),
+            tag,
+            frame,
+        };
+        for (pi, (inst, p)) in self.players.iter().zip(&game.players).enumerate() {
+            let tag = crate::interp::tag(p.model, p.animator.seq);
+            ip.put(PLAYER_KEY | pi as u64, pose(inst, tag, p.animator.frame));
+        }
+        for (i, slot) in self.movers.iter().enumerate() {
+            if let Some((_, inst)) = slot {
+                ip.put(MOVER_KEY | i as u64, pose(inst, 0, 0.0));
+            }
+        }
+        if let Some((_, inst)) = &self.dynamic {
+            ip.put(DYNAMIC_KEY, pose(inst, 0, 0.0));
+        }
+        let mut anims = HashMap::new();
+        for e in &game.entities {
+            let (Some(m), a) = (e.model, &e.animator) else {
+                continue;
+            };
+            let a = match &e.kind {
+                Kind::Critter(c) => &c.parts[0].anim,
+                _ => a,
+            };
+            anims.insert(e.id, (crate::interp::tag(m, a.seq), a.frame));
+        }
+        for (&key, inst) in &self.entities {
+            let (tag, frame) = anims.get(&key).copied().unwrap_or((0, 0.0));
+            ip.put(key, pose(inst, tag, frame));
+        }
+    }
+
+    /// Draw this frame `alpha` (the accumulator over a tick) of the way from
+    /// the previous tick to the current one (interp.rs). Not calling this
+    /// draws the current tick exactly.
+    pub fn blend(&mut self, game: &Game, alpha: f32) {
+        let t = self.interp.alpha(game.frame, alpha);
+        if t >= 1.0 {
+            return;
+        }
+        let ip = &self.interp;
+        let one = |key: u64, inst: &mut Instance| {
+            if let (Some(a), Some(b)) = (ip.prev.get(&key), ip.cur.get(&key)) {
+                crate::interp::blend_pose(a, b, t, &mut inst.transform, &mut inst.parts);
+            }
+        };
+        for (pi, inst) in self.players.iter_mut().enumerate() {
+            one(PLAYER_KEY | pi as u64, inst);
+        }
+        for (i, slot) in self.movers.iter_mut().enumerate() {
+            if let Some((_, inst)) = slot {
+                one(MOVER_KEY | i as u64, inst);
+            }
+        }
+        if let Some((_, inst)) = &mut self.dynamic {
+            one(DYNAMIC_KEY, inst);
+        }
+        for (&key, inst) in self.entities.iter_mut() {
+            one(key, inst);
+        }
+        self.cam = ip.cam(t);
     }
 
     /// Put shadow `key` where `s` says, at its body's opacity.
@@ -566,7 +662,7 @@ impl Scene {
     }
 
     pub fn globals(&self, game: &Game, aspect: f32) -> gpu::Globals {
-        let (eye, at, near) = game.camera_view();
+        let (eye, at, near) = self.cam.unwrap_or_else(|| game.camera_view());
         let m = mirror();
         let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
         let proj = crate::camera::projection(aspect, near, 1500.0);

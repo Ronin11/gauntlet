@@ -143,6 +143,9 @@ Headless test hooks (environment variables): `GDL_MUTE=1` (no audio), `GDL_FUZZ=
 (power-up inventory), `GDL_PUP=9:80,lvl:85` (power-ups switched on by type:hex flags, hero level), `GDL_SUMNER=welcome|runes=..|shards=..|exp=N`, `GDL_FLYBY=1`,
 `GDL_NO_BOSS_CAMERA=1`, `GDL_DEBUG_CAM=1`, `GDL_PSYS=1` (particle systems at the end),
 `GDL_FX=<row|GENHIT|GENDIE>[:frame]` (start an effect in front of player 0).
+`GDL_BLEND=<alpha>` runs one more tick and draws the frame `alpha` of the way to it, as a
+fast display does (the game ticks at 60 Hz and the window interpolates between the last
+two ticks; snapshots are otherwise the exact tick).
 
 ## Credits and references
 

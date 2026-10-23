@@ -545,6 +545,26 @@ fn snapshot_game(args: &Args) -> Result<()> {
     let gpu = headless_gpu()?;
     let mut sc = scene::Scene::new(&gpu, &g)?;
     sc.sync(&gpu, &g);
+    // GDL_BLEND=alpha: one more tick, drawn `alpha` of the way to it as a
+    // faster display would (interp.rs); without it the tick is drawn exactly.
+    if let Some(alpha) = std::env::var("GDL_BLEND")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        g.update(1.0 / 60.0, &[input::PlayerInput::default()]);
+        let t0 = std::time::Instant::now();
+        sc.sync(&gpu, &g);
+        let t1 = std::time::Instant::now();
+        let n = 100;
+        for _ in 0..n {
+            sc.blend(&g, alpha);
+        }
+        println!(
+            "blend {alpha}: sync {:.3} ms, blend {:.3} ms",
+            (t1 - t0).as_secs_f64() * 1e3,
+            t1.elapsed().as_secs_f64() * 1e3 / n as f64
+        );
+    }
     let (w, h) = args.size;
     let mut globals = sc.globals(&g, w as f32 / h as f32);
     if let (Some(eye), Some(at)) = (args.eye, args.at) {
