@@ -1301,20 +1301,17 @@ impl Game {
             let far = if far <= 0.0 { 1e21 } else { far };
             let b = self.boss.get_or_insert_with(Default::default);
             if b.wake_time == 0.0 {
+                // typeFlags 0x80 (the Chimera) waits for its floor to move:
+                // see the floor snap below.
                 if t0.flags & 0x80 == 0 {
                     b.wake_time = now + 2.0;
-                } else if far < t0.activedist.max(1.0) {
-                    // [CHOICE] typeFlags 0x80 (Chimera) waits for a floor trigger
-                    // (triggerstate 0x10) we don't track: the first player in
-                    // its wake distance counts instead.
-                    b.wake_time = now + 2.0;
-                    b.targeted = true;
                 }
             } else if now >= b.wake_time && (t0.activedist <= 0.0 || far < t0.activedist) {
+                // CritterActivateChain.
                 for p in &mut c.parts {
                     p.state = 3;
                 }
-                self.boss_activate();
+                self.boss_activate(true);
             }
         }
         // Move choice.
@@ -1458,8 +1455,18 @@ impl Game {
         }
         // Floor snap (FloorCollide: a radius-5 sphere from 4 above, down).
         let t0 = &w.types[c.parts[0].ty];
-        if let Some(g) = self.critter_floor(self.entities[ei].pos) {
+        if let Some((g, floor)) = self.critter_floor_hit(self.entities[ei].pos) {
             self.entities[ei].pos.y = g + t0.y_offset;
+            // A sleeping typeFlags-0x80 boss wakes when the floor it stands
+            // on (or that floor's parent) moves: triggerstate 0x10.
+            let asleep = self.boss.as_ref().is_some_and(|b| b.wake_time == 0.0);
+            if c.parts[0].state == 0 && asleep && t0.flags & 0x80 != 0 && self.floor_moving(floor)
+            {
+                if let Some(b) = self.boss.as_mut() {
+                    b.wake_time = now + 2.0;
+                }
+                self.boss_activate(false);
+            }
         }
         // Held players ride on the move node.
         self.carry_grabbed(c, ei);
@@ -2508,12 +2515,43 @@ impl Game {
     /// it touches. A floor edge within 5 units counts, as the sphere rests on
     /// it (the Dragon stands at the lip of its ledge this way).
     pub(crate) fn critter_floor(&self, pos: Vec3) -> Option<f32> {
+        self.critter_floor_hit(pos).map(|(g, _)| g)
+    }
+
+    /// The floor object `obj`'s triggerstate, or its parent's, has bit 0x10:
+    /// a trigger's target that is moving (the item world-object update).
+    pub(crate) fn floor_moving(&self, obj: i32) -> bool {
+        let objs = &self.level.worlds.world_objects;
+        if obj < 0 || obj as usize >= objs.len() {
+            return false;
+        }
+        let obj = obj as usize;
+        let is_child = |root: usize| {
+            let mut ch = objs[root].child_index;
+            while ch >= 0 && (ch as usize) < objs.len() {
+                if ch as usize == obj {
+                    return true;
+                }
+                ch = objs[ch as usize].next_index;
+            }
+            false
+        };
+        self.movers
+            .iter()
+            .any(|m| m.moving && (m.root == obj || is_child(m.root)))
+    }
+
+    /// [`Game::critter_floor`] with the world object of the floor it rests
+    /// on (gFloorCollisionResult.obj, -1 for none).
+    pub(crate) fn critter_floor_hit(&self, pos: Vec3) -> Option<(f32, i32)> {
         const R: f32 = 5.0;
         let top = pos.y + 4.0;
-        let mut best: Option<f32> = None;
+        let mut best: Option<(f32, i32)> = None;
         let mut probe = |p: Vec3| {
-            if let Some(g) = self.collision.ground_height(p, top) {
-                best = Some(best.map_or(g, |b: f32| b.max(g)));
+            if let Some((g, o)) = self.collision.ground_hit(p, top) {
+                if best.is_none_or(|b| g > b.0) {
+                    best = Some((g, o));
+                }
             }
         };
         probe(pos);
