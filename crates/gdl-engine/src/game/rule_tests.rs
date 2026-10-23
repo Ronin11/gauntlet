@@ -154,15 +154,15 @@ fn melee_hurts_heroes_only_when_the_option_says() {
     g.players[0].yaw = yaw;
     g.players[1].pos = pos + Vec3::new(0.0, 0.0, 3.0);
     let hp = g.players[1].health;
-    g.player_attack(0, pos, yaw, 1.0, false);
+    g.player_attack(0, pos, yaw, 1.0, 0);
     assert_eq!(g.players[1].health, hp, "Normal: melee passes heroes");
     g.friendly_fire = 2;
-    g.player_attack(0, pos, yaw, 1.0, false);
+    g.player_attack(0, pos, yaw, 1.0, 0);
     assert!(g.players[1].health < hp, "Shots Hurt: the swing lands");
     // Behind the swing: missed.
     let hp = g.players[1].health;
     g.players[1].pos = pos - Vec3::new(0.0, 0.0, 3.0);
-    g.player_attack(0, pos, yaw, 1.0, false);
+    g.player_attack(0, pos, yaw, 1.0, 0);
     assert_eq!(g.players[1].health, hp);
 }
 

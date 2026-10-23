@@ -5682,6 +5682,7 @@ impl Game {
             p.refresh_stats();
             p.health += 100.0;
             self.post(0x22, Some(pi), &[level.to_string()]);
+            self.start_level_up_fx(pi);
         }
     }
 
