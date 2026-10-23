@@ -2193,10 +2193,30 @@ impl Game {
                 })
                 .unwrap_or_default();
             if let Kind::Enemy { ai, brain, .. } = &mut kind {
-                *ai = crate::items::algorithm(etype, spew);
+                // generate_single sets a lookout's algorithm outright.
+                *ai = if sp.ai == 15 {
+                    15
+                } else {
+                    crate::items::algorithm(etype, spew)
+                };
                 brain.generator = Some(sp.generator);
                 if spew == 13 {
                     brain.prev = chain.tail;
+                }
+            }
+            // items.c:3935: once a hit egg has set num_generated to 3, the
+            // next logic-12 spawn starts a new clutch.
+            if spew == 12 {
+                if let Some(Kind::Generator { chain, .. }) = self
+                    .entities
+                    .iter_mut()
+                    .find(|e| e.id == sp.generator)
+                    .map(|e| &mut e.kind)
+                {
+                    if chain.generated >= 3 {
+                        chain.generated -= 3;
+                        chain.flags = 0;
+                    }
                 }
             }
             let id = self.spawn(kind, model, Vec3::new(p.x, g, p.z), a);
@@ -2223,7 +2243,10 @@ impl Game {
                 .find(|e| e.id == sp.generator)
                 .map(|e| &mut e.kind)
             {
-                chain.generated += 1;
+                // place_logic12's spawns aren't counted (items.c:3973).
+                if spew != 12 {
+                    chain.generated += 1;
+                }
                 if spew == 13 {
                     chain.tail = Some(id);
                 }
@@ -5319,6 +5342,40 @@ impl Game {
         }
     }
 
+    /// damage_enemy (enemy.c:6116) / uncouple_enemy: hitting an egg not yet
+    /// hatched sets its generator's flags to 7 (the clutch hatches) and
+    /// num_generated to 3; hitting or killing a lookout turns its generator
+    /// into an ordinary one (ai 0), and a dead lookout's no longer counts.
+    fn alert_generator(&mut self, t: usize, killed: bool) {
+        let Kind::Enemy { brain, etype, .. } = &self.entities[t].kind else {
+            return;
+        };
+        if *etype == crate::enemies::DEATH {
+            return;
+        }
+        let (alg, mode1) = (brain.alg(), brain.mode1());
+        let Some(gid) = brain.generator else { return };
+        let Some(Kind::Generator {
+            ai, chain, spawned, ..
+        }) = self
+            .entities
+            .iter_mut()
+            .find(|e| e.id == gid && e.alive)
+            .map(|e| &mut e.kind)
+        else {
+            return;
+        };
+        if alg == 12 && mode1 < 2 {
+            chain.flags = 7;
+            chain.generated = 3;
+        } else if alg == 15 {
+            *ai = 0;
+            if killed {
+                spawned.clear();
+            }
+        }
+    }
+
     /// fn_8004DC2C: monster `t`'s reaction to the hit it just took (it was in
     /// state `was`). Heavy hits (knockdown, blown away, knockover, whirlwind,
     /// or magic over 10) knock it down (E_HIT_REACT2) and push it 40 (small
@@ -5335,6 +5392,7 @@ impl Game {
         dir: Vec3,
     ) {
         use crate::enemies::{ACID, DEATH, GOLEM, IT};
+        self.alert_generator(t, killed);
         let e = &mut self.entities[t];
         let seqs = e.model.and_then(|m| self.monster_seqs.get(&m)).cloned();
         let Kind::Enemy {
@@ -5715,12 +5773,12 @@ impl Game {
                 }
                 _ => None,
             });
-        let generators: HashMap<u64, u32> = self
+        let generators: HashMap<u64, bool> = self
             .entities
             .iter()
             .filter(|e| e.alive)
             .filter_map(|e| match &e.kind {
-                Kind::Generator { chain, .. } => Some((e.id, chain.generated)),
+                Kind::Generator { chain, .. } => Some((e.id, chain.flags == 7)),
                 _ => None,
             })
             .collect();
@@ -5754,8 +5812,24 @@ impl Game {
                 } => {
                     let (ai, height) = (*ai, *height);
                     let on = visible[ei];
+                    let full = enemy_count + spawns.len() >= self.max_enemies;
+                    if ai == 15 {
+                        // generate_single: a lookout generator keeps one
+                        // lookout out, on screen or not (items.c:3917).
+                        if spawned.is_empty() && !boss_dying && !full {
+                            spawns.push(Spawn {
+                                class: *class,
+                                ai: 15,
+                                strength: *strength,
+                                pos,
+                                yaw: e.yaw,
+                                generator: e.id,
+                                recycle: false,
+                                height,
+                            });
+                        }
                     // generate_enemy refuses everything once the boss is dying.
-                    if (*always || on) && spawned.len() < *max && !boss_dying {
+                    } else if (*always || on) && spawned.len() < *max && !boss_dying {
                         if *timer > 0.0 {
                             *timer -= dt * 60.0;
                         } else {
@@ -5938,10 +6012,10 @@ impl Game {
                             has_generator: brain
                                 .generator
                                 .is_some_and(|g| generators.contains_key(&g)),
-                            generated: brain
+                            hatch: brain
                                 .generator
                                 .and_then(|g| generators.get(&g).copied())
-                                .unwrap_or(0),
+                                .unwrap_or(false),
                         };
                         let probe = crate::ai::WorldProbe {
                             coll: &self.collision,

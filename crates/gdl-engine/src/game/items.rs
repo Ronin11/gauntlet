@@ -804,7 +804,8 @@ impl Game {
 
     /// place_logic12: a logic-12 generator sends its first monster 3.5 to
     /// its left, the next 3.5 to its right (each once the spot is free), and
-    /// any after that stay where they appear.
+    /// any after that stay where they appear. Each egg laid sets its bit of
+    /// the generator's flags (move_logic12 case 0); a full generator sets 7.
     pub(super) fn place_logic12(&mut self, gen: u64, enemy: u64) {
         let Some(g) = self.entities.iter().position(|e| e.id == gen) else {
             return;
@@ -845,10 +846,16 @@ impl Game {
             *d = Some(dest);
         }
         if free {
-            if let Kind::Generator { side, .. } = &mut self.entities[g].kind {
+            if let Kind::Generator { side, chain, .. } = &mut self.entities[g].kind {
+                chain.flags |= match *side {
+                    0 => 1,
+                    1 => 2,
+                    _ => 4,
+                };
                 *side = side.saturating_add(1);
                 if *side as usize >= max {
                     *side = 3;
+                    chain.flags = 7;
                 }
             }
         }
@@ -1700,5 +1707,109 @@ mod tests {
             dests[1]
         );
         assert!(dests[2].length() < 1e-3);
+    }
+
+    /// A grunt generator with gendata ai `ai` 8 in front of the hero.
+    fn generator(g: &mut Game, fs: &GameFs, ai: i32) -> (u64, usize) {
+        let at = g.players[0].pos;
+        let mut cache = HashMap::new();
+        let c = g
+            .monster_class(fs, &mut cache, crate::enemies::GRUNT)
+            .unwrap();
+        let gen = g.spawn(
+            Kind::Generator {
+                class: c,
+                strength: 1,
+                hp: 1000.0,
+                timer: 1e9,
+                interval: 10.0,
+                max: 5,
+                spawned: Vec::new(),
+                etype: crate::enemies::GRUNT,
+                genratio: 0.0,
+                always: true,
+                special: None,
+                ai,
+                height: 2.0,
+                side: 0,
+                chain: Default::default(),
+            },
+            None,
+            at + Vec3::new(0.0, 0.0, 8.0),
+            0.0,
+        );
+        (gen, c)
+    }
+
+    fn gen_of(g: &Game, gen: u64) -> &Kind {
+        &g.entities.iter().find(|e| e.id == gen).unwrap().kind
+    }
+
+    #[test]
+    fn hitting_an_egg_hatches_the_clutch() {
+        let Some(fs) = data() else { return };
+        let mut g = quiet(&fs, &[]);
+        let (gen, c) = generator(&mut g, &fs, 12);
+        let at = g.players[0].pos + Vec3::new(0.0, 0.0, 6.0);
+        let mut kind = g.new_enemy(c, 1, EnemyState::Idle);
+        if let Kind::Enemy {
+            ai, brain, speed, ..
+        } = &mut kind
+        {
+            *ai = 12;
+            *speed = 0.0;
+            brain.generator = Some(gen);
+        }
+        let model = g.classes[c].model(1);
+        let egg = g.spawn(kind, model, at, 0.0);
+        g.place_logic12(gen, egg);
+        let mode1 = |g: &Game| match &g.entities.iter().find(|e| e.id == egg).unwrap().kind {
+            Kind::Enemy { brain, .. } => brain.mode1(),
+            _ => -1,
+        };
+        for _ in 0..10 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        // One egg laid (the left one): it waits.
+        assert!(matches!(gen_of(&g, gen), Kind::Generator { chain, .. } if chain.flags == 1));
+        assert_eq!(mode1(&g), 1);
+        let t = g.entities.iter().position(|e| e.id == egg).unwrap();
+        if let Kind::Enemy { hp, .. } = &mut g.entities[t].kind {
+            *hp = 100.0;
+        }
+        g.hit_entity(0, t, 1.0, Vec2::Y, false);
+        assert!(matches!(gen_of(&g, gen), Kind::Generator { chain, .. }
+            if chain.flags == 7 && chain.generated == 3));
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        assert_eq!(mode1(&g), 2, "hatched");
+    }
+
+    #[test]
+    fn a_hit_lookout_turns_its_generator_ordinary() {
+        let Some(fs) = data() else { return };
+        let mut g = quiet(&fs, &[]);
+        let (gen, _) = generator(&mut g, &fs, 15);
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        // generate_single: one lookout, at once and only one.
+        let Kind::Generator { spawned, .. } = gen_of(&g, gen) else {
+            panic!()
+        };
+        assert_eq!(spawned.len(), 1);
+        let id = spawned[0];
+        let t = g.entities.iter().position(|e| e.id == id).unwrap();
+        assert!(matches!(&g.entities[t].kind, Kind::Enemy { ai: 15, .. }));
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        assert!(matches!(gen_of(&g, gen), Kind::Generator { spawned, .. } if spawned.len() == 1));
+        let t = g.entities.iter().position(|e| e.id == id).unwrap();
+        g.hit_entity(0, t, 1000.0, Vec2::Y, false);
+        assert!(
+            matches!(gen_of(&g, gen), Kind::Generator { ai: 0, spawned, .. }
+            if spawned.is_empty())
+        );
     }
 }
