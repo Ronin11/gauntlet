@@ -185,44 +185,46 @@ impl Vbk {
         }
         let nsounds = be32(b, 0x0C) as usize;
         let nsamples = be32(b, 0x10) as usize;
-        // Sound table: 8-byte entries. Each holds sample references (bit 15 marks the
-        // final one; earlier unflagged words are played before it) and a volume.
-        // Looping sounds (ambience) also set bits 13-14 on the sample word.
+        // Sound table (dcsBankLoad's default case): a stream of u16 "calls", one per
+        // sound and of varying length. A call is its sample words (sample index in
+        // the low 12 bits) played in sequence, the last one flagged with bit 15,
+        // then three parameters: volume, duck and priority. "Red" + "Warrior" is a
+        // two-word call, so calls are not a fixed size. Looping sounds (ambience)
+        // also set bits 13-14 on the flagged word. Offset 4 is the stream's length.
+        let table_end = (0x14 + be32(b, 4) as usize).min(b.len());
         let mut sounds = Vec::with_capacity(nsounds);
-        for i in 0..nsounds {
-            let o = 0x14 + i * 8;
-            if o + 8 > b.len() {
-                break;
-            }
-            let w: Vec<u16> = (0..4).map(|k| be16(b, o + k * 2)).collect();
+        let mut o = 0x14;
+        for _ in 0..nsounds {
             let mut samples = Vec::new();
-            let mut volume = 100;
-            let mut looped = false;
-            for k in 0..3 {
-                let idx = (w[k] & 0x1FFF) as usize;
-                if w[k] & 0x8000 != 0 && w[k + 1] <= 0x7F && idx < nsamples {
-                    // Earlier unflagged words are clips played first ("Red" + "Warrior").
-                    for &prev in &w[..k] {
-                        let p = (prev & 0x1FFF) as usize;
-                        if prev & 0x8000 == 0 && p < nsamples {
-                            samples.push(p);
-                        }
-                    }
+            let mut last = None;
+            while o + 2 <= table_end {
+                let w = be16(b, o);
+                o += 2;
+                let idx = (w & 0xFFF) as usize;
+                if idx < nsamples {
                     samples.push(idx);
-                    volume = w[k + 1] as u8;
-                    looped = w[k] & 0x6000 != 0;
+                }
+                if w & 0x8000 != 0 {
+                    last = Some(w);
                     break;
                 }
             }
+            let Some(last) = last else { break };
+            let volume = if o + 2 <= table_end {
+                be16(b, o).min(0x7F) as u8
+            } else {
+                100
+            };
+            o += 6;
             sounds.push(SoundDef {
                 samples,
                 volume,
-                looped,
+                looped: last & 0x6000 != 0,
             });
         }
         // Samples: standard 0x60-byte DSP headers followed by their data.
         let mut samples = Vec::with_capacity(nsamples);
-        let mut o = 0x14 + nsounds * 8;
+        let mut o = table_end.max(o.min(b.len()));
         while o + 0x60 <= b.len() && samples.len() < nsamples {
             let ns = be32(b, o);
             let nn = be32(b, o + 4);

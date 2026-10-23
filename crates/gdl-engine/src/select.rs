@@ -769,18 +769,23 @@ impl Select {
                         p.change_player(p.class, party);
                         // AudioWelcomeBack (S_WELCOME) for a new character,
                         // AudioWelcome (S_WELCOMEBACK) for one with experience.
+                        // AudioWithName: the greeting, then the select bank's
+                        // colour + class line (S_YELDWF1S = "Yellow" + "Dwarf").
+                        // Sumner has no name line (wflag 0): the greeting alone.
                         let exp = p.carried.as_ref().map_or(0, |c| c.exp);
-                        let welcome = format!(
-                            "VOICE:{}+S_{}{}1S",
-                            if exp == 0 {
-                                "S_WELCOME"
-                            } else {
-                                "S_WELCOMEBACK"
-                            },
-                            COLOURS[p.colour],
-                            CLASSES[p.character]
-                        );
-                        sfx.push(welcome);
+                        let greet = if exp == 0 {
+                            "S_WELCOME"
+                        } else {
+                            "S_WELCOMEBACK"
+                        };
+                        sfx.push(if p.character == 16 {
+                            format!("VOICE:{greet}")
+                        } else {
+                            format!(
+                                "VOICE:{greet}+S_{}{}1S|VOICE:{greet}",
+                                COLOURS[p.colour], CLASSES[p.character]
+                            )
+                        });
                         p.lock_in();
                         if p.in_tower {
                             p.open_character_menu(DONE);
@@ -1960,7 +1965,9 @@ mod tests {
             out = out.or(tick(&mut sel, PlayerInput::default()));
         }
         assert_eq!(out, Some(vec![("JES".to_string(), "YEL".to_string())]));
-        assert!(sel.sfx.iter().any(|s| s.contains("S_WELCOME")));
+        // One announcement, naming the class picked.
+        let voices: Vec<_> = sel.sfx.iter().filter(|s| s.starts_with("VOICE:")).collect();
+        assert_eq!(voices, ["VOICE:S_WELCOME+S_YELJES1S|VOICE:S_WELCOME"]);
     }
 
     #[test]

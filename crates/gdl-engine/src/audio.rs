@@ -598,4 +598,42 @@ mod id_tests {
             "{r:?}"
         );
     }
+
+    /// The select bank's name lines are two-clip calls ("Yellow" + "Dwarf"), so the
+    /// bank's sound table must be walked call by call: each class has its own name
+    /// clip, and S_WELCOME is its own clip, not the first class name.
+    #[test]
+    fn select_name_lines_say_each_class() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        let Ok(fs) = crate::fs::GameFs::open(&root) else {
+            return;
+        };
+        let Some(mut lib) = super::SoundLib::load(&fs) else {
+            return;
+        };
+        let mut clip = |name: &str| {
+            let (bank, idx, _) = lib.names[name];
+            lib.resolve(&fs, name).unwrap();
+            let vbk = &lib.banks[&bank].as_ref().unwrap().1;
+            vbk.sounds[idx].samples.clone()
+        };
+        let welcome = clip("S_WELCOME");
+        assert_eq!(welcome.len(), 1);
+        let mut names = std::collections::HashSet::new();
+        for class in &crate::select::CLASSES[..16] {
+            let mut colours = std::collections::HashSet::new();
+            let mut class_clip = None;
+            for col in crate::select::COLOURS {
+                let s = clip(&format!("S_{col}{class}1S"));
+                assert_eq!(s.len(), 2, "S_{col}{class}1S {s:?}");
+                assert_ne!(s[1], welcome[0]);
+                colours.insert(s[0]);
+                // The class word is the same clip in every colour.
+                assert_eq!(*class_clip.get_or_insert(s[1]), s[1], "{class}");
+            }
+            assert_eq!(colours.len(), 4, "{class}");
+            names.insert(class_clip.unwrap());
+        }
+        assert_eq!(names.len(), 16, "one name clip per class");
+    }
 }
