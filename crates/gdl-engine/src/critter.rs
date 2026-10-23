@@ -2260,14 +2260,21 @@ impl Game {
         }
     }
 
-    /// CritterDropItem: gargoyles leave their gold GARG item; generals and
-    /// gargoyles announce it.
+    /// CritterDropItem: what the critter carries (gotitem), else a
+    /// gargoyle's gold GARG item, comes out in a bag (StartBagFX); generals
+    /// and gargoyles announce it when there is one.
     fn critter_drop_item(&mut self, c: &Critter, ei: usize) {
         let pos = self.entities[ei].pos;
+        let item = match self.take_carried(self.entities[ei].id) {
+            Some(item) => item,
+            None if c.etype == ET_GARGOYLE => {
+                let kind = c.garg_kind.clone().unwrap_or_else(|| "eagl".into());
+                self.garg_carry(&kind)
+            }
+            None => return,
+        };
         match c.etype {
             ET_GARGOYLE => {
-                let kind = c.garg_kind.clone().unwrap_or_else(|| "eagl".into());
-                self.spawn_garg_item(&kind, pos);
                 self.post(0x8A, None, &[]);
             }
             ET_GENERAL => {
@@ -2275,6 +2282,7 @@ impl Game {
             }
             _ => {}
         }
+        self.start_bag(pos, item);
     }
 
     /// CritterDamage: a player's hit on part `pi` (source 1 melee, 2 missile).

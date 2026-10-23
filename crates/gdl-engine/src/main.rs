@@ -24,6 +24,7 @@ struct Args {
     simulate: u32,
     hold: Vec2,
     attack_at: Option<u32>,
+    magic_at: Option<u32>,
     kill_boss_at: Option<u32>,
     legend: bool,
     bot: bool,
@@ -65,6 +66,7 @@ Testing:
   --simulate <frames>   Simulate N 60 Hz frames before the snapshot
   --hold <x,y>          Stick input held during simulation
   --attack-at <frame>   Press attack on that frame
+  --magic-at <frame>    Use a potion on that frame (one is given if none)
   --bot                 Let a simple bot play every player during simulation
   --kill-boss-at <f>    Boss levels: the boss dies on that frame (its death, the
                         coins and the good wizard follow)
@@ -90,6 +92,7 @@ fn parse_args() -> Result<Args> {
         simulate: 0,
         hold: Vec2::ZERO,
         attack_at: None,
+        magic_at: None,
         kill_boss_at: None,
         legend: false,
         bot: false,
@@ -117,6 +120,7 @@ fn parse_args() -> Result<Args> {
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
             "--attack-at" => a.attack_at = Some(val()?.parse()?),
+            "--magic-at" => a.magic_at = Some(val()?.parse()?),
             "--kill-boss-at" => a.kill_boss_at = Some(val()?.parse()?),
             "--legend" => a.legend = true,
             "--bot" => a.bot = true,
@@ -354,9 +358,19 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
             continue;
         }
+        if args.magic_at == Some(f) {
+            for p in &mut g.players {
+                if p.potions == 0 {
+                    p.potions = 1;
+                    p.potion_colours.push(0);
+                }
+            }
+        }
         let inp = input::PlayerInput {
             stick: args.hold,
             attack_pressed: args.attack_at == Some(f),
+            magic: args.magic_at == Some(f),
+            magic_pressed: args.magic_at == Some(f),
             ..Default::default()
         };
         // GDL_FUZZ=seed: every hero mashes random buttons and sticks.

@@ -239,6 +239,8 @@ pub struct Me {
     pub reloading: bool,
     /// Spawned by a generator that still stands.
     pub has_generator: bool,
+    /// How many that generator has made (place_logic12's three eggs).
+    pub generated: u32,
 }
 
 /// A routine's result.
@@ -286,11 +288,10 @@ enum Post {
     Suicide { stuck: bool },
 }
 
-/// gendata.ai and the spawn bookkeeping it drives (items.c fn_800606FC):
-/// ai 13 chains each spawn to the one before (tail), ai 14 alternates them.
+/// The spawn bookkeeping gendata.ai drives (items.c fn_800606FC): ai 13
+/// chains each spawn to the one before (tail), ai 14 alternates them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GenAi {
-    pub ai: i32,
     pub tail: Option<u64>,
     pub generated: u32,
 }
@@ -303,6 +304,8 @@ pub struct Brain {
     pub prev_ai: i32,
     /// The generate_enemy spew still to resolve on the first tick.
     spew: Option<i32>,
+    /// The algorithm the item code already settled (Kind::Enemy.ai).
+    preset: Option<i32>,
     /// org_lvl: the tier it was made at (placed archers 4..6).
     pub level: i32,
     pub ang: f32,
@@ -373,6 +376,7 @@ impl Brain {
             old_ai: -1,
             prev_ai: -1,
             spew: Some(spew),
+            preset: None,
             level,
             ang: yaw,
             angbak: yaw,
@@ -436,6 +440,13 @@ impl Brain {
     /// The algorithm it runs (once settled).
     pub fn alg(&self) -> i32 {
         self.algorithm
+    }
+
+    /// Take the algorithm init_enemy settled (until the first tick).
+    pub fn adopt(&mut self, alg: i32) {
+        if self.spew.is_some() {
+            self.preset = Some(alg);
+        }
     }
 
     /// Its heading as it appears (e->ang = angbak = pyr[1]).
@@ -506,7 +517,10 @@ impl Brain {
         contact: Option<usize>,
     ) -> Out {
         if let Some(spew) = self.spew.take() {
-            let alg = spawn_algorithm(me.etype, self.level, spew, dice);
+            let alg = match self.preset.take() {
+                Some(a) => a,
+                None => spawn_algorithm(me.etype, self.level, spew, dice),
+            };
             self.algorithm = alg;
             self.old_ai = alg;
             self.prev_ai = alg;
@@ -1231,6 +1245,7 @@ impl Ctx<'_> {
             6 => self.logic05(1.0),
             7 => self.logic07(),
             10 => self.logic10(),
+            12 => self.logic12(),
             13 => self.logic13(),
             14 => self.logic14(),
             15 => self.logic15(),
@@ -1254,8 +1269,8 @@ impl Ctx<'_> {
             30 => self.logic30(),
             31 => self.logic31(),
             // Not reached by any shipped monster in this port: 1 (milestone
-            // patrol) and 8 (chest guard) chase; 11/12/19/22 stand in for the
-            // spinning decoys, maggot eggs, golems (critters here) and hands.
+            // patrol) and 8 (chest guard) chase; 11/19/22 stand in for the
+            // spinning decoys, golems (critters here) and hands.
             1 | 8 => self.logic07(),
             _ => self.logic00(),
         }
@@ -1652,6 +1667,28 @@ impl Ctx<'_> {
                 self.b.route = 0;
                 self.b.stuck_count = 0;
             }
+        }
+    }
+
+    /// move_logic12: a logic-12 generator's egg stands where place_logic12
+    /// put it (the game snaps it to Enemy.dest) facing the player until its
+    /// generator has laid all three, then chases.
+    fn logic12(&mut self) {
+        if self.bomber_near() {
+            return self.delegate(24);
+        }
+        if self.b.mode1 >= 2 || !self.me.has_generator {
+            return self.delegate(0);
+        }
+        self.fresh();
+        self.b.ang = self.face_ang();
+        let a = self.b.ang;
+        self.face(a);
+        self.commit(Post::None);
+        if self.b.mode1 == 0 {
+            self.b.mode1 = 1;
+        } else if self.me.generated >= 3 {
+            self.b.mode1 = 2;
         }
     }
 
@@ -2274,6 +2311,7 @@ mod tests {
                 busy: None,
                 reloading: false,
                 has_generator: false,
+                generated: 0,
             };
             let touching = flat(pos, player) < 1.5 + 0.5 + 1.5;
             let out = brain.think(&me, &f, &mut [0.0], walls, &mut dice, touching.then_some(0));
@@ -2468,6 +2506,7 @@ mod tests {
                 busy: None,
                 reloading: false,
                 has_generator: false,
+                generated: 0,
             };
             let out = b.think(&me, &f, &mut [0.0], &walls, &mut dice, None);
             if out.explode {
@@ -2527,6 +2566,7 @@ mod tests {
                 busy: None,
                 reloading: false,
                 has_generator: false,
+                generated: 0,
             };
             b.think(&me, &f, &mut [0.0], &walls, dice, None)
         };
