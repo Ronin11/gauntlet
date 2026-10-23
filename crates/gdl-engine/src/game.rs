@@ -18,6 +18,7 @@ pub(crate) mod items;
 mod magic;
 mod particles;
 pub mod sounds;
+mod unlock;
 pub mod worn;
 
 pub const PLAYER_CLASSES: [&str; 4] = ["WAR", "VAL", "WIZ", "ARC"];
@@ -114,6 +115,21 @@ impl Carried {
             ..Default::default()
         }
     }
+
+    /// player_get_from_save's fixed loadout for playable Sumner: level 99,
+    /// full health, 5000 gold, 9 keys, 9 potions and no power-ups (his 999
+    /// attributes come with `Player::sumner`).
+    pub fn sumner() -> Carried {
+        Carried {
+            health: max_health(99),
+            gold: 5000,
+            keys: 9,
+            potions: vec![0; 9],
+            level: 99,
+            exp: 0x54218,
+            ..Default::default()
+        }
+    }
 }
 
 impl Player {
@@ -149,7 +165,12 @@ impl Player {
 
     /// PlayerUpdateAtts + player_scale_att for the current level.
     pub fn refresh_stats(&mut self) {
-        let a = crate::stats::atts(self.class_id, self.level, self.bonus);
+        let class = if self.sumner {
+            crate::stats::SUMNER
+        } else {
+            self.class_id
+        };
+        let a = crate::stats::atts(class, self.level, self.bonus);
         self.derived = crate::stats::derived(self.class_id, a);
     }
 }
@@ -388,6 +409,15 @@ pub struct Player {
     attached_to: Option<usize>,
     /// What the power-ups put on the hero (PlayerProcessPowerups).
     pub worn: worn::Worn,
+    /// Playable Sumner (character 2 with hidden_code player_sumner_desc):
+    /// the fixed 999 attributes.
+    pub sumner: bool,
+    /// got_count / got_timer for a secret level's coin counter
+    /// (towerAwardWorldRunes), and the secret classes this hero has unlocked
+    /// in the level (save.class_unlock bits).
+    pub coins: u32,
+    pub coin_timer: f32,
+    pub class_unlock: u16,
 }
 
 /// Animation sequence indices for a player model.
@@ -1084,6 +1114,8 @@ pub struct Game {
     item_models: HashMap<String, Option<usize>>,
     /// A secret level's countdown: (total, seconds left).
     pub secret_timer: Option<(f32, f32)>,
+    /// sVisibleSumCoinCount: the gold pieces placed in the level.
+    pub visible_coins: u32,
     /// The party's shards (runestones, 13 bits) and gargoyle items (fangs,
     /// feathers, claws; -1 once their gate has opened).
     pub shards: u16,
@@ -1575,6 +1607,20 @@ impl Game {
         classes: &[(&str, &str)],
         difficulty: usize,
     ) -> Result<Game> {
+        Self::new_heroes(fs, level_name, classes, &[], difficulty)
+    }
+
+    /// A level whose heroes may wear a hidden character's model
+    /// (load_player_geo's hidden_code: PLAYERS/<class>/<dir> in place of the
+    /// colour's model; the class's sounds and colour stay).
+    pub fn new_heroes(
+        fs: &GameFs,
+        level_name: &str,
+        classes: &[(&str, &str)],
+        models: &[Option<&str>],
+        difficulty: usize,
+    ) -> Result<Game> {
+        let model_dir = |i: usize| models.get(i).copied().flatten();
         let level = Level::load(fs, level_name)?;
         let mut collision = Collision::new(build_collision(&level));
         let world_anim = crate::worldanim::WorldAnims::new(&level, &mut collision);
@@ -1640,6 +1686,7 @@ impl Game {
             fx_follow: Vec::new(),
             item_models: HashMap::new(),
             secret_timer: None,
+            visible_coins: 0,
             shards: 0,
             garg_items: [0; 3],
             welcome: 300,
@@ -1720,8 +1767,8 @@ impl Game {
             Err(e) => log::warn!("realm tables: {e:#}"),
         }
 
-        for (class, color) in classes {
-            let m = Model::load_player(fs, class, color)?;
+        for (i, (class, color)) in classes.iter().enumerate() {
+            let m = Model::load_player(fs, class, model_dir(i).unwrap_or(color))?;
             game.player_seqs.push(PlayerSeqs::find(&m));
             game.action_seqs
                 .push(crate::paction::ActionSeqs::new(&m.skeleton));
@@ -1735,7 +1782,7 @@ impl Game {
         }
         // load_player_geo: each hero's SHADOWL1, from its own model bank.
         for (i, (class, color)) in classes.iter().enumerate() {
-            if let Some(m) = crate::shadow::load_player(fs, class, color) {
+            if let Some(m) = crate::shadow::load_player(fs, class, model_dir(i).unwrap_or(color)) {
                 let idx = game.add_model(m);
                 game.shadow_models.insert(i, idx);
             }
@@ -1799,11 +1846,15 @@ impl Game {
                 saved_pos: Vec3::ZERO,
                 attached_to: None,
                 worn: Default::default(),
+                sumner: false,
+                coins: 0,
+                coin_timer: -1.0,
+                class_unlock: 0,
             });
         }
         // Ranged-attack projectile: the class's throw model, else its weapon.
         for (i, (class, color)) in classes.iter().enumerate() {
-            let dir = format!("PLAYERS/{class}/{color}");
+            let dir = format!("PLAYERS/{class}/{}", model_dir(i).unwrap_or(color));
             let Some(asset) = load_asset(fs, &dir) else {
                 continue;
             };
@@ -2655,6 +2706,9 @@ impl Game {
                 ItemType::Powerup => {
                     let kind = pickup_kind(&info, &inst.params);
                     self.note_special(&kind);
+                    if matches!(kind, PickupKind::Gold(_)) {
+                        self.visible_coins += 1;
+                    }
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     self.spawn(
                         Kind::Pickup {
@@ -3244,6 +3298,11 @@ impl Game {
             *t -= dt;
             if *t <= 0.0 {
                 self.crystal_shown = None;
+            }
+        }
+        for p in &mut self.players {
+            if p.coin_timer > 0.0 {
+                p.coin_timer -= dt;
             }
         }
         if let Some((_, left)) = &mut self.secret_timer {
@@ -6736,6 +6795,7 @@ impl Game {
         }
         let realm = self.realm();
         let mut runes_found = false;
+        let mut coins_got = 0;
         for ((pi, kind), food) in pickups.into_iter().zip(pickup_food) {
             if let Some((sub, count)) = sounds::got_it_of(&kind) {
                 self.add_got_it(pi, sub, count);
@@ -6765,6 +6825,7 @@ impl Game {
                 PickupKind::Gold(v) => {
                     p.gold = (p.gold + v).min(99_999);
                     p.stats.gold_found += v;
+                    coins_got += 1;
                 }
                 // Potions are used last in, first out.
                 PickupKind::Potion(c) => {
@@ -6819,6 +6880,12 @@ impl Game {
                     }
                 }
                 PickupKind::Other(_) => {}
+            }
+        }
+        // The secret realm's gold counts towards its secret character.
+        if realm == Some(12) {
+            for _ in 0..coins_got {
+                self.secret_coin();
             }
         }
         for (m, pi) in posts {

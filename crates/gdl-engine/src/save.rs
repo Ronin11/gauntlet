@@ -17,7 +17,18 @@
 use std::path::{Path, PathBuf};
 
 use crate::game::Carried;
+use crate::options::PlayerPrefs;
 use crate::progress::Progress;
+
+/// GameOpts: the 32-byte options block at the front of the save record
+/// (optglobals + 0x80: sfx_vol, music_vol, sound_mode, screen_dx, screen_dy,
+/// style, vibration, subtitles). Loaded once at start-up
+/// (check_prefs_loaded / InitPreferences) and written with every save
+/// (saveSave, MemCardCreateGaunt).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GameOpts {
+    pub data: [i32; 8],
+}
 
 /// Entries in the Gauntlet save file (get_vmu_directory's 8 rows).
 pub const FILES: usize = 8;
@@ -32,7 +43,7 @@ pub const EMPTY: &str = "Empty";
 /// What the card file is called in the save directory.
 pub const CARD_FILE: &str = "memcard_slot_a.sav";
 const MAGIC: &str = "GDL-RS MEMCARD";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// The progress half of a class's `stuff[c]` record: what the party had done
 /// when the hero was last saved as that class.
@@ -125,6 +136,11 @@ pub struct ClassSave {
     pub progress: ClassProgress,
 }
 
+/// help_disp bits: shown since the hero was loaded (cleared on load), and
+/// shown at all.
+pub const SEEN_NOW: u8 = 0x01;
+pub const SEEN_EVER: u8 = 0x10;
+
 /// A hero's save image (PlayerSave).
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeroSave {
@@ -134,6 +150,11 @@ pub struct HeroSave {
     pub colour: usize,
     /// Secret classes unlocked: bit (class - 8); 0x100 is Sumner.
     pub class_unlock: u16,
+    /// control_scheme, control_rumble, control_autoattack, control_autoaim:
+    /// the pad settings (PlayerControl) the hero was saved with.
+    pub controls: PlayerPrefs,
+    /// help_disp: per message, SEEN_NOW | SEEN_EVER once shown to the hero.
+    pub help_disp: [u8; 256],
     pub classes: [ClassSave; 16],
 }
 
@@ -144,8 +165,19 @@ impl HeroSave {
             character,
             colour,
             class_unlock: 0,
+            controls: PlayerPrefs::default(),
+            help_disp: [0; 256],
             classes: Default::default(),
         }
+    }
+
+    /// PlayerLoadSaveFile: `help_disp[j] &= 0xF0`, so only "shown at all"
+    /// survives a load.
+    pub fn loaded(mut self) -> HeroSave {
+        for b in &mut self.help_disp {
+            *b &= 0xF0;
+        }
+        self
     }
 
     /// player_store_in_save: the class being played gets the live state, and
@@ -185,6 +217,9 @@ pub struct MemCard {
     path: Option<PathBuf>,
     /// The Gauntlet save file exists on the card.
     created: bool,
+    /// The options block: as read from the card, then the game's current
+    /// options (set_opts) for the next write.
+    opts: Option<GameOpts>,
     entries: [Option<HeroSave>; FILES],
 }
 
@@ -199,6 +234,7 @@ impl MemCard {
         MemCard {
             path: None,
             created: false,
+            opts: None,
             entries: Default::default(),
         }
     }
@@ -212,7 +248,8 @@ impl MemCard {
         let path = dir.join(CARD_FILE);
         if let Ok(text) = std::fs::read_to_string(&path) {
             match parse(&text) {
-                Ok(entries) => {
+                Ok((opts, entries)) => {
+                    card.opts = opts;
                     card.entries = entries;
                     card.created = true;
                 }
@@ -241,6 +278,16 @@ impl MemCard {
         std::env::var_os("HOME")
             .filter(|d| !d.is_empty())
             .map(|h| PathBuf::from(h).join(".local/share/gauntlet-rs"))
+    }
+
+    /// The options saved on the card, if its save file has them.
+    pub fn opts(&self) -> Option<GameOpts> {
+        self.opts.filter(|_| self.created)
+    }
+
+    /// The options the next write puts on the card (gameOpts).
+    pub fn set_opts(&mut self, o: GameOpts) {
+        self.opts = Some(o);
     }
 
     /// setup_file_entries(pl, 1) > 0: there is a Gauntlet save file.
@@ -317,7 +364,7 @@ impl MemCard {
         let Some(path) = &self.path else {
             return true;
         };
-        let text = serialize(&self.entries);
+        let text = serialize(self.opts.as_ref(), &self.entries);
         let tmp = path.with_extension("tmp");
         let r = path
             .parent()
@@ -341,11 +388,14 @@ fn join<T: std::fmt::Display>(v: &[T]) -> String {
 /// The card file: a versioned, line-based text format.
 ///
 /// ```text
-/// GDL-RS MEMCARD 1
+/// GDL-RS MEMCARD 2
+/// opts <sfx> <music> <sound_mode> <dx> <dy> <style> <vibration> <subtitles>
 /// entry <0..7>
 /// name "<name>"
 /// last <class> <colour>
 /// unlock <class_unlock>
+/// controls <scheme> <rumble> <autoattack> <autoaim>
+/// seen <message>:<help_disp> ...
 /// class <0..15>
 /// health <f32>   gold <u32>   keys <u32>   potions <u8>...
 /// level <u32>    exp <u32>    sumner_exp <u32>
@@ -356,8 +406,11 @@ fn join<T: std::fmt::Display>(v: &[T]) -> String {
 /// boss <x2>  masks <x4>  legend  banked <runes> <shards>
 /// end
 /// ```
-pub fn serialize(entries: &[Option<HeroSave>; FILES]) -> String {
+pub fn serialize(opts: Option<&GameOpts>, entries: &[Option<HeroSave>; FILES]) -> String {
     let mut s = format!("{MAGIC} {VERSION}\n");
+    if let Some(o) = opts {
+        s += &format!("opts {}\n", join(&o.data));
+    }
     for (i, h) in entries.iter().enumerate() {
         let Some(h) = h else {
             continue;
@@ -367,6 +420,21 @@ pub fn serialize(entries: &[Option<HeroSave>; FILES]) -> String {
             "last {} {}\nunlock {}\n",
             h.character, h.colour, h.class_unlock
         );
+        let c = h.controls;
+        s += &format!(
+            "controls {} {} {} {}\n",
+            c.control_style, c.rumble as u8, c.auto_attack as u8, c.auto_aim as u8
+        );
+        let seen: Vec<String> = h
+            .help_disp
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b != 0)
+            .map(|(i, b)| format!("{i}:{b}"))
+            .collect();
+        if !seen.is_empty() {
+            s += &format!("seen {}\n", seen.join(" "));
+        }
         for (c, cs) in h.classes.iter().enumerate() {
             let Some(k) = &cs.carried else {
                 continue;
@@ -434,7 +502,10 @@ fn num<T: std::str::FromStr + Default + Copy>(rest: &str) -> Result<T, String> {
     Ok(nums::<T, 1>(rest)?[0])
 }
 
-pub fn parse(text: &str) -> Result<[Option<HeroSave>; FILES], String> {
+/// The card file: its options block (version 2 on) and entries.
+pub type CardFile = (Option<GameOpts>, [Option<HeroSave>; FILES]);
+
+pub fn parse(text: &str) -> Result<CardFile, String> {
     let mut lines = text.lines();
     let head = lines.next().ok_or("empty file")?;
     let version = head
@@ -447,6 +518,7 @@ pub fn parse(text: &str) -> Result<[Option<HeroSave>; FILES], String> {
         ));
     }
     let mut entries: [Option<HeroSave>; FILES] = Default::default();
+    let mut opts = None;
     let mut hero: Option<(usize, HeroSave)> = None;
     let mut class: Option<usize> = None;
     let mut powerup = 0;
@@ -464,6 +536,12 @@ pub fn parse(text: &str) -> Result<[Option<HeroSave>; FILES], String> {
             }
             hero = Some((i, HeroSave::new("", 0, 0)));
             class = None;
+            continue;
+        }
+        if key == "opts" && hero.is_none() {
+            opts = Some(GameOpts {
+                data: nums(rest).map_err(err)?,
+            });
             continue;
         }
         if key == "end" {
@@ -493,6 +571,24 @@ pub fn parse(text: &str) -> Result<[Option<HeroSave>; FILES], String> {
                     h.colour = col & 3;
                 }
                 "unlock" => h.class_unlock = num(rest)?,
+                "controls" => {
+                    let [style, rumble, attack, aim] = nums::<u8, 4>(rest)?;
+                    h.controls = PlayerPrefs {
+                        control_style: style as usize % crate::options::CONTROL_STYLES.len(),
+                        rumble: rumble != 0,
+                        auto_attack: attack != 0,
+                        auto_aim: aim != 0,
+                    };
+                }
+                "seen" => {
+                    for w in rest.split_whitespace() {
+                        let (i, b) = w.split_once(':').ok_or(format!("bad seen {w:?}"))?;
+                        let i: usize = word(i)?;
+                        *h.help_disp
+                            .get_mut(i)
+                            .ok_or(format!("seen {i} out of range"))? = word(b)?;
+                    }
+                }
                 "class" => {
                     let c: usize = num(rest)?;
                     if c >= 16 {
@@ -573,7 +669,7 @@ pub fn parse(text: &str) -> Result<[Option<HeroSave>; FILES], String> {
     if hero.is_some() {
         return Err("unterminated entry".into());
     }
-    Ok(entries)
+    Ok((opts, entries))
 }
 
 #[cfg(test)]
@@ -638,15 +734,72 @@ mod tests {
         let mut h = HeroSave::new("CHIP ", 3, 2);
         h.store(3, 2, &sample_carried(), &sample_progress());
         h.store(9, 1, &Carried::new_character(), &Progress::default());
-        h.class_unlock = 0x3;
+        h.class_unlock = 0x103;
+        h.controls = PlayerPrefs {
+            control_style: 2,
+            rumble: false,
+            auto_attack: true,
+            auto_aim: false,
+        };
+        h.help_disp[0] = SEEN_NOW | SEEN_EVER;
+        h.help_disp[126] = SEEN_EVER;
         let mut entries: [Option<HeroSave>; FILES] = Default::default();
         entries[2] = Some(h.clone());
         entries[7] = Some(HeroSave::new("AB", 6, 0));
-        let text = serialize(&entries);
-        let back = parse(&text).unwrap();
+        let opts = GameOpts {
+            data: [100, 60, 1, 0, 0, 2, 1, 2],
+        };
+        let text = serialize(Some(&opts), &entries);
+        let (o, back) = parse(&text).unwrap();
+        assert_eq!(o, Some(opts));
         assert_eq!(back, entries);
         assert_eq!(back[2].as_ref().unwrap().character, 9);
         assert_eq!(back[2].as_ref().unwrap().colour, 1);
+        // A version 1 card (no options, controls or seen lines) still loads.
+        let v1 = serialize(None, &entries)
+            .replace("MEMCARD 2", "MEMCARD 1")
+            .lines()
+            .filter(|l| !l.starts_with("controls") && !l.starts_with("seen"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (o, back) = parse(&v1).unwrap();
+        assert_eq!(o, None);
+        let b = back[2].as_ref().unwrap();
+        assert_eq!(b.controls, PlayerPrefs::default());
+        assert_eq!(b.help_disp, [0; 256]);
+        assert_eq!(b.class_unlock, 0x103);
+    }
+
+    #[test]
+    fn loading_keeps_only_seen_ever() {
+        let mut h = HeroSave::new("X", 0, 0);
+        h.help_disp[3] = SEEN_NOW | SEEN_EVER;
+        h.help_disp[4] = SEEN_NOW;
+        let h = h.loaded();
+        assert_eq!(h.help_disp[3], SEEN_EVER);
+        assert_eq!(h.help_disp[4], 0);
+    }
+
+    #[test]
+    fn options_go_with_every_write() {
+        let dir = std::env::temp_dir().join(format!("gdl-opts-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut card = MemCard::open(Some(&dir));
+        assert_eq!(card.opts(), None, "no save file, no options");
+        let o = GameOpts {
+            data: [10, 20, 1, 0, 0, 0, 1, 1],
+        };
+        card.set_opts(o);
+        assert!(card.create());
+        assert_eq!(MemCard::open(Some(&dir)).opts(), Some(o));
+        let o2 = GameOpts {
+            data: [30, 40, 0, 0, 0, 2, 0, 2],
+        };
+        card.set_opts(o2);
+        assert_eq!(MemCard::open(Some(&dir)).opts(), Some(o), "only on a write");
+        assert!(card.write(1, &HeroSave::new("A", 0, 0)));
+        assert_eq!(MemCard::open(Some(&dir)).opts(), Some(o2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

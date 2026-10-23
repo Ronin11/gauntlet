@@ -66,12 +66,17 @@ fn party_for(
     carry: &Option<Carry>,
     heroes: &Heroes,
     progress: &Progress,
+    prefs: &Prefs,
 ) -> crate::select::Party {
+    let mut card = card.clone();
+    // saveSave writes the current gameOpts with every hero.
+    card.set_opts(prefs.game_opts());
     crate::select::Party {
-        card: card.clone(),
+        card,
         carry: carry.clone().unwrap_or_default(),
         heroes: heroes.clone(),
         progress: progress.clone(),
+        controls: prefs.players,
     }
 }
 
@@ -81,6 +86,7 @@ fn party_in_game(
     card: &MemCard,
     heroes: &Heroes,
     progress: &Progress,
+    prefs: &Prefs,
 ) -> crate::select::Party {
     let mut carry: Carry = Default::default();
     for (info, p) in play.panels.iter().zip(&play.game.players) {
@@ -92,7 +98,40 @@ fn party_in_game(
     progress.shards = play.game.shards;
     progress.runes |= play.game.runes | play.game.boss_runes;
     progress.legend = play.game.legend_held;
-    party_for(card, &Some(carry), heroes, &progress)
+    let mut heroes = heroes.clone();
+    bank_heroes(&play.game, &play.panels, &mut heroes);
+    party_for(card, &Some(carry), &heroes, &progress, prefs)
+}
+
+/// What lives in each player's save image during play goes back to the
+/// column's hero: the secret classes unlocked (save.class_unlock) and the
+/// messages seen (save.help_disp).
+fn bank_heroes(game: &Game, panels: &[PanelInfo], heroes: &mut Heroes) {
+    for (i, (info, p)) in panels.iter().zip(&game.players).enumerate() {
+        let h = heroes[info.slot % 4]
+            .get_or_insert_with(|| HeroSave::new(&info.name, info.class.min(15), info.colour));
+        h.class_unlock |= p.class_unlock;
+        h.help_disp = game.msgs.help_disp(i);
+    }
+}
+
+/// A level's heroes as their saves and names make them: playable Sumner's
+/// loadout, the messages each has seen, and the name cheats
+/// (set_hidden_player from load_player_geo).
+fn setup_heroes(game: &mut Game, panels: &[PanelInfo], carry: &Option<Carry>, heroes: &Heroes) {
+    for (i, (info, p)) in panels.iter().zip(&mut game.players).enumerate() {
+        let slot = info.slot % 4;
+        if info.class == crate::stats::SUMNER {
+            p.sumner = true;
+            let c = carry.as_ref().and_then(|c| c[slot].clone());
+            p.restore(&c.unwrap_or_else(crate::game::Carried::sumner));
+        } else if info.hidden.is_none() {
+            crate::cheats::apply_cheats(&info.name, p);
+        }
+        if let Some(h) = &heroes[slot] {
+            game.msgs.set_help_disp(i, &h.help_disp);
+        }
+    }
 }
 
 enum Screen {
@@ -275,6 +314,13 @@ impl App {
             };
             (screen, sources)
         };
+        // init_prefs, then check_prefs_loaded: the options saved on the card.
+        let card = MemCard::open(self.cfg.save_dir.as_deref());
+        let mut prefs = Prefs::default();
+        if let Some(o) = card.opts() {
+            prefs.apply_game_opts(&o);
+        }
+        audio.set_volumes(&prefs);
         Ok(Running {
             surface,
             config,
@@ -286,11 +332,11 @@ impl App {
             music_switch: None,
             music_fade: 1.0,
             progress: Progress::default(),
-            prefs: Prefs::default(),
+            prefs,
             suspended: None,
             carry: None,
             checkpoint: None,
-            card: MemCard::open(self.cfg.save_dir.as_deref()),
+            card,
             heroes: Default::default(),
             movie_tex: None,
             cursor,
@@ -440,6 +486,7 @@ impl App {
                         }
                     }
                     r.checkpoint = r.carry.clone();
+                    setup_heroes(&mut p.game, &p.panels, &r.carry, &r.heroes);
                     p.game.friendly_fire = r.prefs.multiplayer;
                     p.game.crystals = r.progress.crystals;
                     p.game.garg_items = r.progress.garg_items;
@@ -449,6 +496,11 @@ impl App {
                     p.game.set_legend_held(r.progress.legend);
                     if let Some(dir) = p.game.boss_model_dir() {
                         let imgs = hud::boss_meter_images(fs, &dir);
+                        p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
+                    } else if p.game.realm() == Some(12) {
+                        // A secret level has no boss: its overlay bank holds the
+                        // coin icons.
+                        let imgs = hud::coin_images(fs);
                         p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
                     }
                     match p.game.wave {
@@ -609,7 +661,7 @@ impl App {
                         r.checkpoint = None;
                         r.suspended = None;
                         r.heroes = Default::default();
-                        let party = party_for(&r.card, &None, &r.heroes, &r.progress);
+                        let party = party_for(&r.card, &None, &r.heroes, &r.progress, &r.prefs);
                         next = Some(Screen::Select(Select::with_first(src).with_party(party)));
                     } else if t.timed_out {
                         r.audio.stop();
@@ -626,6 +678,7 @@ impl App {
                     }
                     if escape || sel.leave {
                         r.card = sel.card().clone();
+                        r.prefs.players = sel.controls();
                         next = Some(Screen::Title(Title::default()));
                     } else if sel.update(&all).is_some() {
                         r.sources = sel.sources();
@@ -644,6 +697,7 @@ impl App {
                         sel.merge_progress(&mut r.progress);
                         r.heroes = sel.heroes();
                         r.card = sel.card().clone();
+                        r.prefs.players = sel.controls();
                         // Player select always leads into the tower.
                         next = Some(Screen::Loading {
                             level: "levelL1".into(),
@@ -682,6 +736,11 @@ impl App {
                                 play.game.crystals = r.progress.crystals;
                                 play.game.garg_items = r.progress.garg_items;
                                 play.game.shards = r.progress.shards;
+                                for (i, info) in play.panels.iter().enumerate() {
+                                    if let Some(h) = &r.heroes[info.slot % 4] {
+                                        play.game.msgs.set_help_disp(i, &h.help_disp);
+                                    }
+                                }
                                 let streams = play
                                     .game
                                     .wave
@@ -756,7 +815,7 @@ impl App {
                             }
                             None => {
                                 Screen::Select(Select::from_game(panels, &r.sources).with_party(
-                                    party_for(&r.card, &r.carry, &r.heroes, &r.progress),
+                                    party_for(&r.card, &r.carry, &r.heroes, &r.progress, &r.prefs),
                                 ))
                             }
                         });
@@ -802,7 +861,8 @@ impl App {
                                 play.game.level_end = Some(LevelEnd::AllDead);
                             }
                             OptionsAction::ManageCharacter => {
-                                let party = party_in_game(play, &r.card, &r.heroes, &r.progress);
+                                let party =
+                                    party_in_game(play, &r.card, &r.heroes, &r.progress, &r.prefs);
                                 next = Some(Screen::Select(
                                     Select::from_game(&play.panels, &r.sources).with_party(party),
                                 ));
@@ -858,7 +918,7 @@ impl App {
                     {
                         // check_active_players: a new pad joins in the tower, which
                         // opens player select for it (init_player_select(1)).
-                        let party = party_in_game(play, &r.card, &r.heroes, &r.progress);
+                        let party = party_in_game(play, &r.card, &r.heroes, &r.progress, &r.prefs);
                         let mut sel = Select::from_game(&play.panels, &r.sources).with_party(party);
                         sel.join(src);
                         next = Some(Screen::Select(sel));
@@ -1084,6 +1144,12 @@ impl App {
                     &p.game,
                     &p.panels,
                 );
+                hud::build_coins(
+                    &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
+                    &p.game,
+                    &p.panels,
+                    p.boss_bank.as_ref(),
+                );
                 hud::build_boss(
                     &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
                     &p.game,
@@ -1157,6 +1223,12 @@ impl App {
                 unreachable!()
             };
             play.game.level_end = None;
+            bank_heroes(&play.game, &play.panels, &mut r.heroes);
+            if to.is_none() {
+                if let Some(bank) = play.boss_bank.take() {
+                    r.hud.free_bank(bank);
+                }
+            }
             r.progress.crystals = play.game.crystals;
             r.progress.garg_items = play.game.garg_items;
             r.progress.shards = play.game.shards;
@@ -1191,6 +1263,7 @@ impl App {
         }
         if let Screen::Playing { play, .. } = &mut r.screen {
             if let Some(end) = play.game.level_end.take() {
+                bank_heroes(&play.game, &play.panels, &mut r.heroes);
                 // Crystals are kept whether or not the level was finished.
                 r.progress.crystals = play.game.crystals;
                 r.progress.garg_items = play.game.garg_items;
@@ -1401,6 +1474,7 @@ fn panels_for(players: &[(String, String)]) -> Vec<PanelInfo> {
             name: String::new(),
             colour: COLOURS.iter().position(|c| c == colour).unwrap_or(slot % 4),
             class: CLASSES.iter().position(|c| c == class).unwrap_or(0),
+            hidden: None,
         })
         .collect()
 }
@@ -1412,7 +1486,8 @@ fn start_game(
     panels: Vec<PanelInfo>,
     difficulty: usize,
 ) -> Result<Playing> {
-    // Sumner plays with the Wizard's model.
+    // Sumner is the Wizard (character 2) with hidden_code "sum"; a hidden
+    // character is its class with its own model.
     let classes: Vec<(&str, &str)> = panels
         .iter()
         .map(|p| {
@@ -1426,7 +1501,15 @@ fn start_game(
             )
         })
         .collect();
-    let game = Game::new_with(fs, level, &classes, difficulty)?;
+    let models: Vec<Option<&str>> = panels
+        .iter()
+        .map(|p| match p.hidden {
+            _ if p.class >= 16 => Some("SUM"),
+            Some(h) => crate::cheats::HIDDEN.get(h).map(|h| h.dir),
+            None => None,
+        })
+        .collect();
+    let game = Game::new_heroes(fs, level, &classes, &models, difficulty)?;
     let scene = Scene::new(gpu, &game)?;
     Ok(Playing {
         game,
@@ -1606,5 +1689,85 @@ fn attract_event(
             }
         }
         attract::Event::None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data() -> Option<GameFs> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
+        GameFs::open(&root).ok()
+    }
+
+    fn panel(slot: usize, name: &str, class: usize, hidden: Option<usize>) -> PanelInfo {
+        PanelInfo {
+            slot,
+            name: name.into(),
+            colour: slot,
+            class,
+            hidden,
+        }
+    }
+
+    /// The level's heroes: Sumner's loadout, a name cheat, a hidden
+    /// character without its cheats; and what they bring back.
+    #[test]
+    fn heroes_go_into_a_level_and_back() {
+        let Some(fs) = data() else { return };
+        let panels = [
+            panel(0, "BOB", 16, None),
+            panel(1, "10000K", 0, None),
+            panel(2, "ICE600", 4, Some(0)),
+        ];
+        let classes = [("WIZ", "YEL"), ("WAR", "BLU"), ("DWF", "RED")];
+        let models = [Some("SUM"), None, Some("GEI")];
+        let mut g = Game::new_heroes(&fs, "levelA1", &classes, &models, 1).unwrap();
+        let mut heroes: Heroes = Default::default();
+        let mut seen = HeroSave::new("10000K", 0, 1);
+        seen.help_disp[15] = crate::save::SEEN_EVER;
+        heroes[1] = Some(seen);
+        setup_heroes(&mut g, &panels, &None, &heroes);
+        let sumner = &g.players[0];
+        assert!(sumner.sumner);
+        assert_eq!((sumner.level, sumner.gold, sumner.keys), (99, 5000, 9));
+        let full = crate::stats::derived(2, crate::stats::atts(16, 99, Default::default()));
+        assert_eq!(sumner.derived, full, "999 in every attribute");
+        assert_eq!(g.players[1].gold, 10000, "10000K");
+        assert_eq!(g.players[2].gold, 0, "a hidden character gets no cheats");
+        assert_eq!(g.msgs.help_disp(1)[15], crate::save::SEEN_EVER);
+        // Back from the level: unlocks and seen messages go to the heroes.
+        g.players[2].class_unlock = 0x100;
+        bank_heroes(&g, &panels, &mut heroes);
+        assert_eq!(heroes[2].as_ref().unwrap().class_unlock, 0x100);
+        assert_eq!(
+            heroes[1].as_ref().unwrap().help_disp[15],
+            crate::save::SEEN_EVER
+        );
+        assert_eq!(heroes[0].as_ref().unwrap().class_unlock, 0);
+    }
+
+    /// The options block round-trips through the card's GameOpts.
+    #[test]
+    fn options_round_trip_through_the_card() {
+        let mut p = Prefs::default();
+        p.sfx_vol = 40;
+        p.music_vol = 200;
+        p.stereo = false;
+        p.difficulty = 2;
+        p.compass = true;
+        p.multiplayer = 1;
+        p.players[0].rumble = false;
+        let mut q = Prefs::default();
+        q.apply_game_opts(&p.game_opts());
+        assert_eq!((q.sfx_vol, q.music_vol, q.stereo), (40, 200, false));
+        assert_eq!((q.difficulty, q.compass, q.multiplayer), (2, true, 1));
+        // The pads' settings go with the heroes, not the options block.
+        assert!(q.players[0].rumble);
+        assert_eq!(
+            Prefs::default().game_opts().data,
+            [128, 128, 1, 0, 0, 1, 0, 0]
+        );
     }
 }

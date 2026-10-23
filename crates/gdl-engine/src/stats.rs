@@ -95,9 +95,22 @@ pub struct Derived {
     pub missile_speed: f32,
 }
 
+/// The select screen's class 16: playable Sumner (character 2 with
+/// hidden_code player_sumner_desc).
+pub const SUMNER: usize = 16;
+
 /// PlayerUpdateAtts: each attribute is the class minimum plus 5 per level above
-/// 1, up to the class maximum, plus any shop bonus, at most 999.
+/// 1, up to the class maximum, plus any shop bonus, at most 999. Sumner skips
+/// it (check_player_atts) and keeps player_get_from_save's 999s.
 pub fn atts(class: usize, level: u32, bonus: Atts) -> Atts {
+    if class == SUMNER {
+        return Atts {
+            fight: 999.0,
+            speed: 999.0,
+            armor: 999.0,
+            magic: 999.0,
+        };
+    }
     let (r, _) = CLASS_ATTS[class.min(15)];
     let at = |(lo, hi): (f32, f32), b: f32| {
         ((lo + 5.0 * (level.max(1) - 1) as f32).min(hi) + b).min(999.0)

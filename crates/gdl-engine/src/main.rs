@@ -655,18 +655,28 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 .position(|k| k == col)
                 .unwrap_or(slot % 4),
             class: select::CLASSES.iter().position(|k| k == c).unwrap_or(0),
+            hidden: None,
         })
         .collect();
-    let boss_bank = g.boss_model_dir().map(|d| {
-        let imgs = hud::boss_meter_images(&fs, &d);
-        hud.load_images(&gpu.device, &gpu.queue, &imgs)
-    });
+    let boss_bank = match g.boss_model_dir() {
+        Some(d) => Some(hud.load_images(&gpu.device, &gpu.queue, &hud::boss_meter_images(&fs, &d))),
+        None if g.wave.is_some_and(|w| w >> 8 == 12) => {
+            Some(hud.load_images(&gpu.device, &gpu.queue, &hud::coin_images(&fs)))
+        }
+        None => None,
+    };
     let draw_hud = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
         hud::build(
             &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
             &g,
             &panels,
+        );
+        hud::build_coins(
+            &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
+            &g,
+            &panels,
+            boss_bank.as_ref(),
         );
         hud::build_boss(
             &mut screen::Scr::new(&mut canvas, &hud.ui, 100),
