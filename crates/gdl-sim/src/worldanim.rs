@@ -631,11 +631,61 @@ impl crate::game::Game {
         self.movers.len() - 1
     }
 
+    /// AddItemSub (items.c), once every item is set and fn_80062A00 has put
+    /// the trigger targets at their starting heights: a trigger item
+    /// (iteminfo colflags bit 0 clear) is put 0.1 (sItemFloorYOffset) above
+    /// the floor FloorPos finds under it (radius 1, from 4 above to 10
+    /// below), and is parented to that floor's node if the floor object
+    /// moves (flag 0x1000): a pad on a lift that starts lowered sits on the
+    /// lowered deck and rides with it. (The original does this for every
+    /// item; only triggers are put down here.)
+    pub(crate) fn put_triggers_on_floor(&mut self, ids: &[u64]) {
+        use crate::game::Kind;
+        for e in self.entities.iter_mut().filter(|e| ids.contains(&e.id)) {
+            let Kind::Trigger { ride, .. } = &mut e.kind else {
+                continue;
+            };
+            let hit = self.collision.floor_collide(e.pos, 1.0, 4.0, -10.0, true);
+            e.pos.y = hit.map_or(e.pos.y, |h| h.at.y) + 0.1;
+            *ride = hit
+                .filter(|h| self.collision.obj_flags[h.tri] & NODE != 0)
+                .map(|h| {
+                    let off = Self::sliding(&self.movers, h.owner).map_or(0.0, |m| m.offset);
+                    (h.owner, e.pos.y, off)
+                });
+        }
+    }
+
+    /// The mover that slides world object `owner` (with its subtree).
+    fn sliding(movers: &[crate::triggers::Mover], owner: i32) -> Option<&crate::triggers::Mover> {
+        let o = usize::try_from(owner).ok()?;
+        movers
+            .iter()
+            .find(|m| !m.animated && !m.fades() && m.objects.contains(&o))
+    }
+
+    /// Triggers parented to a slid floor (see put_triggers_on_floor) go up
+    /// and down with it.
+    pub(crate) fn slide_riding_triggers(&mut self) {
+        use crate::game::Kind;
+        for e in &mut self.entities {
+            if let Kind::Trigger {
+                ride: Some((o, y, off)),
+                ..
+            } = e.kind
+            {
+                if let Some(m) = Self::sliding(&self.movers, o) {
+                    e.pos.y = y + m.offset - off;
+                }
+            }
+        }
+    }
+
     /// The world's moving parts for one frame, before the heroes move:
     /// PlayerCheckMovingFloor notes what everyone stands on, DoWorldAnimation
     /// and the rotators move the world, and the riders go with their floors.
     pub(crate) fn update_world_motion(&mut self, dt: f32) {
-        use crate::game::{Kind, PLAYER_RADIUS};
+        use crate::game::{Kind, PLAYER_COL_HEIGHT, PLAYER_RADIUS};
         let floor_of = |c: &Collision, at: Vec3| {
             c.ground_hit(at, at.y + 0.3)
                 .filter(|(y, _)| at.y - y < 0.3)
@@ -645,8 +695,15 @@ impl crate::game::Game {
             .players
             .iter()
             .map(|p| {
+                // PlayerCheckMovingFloor: the floor found with the hero's
+                // radius (PlayerCollideFloor's).
                 (p.state.active() && p.on_ground)
-                    .then(|| floor_of(&self.collision, p.pos))
+                    .then(|| {
+                        self.collision
+                            .player_floor(p.pos, PLAYER_RADIUS, PLAYER_COL_HEIGHT, true)
+                            .filter(|h| (p.pos.y - h.at.y).abs() < 0.3)
+                            .map(|h| h.owner)
+                    })
                     .flatten()
             })
             .collect();
@@ -675,6 +732,21 @@ impl crate::game::Game {
                 let e = &mut self.entities[ei];
                 e.pos = to;
                 e.yaw += turn;
+            }
+        }
+        // Triggers parented to an animated floor (put_triggers_on_floor).
+        for e in &mut self.entities {
+            if let Kind::Trigger {
+                ride: Some((o, _, _)),
+                ..
+            } = e.kind
+            {
+                if Self::sliding(&self.movers, o).is_none() {
+                    if let Some((to, turn)) = self.world_anim.carry(o, e.pos) {
+                        e.pos = to;
+                        e.yaw += turn;
+                    }
+                }
             }
         }
         for (kind, _) in sounds {

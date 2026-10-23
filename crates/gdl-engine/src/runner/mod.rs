@@ -415,8 +415,6 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
         ignore: &ignore,
         min_y: g.level.worlds.min_bounds[1],
         cracks: Default::default(),
-                bridge: false,
-                step_up: std::env::var("GDL_NAV_STEP").ok().and_then(|v| v.parse().ok()).unwrap_or(crate::game::STEP_HEIGHT),
     };
     // GDL_NAV_NODES=r: the nav nodes within r of the target and their edges.
     if let Some(r) = std::env::var("GDL_NAV_NODES").ok().and_then(|v| v.parse::<f32>().ok()) {
@@ -753,8 +751,6 @@ mod tests {
             ignore: &ignore,
             min_y: g.level.worlds.min_bounds[1],
             cracks: Default::default(),
-            bridge: false,
-            step_up: crate::game::STEP_HEIGHT,
         };
         let sim = w.walk(from, to);
         for _ in 0..120 {

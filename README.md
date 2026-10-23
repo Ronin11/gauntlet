@@ -180,8 +180,8 @@ gauntlet --runner-merge runner-out           # rebuild runner-out/summary.md
   won't open to a hero with a key, falling out of the world): a bug report with a
   `runner.md` note (objective, path, last positions, objectives so far), a `stuck.state`
   save state and a top-down `navmap.png` (reachable floor green, the rest grey, possible
-  floor seams pink). An unreachable exit is re-planned with the floor seams bridged and
-  with a 1.5 step, to show whether those walking rules explain it.
+  floor seams pink). An unreachable exit's report lists the floor seams that stopped the
+  nav's walks at the edge of the reachable area.
 - Results: `<out>/summary.md`, `summary.tsv`, `summary.json`; per level `<out>/<level>/`.
   Debugging aids: `--runner-state <file>` starts from a save state, `--runner-probe
   x,y,z:x,y,z` walks the hero between two spots in the game and in the nav's simulation,
