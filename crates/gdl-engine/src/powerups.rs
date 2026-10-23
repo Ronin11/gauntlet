@@ -38,7 +38,11 @@ pub const S_BREATH: u32 = 0x70;
 pub const S_PHOENIX: u32 = 0x80;
 pub const S_GROWTH: u32 = 0x100;
 pub const S_SHRINK: u32 = 0x200;
+/// Pojo: the hero becomes Pojo (its moves, sounds and fire).
+pub const S_POJO: u32 = 0x400;
 pub const S_TURBO: u32 = 0x80000;
+/// Mikey: a decoy let out where the hero stands.
+pub const S_MIKEY: u32 = 0x100000;
 pub const S_HANDOFDEATH: u32 = 0x200000;
 pub const S_VAMPIRE: u32 = 0x400000;
 

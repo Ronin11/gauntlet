@@ -89,6 +89,15 @@ pub struct PlayerData {
     /// player's frame (x right, z ahead) from its effectpos.
     pub weapon_offset: [f32; 3],
     pub turboa_offset: [f32; 3],
+    /// weapon_fx_offset / weapon_fx_scale: where an amulet's glow sits on the
+    /// weapon hand, and its scale (x 0: unscaled), by level / 10.
+    pub weapon_fx_offset: [[f32; 3]; 10],
+    pub weapon_fx_scale: [[f32; 3]; 10],
+    /// familiar_offset: where the level-30/80 familiar rides (PlayerProcessSkinFX).
+    pub familiar_offset: [f32; 3],
+    /// fam_proj_offset: where a familiar's or the Phoenix's shot starts, in the
+    /// player's frame, scaled by the hero's node scale.
+    pub fam_proj_offset: [f32; 3],
 }
 
 impl PlayerData {
@@ -177,6 +186,12 @@ impl PlayerData {
             };
             pd.weapon_offset = v(0x5C)?;
             pd.turboa_offset = v(0x158)?;
+            for t in 0..10 {
+                pd.weapon_fx_offset[t] = v(0x68 + 12 * t)?;
+                pd.weapon_fx_scale[t] = v(0xE0 + 12 * t)?;
+            }
+            pd.familiar_offset = v(0x164)?;
+            pd.fam_proj_offset = v(0x170)?;
         }
         Ok(pd)
     }
@@ -217,6 +232,7 @@ mod tests {
         assert!(!pd.chain(pd.rows.turbo_c1).is_empty());
         assert_eq!(pd.weapon_offset, [-0.5, 0.5, 1.5]);
         assert_eq!(pd.turboa_offset, [0.0, 0.5, 1.5]);
+        assert_eq!(pd.fam_proj_offset, [-1.0, 5.0, -1.0]);
     }
 
     #[test]

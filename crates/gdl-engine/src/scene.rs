@@ -30,6 +30,10 @@ pub struct Scene {
     hidden_count: usize,
     /// The boss's SEETHROUGH material, made on first use.
     seethrough: Option<std::sync::Arc<wgpu::BindGroup>>,
+    /// This frame's worn power-up models: (instance key, model).
+    worn: Vec<(u64, usize)>,
+    /// The model of each shadow instance in `entities`, by key.
+    shadow_models: HashMap<u64, usize>,
 }
 
 /// Instance key bit for a critter's GMETER bar.
@@ -37,6 +41,11 @@ const METER_KEY: u64 = 1 << 63;
 /// Instance keys for a hero's X-ray content (| the player) and the compass.
 const XRAY_KEY: u64 = 1 << 62;
 const COMPASS_KEY: u64 = 1 << 61;
+/// Instance keys for what a hero wears (| player << 32 | model).
+const WORN_KEY: u64 = 1 << 58;
+/// Instance keys for a shadow: | the entity id, or | SHADOW_PLAYER | the hero.
+const SHADOW_KEY: u64 = 1 << 60;
+const SHADOW_PLAYER: u64 = 1 << 59;
 /// MBTreeSetAlpha's see-through chest (0xC0) and compass (lbl_80343C20 128):
 /// invAlpha = 255 - alpha.
 const XRAY_CHEST_ALPHA: f32 = 63.0 / 255.0;
@@ -117,6 +126,8 @@ impl Scene {
             entities: HashMap::new(),
             hidden_count: game.hidden.len(),
             seethrough: None,
+            worn: Vec::new(),
+            shadow_models: HashMap::new(),
         })
     }
 
@@ -160,14 +171,32 @@ impl Scene {
         }
         for (pi, (inst, p)) in self.players.iter_mut().zip(&game.players).enumerate() {
             let model = &game.models[p.model];
+            // p->node (PlayerApplyPowerupScale's size), the skeleton lifted by
+            // levitation.
+            let w = &p.worn;
             inst.transform =
-                mirror() * Mat4::from_translation(p.pos) * Mat4::from_rotation_y(p.yaw);
+                mirror() * game.player_xform(pi) * Mat4::from_translation(Vec3::Y * w.lift);
             (inst.parts, inst.hidden) = model.evaluate(p.animator.seq, p.animator.frame);
+            // A held power-up object hides the weapon (weaphold_node), a held
+            // shield the hero's own.
+            if w.hide_weapon {
+                for part in model.attachment_parts() {
+                    inst.hidden[part as usize] = true;
+                }
+            }
+            if let Some(part) = w.hide_node.and_then(|n| model.node_part(n)) {
+                inst.hidden[part as usize] = true;
+            }
             inst.part_fx = model.texmod_fx(p.animator.seq, p.animator.frame);
             let flash = p.hurt_flash;
             // DoTransporter fades the hero out and in.
             let alpha = game.transport.alpha(pi);
-            inst.tint = Vec4::new(1.0 + flash, 1.0 - flash * 0.5, 1.0 - flash * 0.5, alpha);
+            inst.tint = Vec4::new(
+                1.0 + flash,
+                1.0 - flash * 0.5,
+                1.0 - flash * 0.5,
+                alpha * w.alpha,
+            );
             inst.visible = match p.state {
                 PlayerState::Dead { timer } => !(timer < 2.0 && (timer * 8.0).fract() < 0.5),
                 PlayerState::Exited | PlayerState::InTower => false,
@@ -177,6 +206,30 @@ impl Scene {
 
         let focus = game.cam_focus;
         let mut live = std::collections::HashSet::new();
+        // What the power-ups hang on each hero.
+        self.worn.clear();
+        for pi in 0..game.players.len() {
+            let shown = self.players.get(pi).is_some_and(|i| i.visible);
+            if !shown {
+                continue;
+            }
+            let base = mirror() * game.player_xform(pi);
+            let fade = game.transport.alpha(pi);
+            for (m, xf, seq, frame, a) in game.worn_draws(pi) {
+                let key = WORN_KEY | (pi as u64) << 32 | m as u64;
+                let inst = self
+                    .entities
+                    .entry(key)
+                    .or_insert_with(|| gpu.new_instance(&self.models[m]));
+                inst.transform = base * xf;
+                (inst.parts, inst.hidden) = game.models[m].evaluate(seq, frame);
+                inst.part_fx = game.models[m].texmod_fx(seq, frame);
+                inst.tint = Vec4::new(1.0, 1.0, 1.0, fade * a);
+                inst.visible = true;
+                live.insert(key);
+                self.worn.push((key, m));
+            }
+        }
         for e in &game.entities {
             let Some(m) = e.model else { continue };
             let far = if matches!(e.kind, Kind::Critter(_)) {
@@ -301,6 +354,29 @@ impl Scene {
             }
             inst.visible = e.fade > 0.0;
         }
+        // Floor shadows (shadow.rs): each node fades with its body
+        // (MBTreeSetAlpha on both) and is hidden with it.
+        for (pi, p) in game.players.iter().enumerate() {
+            let key = SHADOW_KEY | SHADOW_PLAYER | pi as u64;
+            let body = self.players.get(pi).map(|i| (i.visible, i.tint.w));
+            if let (Some(s), Some((true, alpha))) = (game.player_shadow(p), body) {
+                Self::place_shadow(&mut self.entities, gpu, &self.models, key, s, alpha);
+                self.shadow_models.insert(key, s.model);
+                live.insert(key);
+            }
+        }
+        for e in &game.entities {
+            let body = self.entities.get(&e.id).filter(|_| live.contains(&e.id));
+            let Some(body) = body.map(|i| (i.visible, i.tint.w)) else {
+                continue;
+            };
+            if let (Some(s), (true, alpha)) = (game.entity_shadow(e), body) {
+                let key = SHADOW_KEY | e.id;
+                Self::place_shadow(&mut self.entities, gpu, &self.models, key, s, alpha);
+                self.shadow_models.insert(key, s.model);
+                live.insert(key);
+            }
+        }
         // do_see_thru: what the chest holds, inside it at 0.65.
         for (pi, x) in game.snd.xray.iter().enumerate() {
             let Some(x) = x else { continue };
@@ -334,6 +410,24 @@ impl Scene {
             live.insert(COMPASS_KEY);
         }
         self.entities.retain(|id, _| live.contains(id));
+        self.shadow_models.retain(|id, _| live.contains(id));
+    }
+
+    /// Put shadow `key` where `s` says, at its body's opacity.
+    fn place_shadow(
+        entities: &mut HashMap<u64, Instance>,
+        gpu: &Gpu,
+        models: &[GpuMesh],
+        key: u64,
+        s: crate::shadow::Placed,
+        alpha: f32,
+    ) {
+        let inst = entities
+            .entry(key)
+            .or_insert_with(|| gpu.new_instance(&models[s.model]));
+        inst.transform = mirror() * s.transform;
+        inst.tint = Vec4::new(1.0, 1.0, 1.0, alpha);
+        inst.visible = alpha > 0.0;
     }
 
     /// World objects left out of the static world mesh: trigger movers,
@@ -364,8 +458,27 @@ impl Scene {
         let mut d = vec![(&self.world, &self.world_inst)];
         d.extend(self.movers.iter().flatten().map(|(m, i)| (m, i)));
         d.extend(self.dynamic.iter().map(|(m, i)| (m, i)));
+        // Shadows before the actors: their zsort_add (3) sorts them behind
+        // whatever stands on them among the blended draws.
+        let shadow_keys = (0..game.players.len())
+            .map(|pi| SHADOW_KEY | SHADOW_PLAYER | pi as u64)
+            .chain(game.entities.iter().map(|e| SHADOW_KEY | e.id));
+        for key in shadow_keys {
+            if let (Some(&m), Some(inst)) = (self.shadow_models.get(&key), self.entities.get(&key))
+            {
+                d.push((&self.models[m], inst));
+            }
+        }
+        // Pojo stands in for the hero's body (its shadow stays).
         for (inst, p) in self.players.iter().zip(&game.players) {
-            d.push((&self.models[p.model], inst));
+            if !p.worn.hide_body {
+                d.push((&self.models[p.model], inst));
+            }
+        }
+        for &(key, m) in &self.worn {
+            if let Some(inst) = self.entities.get(&key) {
+                d.push((&self.models[m], inst));
+            }
         }
         for e in &game.entities {
             if let (Some(m), Some(inst)) = (e.model, self.entities.get(&e.id)) {

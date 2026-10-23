@@ -314,6 +314,35 @@ fn snapshot_game(args: &Args) -> Result<()> {
             slide: 128,
         };
     }
+    // GDL_PUP=<type>:<hex flags>[,...]: player 0 holds these power-ups
+    // switched on (e.g. 9:80 the Phoenix, 9:400 Pojo, 6:200000 fire armour);
+    // `lvl:<n>` sets every hero's level (the familiars come at 30 and 80).
+    if let Ok(v) = std::env::var("GDL_PUP") {
+        use gdl_engine::powerups as pu;
+        for item in v.split(',').filter(|s| !s.is_empty()) {
+            let (k, f) = item.split_once(':').unwrap_or((item, "0"));
+            if k == "lvl" {
+                let n: u32 = f.parse()?;
+                g.players.iter_mut().for_each(|p| {
+                    p.level = n.clamp(1, 99);
+                    p.refresh_stats();
+                });
+                continue;
+            }
+            let kind: u8 = k.parse()?;
+            let flags = u32::from_str_radix(f, 16)?;
+            let p = &mut g.players[0];
+            p.powerups.add(kind, flags, 3.0, 60.0);
+            if let Some(sl) = p
+                .powerups
+                .slots
+                .iter_mut()
+                .find(|s| s.kind == kind && s.flags == flags)
+            {
+                sl.state = pu::ON;
+            }
+        }
+    }
     // GDL_COMPASS=1: the Compass option on. GDL_XRAY=1: every hero's X-ray on.
     if std::env::var_os("GDL_COMPASS").is_some() {
         g.snd.show_compass = true;

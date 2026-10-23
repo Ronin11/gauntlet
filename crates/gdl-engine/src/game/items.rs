@@ -103,6 +103,39 @@ pub struct Blast {
     pub fx: Option<u64>,
     /// Critters already hit (fn_80037ED0: once per effect).
     hit: Vec<u64>,
+    /// damagedelay: the damage starts this long after the effect.
+    pub delay: f32,
+}
+
+impl Blast {
+    /// SfxSetDamage on an expanding effect (flags 0x20) lasting `maxtime`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        pos: Vec3,
+        damage: f32,
+        dtype: u32,
+        radius: f32,
+        flags: u32,
+        owner: Option<usize>,
+        maxtime: f32,
+        delay: f32,
+        fx: Option<u64>,
+    ) -> Blast {
+        Blast {
+            pos,
+            damage,
+            dtype,
+            radius,
+            flags,
+            owner,
+            remaining: maxtime,
+            maxtime,
+            morph: Vec::new(),
+            fx,
+            hit: Vec::new(),
+            delay,
+        }
+    }
 }
 
 impl Blast {
@@ -429,6 +462,7 @@ impl Game {
             morph,
             fx,
             hit: Vec::new(),
+            delay: 0.0,
         });
     }
 
@@ -893,7 +927,7 @@ impl Game {
             b.remaining -= dt;
             let age = b.remaining + 0.066_667;
             let fade = if age < 1.0 { 1.0 } else { age };
-            let dtime = b.maxtime;
+            let dtime = b.maxtime - b.delay;
             let phase = if b.remaining > dtime {
                 0.0
             } else if dtime <= 0.033_333_3 {
