@@ -634,6 +634,104 @@ mod tests {
         assert_ne!(g.camera_view().0, eye);
     }
 
+    /// Walk hero 0 from `from` toward world direction `dir` (x, z) for `n` ticks.
+    fn walk(g: &mut Game, from: Vec3, dir: glam::Vec2, n: usize) {
+        g.players[0].pos = from;
+        g.players[0].vy = 0.0;
+        tick(g, 10);
+        for _ in 0..n {
+            let stick = g.stick_toward(dir);
+            g.update(
+                1.0 / 60.0,
+                &[PlayerInput {
+                    stick,
+                    ..Default::default()
+                }],
+            );
+        }
+    }
+
+    /// levelA1's elevator, A1ELEV3 (its elevator_switch latches, flag 8
+    /// clear): lowered, it leaves a 10-deep gap in the wall walk that a hero
+    /// stops at (PlayerCollideFloor) instead of dropping onto it, where a
+    /// rider would hold it still for good. Its pad raises it and shows set
+    /// off from then on; then a hero walks across. A1ELEV1 (flag 8) carries
+    /// a rider up.
+    #[test]
+    fn levela1_elevator_bridges_the_wall_walk() {
+        let Some(fs) = data() else { return };
+        let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+        let (ti, pad) = find_trigger(&g, |_, id| id == 6);
+        let Kind::Trigger {
+            mover: Some(m),
+            mode,
+            ..
+        } = g.entities[ti].kind
+        else {
+            panic!("the switch has a target");
+        };
+        assert_eq!(mode, TriggerMode::Latch);
+        assert_eq!(
+            g.level.worlds.world_objects[g.movers[m].root].name,
+            "A1ELEV3"
+        );
+        assert_eq!(g.movers[m].offset, -10.0);
+        // Lowered: the hero stops at the gap's north edge (z 52.6).
+        walk(
+            &mut g,
+            Vec3::new(-94.9, 26.5, 58.0),
+            glam::Vec2::new(0.0, -1.0),
+            150,
+        );
+        let p = g.players[0].pos;
+        assert!(p.y > 25.5 && p.z > 52.0, "stopped at the gap: {p}");
+        // The pad: the trigger camera runs while it rises, then it stays up.
+        g.players[0].pos = pad + Vec3::Y * 0.5;
+        tick(&mut g, 2);
+        assert!(g.trigger_cam.is_some(), "the pad's camera runs");
+        let pressed = |g: &Game| matches!(g.entities[ti].kind, Kind::Trigger { pressed: true, .. });
+        assert!(pressed(&g));
+        for _ in 0..900 {
+            if g.trigger_cam.is_none() {
+                break;
+            }
+            tick(&mut g, 1);
+        }
+        assert!(g.trigger_cam.is_none(), "the camera ends");
+        assert!(g.movers[m].active && !g.movers[m].moving);
+        assert!(
+            g.movers[m].offset.abs() < 0.01,
+            "raised: {}",
+            g.movers[m].offset
+        );
+        // Off the pad it still shows set off (a latch).
+        walk(
+            &mut g,
+            pad + Vec3::new(0.0, 0.5, 6.0),
+            glam::Vec2::new(0.0, 1.0),
+            30,
+        );
+        assert!(pressed(&g), "the pad stays down");
+        // Raised, it carries the walk: north to south across the gap.
+        walk(
+            &mut g,
+            Vec3::new(-94.9, 26.5, 58.0),
+            glam::Vec2::new(0.0, -1.0),
+            150,
+        );
+        let p = g.players[0].pos;
+        assert!(p.y > 25.5 && p.z < 44.0, "walked across: {p}");
+
+        // A1ELEV1 (an activator switch's target, flag 8): a rider goes up.
+        g.players[0].pos = Vec3::new(46.5, 3.0, 45.0);
+        tick(&mut g, 30);
+        assert!((g.players[0].pos.y - 2.15).abs() < 0.1);
+        g.activate_trigger(4);
+        tick(&mut g, 240);
+        let y = g.players[0].pos.y;
+        assert!((y - 12.15).abs() < 0.1, "rode up to {y}");
+    }
+
     /// Flag 0x400 (levelA5's lift): one hero of two is told to bring the
     /// other (message 127) and nothing moves; both together set it off.
     #[test]
