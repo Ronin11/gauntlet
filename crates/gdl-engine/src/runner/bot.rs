@@ -1359,6 +1359,8 @@ impl Bot {
                     self.log(g, line);
                     if done {
                         self.used.push(o.name());
+                        // Getting things done is not being pinned.
+                        self.anchor.1 = g.time;
                     }
                 }
                 *self.tried.entry(o).or_default() += 1;
@@ -1820,7 +1822,18 @@ impl Bot {
             }
         }
         PlayerInput {
-            stick: g.stick_toward(steer.normalize_or_zero()) * mag,
+            stick: {
+                // Not getting anywhere for a second: wiggle the heading, as a
+                // player would (a step that lands in a floor seam is refused;
+                // another heading may clear it).
+                let mut s = steer.normalize_or_zero();
+                if now - a.last_adv > 1.0 {
+                    let ang = (g.frame as f32 * 0.07).sin() * 0.7;
+                    let (sn, cs) = ang.sin_cos();
+                    s = Vec2::new(s.x * cs - s.y * sn, s.x * sn + s.y * cs);
+                }
+                g.stick_toward(s) * mag
+            },
             ..Default::default()
         }
     }
