@@ -1115,7 +1115,7 @@ impl DebugMenu {
             s.text(
                 1.0,
                 x0 + w - 10.0 - mw,
-                y0 + h - 36.0,
+                y0 + h - 38.0,
                 FONT_8X8,
                 0x808080,
                 0,
@@ -1125,8 +1125,10 @@ impl DebugMenu {
         if let Some((m, _)) = &self.status {
             s.text(1.0, x0 + 10.0, y0 + h - 36.0, FONT_8X8, 0x80FF80, 0, m);
         }
-        let help = "Up/Down choose  Left/Right change  A apply  B back";
-        s.text(1.0, x0 + 10.0, y0 + h - 18.0, FONT_8X8, 0xA0A0A0, 0, help);
+        let keys = "Keys: Arrows  Enter apply  Backspace back  Esc close";
+        let pad = "Pad:  D-pad   A apply      B back";
+        s.text(0.9, x0 + 10.0, y0 + h - 22.0, FONT_8X8, 0xA0A0A0, 0, keys);
+        s.text(0.9, x0 + 10.0, y0 + h - 11.0, FONT_8X8, 0xA0A0A0, 0, pad);
     }
 
     /// A reminder while god mode is on and the menu is shut.
