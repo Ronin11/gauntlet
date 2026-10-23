@@ -203,7 +203,9 @@ impl Audio {
                             _music = Some(s);
                         }
                         Cmd::MusicOnce(pcm, ch, rate) => {
+                            // Movies follow the music volume like the tracks do.
                             let s = new_sink();
+                            s.set_volume(0.5 * music_vol);
                             s.append(buf(ch, rate, &pcm));
                             _music = Some(s);
                         }
