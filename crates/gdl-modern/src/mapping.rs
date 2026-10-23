@@ -27,3 +27,21 @@ pub const BIPED: &[(&str, &str)] = &[
     ("NECK", "NeckTwist01"),
     ("HEAD", "Head"),
 ];
+
+/// `(game node, game node it points at)`: bones retargeted by direction.
+/// Pelvis, hands, feet and head have no aim and follow the game's rotation.
+pub const BIPED_AIM: &[(&str, &str)] = &[
+    ("L_HIP", "L_KNEE"),
+    ("L_KNEE", "L_ANKLE"),
+    ("R_HIP", "R_KNEE"),
+    ("R_KNEE", "R_ANKLE"),
+    ("TORSO_SEC", "CHEST_SE"),
+    ("CHEST_SE", "NECK"),
+    ("CHEST_L_ARM_2", "L_SHOULD"),
+    ("L_SHOULD", "L_ELBO"),
+    ("L_ELBO", "L_WRIST"),
+    ("CHEST_R_ARM_2", "R_SHOULD"),
+    ("R_SHOULD", "R_ELBO"),
+    ("R_ELBO", "R_WRIST"),
+    ("NECK", "HEAD"),
+];

@@ -36,7 +36,13 @@ impl ModernHero {
             .iter()
             .map(|n| n.name.as_str())
             .collect();
-        let retarget = retarget::Retarget::new(&model, &names, &game_ref, mapping::BIPED)?;
+        let retarget = retarget::Retarget::new(
+            &model,
+            &names,
+            &game_ref,
+            mapping::BIPED,
+            mapping::BIPED_AIM,
+        )?;
         let scale = retarget.scale(&model, &game_ref);
         Ok(ModernHero {
             model,
