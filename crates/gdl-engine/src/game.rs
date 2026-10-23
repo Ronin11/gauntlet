@@ -224,6 +224,9 @@ impl DmgType {
     pub const LOW: u32 = 0x4000_0000;
 }
 
+/// Death's exit (enemy.c:5313): alpha +4 a tick to 255, 64 ticks.
+const DEATH_EXIT: f32 = 64.0 / 60.0;
+
 /// ModifyDamage: an elemental hit on a target with no affinity does 1.5x. Every
 /// potion, turbo move and amulet hit has an element; monsters here are neutral.
 const ELEMENT_BONUS: f32 = 1.5;
@@ -744,8 +747,9 @@ pub enum Kind {
         /// Seconds until the next throw or cast (idle_secs / counter1), or the
         /// suicide charge's clock.
         reload: f32,
-        /// Death: health drained so far; IT and the rest: unused.
-        drained: f32,
+        /// Death's flag2: it left having drained its fill (or its victim),
+        /// and says so as it goes (0x81 / 0x83); unused for the rest.
+        drained: bool,
         /// The Warlock's blink: seconds left seen (> 0) or unseen (< 0).
         blink: f32,
         /// do_ai's state: its move_logic routine and what that keeps.
@@ -2274,7 +2278,7 @@ impl Game {
             attacks: 0,
             target: None,
             reload: 0.0,
-            drained: 0.0,
+            drained: false,
             blink: 0.0,
             brain: Box::new(crate::ai::Brain::new(strength as i32, ai, 0.0, sight)),
             ai: crate::items::algorithm(
@@ -4901,23 +4905,43 @@ impl Game {
             Kind::Enemy { state, .. } => Some(*state),
             _ => None,
         };
+        let death = match &self.entities[t].kind {
+            Kind::Enemy {
+                etype: crate::enemies::DEATH,
+                hp,
+                strength,
+                ..
+            } => Some((*hp, *strength == 2)),
+            _ => None,
+        };
         let r = Self::apply_hit(&mut self.entities[t], dmg, push);
         // AudioPlayEvt101: Death dies.
         if r.killed && r.tier == crate::enemies::DEATH && !r.generator {
             self.sfx_id(0x65);
         }
-        // The monster staggers (HIT1) or dies (DEATH / HIT2).
-        if r.hit
-            && MAGIC_HIT.with(|m| m.get()) == 0
-            && matches!(
-                self.entities[t].kind,
-                Kind::Enemy {
-                    etype: crate::enemies::DEATH,
-                    ..
+        // damage_enemy (enemy.c:5976): magic kills Death and heals a hero
+        // above level 75 by part of what it had left; with the anti-Death
+        // shield each hit gives +1 health (a tier-2 Death's: experience),
+        // without it the hero hears it can't be hurt (msg 0).
+        if let (Some((hp, tier2)), true) = (death, r.hit) {
+            let p = &mut self.players[pi];
+            if MAGIC_HIT.with(|m| m.get()) != 0 {
+                if p.level > 75 {
+                    let k = 0.032 * (p.level - 75) as f32 + 0.2;
+                    let cap = max_health(p.level);
+                    if p.health < cap {
+                        p.health = (p.health + hp * k).min(cap);
+                    }
                 }
-            )
-        {
-            self.post(0, Some(pi), &[]);
+            } else if p.fx.armor & crate::powerups::A_ANTIDEATH != 0 {
+                if tier2 {
+                    self.death_exp(pi, 1);
+                } else {
+                    p.health += 1.0;
+                }
+            } else {
+                self.post(0, Some(pi), &[]);
+            }
         }
         // damage_enemy's burst by the hit's element (the potion's, the
         // weapon's, or what the caller dealt).
@@ -5230,6 +5254,71 @@ impl Game {
             )
     }
 
+    /// fn_80046140's drain by Death `ei` of hero `pi`: a tier-2 Death takes
+    /// experience (AddExp mode -2; msg 0x80), the rest health round armour
+    /// (msg 0x82). Death pays `fight` from its own health each time, and
+    /// leaves when that runs out or its victim dies (AudioPlayEvt104);
+    /// otherwise S_DEATHSUCK goes on (AudioPlayEvt102Follow).
+    fn death_drain(&mut self, ei: usize, pi: usize, fight: f32, tier2: bool) {
+        let mut died = false;
+        if tier2 {
+            self.death_exp(pi, -1);
+            self.post(0x80, Some(pi), &[]);
+        } else {
+            let was = self.players[pi].health > 0.0;
+            self.damage_player(pi, fight, DmgType::NO_ARMOR);
+            died = was && self.players[pi].health <= 0.0;
+            self.post(0x82, Some(pi), &[]);
+        }
+        let Kind::Enemy {
+            hp, state, drained, ..
+        } = &mut self.entities[ei].kind
+        else {
+            return;
+        };
+        if died {
+            *hp = 0.0;
+        }
+        *hp -= fight;
+        if *hp >= 0.0 {
+            self.snd.death_suck = 4;
+        } else {
+            *drained = true;
+            *state = EnemyState::Dying { timer: DEATH_EXIT };
+            self.sfx_id(0x68);
+        }
+    }
+
+    /// AddExp mode -2 (Death's): `sign` x 1% of the level's step, (lv - 1) x
+    /// 60 + 1000 (4600 past 60); none taken at 99. Lost experience can take
+    /// levels away (ModifyExp; AudioExp "lost a level"), gained can add them.
+    fn death_exp(&mut self, pi: usize, sign: i32) {
+        let p = &mut self.players[pi];
+        if sign < 0 && p.level == 99 {
+            return;
+        }
+        let step = if p.level <= 60 {
+            (p.level as i32 - 1) * 60 + 1000
+        } else {
+            4600
+        };
+        let amount = sign * (0.01 * step as f32) as i32;
+        p.exp = (p.exp as i64 + amount as i64).max(0) as u32;
+        let level = crate::stats::exp_to_level(p.exp);
+        if amount < 0 && level < p.level {
+            p.level = level.max(1);
+            p.refresh_stats();
+            let name = format!("VOICE:S_{}{}1", p.color, p.class);
+            self.sfx
+                .push(format!("{name}+S_LOSTLEVEL|VOICE:S_LOSTLEVEL"));
+        } else if amount > 0 && level > p.level {
+            p.level = level.min(99);
+            p.refresh_stats();
+            p.health += 100.0;
+            self.post(0x22, Some(pi), &[level.to_string()]);
+        }
+    }
+
     /// fn_8004DC2C: monster `t`'s reaction to the hit it just took (it was in
     /// state `was`). Heavy hits (knockdown, blown away, knockover, whirlwind,
     /// or magic over 10) knock it down (E_HIT_REACT2) and push it 40 (small
@@ -5288,6 +5377,10 @@ impl Game {
             if pushed.length_squared() > 1600.0 {
                 *pushed = pushed.normalize() * 40.0;
             }
+        }
+        if killed && et == DEATH {
+            *state = EnemyState::Dying { timer: DEATH_EXIT };
+            return;
         }
         let Some(seqs) = seqs else { return };
         if killed {
@@ -5535,13 +5628,15 @@ impl Game {
         let mut spawns: Vec<Spawn> = Vec::new();
         let mut shots: Vec<Shot> = Vec::new();
         let mut blasts: Vec<(Vec3, f32)> = Vec::new();
-        let mut drains: Vec<(usize, f32)> = Vec::new();
+        // Death's drains: (Death, victim, its fight, tier 2).
+        let mut drains: Vec<(usize, usize, f32, bool)> = Vec::new();
+        // Deaths gone after draining: their message, and to whom.
+        let mut death_left: Vec<(usize, Option<usize>)> = Vec::new();
         // Garm's swings (StartEnemyAtkFX) and deaths (fn_8004F1DC).
         let mut garm_atk: Vec<(u64, usize)> = Vec::new();
         let mut garm_dead: Vec<Vec3> = Vec::new();
         // Death and whom it drains (StartDeathFX on both).
         let mut drain_fx: Vec<(u64, usize)> = Vec::new();
-        let mut death_done: Vec<usize> = Vec::new();
         let mut tagged: Option<usize> = None;
         let halo: Vec<bool> = self
             .players
@@ -5877,6 +5972,22 @@ impl Game {
                     };
                     match state {
                         EnemyState::Dying { timer } => {
+                            // Death rises 10 a second as it fades out (alpha +4
+                            // a tick), then is gone; having drained its fill
+                            // it says so (enemy.c:5313).
+                            if *etype == crate::enemies::DEATH {
+                                *timer -= dt;
+                                e.fade = (*timer / DEATH_EXIT).clamp(0.0, 1.0);
+                                e.pos.y += 10.0 * dt;
+                                if *timer <= 0.0 {
+                                    e.alive = false;
+                                    if *drained {
+                                        let m = if *strength == 2 { 0x81 } else { 0x83 };
+                                        death_left.push((m, target.map(|t| t.0)));
+                                    }
+                                }
+                                continue;
+                            }
                             // The death (or HIT2) animation, then gone: at once for
                             // small monsters, after the 0.7 s burn for the rest.
                             *timer -= dt;
@@ -5939,20 +6050,18 @@ impl Game {
                                     continue;
                                 }
                             } else if *etype == DEATH {
-                                // Death drains whoever it touches, 3 ticks at a
-                                // time, until it has taken 100, then leaves.
+                                // fn_80046140: Death drains whoever it touches
+                                // every 3 ticks (health, or a tier-2 Death's
+                                // experience), paying its fight from its own
+                                // health each time.
                                 if let Some(pi) = contact.filter(|&pi| !halo[pi]) {
                                     walk = false;
+                                    // coll_pnum: whom it says it leaves.
+                                    *target = Some((pi, false));
                                     drain_fx.push((e.id, pi));
                                     if *reload <= 0.0 {
                                         *reload = 3.0 / 60.0;
-                                        let f = self.tuning.damage;
-                                        drains.push((pi, f));
-                                        *drained += f;
-                                        if *drained >= 100.0 {
-                                            *state = EnemyState::Dying { timer: 1.0 };
-                                            death_done.push(pi);
-                                        }
+                                        drains.push((ei, pi, self.tuning.damage, *strength == 2));
                                     }
                                     if let Some((a, _)) = seqs.attack {
                                         if e.animator.seq != a {
@@ -7058,14 +7167,11 @@ impl Game {
         for (pos, dmg) in blasts {
             self.suicide_explosion(pos, dmg);
         }
-        // Death's drain goes round armour; once it has had 100 it leaves.
-        // AudioPlayEvt102Follow: S_DEATHSUCK while Death drains;
-        // AudioPlayEvt104: its laugh as it leaves.
-        if !drains.is_empty() {
-            self.snd.death_suck = 4;
+        for (ei, pi, f, tier2) in drains {
+            self.death_drain(ei, pi, f, tier2);
         }
-        for (pi, f) in drains {
-            self.damage_player(pi, f, DmgType::NO_ARMOR);
+        for (m, pi) in death_left {
+            self.post(m, pi, &[]);
         }
         for (id, pi) in drain_fx {
             self.note_drain(id, pi);
@@ -7075,10 +7181,6 @@ impl Game {
         }
         for at in garm_dead {
             self.garm_death_fx(at);
-        }
-        for pi in death_done {
-            self.sfx_id(0x68);
-            self.post(0x83, Some(pi), &[]);
         }
         if let Some(pi) = tagged {
             self.it_holder = Some(pi);
@@ -7524,6 +7626,112 @@ mod tests {
         };
         // Along the hero's facing, rising with the damage; at most 40.
         assert!(pushed.z > 10.0 && pushed.y > 0.0 && pushed.length() <= 40.0 + 1e-3);
+    }
+
+    /// A lone Warrior on the first level with a Death class, and Death (tier
+    /// `tier`) touching him, still; returns its index.
+    fn death_touching(fs: &GameFs, tier: usize) -> Option<(Game, usize)> {
+        for lv in [
+            "levelA1", "levelA2", "levelA3", "levelB1", "levelB2", "levelC1",
+        ] {
+            let mut g = Game::new(fs, lv, &[("WAR", "RED")]).unwrap();
+            let Some(class) = g
+                .classes
+                .iter()
+                .position(|c| c.etype == crate::enemies::DEATH)
+            else {
+                continue;
+            };
+            g.entities.clear();
+            g.pending_enemies.clear();
+            for _ in 0..30 {
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            }
+            let model = g.classes[class].model(1);
+            let mut kind = g.new_enemy(class, tier, EnemyState::Chase);
+            if let Kind::Enemy {
+                speed, recognized, ..
+            } = &mut kind
+            {
+                *speed = 0.0;
+                *recognized = true;
+            }
+            let at = g.players[0].pos + Vec3::new(0.0, 0.0, 2.6);
+            g.spawn(kind, model, at, std::f32::consts::PI);
+            let t = g.entities.len() - 1;
+            return Some((g, t));
+        }
+        None
+    }
+
+    #[test]
+    fn tier_two_death_drains_experience() {
+        let Some(fs) = data() else { return };
+        let Some((mut g, t)) = death_touching(&fs, 2) else {
+            return;
+        };
+        // Level 10: 1% of 9 x 60 + 1000 = 15 a drain.
+        g.players[0].exp = crate::stats::level_to_exp(10) + 20;
+        g.players[0].level = 10;
+        let hp = g.players[0].health;
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
+        let p = &g.players[0];
+        assert!(p.level < 10, "drained a level away: {} {}", p.level, p.exp);
+        assert!(p.health >= hp, "health untouched");
+        assert!(g.sfx.iter().any(|s| s.contains("S_LOSTLEVEL")));
+        assert!(g.sfx.iter().any(|v| v.contains("S_DEATHDRAINXP")));
+        let Kind::Enemy { hp, .. } = g.entities[t].kind else {
+            panic!()
+        };
+        assert!(hp < 100.0, "each drain costs Death its fight");
+    }
+
+    #[test]
+    fn death_leaves_when_its_victim_dies_and_fades_out() {
+        let Some(fs) = data() else { return };
+        let Some((mut g, t)) = death_touching(&fs, 1) else {
+            return;
+        };
+        let id = g.entities[t].id;
+        g.players[0].health = 1.0;
+        let mut rose = false;
+        let mut faded = false;
+        let y0 = g.entities[t].pos.y;
+        for _ in 0..120 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            if let Some(e) = g.entities.iter().find(|e| e.id == id) {
+                rose |= e.pos.y > y0 + 3.0;
+                faded |= e.fade < 0.5 && e.fade > 0.0;
+            }
+        }
+        assert!(rose && faded, "rises as it fades");
+        assert!(
+            !g.entities.iter().any(|e| e.id == id),
+            "gone after its exit"
+        );
+        assert!(
+            g.sfx.iter().any(|v| v.contains("S_DEATHDRAINS")),
+            "{:?}",
+            g.sfx
+        );
+    }
+
+    #[test]
+    fn hitting_death_with_the_shield_heals() {
+        let Some(fs) = data() else { return };
+        let Some((mut g, t)) = death_touching(&fs, 1) else {
+            return;
+        };
+        g.players[0].fx.armor |= crate::powerups::A_ANTIDEATH;
+        let hp = g.players[0].health;
+        g.hit_entity(0, t, 20.0, Vec2::Y, true);
+        assert_eq!(g.players[0].health, hp + 1.0);
+        let Kind::Enemy { hp: dhp, .. } = g.entities[t].kind else {
+            panic!()
+        };
+        assert_eq!(dhp, 99.0);
     }
 
     #[test]

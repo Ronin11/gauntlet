@@ -929,15 +929,30 @@ impl Game {
         self.start_enter_fx((lo + hi) * 0.5);
     }
 
-    /// The drain arcs: Death keeps its specialfx while it lives; a drained
-    /// hero has theirs only while drained (DeleteEffect mode 0 after).
+    /// The drain arcs: Death keeps its specialfx until it dies (enemy.c:5317
+    /// deletes it as the exit starts); a drained hero has theirs only while
+    /// drained (DeleteEffect mode 0 after).
     fn update_death_fx(&mut self) {
+        let leaving = |e: &Entity| {
+            matches!(
+                e.kind,
+                Kind::Enemy {
+                    state: crate::game::EnemyState::Dying { .. },
+                    ..
+                }
+            )
+        };
         let gone: Vec<u64> = self
             .effects
             .death_fx
             .keys()
             .copied()
-            .filter(|&id| !self.entities.iter().any(|e| e.id == id && e.alive))
+            .filter(|&id| {
+                !self
+                    .entities
+                    .iter()
+                    .any(|e| e.id == id && e.alive && !leaving(e))
+            })
             .collect();
         for id in gone {
             if let Some(fx) = self.effects.death_fx.remove(&id) {
