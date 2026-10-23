@@ -4404,9 +4404,20 @@ impl Game {
                         }
                     }
                 }
-                // Don't walk off into the void: require ground within reach.
-                let probe = self.collision.ground_height(target, p.pos.y + STEP_HEIGHT);
-                if probe.is_some_and(|g| g > p.pos.y - 20.0) || !p.on_ground {
+                // PlayerCollideFloor: a step whose floor is more than
+                // lbl_80347BF8 (3) from the one stood on, 4 onto the floor
+                // object already underfoot, or that finds no floor, doesn't
+                // move the hero: heroes don't walk off ledges (into a
+                // lowered lift's shaft, say).
+                let probe = self.collision.ground_hit(target, p.pos.y + STEP_HEIGHT);
+                let under = self
+                    .collision
+                    .ground_hit(p.pos, p.pos.y + 0.1)
+                    .map(|(_, o)| o);
+                let ledge = |(g, o): (f32, i32)| {
+                    p.pos.y - g <= STAIR_RISE + if Some(o) == under { 1.0 } else { 0.0 }
+                };
+                if probe.is_some_and(ledge) || !p.on_ground {
                     p.pos = target;
                 }
             }
