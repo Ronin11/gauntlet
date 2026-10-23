@@ -107,6 +107,38 @@ pub struct Blast {
     pub delay: f32,
 }
 
+/// StartExplosion's per-type set-up (sfx.c 0x800933BC): damageradius and
+/// damagetype (SetMagicParams), the x/z scale of the effect's node (y stays
+/// 1; None: left alone) and how far the node is raised.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ExplosionShape {
+    pub radius: f32,
+    pub dtype: u32,
+    pub wide: Option<f32>,
+    pub rise: f32,
+}
+
+/// [`ExplosionShape`] of StartExplosion type `ty`: 29 (trap chest) 12 of
+/// fire wide 2.5 up 3, 24 (barrel) 12 wide 1.75 up 2, 25 (poison barrel)
+/// 6.5 of poison gas wide 3.5, 23 4 of fire unscaled, the rest 6 wide 1.5
+/// (lbl_80348158 12, lbl_80348140 2.5, lbl_80348168 1.75, lbl_80348144 6,
+/// lbl_8034816C 1.5, f64 lbl_80348150 2 / lbl_80348160 3).
+pub(crate) fn explosion_shape(ty: usize) -> ExplosionShape {
+    let (radius, dtype, wide, rise) = match ty {
+        FX_EXPCHEST => (12.0, 0x421, Some(2.5), 3.0),
+        FX_EXPBARREL => (12.0, 0x421, Some(1.75), 2.0),
+        23 => (4.0, 0x11, None, 0.0),
+        FX_EXPPOISON => (6.5, DmgType::POISON_GAS, Some(3.5), 0.0),
+        _ => (6.0, 0x421, Some(1.5), 0.0),
+    };
+    ExplosionShape {
+        radius,
+        dtype,
+        wide,
+        rise,
+    }
+}
+
 impl Blast {
     /// SfxSetDamage on an expanding effect (flags 0x20) lasting `maxtime`.
     #[allow(clippy::too_many_arguments)]
@@ -409,29 +441,34 @@ impl Game {
     /// StartExplosion: a typed blast at `pos` doing `damage` — 24 the
     /// explosive barrel (radius 12, fire + knockdown + explode), 25 the poison
     /// barrel (6.5, poison gas, then POISONEXP2 for 4 s and POISONEXP3), 29 the
-    /// trap chest (EXPLOSION with EXPCHEST over it), the rest radius 6. Its
-    /// effect hits heroes, items and monsters (flags 0x2B).
+    /// trap chest (EXPLOSION with EXPCHEST over it), 23 radius 4 of fire, the
+    /// rest radius 6. Its effect hits heroes, items and monsters (flags 0x2B)
+    /// and is widened (and raised) as [`explosion_shape`] says.
     pub(crate) fn start_explosion(&mut self, pos: Vec3, ty: usize, damage: f32) {
         let shown = if ty == FX_EXPCHEST { FX_EXPLODE } else { ty };
-        let (radius, dtype, morph) = match ty {
-            FX_EXPPOISON => (
-                6.5,
-                DmgType::POISON_GAS,
-                vec![(FX_EXPPOISON2, 4.0), (FX_EXPPOISON3, 0.0)],
-            ),
-            FX_EXPBARREL | FX_EXPCHEST => (12.0, 0x421, Vec::new()),
-            _ => (6.0, 0x421, Vec::new()),
+        let shape = explosion_shape(ty);
+        let morph = if ty == FX_EXPPOISON {
+            vec![(FX_EXPPOISON2, 4.0), (FX_EXPPOISON3, 0.0)]
+        } else {
+            Vec::new()
         };
         if ty == FX_EXPCHEST {
             self.start_fx(FX_EXPCHEST, pos, 0.0, 0.0);
         }
+        // The node is raised (yp[13] += rise); its position is the blast's.
+        let at = pos + Vec3::Y * shape.rise;
         let maxtime = self.fx_time(shown);
-        let fx = self.start_fx(shown, pos, 0.0, maxtime + 1.0);
+        let fx = self.start_fx(shown, at, 0.0, maxtime + 1.0);
+        // The node's x/z scale stays through the morphs (ChangeEffect keeps
+        // the node).
+        if let (Some(id), Some(w)) = (fx, shape.wide) {
+            self.scale_fx(id, Vec3::new(w, 1.0, w));
+        }
         self.items.blasts.push(Blast {
-            pos,
+            pos: at,
             damage,
-            dtype,
-            radius,
+            dtype: shape.dtype,
+            radius: shape.radius,
             flags: 0x2B,
             owner: None,
             remaining: maxtime,
@@ -1459,6 +1496,83 @@ mod tests {
         assert!(!alive(&g, b), "the blast sets the next barrel off");
         assert!(!alive(&g, mon), "the grunt beside it dies");
         assert!(g.players[0].health < before, "the hero 6 away is hurt");
+    }
+
+    #[test]
+    fn explosion_shapes_are_start_explosions() {
+        // sfx.c StartExplosion: case 25 rad 6.5, damagetype 0x800, node scale
+        // (3.5, 1, 3.5); 24 lbl_80348158 12 / lbl_80348168 1.75 / +2.0; 29
+        // 12 / lbl_80348140 2.5 / +3.0; 23 4.0 / 17 unscaled; default
+        // lbl_80348144 6 / lbl_8034816C 1.5.
+        let poison = explosion_shape(FX_EXPPOISON);
+        assert_eq!(poison.radius, 6.5);
+        assert_eq!(poison.dtype, DmgType::POISON_GAS);
+        assert_eq!(poison.wide, Some(3.5));
+        assert_eq!(poison.rise, 0.0);
+        let barrel = explosion_shape(FX_EXPBARREL);
+        assert_eq!(
+            (barrel.radius, barrel.wide, barrel.rise),
+            (12.0, Some(1.75), 2.0)
+        );
+        let chest = explosion_shape(FX_EXPCHEST);
+        assert_eq!(
+            (chest.radius, chest.wide, chest.rise),
+            (12.0, Some(2.5), 3.0)
+        );
+        let e23 = explosion_shape(23);
+        assert_eq!((e23.radius, e23.dtype, e23.wide), (4.0, 0x11, None));
+        let other = explosion_shape(FX_EXPLODE);
+        assert_eq!(
+            (other.radius, other.dtype, other.wide),
+            (6.0, 0x421, Some(1.5))
+        );
+    }
+
+    #[test]
+    fn poison_cloud_is_wide_and_reaches_its_radius() {
+        let Some(fs) = data() else { return };
+        let mut g = quiet(&fs, &[]);
+        let at = g.players[0].pos;
+        let centre = at + Vec3::new(0.0, 0.0, 20.0);
+        g.start_explosion(centre, FX_EXPPOISON, 10.0);
+        let b = &g.items.blasts[0];
+        assert_eq!(b.radius, 6.5);
+        // The cloud is drawn 3.5 wide, as the original's node.
+        let fx = b.fx.expect("the cloud");
+        assert_eq!(
+            g.fx_look(fx).and_then(|l| l.scale),
+            Some(Vec3::new(3.5, 1.0, 3.5))
+        );
+        // A hero whose edge is just inside the grown radius (6.5 x 0.99 + 1.5)
+        // is gassed; one 9 away never is.
+        let run = |g: &mut Game, d: f32| {
+            let mut hurts = 0;
+            let start = g.players[0].health;
+            let mut last = start;
+            for _ in 0..(4 * 60) {
+                g.players[0].pos = Vec3::new(centre.x + d, at.y, centre.z);
+                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                if g.players[0].health < last {
+                    hurts += 1;
+                }
+                last = g.players[0].health;
+            }
+            hurts
+        };
+        assert!(
+            run(&mut g, 7.7) >= 1,
+            "a hero 7.7 from the centre is gassed"
+        );
+        let mut g2 = quiet(&fs, &[]);
+        g2.start_explosion(centre, FX_EXPPOISON, 10.0);
+        let fx2 = g2.items.blasts[0].fx.expect("the cloud");
+        assert_eq!(run(&mut g2, 9.0), 0, "a hero 9 from the centre is not");
+        // The scale stays on the cloud through its morph (into POISONEXP2).
+        assert!(g2.entities.iter().any(|e| e.id == fx2 && e.alive));
+        assert_eq!(
+            g2.fx_look(fx2).and_then(|l| l.scale),
+            Some(Vec3::new(3.5, 1.0, 3.5))
+        );
     }
 
     #[test]
