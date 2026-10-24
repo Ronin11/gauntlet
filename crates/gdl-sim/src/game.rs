@@ -981,6 +981,15 @@ pub enum Kind {
         cam: Option<(Vec3, Vec3, u8)>,
         /// A door_switch (subtype 0x17): it posts the traps hint (message 5).
         door_switch: bool,
+        /// LinkItemTriggers: the trigger this one sets off with itself (its
+        /// nextid, params byte 7, names it), so one pad can drive a chain of
+        /// targets.
+        next: Option<u64>,
+        /// A link target (flags 0x200): only its chain sets it off, never a
+        /// hero walking into it.
+        linked: bool,
+        /// The heroes' mask handed down the chain this frame.
+        fed: u32,
     },
     Prop,
     /// items.c obstacles 0x28/0x31/0x34/0x35: a rock that falls (or sinks)
@@ -1561,54 +1570,44 @@ impl Game {
         }
     }
 
-    /// EnterTower: barriers whose crystals are done start open, and the tower's
-    /// orange crystals are gone once orange is done.
+    /// EnterTower: what the party has already earned starts in its finished
+    /// state (ActivateSpecialTrigger(id, 1): the target jumps to its end, it
+    /// does not animate there again): the barriers of the crystal colours
+    /// done, the statue gates of the gargoyle items done (the lion gate also
+    /// brings the lift and elevator down to the Battle realm's floor) and,
+    /// with the 13th runestone, the lift to the Citadel. The tower's orange
+    /// crystals are gone once orange is done.
     pub fn enter_tower(&mut self) {
         let crystals = self.crystals;
         let garg = self.garg_items;
-        let mut open = Vec::new();
-        for e in &mut self.entities {
-            match &e.kind {
-                Kind::Trigger {
-                    gate: Some(c),
-                    mover: Some(m),
-                    ..
-                } if (*c < 9 && crystals[*c] < 0)
-                    || ((101..=103).contains(c) && garg[*c - 101] < 0) =>
-                {
-                    open.push(*m)
+        if crystals[1] < 0 {
+            self.entities.retain(|e| {
+                !matches!(
+                    e.kind,
+                    Kind::Pickup {
+                        kind: PickupKind::Crystal(1),
+                        ..
+                    }
+                )
+            });
+        }
+        let mut ids: Vec<u8> = (1..=8)
+            .filter(|&c| crystals[c] < 0)
+            .map(|c| c as u8)
+            .collect();
+        for j in 0..3 {
+            if garg[j] < 0 {
+                ids.push(101 + j as u8);
+                if j == 2 {
+                    ids.extend([104, 199]);
                 }
-                Kind::Pickup {
-                    kind: PickupKind::Crystal(1),
-                    ..
-                } if crystals[1] < 0 => e.alive = false,
-                _ => {}
             }
         }
-        self.entities.retain(|e| e.alive);
-        // The lion gate also brings the lift and elevator down to the Battle
-        // realm's floor; the 13th shard opens the lift to the Citadel.
-        let extra: Vec<usize> = self
-            .entities
-            .iter()
-            .filter_map(|e| match e.kind {
-                Kind::Trigger {
-                    id: 104 | 199,
-                    mover: Some(m),
-                    ..
-                } if garg[2] < 0 => Some(m),
-                Kind::Trigger {
-                    id: 255,
-                    mover: Some(m),
-                    ..
-                } if self.shards & 0x1000 != 0 => Some(m),
-                _ => None,
-            })
-            .collect();
-        for m in open.into_iter().chain(extra) {
-            if let Some(m) = self.movers.get_mut(m) {
-                m.active = true;
-            }
+        if self.shards & 0x1000 != 0 {
+            ids.push(255);
+        }
+        for id in ids {
+            self.special_trigger(id, true);
         }
     }
 
@@ -1705,25 +1704,88 @@ impl Game {
         shown
     }
 
-    /// ActivateSpecialTrigger(id, 0): set off the mover of trigger `id`.
+    /// ActivateSpecialTrigger(id, 0): set off the triggers with `id` and
+    /// every trigger chained after them.
     pub fn activate_trigger(&mut self, id: u8) {
-        let movers: Vec<usize> = self
+        self.special_trigger(id, false);
+    }
+
+    /// ActivateSpecialTrigger: the triggers with `id`, and the chains they
+    /// head, set their targets off; with `settle` (flag 1) each target jumps
+    /// to its finished state instead of moving there.
+    fn special_trigger(&mut self, id: u8, settle: bool) {
+        let heads: Vec<usize> = self
             .entities
             .iter()
-            .filter_map(|e| match e.kind {
-                Kind::Trigger {
-                    id: i,
-                    mover: Some(m),
-                    ..
-                } if i == id => Some(m),
+            .enumerate()
+            .filter_map(|(i, e)| match e.kind {
+                Kind::Trigger { id: t, .. } if t == id => Some(i),
                 _ => None,
             })
             .collect();
-        for m in movers {
-            if let Some(m) = self.movers.get_mut(m) {
-                m.active = true;
+        let mut movers = Vec::new();
+        for h in heads {
+            for i in std::iter::once(h).chain(self.trigger_chain(h)) {
+                if let Kind::Trigger { mover: Some(m), .. } = self.entities[i].kind {
+                    movers.push(m);
+                }
             }
         }
+        for m in movers {
+            let Some(mv) = self.movers.get_mut(m) else {
+                continue;
+            };
+            if settle {
+                mv.settle(&mut self.collision, &mut self.world_anim);
+            } else {
+                mv.active = true;
+            }
+        }
+    }
+
+    /// LinkItemTriggers: connect each trigger naming a successor (nextid) to
+    /// the trigger with that id that is not a tower gate (flags 0x40), and
+    /// mark the successor a link target (flags 0x200). A link that would
+    /// close a loop is dropped.
+    fn link_triggers(&mut self, links: &[(u64, u8)]) {
+        for &(from, nextid) in links {
+            let Some(fi) = self.entities.iter().position(|e| e.id == from) else {
+                continue;
+            };
+            let Some(ti) = self.entities.iter().position(|e| {
+                e.id != from
+                    && matches!(e.kind, Kind::Trigger { id, flags, .. } if id == nextid && flags & 0x40 == 0)
+            }) else {
+                continue;
+            };
+            if self.trigger_chain(ti).contains(&fi) {
+                continue;
+            }
+            let to = self.entities[ti].id;
+            if let Kind::Trigger { next, .. } = &mut self.entities[fi].kind {
+                *next = Some(to);
+            }
+            if let Kind::Trigger { linked, .. } = &mut self.entities[ti].kind {
+                *linked = true;
+            }
+        }
+    }
+
+    /// The triggers chained after entity `head` (indices, in order).
+    fn trigger_chain(&self, head: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut i = head;
+        while let Kind::Trigger { next: Some(n), .. } = self.entities[i].kind {
+            let Some(j) = self.entities.iter().position(|e| e.id == n) else {
+                break;
+            };
+            if j == head || out.contains(&j) {
+                break;
+            }
+            out.push(j);
+            i = j;
+        }
+        out
     }
 
     /// Hide a world object (and its children) by name; false if there is none.
@@ -2916,6 +2978,8 @@ impl Game {
         let mut placing: (u32, u64) = (0, self.next_id);
         // Triggers AddItemSub puts on the floor.
         let mut on_floor: Vec<u64> = Vec::new();
+        // Triggers naming a successor (LinkItemTriggers): (trigger, nextid).
+        let mut links: Vec<(u64, u8)> = Vec::new();
         for (inst_idx, inst) in instances.iter().enumerate() {
             self.note_placed(placing);
             placing = (inst_idx as u32, self.next_id);
@@ -3452,6 +3516,9 @@ impl Game {
                             })
                             .flatten(),
                             door_switch: info.subtype == 0x17,
+                            next: None,
+                            linked: false,
+                            fed: 0,
                         },
                         model,
                         pos,
@@ -3459,6 +3526,9 @@ impl Game {
                     );
                     if info.coll_flags & 1 == 0 {
                         on_floor.push(id);
+                    }
+                    if inst.params[7] != 0 {
+                        links.push((id, inst.params[7]));
                     }
                 }
                 // SetItem case 13: a sound item with a music area selects it
@@ -3518,6 +3588,7 @@ impl Game {
             }
         }
         self.note_placed(placing);
+        self.link_triggers(&links);
         self.put_items_on_floor(&on_floor);
         self.link_carried(&carriers);
         self.load_item_fx(fs, &mut cache, &mut known, &dirs);
@@ -6637,6 +6708,8 @@ impl Game {
             .count();
         type Fired = (Vec3, u16, Option<usize>, Option<(Vec3, Vec3, u8)>, bool);
         let mut trigger_fired: Vec<Fired> = Vec::new();
+        // Chain heads set off this frame and their heroes, for their chains.
+        let mut chain_feed: Vec<(u64, u32)> = Vec::new();
         let mut door_hint = false;
         let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32, u64)> = Vec::new();
         let mut fallers_started: Vec<(i32, Option<(usize, usize)>)> = Vec::new();
@@ -7549,6 +7622,9 @@ impl Game {
                     flags,
                     cam,
                     door_switch,
+                    next,
+                    linked,
+                    fed,
                     ..
                 } => {
                     use crate::triggers::tflags;
@@ -7571,8 +7647,11 @@ impl Game {
                     let root = mover.and_then(|m| self.movers.get(m)).map(|m| m.root);
                     let objs = &self.level.worlds.world_objects;
                     let mut mask = 0u32;
+                    // A link target (flags 0x200) has no reach of its own
+                    // (item collision case 5: keep = 0).
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                         if *shoot
+                            || *linked
                             || !*alive
                             || Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
                                 >= reach + PLAYER_RADIUS + 0.6
@@ -7598,6 +7677,20 @@ impl Game {
                         }
                         mask |= 1 << pi;
                     }
+                    // The chain ahead of it hands down its heroes; flag 0x100
+                    // on a link target keeps only those standing on its target
+                    // (item update case 5).
+                    mask |= *fed;
+                    *fed = 0;
+                    if let (true, true, Some(r)) = (*linked, *flags & tflags::ON_TARGET != 0, root)
+                    {
+                        for pi in 0..player_pos.len().min(32) {
+                            let floor = trigger_floors.get(pi).copied().flatten();
+                            if !crate::triggers::on_target(objs, r, floor) {
+                                mask &= !(1 << pi);
+                            }
+                        }
+                    }
                     // Flag 0x400: nothing until every hero in play is on it.
                     if *flags & tflags::ALL_HEROES != 0 && mask != all_heroes {
                         mask = 0;
@@ -7608,6 +7701,11 @@ impl Game {
                         barrier_touches.extend(*gate);
                     }
                     let touched = !locked && contact;
+                    // The chain after it gets the same heroes (a locked gate
+                    // hands down none).
+                    if next.is_some() && touched {
+                        chain_feed.push((e.id, mask | *hit as u32));
+                    }
                     *hit = false;
                     let mut active = None;
                     if let Some(m) = mover.and_then(|m| self.movers.get_mut(m)) {
@@ -7906,6 +8004,16 @@ impl Game {
         }
 
         self.barrier_touches = barrier_touches;
+        for (head, mask) in chain_feed {
+            let Some(h) = self.entities.iter().position(|e| e.id == head) else {
+                continue;
+            };
+            for i in self.trigger_chain(h) {
+                if let Kind::Trigger { fed, .. } = &mut self.entities[i].kind {
+                    *fed |= mask;
+                }
+            }
+        }
         // (Not in the attract flyby: MODE_GROUP_ATTRACT.)
         if door_hint && self.fixed_camera.is_none() {
             self.post(5, None, &[]);

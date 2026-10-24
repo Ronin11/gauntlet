@@ -320,13 +320,14 @@ impl WorldAnims {
     }
 
     /// ActivateSpecialTrigger with `flag`, items.c SetItem's tower case:
-    /// jump a trigger target's animation to its last frame.
+    /// jump a trigger target's animation to its last frame, pointed forward
+    /// so it holds there.
     pub fn jump_to_end(&mut self, o: usize) {
         if let Some(a) = self.anims.iter_mut().find(|a| a.obj == o) {
             a.curframe = (a.nframes - 1) as f32;
         }
         if let Some(f) = self.flags.get_mut(o) {
-            *f |= FORWARD | AT_END;
+            *f = (*f | FORWARD | AT_END) & !REVERSE;
         }
     }
 

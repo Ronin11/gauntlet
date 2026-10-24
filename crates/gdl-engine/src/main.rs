@@ -360,8 +360,8 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
     }
     // GDL_SUMNER=welcome | runes=..,shards=..,banked_runes=..,banked_shards=..,
-    // beaten=..,exp=..: the tower with Sumner, as the app would enter it (masks
-    // in hex, exp in decimal).
+    // beaten=..,exp=..,crystals=..,garg=..: the tower with Sumner, as the app
+    // would enter it (masks in hex, exp in decimal).
     // GDL_BOX_CLOSE=n presses B n ticks into each message box page.
     if let Ok(spec) = std::env::var("GDL_SUMNER") {
         let mut entry = gdl_engine::tower::Entry::default();
@@ -383,6 +383,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     })
                 }
                 "crystals" => g.crystals[1] = n as i32,
+                // garg=<bits>: the gargoyle items (fangs, feathers, claws) done.
+                "garg" => {
+                    for j in 0..3 {
+                        if n & (1 << j) != 0 {
+                            g.garg_items[j] = -1;
+                        }
+                    }
+                }
                 _ => anyhow::bail!("GDL_SUMNER: unknown key {k}"),
             }
         }

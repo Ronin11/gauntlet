@@ -428,3 +428,137 @@ fn an_opened_gold_chest_gives_its_gold_on_touch() {
         .iter()
         .any(|e| matches!(e.kind, Kind::Pickup { .. })));
 }
+
+/// The tower's world object called `name`.
+fn object(g: &Game, name: &str) -> usize {
+    g.level
+        .worlds
+        .world_objects
+        .iter()
+        .position(|o| o.name == name)
+        .unwrap_or_else(|| panic!("no world object {name}"))
+}
+
+/// The mover of the trigger target `name`.
+fn mover<'a>(g: &'a Game, name: &str) -> &'a crate::triggers::Mover {
+    let o = object(g, name);
+    g.movers
+        .iter()
+        .find(|m| m.root == o)
+        .unwrap_or_else(|| panic!("no mover for {name}"))
+}
+
+/// The trigger entity with `id`.
+fn trigger(g: &Game, id: u8) -> &Entity {
+    g.entities
+        .iter()
+        .find(|e| matches!(e.kind, Kind::Trigger { id: t, .. } if t == id))
+        .unwrap_or_else(|| panic!("no trigger {id}"))
+}
+
+fn step(g: &mut Game, n: usize) {
+    for _ in 0..n {
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    }
+}
+
+#[test]
+fn the_dragon_gate_opens_through_its_trigger_chain() {
+    // "The dragon doors didn't open": the pad of the serpent gate (trigger
+    // 101) drives only an invisible wall; the statue's heads, wings and jaws
+    // hang off a chain of triggers named by nextid (LinkItemTriggers:
+    // 101 -> 71 -> ... -> 78 -> 20 -> ... -> 27), each with its own target.
+    // Setting off the head sets off the chain; a link target (flags 0x200)
+    // never fires for a hero walking into it on its own.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
+    g.pending_enemies.clear();
+    g.garg_items[0] = -1;
+    use crate::worldanim::wflags::{AT_END, FORWARD};
+    let parts = ["L1RSNAKEWA", "L1LSNAKEWD", "L1RSNAKERE", "L1LLSNAKET"];
+    step(&mut g, 5);
+    for p in parts {
+        assert!(!mover(&g, p).active, "{p} waits for the gate");
+    }
+    // A hero on a chained pad (trigger 71's) on its own: nothing.
+    g.players[0].pos = trigger(&g, 71).pos + Vec3::Y * 0.5;
+    step(&mut g, 10);
+    assert!(
+        !mover(&g, "L1RSNAKEWA").active,
+        "a link target is not set off by a hero on it"
+    );
+    // On the gate's own pad: the whole chain goes.
+    g.players[0].pos = trigger(&g, 101).pos + Vec3::Y * 0.5;
+    step(&mut g, 10);
+    assert!(
+        mover(&g, "L1TRAPWEASYA").active,
+        "the gate's own wall opens"
+    );
+    for p in parts {
+        let m = mover(&g, p);
+        assert!(m.active, "{p} is set off down the chain");
+        let f = g.world_anim.flags[m.root];
+        assert!(f & FORWARD != 0, "{p} plays forward: {f:#x}");
+    }
+    step(&mut g, 600);
+    for p in parts {
+        let f = g.world_anim.flags[mover(&g, p).root];
+        assert!(f & AT_END != 0, "{p} reaches its open pose: {f:#x}");
+    }
+}
+
+#[test]
+fn the_tower_starts_with_what_is_earned_already_in_place() {
+    // EnterTower uses ActivateSpecialTrigger(id, 1): a target already earned
+    // jumps to its finished state. The lion gate's lift and elevator must
+    // not ride down again every time the tower loads, and the Citadel lift
+    // and the statues' parts start at their ends.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
+    g.pending_enemies.clear();
+    let lift = object(&g, "L1LIFT01");
+    g.garg_items = [-1, -1, -1];
+    g.shards = 0x1FFF;
+    g.enter_tower();
+    step(&mut g, 2);
+    let dy = g.world_anim.delta(lift).w_axis.y;
+    assert!(
+        (-17.0..-16.0).contains(&dy),
+        "the lift is already down at the Battle floor: {dy}"
+    );
+    assert!(!mover(&g, "L1LIFT01").moving, "and not riding there");
+    let elev = mover(&g, "L1ELEV02");
+    assert!(
+        !elev.moving && (elev.offset - 1.0).abs() < 1e-3,
+        "the elevator sits at its raised height: {} moving {}",
+        elev.offset,
+        elev.moving
+    );
+    use crate::worldanim::wflags::AT_END;
+    for p in [
+        "L1ELEV669",
+        "L1RSNAKEWA",
+        "L1LEAGLEWA",
+        "L1LIONUARM",
+        "L1BLK669",
+    ] {
+        let m = mover(&g, p);
+        let f = g.world_anim.flags[m.root];
+        assert!(
+            m.active && !m.moving && f & AT_END != 0,
+            "{p} starts at its end: {f:#x} moving {}",
+            m.moving
+        );
+    }
+    // Nothing in the tower is still on its way anywhere.
+    step(&mut g, 60);
+    assert!(
+        g.movers.iter().all(|m| !m.moving),
+        "no target animates on entry"
+    );
+    let again = g.world_anim.delta(lift).w_axis.y;
+    assert!(
+        (again - dy).abs() < 1e-3,
+        "the lift stays put: {again} vs {dy}"
+    );
+}

@@ -3265,11 +3265,17 @@ mod tests {
             .iter()
             .position(|m| g.level.worlds.world_objects[m.root].name == "A5ELEVATOR")
             .unwrap();
-        let pad = g
+        // The elevator's trigger needs every hero and is fed by the pads
+        // around the arena (LinkItemTriggers); the one nearest it.
+        let (gate, at) = g
             .entities
             .iter()
             .find(|e| matches!(e.kind, Kind::Trigger { mover: Some(m), .. } if m == elevator))
-            .map(|e| e.pos)
+            .map(|e| (e.id, e.pos))
+            .unwrap();
+        let pad = crate::triggers::tests::standable_pads(&g, gate)
+            .into_iter()
+            .min_by(|a, b| a.distance(at).total_cmp(&b.distance(at)))
             .unwrap();
         // Next to the boss but off the pad: it stays asleep.
         face_boss(&mut g, 10.0);
@@ -3281,9 +3287,10 @@ mod tests {
         assert_eq!(g.boss_critter().unwrap().1.parts[0].state, 0);
         // On the pad the elevator moves: BossActivate(c, 0) now, the
         // critters wake 2 s on (CritterActivateChain).
-        g.players[0].pos = pad;
         let mut woke = None;
         for f in 0..600 {
+            // Held on the pad: the arena's walls push a hero off some of them.
+            g.players[0].pos = pad;
             g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
             if g.boss_critter().unwrap().1.parts[0].state == 3 {
                 woke = Some(f);
