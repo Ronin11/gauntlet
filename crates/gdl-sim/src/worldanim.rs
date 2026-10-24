@@ -632,22 +632,20 @@ impl crate::game::Game {
     }
 
     /// AddItemSub (items.c), once every item is set and fn_80062A00 has put
-    /// the trigger targets at their starting heights: a trigger item
-    /// (iteminfo colflags bit 0 clear) is put 0.1 (sItemFloorYOffset) above
-    /// the floor FloorPos finds under it (radius 1, from 4 above to 10
-    /// below), and is parented to that floor's node if the floor object
-    /// moves (flag 0x1000): a pad on a lift that starts lowered sits on the
-    /// lowered deck and rides with it. (The original does this for every
-    /// item; only triggers are put down here.)
-    pub(crate) fn put_triggers_on_floor(&mut self, ids: &[u64]) {
-        use crate::game::Kind;
+    /// the trigger targets at their starting heights: an item without
+    /// collision of its own (iteminfo colflags bit 0 clear) is put 0.1
+    /// (sItemFloorYOffset) above the floor FloorPos finds under it (radius
+    /// 1, from 4 above to 10 below), and is parented to that floor's node if
+    /// the floor object moves (flag 0x1000): a pad on a lift that starts
+    /// lowered sits on the lowered deck and rides with it, and the tower's
+    /// Citadel portal rides the lift the 13th runestone raises. (The
+    /// original does this for every item; triggers and exits are put down
+    /// here.)
+    pub(crate) fn put_items_on_floor(&mut self, ids: &[u64]) {
         for e in self.entities.iter_mut().filter(|e| ids.contains(&e.id)) {
-            let Kind::Trigger { ride, .. } = &mut e.kind else {
-                continue;
-            };
             let hit = self.collision.floor_collide(e.pos, 1.0, 4.0, -10.0, true);
             e.pos.y = hit.map_or(e.pos.y, |h| h.at.y) + 0.1;
-            *ride = hit
+            e.ride = hit
                 .filter(|h| self.collision.obj_flags[h.tri] & NODE != 0)
                 .map(|h| {
                     let off = Self::sliding(&self.movers, h.owner).map_or(0.0, |m| m.offset);
@@ -664,16 +662,11 @@ impl crate::game::Game {
             .find(|m| !m.animated && !m.fades() && m.objects.contains(&o))
     }
 
-    /// Triggers parented to a slid floor (see put_triggers_on_floor) go up
-    /// and down with it.
-    pub(crate) fn slide_riding_triggers(&mut self) {
-        use crate::game::Kind;
+    /// Items parented to a slid floor (see put_items_on_floor) go up and
+    /// down with it.
+    pub(crate) fn slide_riding_items(&mut self) {
         for e in &mut self.entities {
-            if let Kind::Trigger {
-                ride: Some((o, y, off)),
-                ..
-            } = e.kind
-            {
+            if let Some((o, y, off)) = e.ride {
                 if let Some(m) = Self::sliding(&self.movers, o) {
                     e.pos.y = y + m.offset - off;
                 }
@@ -734,13 +727,9 @@ impl crate::game::Game {
                 e.yaw += turn;
             }
         }
-        // Triggers parented to an animated floor (put_triggers_on_floor).
+        // Items parented to an animated floor (put_items_on_floor).
         for e in &mut self.entities {
-            if let Kind::Trigger {
-                ride: Some((o, _, _)),
-                ..
-            } = e.kind
-            {
+            if let Some((o, _, _)) = e.ride {
                 if Self::sliding(&self.movers, o).is_none() {
                     if let Some((to, turn)) = self.world_anim.carry(o, e.pos) {
                         e.pos = to;

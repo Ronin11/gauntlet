@@ -981,10 +981,6 @@ pub enum Kind {
         cam: Option<(Vec3, Vec3, u8)>,
         /// A door_switch (subtype 0x17): it posts the traps hint (message 5).
         door_switch: bool,
-        /// AddItemSub parented it to the moving floor object it was put on
-        /// (flag 0x1000): that object, the height it was put at and the
-        /// offset then of the mover sliding the object (if one does).
-        ride: Option<(i32, f32, f32)>,
     },
     Prop,
     /// items.c obstacles 0x28/0x31/0x34/0x35: a rock that falls (or sinks)
@@ -1048,6 +1044,12 @@ pub struct Entity {
     pub alive: bool,
     /// 1 = fully shown, 0 = invisible (the tower's fade-ins).
     pub fade: f32,
+    /// AddItemSub parented a placed item to the moving floor object it was
+    /// put on (flag 0x1000): that object, the height it was put at and the
+    /// offset then of the mover sliding the object (if one does). The item
+    /// rides the floor: a pad on a lift, or the tower's Citadel portal on
+    /// the lift the 13th runestone raises.
+    pub ride: Option<(i32, f32, f32)>,
 }
 
 /// A monster type (`GRU`, `RAT`, ...) with a model per strength level.
@@ -2720,6 +2722,7 @@ impl Game {
             scale: 1.0,
             alive: true,
             fade: 1.0,
+            ride: None,
         });
         id
     }
@@ -3272,7 +3275,7 @@ impl Game {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     let dest = self.exit_dest(&inst.params);
                     let anim = Box::new(exits::ExitAnim::new(model.map(|m| &*self.models[m])));
-                    self.spawn(
+                    let id = self.spawn(
                         Kind::Exit {
                             radius: PLAYER_RADIUS + info.radius,
                             height: info.height + PLAYER_HEIGHT,
@@ -3284,6 +3287,9 @@ impl Game {
                         pos,
                         yaw,
                     );
+                    if info.coll_flags & 1 == 0 {
+                        on_floor.push(id);
+                    }
                 }
                 // SetItem case 8: damage = the placed value (or the item's) x
                 // trap_damage; a placed delay sets the off time to -3 x it.
@@ -3396,7 +3402,6 @@ impl Game {
                             })
                             .flatten(),
                             door_switch: info.subtype == 0x17,
-                            ride: None,
                         },
                         model,
                         pos,
@@ -3463,7 +3468,7 @@ impl Game {
             }
         }
         self.note_placed(placing);
-        self.put_triggers_on_floor(&on_floor);
+        self.put_items_on_floor(&on_floor);
         self.link_carried(&carriers);
         self.load_item_fx(fs, &mut cache, &mut known, &dirs);
         self.append_bigape_powerups(fs, &mut cache, &mut known);
@@ -8203,7 +8208,7 @@ impl Game {
                 self.sfx.push(format!("S_ELVSTONESTP{w}|S_STONEGATESTOP"));
             }
         }
-        self.slide_riding_triggers();
+        self.slide_riding_items();
 
         for pi in chest_used {
             self.players[pi].keys -= 1;

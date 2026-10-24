@@ -182,6 +182,71 @@ fn the_altar_door_opens_to_a_hero_held_at_its_edge() {
 }
 
 #[test]
+fn the_citadel_portal_rides_the_tower_lift_up() {
+    // Bug report 20261023-234746: with the 13th runestone banked, the tower
+    // raises the lift to the Citadel (ActivateSpecialTrigger(255, 1)) and the
+    // portal placed on that lift must come up with it, as every item put on a
+    // moving floor does (AddItemSub), or it stays buried under the hall floor.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelL1", &[("JAC", "BLU")]).unwrap();
+    g.pending_enemies.clear();
+    let portal = |g: &Game| {
+        g.entities
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    Kind::Exit {
+                        dest: Some(0x803),
+                        ..
+                    }
+                )
+            })
+            .map(|e| e.pos)
+            .unwrap()
+    };
+    let down = portal(&g);
+    assert!(
+        down.y < -37.0,
+        "the portal starts on the lowered lift: {down:?}"
+    );
+    g.shards = 0x1FFF;
+    g.enter_tower();
+    for _ in 0..200 {
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    }
+    let up = portal(&g);
+    assert!(
+        up.y > -29.5 && up.y < -28.0,
+        "the portal rode the lift up: {up:?}"
+    );
+    // A hero on the raised lift beside it is within its reach.
+    let hero = Vec3::new(2.19, -28.89, 67.69);
+    let Kind::Exit { radius, .. } = g
+        .entities
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                Kind::Exit {
+                    dest: Some(0x803),
+                    ..
+                }
+            )
+        })
+        .map(|e| &e.kind)
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let d = Vec2::new(hero.x - up.x, hero.z - up.z).length();
+    assert!(
+        d < *radius,
+        "the hall-level hero reaches the portal: {d:.2} < {radius}"
+    );
+}
+
+#[test]
 fn melee_hurts_heroes_only_when_the_option_says() {
     let Some(fs) = data() else { return };
     let mut g = bare(&fs, &[("WAR", "RED"), ("VAL", "BLU")]);
