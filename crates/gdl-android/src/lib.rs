@@ -27,10 +27,12 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         .flatten()
         .collect();
     let fs = dirs.iter().find_map(|d| GameFs::find_in(d));
-    let Some(fs) = fs else {
+    let Some(mut fs) = fs else {
         log::error!("no game data found; copy your disc image into {:?}", dirs);
         return;
     };
+    // Asset packs: asset-packs/<name>/ folders beside the disc image.
+    fs.add_default_packs(&dirs);
     let cfg = app::Config {
         fs,
         level: "levelA1".into(),

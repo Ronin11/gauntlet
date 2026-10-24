@@ -44,6 +44,25 @@ counts as a controller (Enter). In the tower, a new controller can join with Sta
 Other options: `--level levelB1` to start elsewhere, `--players WAR,VAL/BLU` to skip the
 join screen, `--mute`. See `gauntlet --help`. Sound starts at 20% of the original's level (the Audio options scale on top); `GDL_VOLUME=0.5` sets another level.
 
+## Asset packs
+
+The disc is the original game. An **asset pack** is a folder laid out like the disc's
+`Gauntlet/` folder (`LEVELS/levelA1/textures.ngc`, `AUDIO/MUSIC.VBK`, ...); every file
+in it replaces the disc's file of the same name, and the rest still comes from the disc.
+Packs never change the game's rules, only what it looks and sounds like, so the original
+is always one flag away.
+
+```sh
+gauntlet --assets my-pack                 # one pack (repeat the flag; the first wins)
+GDL_ASSETS=hd-textures:new-music gauntlet # packs from the environment
+gauntlet --no-assets                      # the disc alone
+```
+
+Without flags, every folder inside an `asset-packs/` directory beside the game data, beside
+the executable or in the working directory is a pack, applied in name order (number them,
+`10-textures`, `20-music`, to choose the layering). On Android the folder sits beside the
+disc image. The log names each pack as it is added.
+
 ## Debug menu (developer tool)
 
 Not part of the original. **F1** on the keyboard, or on a gamepad **hold L + R + Z and

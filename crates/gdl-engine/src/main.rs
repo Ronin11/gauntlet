@@ -10,6 +10,10 @@ use std::path::PathBuf;
 
 struct Args {
     data: Option<PathBuf>,
+    /// --assets: asset packs layered over the game data, first wins.
+    assets: Vec<PathBuf>,
+    /// --no-assets: ignore GDL_ASSETS and asset-packs/ folders.
+    no_assets: bool,
     level: String,
     players: Vec<(String, String)>,
     snapshot: Option<PathBuf>,
@@ -60,6 +64,10 @@ USAGE: gauntlet [OPTIONS]
 
   --data <ISO|DIR>      Game disc image or extracted folder (default: auto-detect,
                         or $GDL_DATA)
+  --assets <DIR>        An asset pack laid over the game data (repeatable; the first
+                        wins). Without flags, $GDL_ASSETS and every folder in an
+                        asset-packs/ directory beside the data, the executable or
+                        here apply, in name order. --no-assets plays the disc alone.
   --level <name>        Level to start in (default levelA1)
   --mute                No music or sound (also: GDL_MUTE=1)
   --players <list>      Comma list of CLASS[/COLOR], e.g. WAR,VAL/BLU (default WAR)
@@ -108,6 +116,8 @@ Testing:
 fn parse_args() -> Result<Args> {
     let mut a = Args {
         data: None,
+        assets: Vec::new(),
+        no_assets: false,
         level: "levelA1".into(),
         players: Vec::new(),
         snapshot: None,
@@ -143,6 +153,8 @@ fn parse_args() -> Result<Args> {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "--data" => a.data = Some(val()?.into()),
+            "--assets" => a.assets.push(val()?.into()),
+            "--no-assets" => a.no_assets = true,
             "--level" => a.level = val()?,
             "--players" => {
                 a.players = val()?
@@ -203,10 +215,17 @@ fn parse_args() -> Result<Args> {
 }
 
 fn open_fs(args: &Args) -> Result<fs::GameFs> {
-    match &args.data {
-        Some(p) => fs::GameFs::open(p),
-        None => fs::GameFs::discover(),
+    let mut fs = match &args.data {
+        Some(p) => fs::GameFs::open(p)?,
+        None => fs::GameFs::discover()?,
+    };
+    for a in &args.assets {
+        fs.add_pack(a);
     }
+    if !args.no_assets {
+        fs.add_default_packs(&[]);
+    }
+    Ok(fs)
 }
 
 fn headless_gpu() -> Result<gpu::Gpu> {
