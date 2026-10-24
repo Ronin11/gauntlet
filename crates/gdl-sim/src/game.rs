@@ -3004,13 +3004,11 @@ impl Game {
                 continue;
             };
             // Random items pick one of their candidates.
-            if info.item_type == ItemType::Random && !info.random_indices.is_empty() {
-                let pick =
-                    info.random_indices[self.rng.next_u32() as usize % info.random_indices.len()];
-                match infos.get(pick as usize) {
+            if info.item_type == ItemType::Random {
+                match self.decide_random(info_idx) {
                     Some(i) => {
-                        info = i.clone();
-                        info_idx = pick as usize;
+                        info_idx = i;
+                        info = infos[i].clone();
                     }
                     None => continue,
                 }
@@ -3341,10 +3339,11 @@ impl Game {
                     if model.is_none() {
                         continue;
                     }
+                    // fn_8005E90C: what it holds, a random row decided now.
                     let drop = (info.item_type == ItemType::Container)
                         .then(|| i32::from_le_bytes(inst.params[0..4].try_into().unwrap()))
                         .filter(|&i| i >= 0)
-                        .map(|i| i as usize);
+                        .and_then(|i| self.decide_random(i as usize));
                     // fn_8005C1DC goes by the info's subtype (not SetItem case
                     // 10's params[0], which barrels set to 0x2B). A type-2
                     // barrel breaks rather than opening.
@@ -6617,7 +6616,29 @@ impl Game {
     }
 
     /// A chest or breakable's content: the placed item, or nothing.
+    /// fn_8005E90C's reroll: a random item row (type -1) stands for one of
+    /// its candidates, chosen here (the original: ((sItemRandSeed >> 5) +
+    /// item) % n, the seed stepping by 439); a chain of random rows is
+    /// followed to a real one. None for an index with no row, or a random
+    /// row with nothing to choose from.
+    pub(crate) fn decide_random(&mut self, mut idx: usize) -> Option<usize> {
+        for _ in 0..8 {
+            let info = self.level.worlds.item_infos.get(idx)?;
+            if info.item_type != ItemType::Random {
+                return Some(idx);
+            }
+            if info.random_indices.is_empty() {
+                return None;
+            }
+            let pick =
+                info.random_indices[self.rng.next_u32() as usize % info.random_indices.len()];
+            idx = usize::try_from(pick).ok()?;
+        }
+        None
+    }
+
     fn spawn_content(&mut self, pos: Vec3, item: Option<usize>) {
+        let item = item.and_then(|i| self.decide_random(i));
         let Some(info) = item
             .and_then(|i| self.level.worlds.item_infos.get(i))
             .cloned()

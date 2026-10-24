@@ -618,3 +618,72 @@ fn the_pad_in_a_swinging_lift_cabin_rides_with_it() {
         "the cabin is on its way back with its pad: {after:?} -> {back:?}"
     );
 }
+
+#[test]
+fn random_contents_are_decided_when_the_level_is_placed() {
+    // "A bunch of empty chests in the first level": some of levelA1's chests
+    // and barrels hold a random row (item type -1), which the original
+    // rerolls into one of its candidates as it places the level
+    // (fn_8005E90C). Left as the random row, a container opened or broken
+    // gave nothing.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+    g.pending_enemies.clear();
+    g.entities
+        .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
+    let infos = &g.level.worlds.item_infos;
+    let random_rows: Vec<usize> = infos
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.item_type == ItemType::Random)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!random_rows.is_empty(), "the level has random rows");
+    let holders: Vec<(u64, Vec3)> = g
+        .entities
+        .iter()
+        .filter_map(|e| match e.kind {
+            Kind::Container { drop: Some(d), .. } => {
+                assert!(
+                    !random_rows.contains(&d),
+                    "{:?} holds a decided item",
+                    e.kind
+                );
+                Some((e.id, e.pos))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        holders.len() >= 10,
+        "containers with contents: {}",
+        holders.len()
+    );
+    // The chest placed with a random row (inst 44) opens to something.
+    let chest = g
+        .entities
+        .iter()
+        .find(|e| {
+            matches!(e.kind, Kind::Container { chest: true, .. })
+                && (e.pos - Vec3::new(109.5, 19.96, 9.5)).length() < 1.0
+        })
+        .map(|e| (e.id, e.pos))
+        .expect("the chest at (109.5, 19.96, 9.5)");
+    g.players[0].keys = 1;
+    let before: Vec<u64> = g.entities.iter().map(|e| e.id).collect();
+    for _ in 0..40 {
+        g.players[0].pos = chest.1 + Vec3::new(2.8, 0.3, 0.0);
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    }
+    for _ in 0..240 {
+        g.players[0].pos = chest.1 + Vec3::new(20.0, 0.3, 0.0);
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    }
+    assert_eq!(g.players[0].keys, 0, "the key opened it");
+    let out = g
+        .entities
+        .iter()
+        .filter(|e| e.alive && !before.contains(&e.id) && (e.pos - chest.1).length() < 6.0)
+        .count();
+    assert!(out >= 1, "something came out of the chest");
+}
