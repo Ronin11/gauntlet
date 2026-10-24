@@ -5,6 +5,7 @@
 
 pub mod clip;
 pub mod mapping;
+pub mod prop;
 pub mod retarget;
 
 use anyhow::{bail, Context, Result};
@@ -262,7 +263,7 @@ impl ModernModel {
     }
 }
 
-fn rgba8(img: &gltf::image::Data) -> Option<Texture> {
+pub(crate) fn rgba8(img: &gltf::image::Data) -> Option<Texture> {
     use gltf::image::Format;
     let n = (img.width * img.height) as usize;
     let rgba = match img.format {

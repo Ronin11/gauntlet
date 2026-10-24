@@ -28,6 +28,12 @@ struct Args {
     modern_time: f32,
     /// --modern-roll JOINT:DEGREES[:TOWARD] (repeatable): twist a joint about the bone into it (or out to TOWARD).
     modern_roll: Vec<String>,
+    /// --modern-attach FILE:JOINT:LENGTH:GRIP[:RX,RY,RZ[:X,Y,Z]] (repeatable): a weapon on a joint.
+    modern_attach: Vec<String>,
+    /// --modern-only: with --modern, leave out the original.
+    modern_only: bool,
+    /// --modern-grip-clip FILE:NAME: the clip whose first frame --modern-attach aims are given in.
+    modern_grip_clip: Option<String>,
     seq: String,
     frame: f32,
     simulate: u32,
@@ -128,6 +134,9 @@ fn parse_args() -> Result<Args> {
         modern_clip: None,
         modern_time: 0.0,
         modern_roll: Vec::new(),
+        modern_attach: Vec::new(),
+        modern_only: false,
+        modern_grip_clip: None,
         seq: "READY".into(),
         frame: 0.0,
         simulate: 0,
@@ -170,6 +179,9 @@ fn parse_args() -> Result<Args> {
             "--modern-clip" => a.modern_clip = Some(val()?.into()),
             "--modern-time" => a.modern_time = val()?.parse()?,
             "--modern-roll" => a.modern_roll.push(val()?),
+            "--modern-attach" => a.modern_attach.push(val()?),
+            "--modern-only" => a.modern_only = true,
+            "--modern-grip-clip" => a.modern_grip_clip = Some(val()?),
             "--seq" => a.seq = val()?,
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
@@ -298,8 +310,8 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
             let ref_seq = cm
                 .sequence(rs)
                 .with_context(|| format!("no sequence {rs} for --modern-ref"))?;
-            let hero = gdl_engine::modern::ModernHero::load(path, &cm, ref_seq, rf.parse()?)?;
-            let posed = match &args.modern_clip {
+            let mut hero = gdl_engine::modern::ModernHero::load(path, &cm, ref_seq, rf.parse()?)?;
+            let clip = match &args.modern_clip {
                 Some(c) => {
                     let spec = c.to_string_lossy();
                     let (file, name) = match spec.rsplit_once(':') {
@@ -313,8 +325,54 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
                         let (j, d) = j.zip(d).context("--modern-roll JOINT:DEGREES[:TOWARD]")?;
                         clip.roll(hero.model(), j, to, d.parse()?)?;
                     }
-                    hero.mesh_clip(&clip, args.modern_time)?
+                    Some(clip)
                 }
+                None => None,
+            };
+            let ref_pose = match &args.modern_grip_clip {
+                Some(spec) => {
+                    let (file, name) = match spec.rsplit_once(':') {
+                        Some((f, n)) => (f, Some(n)),
+                        None => (&**spec, None),
+                    };
+                    let c = gdl_modern::clip::Clip::load_named(file, hero.model(), name)?;
+                    Some(c.skin_matrices(hero.model(), 0.0))
+                }
+                None => clip.as_ref().map(|c| c.skin_matrices(hero.model(), 0.0)),
+            };
+            for spec in &args.modern_attach {
+                let f: Vec<&str> = spec.split(':').collect();
+                let vec3 = |s: Option<&&str>| -> Result<Vec3> {
+                    match s {
+                        Some(s) => parse_vec3(s),
+                        None => Ok(Vec3::ZERO),
+                    }
+                };
+                anyhow::ensure!(f.len() >= 4, "--modern-attach FILE:JOINT:LENGTH:GRIP[:ROT[:SHIFT]]");
+                // ROT is x,y,z degrees, or aim=x,y,z[,twist]: where the far end points.
+                let (mut aim, mut twist, mut rotate) = (None, 0.0, Vec3::ZERO);
+                if !f.get(4).is_some_and(|r| r.starts_with("aim=")) {
+                    rotate = vec3(f.get(4))?;
+                }
+                if let Some(a) = f.get(4).and_then(|r| r.strip_prefix("aim=")) {
+                    let mut n = a.split(',').map(|x| x.parse::<f32>());
+                    let mut next = || -> Result<f32> { Ok(n.next().context("aim=x,y,z[,twist]")??) };
+                    aim = Some(Vec3::new(next()?, next()?, next()?));
+                    twist = next().unwrap_or(0.0);
+                    rotate = Vec3::ZERO;
+                }
+                let mount = gdl_modern::prop::Mount {
+                    length: f[2].parse()?,
+                    grip: f[3].parse()?,
+                    rotate,
+                    offset: vec3(f.get(5))?,
+                    aim,
+                    twist,
+                };
+                hero.attach(f[0], f[1], &mount, ref_pose.as_deref())?;
+            }
+            let posed = match &clip {
+                Some(clip) => hero.mesh_clip(clip, args.modern_time)?,
                 None => hero.mesh(&cm.node_world(seq, args.frame))?,
             };
             let mesh = gpu.upload_mesh(&posed)?;
@@ -335,7 +393,11 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
     let view = Mat4::look_at_rh(m.transform_point3(eye), m.transform_point3(at), Vec3::Y);
     let proj = Mat4::perspective_rh(50f32.to_radians(), w as f32 / h as f32, 0.1, 500.0);
     let g = gpu::globals(proj * view, m.transform_point3(eye), [0.0; 3], 0.0);
-    let mut draws = vec![(&gm, &inst)];
+    let mut draws = if modern.is_some() && args.modern_only {
+        vec![]
+    } else {
+        vec![(&gm, &inst)]
+    };
     if let Some((m, i)) = &modern {
         draws.push((m, i));
     }

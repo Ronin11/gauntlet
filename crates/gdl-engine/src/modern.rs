@@ -8,6 +8,7 @@ use crate::character::Model;
 use crate::mesh::{Batch, MeshData, Vertex};
 use anyhow::{Context, Result};
 use gdl_formats::Image;
+use gdl_modern::prop::{Mount, Prop};
 use gdl_modern::{mapping, retarget, ModernModel};
 use glam::{Mat4, Vec3};
 use std::path::Path;
@@ -18,6 +19,8 @@ pub struct ModernHero {
     /// The game pose the modern bind pose stands for.
     game_ref: Vec<Mat4>,
     scale: f32,
+    /// Weapons riding on joints: the prop, the joint index and its placement.
+    props: Vec<(Prop, usize, Mat4)>,
 }
 
 impl ModernHero {
@@ -51,6 +54,7 @@ impl ModernHero {
             retarget,
             game_ref,
             scale,
+            props: Vec::new(),
         })
     }
 
@@ -66,6 +70,39 @@ impl ModernHero {
     /// The mesh posed by a keyframe clip of the glTF at `time` seconds.
     pub fn mesh_clip(&self, clip: &gdl_modern::clip::Clip, time: f32) -> Result<MeshData> {
         self.mesh_from(&clip.skin_matrices(&self.model, time))
+    }
+
+    /// Carry the glTF at `path` on `joint`, placed by `mount`. `pose`: skin
+    /// matrices of the pose an `aim` is given in.
+    pub fn attach(
+        &mut self,
+        path: impl AsRef<Path>,
+        joint: &str,
+        mount: &Mount,
+        pose: Option<&[Mat4]>,
+    ) -> Result<()> {
+        let prop = Prop::load(path)?;
+        let j = self
+            .model
+            .joint(joint)
+            .with_context(|| format!("no joint {joint}"))?;
+        let mut mount = *mount;
+        // An aim is given in game space; the joint wants it in model space.
+        mount.aim = mount.aim.map(|a| self.retarget.from_game(a));
+        // The aim is meant for the pose given (an arm hanging), else the bind pose.
+        let rest = {
+            let rest_world = self.model.joints[j].rest_world;
+            let m = pose.map_or(rest_world, |p| p[j] * rest_world);
+            glam::Quat::from_mat3(&glam::Mat3::from_cols(
+                m.x_axis.truncate().normalize_or_zero(),
+                m.y_axis.truncate().normalize_or_zero(),
+                m.z_axis.truncate().normalize_or_zero(),
+            ))
+            .normalize()
+        };
+        let place = prop.placement(&mount, rest);
+        self.props.push((prop, j, place));
+        Ok(())
     }
 
     pub fn model(&self) -> &ModernModel {
@@ -117,6 +154,53 @@ impl ModernHero {
             height: tex.height,
             rgba: tex.rgba.clone(),
         });
+        for (prop, j, place) in &self.props {
+            let pose = mats[*j] * self.model.joints[*j].rest_world * *place;
+            let base = m.vertices.len() as u32;
+            let start = m.indices.len() as u32;
+            for ((p, n), uv) in prop.positions.iter().zip(&prop.normals).zip(&prop.uvs) {
+                let q = self.retarget.to_game(pose.transform_point3(*p)) * self.scale;
+                lo = lo.min(q);
+                hi = hi.max(q);
+                m.vertices.push(Vertex {
+                    pos: q.into(),
+                    normal: self
+                        .retarget
+                        .to_game(pose.transform_vector3(*n))
+                        .normalize_or_zero()
+                        .into(),
+                    color: [1.0; 4],
+                    uv: (*uv).into(),
+                    lm_uv: [0.0; 2],
+                });
+            }
+            for t in prop.indices.chunks_exact(3) {
+                m.indices.extend(if mirrored {
+                    [base + t[0], base + t[2], base + t[1]]
+                } else {
+                    [base + t[0], base + t[1], base + t[2]]
+                });
+            }
+            let tex = prop
+                .texture
+                .as_ref()
+                .context("prop has no base-colour texture")?;
+            m.batches.push(Batch {
+                start,
+                count: m.indices.len() as u32 - start,
+                texture: Some(m.textures.len()),
+                lightmap: None,
+                blend: false,
+                prelit: false,
+                additive: false,
+                part: 0,
+            });
+            m.textures.push(Image {
+                width: tex.width,
+                height: tex.height,
+                rgba: tex.rgba.clone(),
+            });
+        }
         m.bounds_min = lo;
         m.bounds_max = hi;
         Ok(m)

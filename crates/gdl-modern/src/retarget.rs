@@ -187,6 +187,11 @@ impl Retarget {
         self.basis * v
     }
 
+    /// A direction in game space, in the modern model's space.
+    pub fn from_game(&self, v: Vec3) -> Vec3 {
+        self.basis.transpose() * v
+    }
+
     /// Whether going to game space turns the model inside out (flips winding).
     pub fn mirrors(&self) -> bool {
         self.basis.determinant() < 0.0
