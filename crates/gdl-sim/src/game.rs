@@ -1418,6 +1418,40 @@ pub(crate) struct AssetFile {
     anim: Option<Anim>,
 }
 
+/// InitPlayerMissiles (combat.c): the hero's thrown model. Under level 10 it
+/// is `<weapon>_THROW0`; from level 10 on, `<weapon>_THROW<level / 10>`
+/// (the Archer's BOW_THROW1..4 arrows), else `<weapon>_THROW1`. The hero's
+/// own file is searched first, then the class's SFX bank, where a throw
+/// model counts only if its name carries the hero's class or base class
+/// (the Warrior's bank also holds the Minotaur's MIN_THROW1). Returns
+/// whether it came from the SFX bank, and the object's name.
+fn throw_object(
+    model: &[gdl_formats::objects::ObjectDef],
+    sfx: &[gdl_formats::objects::ObjectDef],
+    classes: &[&str],
+    level: u32,
+) -> Option<(bool, String)> {
+    let find = |tag: &str| {
+        model
+            .iter()
+            .find(|d| d.name.contains(tag))
+            .map(|d| (false, d.name.clone()))
+            .or_else(|| {
+                sfx.iter()
+                    .find(|d| d.name.contains(tag) && classes.iter().any(|c| d.name.contains(c)))
+                    .map(|d| (true, d.name.clone()))
+            })
+    };
+    let tier = (level / 10).min(9);
+    if tier == 0 {
+        return find("_THROW0").or_else(|| find("_THROW1"));
+    }
+    (1..=tier)
+        .rev()
+        .find_map(|t| find(&format!("_THROW{t}")))
+        .or_else(|| find("_THROW0"))
+}
+
 fn load_asset(fs: &GameFs, dir: &str) -> Option<AssetFile> {
     let objects = Objects::parse(&fs.read(&format!("{dir}/objects.ngc")).ok()?).ok()?;
     let textures = fs.read(&format!("{dir}/textures.ngc")).ok()?;
@@ -2040,34 +2074,50 @@ impl Game {
                 class_unlock: 0,
             });
         }
-        // Ranged-attack projectile: the class's throw model, else its weapon.
+        // Ranged-attack projectile (InitPlayerMissiles): the class's throw
+        // model from the hero's own file or the class's SFX bank, else the
+        // weapon itself.
+        let mut sfx_banks: BTreeMap<String, Option<AssetFile>> = BTreeMap::new();
         for (i, (class, color)) in classes.iter().enumerate() {
             let dir = format!("PLAYERS/{class}/{}", model_dir(i).unwrap_or(color));
             let Some(asset) = load_asset(fs, &dir) else {
                 continue;
             };
-            let throw = asset
-                .objects
-                .object_defs
-                .iter()
-                .find(|d| d.name.contains("_THROW0"))
-                .or_else(|| {
-                    asset
-                        .objects
-                        .object_defs
-                        .iter()
-                        .find(|d| d.name.starts_with("WEAP_"))
-                })
-                .map(|d| d.name.clone());
-            if let Some(name) = throw {
-                if let Some(m) = Model::from_objects_anim(
-                    &asset.objects,
-                    &asset.textures,
-                    asset.anim.as_ref(),
-                    &[&name],
-                ) {
-                    game.players[i].proj_model = Some(game.add_model(m));
-                }
+            let ct = game.players[i].class_id;
+            let base = crate::heroes::CLASSES[if (8..16).contains(&ct) { ct - 8 } else { ct }];
+            let sfx_dir = format!("PLAYERS/{base}/SFX{}", color.get(..3).unwrap_or(color));
+            let sfx = sfx_banks
+                .entry(sfx_dir.clone())
+                .or_insert_with(|| load_asset(fs, &sfx_dir));
+            let no_defs = Vec::new();
+            let sfx_defs = sfx.as_ref().map_or(&no_defs, |a| &a.objects.object_defs);
+            let throw = throw_object(
+                &asset.objects.object_defs,
+                sfx_defs,
+                &[class, base],
+                game.players[i].level,
+            );
+            let (from_sfx, name) = match throw {
+                Some(t) => t,
+                None => match asset
+                    .objects
+                    .object_defs
+                    .iter()
+                    .find(|d| d.name.starts_with("WEAP_"))
+                {
+                    Some(d) => (false, d.name.clone()),
+                    None => continue,
+                },
+            };
+            let src = if from_sfx {
+                sfx.as_ref().unwrap()
+            } else {
+                &asset
+            };
+            if let Some(m) =
+                Model::from_objects_anim(&src.objects, &src.textures, src.anim.as_ref(), &[&name])
+            {
+                game.players[i].proj_model = Some(game.add_model(m));
             }
         }
         // PlayerSfxInitData: each record's effect from the hero's SFX tree
@@ -10755,6 +10805,48 @@ mod tests {
     /// Bot-driven inputs for every hero, from the game's own state.
     fn bot_inputs(g: &Game) -> Vec<PlayerInput> {
         (0..g.players.len()).map(|i| g.bot_input(i)).collect()
+    }
+
+    #[test]
+    fn archers_throw_arrows_not_their_bows() {
+        let Some(fs) = data() else {
+            eprintln!("game data not found; skipping");
+            return;
+        };
+        let defs = |dir: &str| load_asset(&fs, dir).unwrap().objects.object_defs;
+        let (arc, arc_sfx) = (defs("PLAYERS/ARC/BLU"), defs("PLAYERS/ARC/SFXBLU"));
+        assert_eq!(
+            throw_object(&arc, &arc_sfx, &["ARC", "ARC"], 1),
+            Some((true, "BOW_THROW1ARC_A".into())),
+            "the Archer's arrow comes from her SFX bank"
+        );
+        assert_eq!(
+            throw_object(&arc, &arc_sfx, &["ARC", "ARC"], 23),
+            Some((true, "BOW_THROW2ARC_A".into())),
+            "a higher arrow from level 20"
+        );
+        let (tig, _) = (defs("PLAYERS/TIG/BLU"), ());
+        assert_eq!(
+            throw_object(&tig, &arc_sfx, &["TIG", "ARC"], 1),
+            Some((true, "BOW_THROW1ARC_A".into())),
+            "the Tigress shares the Archer's arrows"
+        );
+        let (war, war_sfx) = (defs("PLAYERS/WAR/RED"), defs("PLAYERS/WAR/SFXRED"));
+        assert_eq!(
+            throw_object(&war, &war_sfx, &["WAR", "WAR"], 1),
+            Some((false, "AXE_THROW0GROUP".into())),
+            "the Warrior's axe is in his own file"
+        );
+        assert_eq!(
+            throw_object(&war, &war_sfx, &["WAR", "WAR"], 30),
+            Some((false, "AXE_THROW0GROUP".into())),
+            "the Minotaur's MIN_THROW1 in the shared bank is not the Warrior's"
+        );
+        let mut g = Game::new(&fs, "levelA1", &[("ARC", "BLU")]).unwrap();
+        assert!(g.players[0].proj_model.is_some());
+        for _ in 0..30 {
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        }
     }
 
     #[test]
