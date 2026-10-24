@@ -105,7 +105,7 @@ Testing:
   --char CLASS/COLOR    Snapshot a single character (or monster/NAME)
   --modern <glb>        With --char: also draw a rigged glTF in the same pose, beside it
   --modern-ref SEQ[:F]  The game pose the glTF's bind pose matches (default READY:0)
-  --modern-clip <glb>   Pose the glTF from this clip's keyframes at --modern-time seconds
+  --modern-clip <glb[:name]>  Pose the glTF from this clip's keyframes at --modern-time seconds
   --seq NAME --frame F  Animation sequence and frame for --char
   --eye x,y,z --at x,y,z --size WxH   Snapshot camera";
 
@@ -297,7 +297,12 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
             let hero = gdl_engine::modern::ModernHero::load(path, &cm, ref_seq, rf.parse()?)?;
             let posed = match &args.modern_clip {
                 Some(c) => {
-                    let clip = gdl_modern::clip::Clip::load(c, hero.model())?;
+                    let spec = c.to_string_lossy();
+                    let (file, name) = match spec.rsplit_once(':') {
+                        Some((f, n)) => (f, Some(n)),
+                        None => (&*spec, None),
+                    };
+                    let clip = gdl_modern::clip::Clip::load_named(file, hero.model(), name)?;
                     hero.mesh_clip(&clip, args.modern_time)?
                 }
                 None => hero.mesh(&cm.node_world(seq, args.frame))?,

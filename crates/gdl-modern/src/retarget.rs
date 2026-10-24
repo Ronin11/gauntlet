@@ -68,7 +68,20 @@ impl Retarget {
         aim: &[(&str, &str)],
         forward: (&str, &str),
     ) -> Result<Self> {
-        let node_of = |name: &str| game_nodes.iter().position(|g| g.eq_ignore_ascii_case(name));
+        // Some heroes' node names are cut short (`ROOT_PEL` for `ROOT_PELVIS`).
+        let node_of = |name: &str| {
+            let same = |g: &&str| g.eq_ignore_ascii_case(name);
+            let cut = |g: &&str| {
+                g.len() >= 7
+                    && name
+                        .to_ascii_uppercase()
+                        .starts_with(&g.to_ascii_uppercase())
+            };
+            game_nodes
+                .iter()
+                .position(|g| same(&g))
+                .or_else(|| game_nodes.iter().position(|g| cut(&g)))
+        };
         let mut pairs = Vec::new();
         let mut missing = Vec::new();
         for &(node, joint) in map {
@@ -83,7 +96,11 @@ impl Retarget {
             }
         }
         if !missing.is_empty() {
-            bail!("unmapped: {}", missing.join(", "));
+            bail!(
+                "unmapped: {} (the game skeleton has: {})",
+                missing.join(", "),
+                game_nodes.join(" ")
+            );
         }
         let joint_of_node = |n: usize| pairs.iter().find(|p| p.node == n).map(|p| p.joint);
         let aims: Vec<Option<(usize, usize)>> = pairs
@@ -111,7 +128,10 @@ impl Retarget {
             p.aim = aims[i];
             p.parent = parents[i];
         }
-        let find = |name: &str| pairs.iter().find(|p| game_nodes[p.node] == name);
+        let find = |name: &str| {
+            let n = node_of(name)?;
+            pairs.iter().find(|p| p.node == n)
+        };
         let root = find("ROOT_PELVIS").map(|p| p.node).unwrap_or(pairs[0].node);
         let pos = |name: &str| {
             model

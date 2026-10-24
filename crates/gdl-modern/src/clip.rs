@@ -55,10 +55,22 @@ impl Clip {
     /// The first animation of `path`, with channels matched to `model`'s joints
     /// by node name.
     pub fn load(path: impl AsRef<Path>, model: &ModernModel) -> Result<Self> {
+        Self::load_named(path, model, None)
+    }
+
+    /// The animation called `name` (the first, if `None`).
+    pub fn load_named(
+        path: impl AsRef<Path>,
+        model: &ModernModel,
+        name: Option<&str>,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let (doc, buffers, _) =
             gltf::import(path).with_context(|| format!("reading {}", path.display()))?;
-        let anim = doc.animations().next().context("glTF has no animation")?;
+        let anim = doc
+            .animations()
+            .find(|a| name.map_or(true, |n| a.name() == Some(n)))
+            .with_context(|| format!("no animation {name:?} in {}", path.display()))?;
         let by_node: std::collections::HashMap<usize, usize> = doc
             .nodes()
             .filter_map(|n| Some((n.index(), model.joint(n.name()?)?)))
