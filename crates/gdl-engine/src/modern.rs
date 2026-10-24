@@ -60,7 +60,20 @@ impl ModernHero {
         let mats = self
             .retarget
             .skin_matrices(&self.model, &self.game_ref, game_now);
-        let posed = retarget::skin(&self.model, &mats);
+        self.mesh_from(&mats)
+    }
+
+    /// The mesh posed by a keyframe clip of the glTF at `time` seconds.
+    pub fn mesh_clip(&self, clip: &gdl_modern::clip::Clip, time: f32) -> Result<MeshData> {
+        self.mesh_from(&clip.skin_matrices(&self.model, time))
+    }
+
+    pub fn model(&self) -> &ModernModel {
+        &self.model
+    }
+
+    fn mesh_from(&self, mats: &[Mat4]) -> Result<MeshData> {
+        let posed = retarget::skin(&self.model, mats);
         let tex = self
             .model
             .texture

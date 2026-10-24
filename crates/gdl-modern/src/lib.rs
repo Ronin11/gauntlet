@@ -3,6 +3,7 @@
 //! [`ModernModel`] reads a rigged `.glb` (Tripo's biped output, or any glTF skin);
 //! [`mapping`] says which glTF joint stands in for each game skeleton node.
 
+pub mod clip;
 pub mod mapping;
 pub mod retarget;
 

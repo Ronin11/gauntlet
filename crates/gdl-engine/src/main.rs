@@ -23,6 +23,9 @@ struct Args {
     modern: Option<PathBuf>,
     /// --modern-ref SEQ[:FRAME]: the game pose the glTF's bind pose matches.
     modern_ref: String,
+    /// --modern-clip: pose the glTF from a keyframe clip instead of --seq.
+    modern_clip: Option<PathBuf>,
+    modern_time: f32,
     seq: String,
     frame: f32,
     simulate: u32,
@@ -102,6 +105,7 @@ Testing:
   --char CLASS/COLOR    Snapshot a single character (or monster/NAME)
   --modern <glb>        With --char: also draw a rigged glTF in the same pose, beside it
   --modern-ref SEQ[:F]  The game pose the glTF's bind pose matches (default READY:0)
+  --modern-clip <glb>   Pose the glTF from this clip's keyframes at --modern-time seconds
   --seq NAME --frame F  Animation sequence and frame for --char
   --eye x,y,z --at x,y,z --size WxH   Snapshot camera";
 
@@ -119,6 +123,8 @@ fn parse_args() -> Result<Args> {
         character: None,
         modern: None,
         modern_ref: "READY".into(),
+        modern_clip: None,
+        modern_time: 0.0,
         seq: "READY".into(),
         frame: 0.0,
         simulate: 0,
@@ -158,6 +164,8 @@ fn parse_args() -> Result<Args> {
             "--char" => a.character = Some(val()?),
             "--modern" => a.modern = Some(val()?.into()),
             "--modern-ref" => a.modern_ref = val()?,
+            "--modern-clip" => a.modern_clip = Some(val()?.into()),
+            "--modern-time" => a.modern_time = val()?.parse()?,
             "--seq" => a.seq = val()?,
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
@@ -287,7 +295,14 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
                 .sequence(rs)
                 .with_context(|| format!("no sequence {rs} for --modern-ref"))?;
             let hero = gdl_engine::modern::ModernHero::load(path, &cm, ref_seq, rf.parse()?)?;
-            let mesh = gpu.upload_mesh(&hero.mesh(&cm.node_world(seq, args.frame))?)?;
+            let posed = match &args.modern_clip {
+                Some(c) => {
+                    let clip = gdl_modern::clip::Clip::load(c, hero.model())?;
+                    hero.mesh_clip(&clip, args.modern_time)?
+                }
+                None => hero.mesh(&cm.node_world(seq, args.frame))?,
+            };
+            let mesh = gpu.upload_mesh(&posed)?;
             let mut inst = gpu.new_instance(&mesh);
             inst.transform = mirror() * Mat4::from_translation(Vec3::new(4.0, 0.0, 0.0));
             Some((mesh, inst))
