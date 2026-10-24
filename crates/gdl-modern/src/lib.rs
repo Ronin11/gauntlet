@@ -235,13 +235,21 @@ impl ModernModel {
                     .find_map(|k| limb_of[v.joints[k] as usize])
             })
             .collect();
+        let limb_anchor: Vec<Option<usize>> =
+            roots.iter().map(|&r| self.joints[r].parent).collect();
         let before = self.indices.len();
         let mut kept = Vec::with_capacity(before);
         for t in self.indices.chunks_exact(3) {
-            let limbs = t.iter().filter_map(|&i| limb_of_vertex[i as usize]);
-            let mut limbs = limbs.collect::<Vec<_>>();
-            limbs.dedup();
-            if limbs.len() < 2 {
+            // Limbs hanging off the same joint (both thighs, both clavicles) meet
+            // at the body's centre line on purpose; only others get cut apart.
+            let limbs: Vec<usize> = t
+                .iter()
+                .filter_map(|&i| limb_of_vertex[i as usize])
+                .collect();
+            let apart = limbs
+                .iter()
+                .any(|&a| limbs.iter().any(|&b| limb_anchor[a] != limb_anchor[b]));
+            if !apart {
                 kept.extend_from_slice(t);
             }
         }
