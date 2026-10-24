@@ -562,3 +562,59 @@ fn the_tower_starts_with_what_is_earned_already_in_place() {
         "the lift stays put: {again} vs {dy}"
     );
 }
+
+#[test]
+fn the_pad_in_a_swinging_lift_cabin_rides_with_it() {
+    // Bug report 20261024-025014 (levelG1, "platform won't move"): the
+    // lever on the pier swings the wooden lift cabin over, and the toggle
+    // pad in the cabin (every hero on it) sends it back. The cabin's
+    // animation starts it away from where it was modelled, so the pad was
+    // put down on nothing at load and stayed behind when the cabin came.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelG1", &[("WAR", "RED")]).unwrap();
+    g.pending_enemies.clear();
+    let arm = object(&g, "G1WOOD_ARM");
+    let floor = object(&g, "G1FLOOR#29");
+    let m = g.movers.iter().position(|m| m.root == arm).unwrap();
+    let pad = g
+        .entities
+        .iter()
+        .position(|e| {
+            matches!(e.kind, Kind::Trigger { mover: Some(mm), mode: TriggerMode::Toggle, .. } if mm == m)
+        })
+        .expect("the cabin's toggle pad");
+    let ride = g.entities[pad]
+        .ride
+        .expect("the pad is parented to the cabin floor");
+    assert_eq!(ride.obj, floor as i32);
+    let before = g.entities[pad].pos;
+    // The pier's lever brings the cabin over, pad and all.
+    g.movers[m].active = true;
+    step(&mut g, 240);
+    assert!(!g.movers[m].moving, "the cabin has arrived");
+    let after = g.entities[pad].pos;
+    assert!(
+        (after - before).length() > 8.0,
+        "the pad came over with the cabin: {before:?} -> {after:?}"
+    );
+    let cabin = g
+        .world_anim
+        .delta(floor)
+        .transform_point3(g.level.world_pos[floor].into());
+    assert!(
+        Vec2::new(after.x - cabin.x, after.z - cabin.z).length() < 4.0,
+        "the pad is in the cabin: {after:?} vs {cabin:?}"
+    );
+    // A hero standing on it in the cabin sends the cabin back.
+    for _ in 0..12 {
+        g.players[0].pos = after + Vec3::Y * 0.2;
+        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    }
+    assert!(!g.movers[m].active, "the pad toggled the cabin back");
+    step(&mut g, 120);
+    let back = g.entities[pad].pos;
+    assert!(
+        (back - after).length() > 2.0,
+        "the cabin is on its way back with its pad: {after:?} -> {back:?}"
+    );
+}

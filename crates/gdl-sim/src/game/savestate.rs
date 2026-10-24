@@ -502,9 +502,11 @@ impl Game {
             self.world_anim
                 .restore_rotator(r.target, r.curang, r.on, r.done, r.node);
         }
-        // Pose the world at the restored frames, and its collision with it.
+        // Pose the world at the restored frames, and its collision with it,
+        // and the items parented to its moving floors where it puts them.
         self.world_anim.update(&mut self.collision, 0.0);
         self.collision.refit_dynamic();
+        self.pose_riding_items();
     }
 
     fn apply_placed(&mut self, i: usize, p: &Placed) {

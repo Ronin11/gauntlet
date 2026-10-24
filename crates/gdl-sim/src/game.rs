@@ -1054,11 +1054,23 @@ pub struct Entity {
     /// 1 = fully shown, 0 = invisible (the tower's fade-ins).
     pub fade: f32,
     /// AddItemSub parented a placed item to the moving floor object it was
-    /// put on (flag 0x1000): that object, the height it was put at and the
-    /// offset then of the mover sliding the object (if one does). The item
-    /// rides the floor: a pad on a lift, or the tower's Citadel portal on
-    /// the lift the 13th runestone raises.
-    pub ride: Option<(i32, f32, f32)>,
+    /// put on (flag 0x1000). The item rides the floor: a pad on a lift, the
+    /// tower's Citadel portal on the lift the 13th runestone raises, the
+    /// pad in a swinging lift cabin.
+    pub ride: Option<Ride>,
+}
+
+/// How a placed item is parented to its moving floor (MBNodeSetParent in
+/// AddItemSub): the floor object, where the item sits in that object's own
+/// frame (so it goes wherever the object's node goes, an animated floor
+/// included), and for a floor a mover slides, the height it was put at and
+/// the mover's offset then.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ride {
+    pub obj: i32,
+    pub local: Vec3,
+    pub y: f32,
+    pub off: f32,
 }
 
 /// A monster type (`GRU`, `RAT`, ...) with a model per strength level.

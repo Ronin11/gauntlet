@@ -643,6 +643,11 @@ impl crate::game::Game {
     /// original does this for every item; triggers and exits are put down
     /// here.)
     pub(crate) fn put_items_on_floor(&mut self, ids: &[u64]) {
+        // The world posed at its animations' first frames, as it is when
+        // the original adds its items: a lift cabin whose animation starts
+        // it away from where it was modelled has its pad put down in the
+        // cabin, not on the water where the cabin was modelled.
+        self.world_anim.update(&mut self.collision, 0.0);
         for e in self.entities.iter_mut().filter(|e| ids.contains(&e.id)) {
             let hit = self.collision.floor_collide(e.pos, 1.0, 4.0, -10.0, true);
             e.pos.y = hit.map_or(e.pos.y, |h| h.at.y) + 0.1;
@@ -650,7 +655,17 @@ impl crate::game::Game {
                 .filter(|h| self.collision.obj_flags[h.tri] & NODE != 0)
                 .map(|h| {
                     let off = Self::sliding(&self.movers, h.owner).map_or(0.0, |m| m.offset);
-                    (h.owner, e.pos.y, off)
+                    let world = usize::try_from(h.owner)
+                        .ok()
+                        .and_then(|o| self.world_anim.world.get(o))
+                        .copied()
+                        .unwrap_or(Mat4::IDENTITY);
+                    crate::game::Ride {
+                        obj: h.owner,
+                        local: world.inverse().transform_point3(e.pos),
+                        y: e.pos.y,
+                        off,
+                    }
                 });
         }
     }
@@ -667,11 +682,35 @@ impl crate::game::Game {
     /// down with it.
     pub(crate) fn slide_riding_items(&mut self) {
         for e in &mut self.entities {
-            if let Some((o, y, off)) = e.ride {
-                if let Some(m) = Self::sliding(&self.movers, o) {
-                    e.pos.y = y + m.offset - off;
+            if let Some(r) = e.ride {
+                if let Some(m) = Self::sliding(&self.movers, r.obj) {
+                    e.pos.y = r.y + m.offset - r.off;
                 }
             }
+        }
+    }
+
+    /// Items parented to a floor whose node moves (an animated lift, a
+    /// rotator's deck) sit where its node now puts them, turned as it
+    /// turned this frame.
+    pub(crate) fn pose_riding_items(&mut self) {
+        for e in &mut self.entities {
+            let Some(r) = e.ride else {
+                continue;
+            };
+            if Self::sliding(&self.movers, r.obj).is_some() {
+                continue;
+            }
+            let Some(world) = usize::try_from(r.obj)
+                .ok()
+                .and_then(|o| self.world_anim.world.get(o))
+            else {
+                continue;
+            };
+            if let Some((_, turn)) = self.world_anim.carry(r.obj, e.pos) {
+                e.yaw += turn;
+            }
+            e.pos = world.transform_point3(r.local);
         }
     }
 
@@ -729,16 +768,7 @@ impl crate::game::Game {
             }
         }
         // Items parented to an animated floor (put_items_on_floor).
-        for e in &mut self.entities {
-            if let Some((o, _, _)) = e.ride {
-                if Self::sliding(&self.movers, o).is_none() {
-                    if let Some((to, turn)) = self.world_anim.carry(o, e.pos) {
-                        e.pos = to;
-                        e.yaw += turn;
-                    }
-                }
-            }
-        }
+        self.pose_riding_items();
         for (kind, _) in sounds {
             let id = if kind == 0 {
                 self.realm_sound(&ROTATE_SFX)
@@ -936,8 +966,8 @@ mod tests {
         let turned = f.x.atan2(f.z).abs().to_degrees();
         assert!((turned - 30.0).abs() < 1.0, "turned {turned}");
         // Each vertex keeps its distance from the node (which its elevator
-        // trigger may also have slid).
-        let r0 = (v0[0] - g.world_anim.rest[o]).length();
+        // trigger may also have slid; the world is posed from load).
+        let r0 = (v0[0] - g.world_anim.world[o].w_axis.truncate()).length();
         let v1 = g.collision.tris[tri].v;
         let r1 = (v1[0] - g.world_anim.world[o].w_axis.truncate()).length();
         assert!((r1 - r0).abs() < 1e-3, "{r0} {r1}");
