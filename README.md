@@ -63,6 +63,12 @@ the executable or in the working directory is a pack, applied in name order (num
 `10-textures`, `20-music`, to choose the layering). On Android the folder sits beside the
 disc image. The log names each pack as it is added.
 
+The rules are the other half of the split. `--rules classic` (the default) plays the
+GameCube original; `--rules remix` selects the modernised rules, which are the classic
+values until a remix feature changes one. Rules are a value the simulation reads
+(`crates/gdl-sim/src/rules.rs`), so a tunable moves in there only when something needs
+to change it, keeping its original value as the classic default.
+
 ## Debug menu (developer tool)
 
 Not part of the original. **F1** on the keyboard, or on a gamepad **hold L + R + Z and

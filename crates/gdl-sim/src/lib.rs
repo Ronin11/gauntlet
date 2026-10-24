@@ -29,6 +29,7 @@ pub mod paction;
 pub mod powerups;
 pub mod progress;
 pub mod psys;
+pub mod rules;
 pub mod save;
 pub mod shadow;
 pub mod soundlib;

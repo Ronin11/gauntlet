@@ -4,10 +4,10 @@
 //! notices when it gets nowhere.
 
 use super::nav::{xz, Goal, Nav};
+use super::nav::{HashMap, HashSet};
 use crate::game::{EnemyState, Game, Kind, LevelEnd, PickupKind, PlayerState, PLAYER_RADIUS};
 use crate::input::PlayerInput;
 use glam::{Vec2, Vec3};
-use super::nav::{HashMap, HashSet};
 use std::collections::VecDeque;
 
 /// What a hero is after.
@@ -310,9 +310,7 @@ impl Bot {
                 _ => return None,
             },
             (Obj::Door(_), Some(e)) => match e.kind {
-                Kind::Door { radius, .. } => {
-                    (vec![Goal::new(e.pos, radius + 1.0, 2.5)], e.pos)
-                }
+                Kind::Door { radius, .. } => (vec![Goal::new(e.pos, radius + 1.0, 2.5)], e.pos),
                 _ => return None,
             },
             (Obj::Trigger(_), Some(e)) => match e.kind {
@@ -334,16 +332,21 @@ impl Bot {
                     .iter()
                     .copied()
                     .min_by(|a, b| (*a - me).length().total_cmp(&(*b - me).length()))?;
-                (pts.iter().map(|&p| Goal::new(p, PLAYER_RADIUS + 1.6, 4.0)).collect(), near)
+                (
+                    pts.iter()
+                        .map(|&p| Goal::new(p, PLAYER_RADIUS + 1.6, 4.0))
+                        .collect(),
+                    near,
+                )
             }
             (Obj::Smash(_), Some(e)) => {
                 let r = solid_radius(e) + PLAYER_RADIUS + 1.2;
                 (vec![Goal::new(e.pos, r, 3.0)], e.pos)
             }
             (Obj::Lectern, _) => {
-                let e = g.entities.iter().find(|e| {
-                    matches!(e.kind, Kind::Trigger { id, .. } if id == crate::tower::LECTERN)
-                })?;
+                let e = g.entities.iter().find(
+                    |e| matches!(e.kind, Kind::Trigger { id, .. } if id == crate::tower::LECTERN),
+                )?;
                 let r = match e.kind {
                     Kind::Trigger { radius, .. } => radius + 1.0,
                     _ => 2.0,
@@ -360,7 +363,10 @@ impl Bot {
                     .untouched_rotators()
                     .into_iter()
                     .find(|x| x.2 as u64 == t)?;
-                (vec![Goal::new(at, (r + PLAYER_RADIUS - 0.3).max(1.0), 2.5)], at)
+                (
+                    vec![Goal::new(at, (r + PLAYER_RADIUS - 0.3).max(1.0), 2.5)],
+                    at,
+                )
             }
             (Obj::Boss, _) => {
                 let (at, r) = boss_point(g, g.players[0].pos)?;
@@ -406,7 +412,11 @@ impl Bot {
         Some((*o, path, cost))
     }
 
-    fn cands(&self, g: &Game, f: impl Fn(&crate::game::Entity) -> Option<Obj>) -> Vec<(Obj, Vec<Goal>, Vec3)> {
+    fn cands(
+        &self,
+        g: &Game,
+        f: impl Fn(&crate::game::Entity) -> Option<Obj>,
+    ) -> Vec<(Obj, Vec<Goal>, Vec3)> {
         g.entities
             .iter()
             .filter(|e| e.alive)
@@ -417,7 +427,9 @@ impl Bot {
     }
 
     fn set_obj(&mut self, g: &Game, i: usize, o: Obj, path: Vec<u32>, cost: f32) {
-        let (goals, target) = self.goals_of(g, o).unwrap_or((Vec::new(), g.players[i].pos));
+        let (goals, target) = self
+            .goals_of(g, o)
+            .unwrap_or((Vec::new(), g.players[i].pos));
         let a = &mut self.agents[i];
         let same = a.obj == Some(o);
         a.obj = Some(o);
@@ -462,7 +474,11 @@ impl Bot {
                     // A boss out of walking reach (flying, in a pit) is steered
                     // at directly; the search is retried only now and then.
                     let retry = g.time - self.boss_fail_t > 15.0;
-                    let r = if retry { self.plan_any(g, i, &cands) } else { None };
+                    let r = if retry {
+                        self.plan_any(g, i, &cands)
+                    } else {
+                        None
+                    };
                     match r {
                         Some((o, path, cost)) => self.set_obj(g, i, o, path, cost),
                         None => {
@@ -508,7 +524,11 @@ impl Bot {
                 // Which open portals can be walked to at all.
                 self.portals_reachable.clear();
                 let portals = self.cands(g, |e| match e.kind {
-                    Kind::Exit { open: true, dest: Some(_), .. } => Some(Obj::Portal(e.id)),
+                    Kind::Exit {
+                        open: true,
+                        dest: Some(_),
+                        ..
+                    } => Some(Obj::Portal(e.id)),
                     _ => None,
                 });
                 for c in &portals {
@@ -519,13 +539,19 @@ impl Bot {
                     let ok = self.plan_any(g, i, std::slice::from_ref(c)).is_some();
                     self.portals_reachable.push(format!(
                         "{}:{}",
-                        g.worlds.level(dest).map_or(format!("{dest:#x}"), |l| l.name.clone()),
+                        g.worlds
+                            .level(dest)
+                            .map_or(format!("{dest:#x}"), |l| l.name.clone()),
                         if ok { "reachable" } else { "UNREACHABLE" }
                     ));
                 }
             }
             let portals = self.cands(g, |e| match e.kind {
-                Kind::Exit { open: true, dest: Some(_), .. } => Some(Obj::Portal(e.id)),
+                Kind::Exit {
+                    open: true,
+                    dest: Some(_),
+                    ..
+                } => Some(Obj::Portal(e.id)),
                 _ => None,
             });
             if let Some((o, path, cost)) = self.plan_any(g, i, &portals) {
@@ -535,7 +561,10 @@ impl Bot {
             // A new party's way out: the tower's crystals open its first
             // barrier (the barrier opens to a touch once enough are found).
             let crystals = self.cands(g, |e| match e.kind {
-                Kind::Pickup { kind: PickupKind::Crystal(_), .. } => Some(Obj::Pickup(e.id)),
+                Kind::Pickup {
+                    kind: PickupKind::Crystal(_),
+                    ..
+                } => Some(Obj::Pickup(e.id)),
                 _ => None,
             });
             if let Some((o, path, cost)) = self.plan_any(g, i, &crystals) {
@@ -567,7 +596,10 @@ impl Bot {
         // Low on health: food close by first.
         if health < 0.5 {
             let cands = self.cands(g, |e| match e.kind {
-                Kind::Pickup { kind: PickupKind::Food(v), .. } if v > 0.0 => Some(Obj::Food(e.id)),
+                Kind::Pickup {
+                    kind: PickupKind::Food(v),
+                    ..
+                } if v > 0.0 => Some(Obj::Food(e.id)),
                 _ => None,
             });
             if let Some((o, path, cost)) = self.plan_any(g, i, &cands) {
@@ -611,11 +643,17 @@ impl Bot {
             if !self.failed.contains(&o) {
                 if is_door && keys == 0 {
                     let ks = self.cands(g, |e| match e.kind {
-                        Kind::Pickup { kind: PickupKind::Key(_), .. } => Some(Obj::Key(e.id)),
+                        Kind::Pickup {
+                            kind: PickupKind::Key(_),
+                            ..
+                        } => Some(Obj::Key(e.id)),
                         _ => None,
                     });
                     if let Some((o, path, cost)) = self.plan_any(g, i, &ks) {
-                        let line = format!("{} blocks the way to the exit: fetching a key", Obj::Door(b).name());
+                        let line = format!(
+                            "{} blocks the way to the exit: fetching a key",
+                            Obj::Door(b).name()
+                        );
                         self.log(g, line);
                         self.set_obj(g, i, o, path, cost);
                         return Ok(());
@@ -640,7 +678,13 @@ impl Bot {
         if self.verbose {
             // Where each lever and pad stands relative to what can be reached.
             for e in g.entities.iter().filter(|e| e.alive) {
-                if let Kind::Trigger { gate: None, pressed, mode, .. } = e.kind {
+                if let Kind::Trigger {
+                    gate: None,
+                    pressed,
+                    mode,
+                    ..
+                } = e.kind
+                {
                     let near = reach
                         .iter()
                         .map(|&n| self.nav.nodes[n as usize].pos)
@@ -660,10 +704,16 @@ impl Bot {
             .iter()
             .filter(|e| e.alive)
             .filter_map(|e| match e.kind {
-                Kind::Trigger { gate: None, id, mover: Some(m), mode, pressed, .. }
-                    if id != crate::tower::LECTERN
-                        && !(mode == crate::triggers::TriggerMode::Latch
-                            && (pressed || g.movers.get(m).is_some_and(|m| m.active))) =>
+                Kind::Trigger {
+                    gate: None,
+                    id,
+                    mover: Some(m),
+                    mode,
+                    pressed,
+                    ..
+                } if id != crate::tower::LECTERN
+                    && !(mode == crate::triggers::TriggerMode::Latch
+                        && (pressed || g.movers.get(m).is_some_and(|m| m.active))) =>
                 {
                     Some(e.id)
                 }
@@ -675,7 +725,9 @@ impl Bot {
             if self.failed.contains(&o) {
                 continue;
             }
-            let Some((gl, _)) = self.goals_of(g, o) else { continue };
+            let Some((gl, _)) = self.goals_of(g, o) else {
+                continue;
+            };
             let at_hand = reach
                 .iter()
                 .any(|&n| gl.iter().any(|x| x.holds(self.nav.nodes[n as usize].pos)));
@@ -709,9 +761,14 @@ impl Bot {
                 self.log(g, line);
             }
             self.reach_mark = reach;
-            self.tried.retain(|o, _| !matches!(o, Obj::Trigger(_) | Obj::Smash(_)));
-            self.failed
-                .retain(|o| !matches!(o, Obj::Trigger(_) | Obj::Smash(_) | Obj::Door(_) | Obj::Exit(_)));
+            self.tried
+                .retain(|o, _| !matches!(o, Obj::Trigger(_) | Obj::Smash(_)));
+            self.failed.retain(|o| {
+                !matches!(
+                    o,
+                    Obj::Trigger(_) | Obj::Smash(_) | Obj::Door(_) | Obj::Exit(_)
+                )
+            });
         }
         let keys: u32 = g.players.iter().map(|p| p.keys).sum();
         let tried_map = self.tried.clone();
@@ -719,7 +776,9 @@ impl Bot {
         // 1. A locked door, with a key.
         if keys > 0 {
             let doors: Vec<_> = self
-                .cands(g, |e| matches!(e.kind, Kind::Door { .. }).then_some(Obj::Door(e.id)))
+                .cands(g, |e| {
+                    matches!(e.kind, Kind::Door { .. }).then_some(Obj::Door(e.id))
+                })
                 .into_iter()
                 .filter(|c| tried(&c.0) < 2)
                 .collect();
@@ -731,7 +790,10 @@ impl Bot {
         // 2. Keys.
         if keys < crate::game::MAX_KEYS {
             let ks = self.cands(g, |e| match e.kind {
-                Kind::Pickup { kind: PickupKind::Key(_), .. } => Some(Obj::Key(e.id)),
+                Kind::Pickup {
+                    kind: PickupKind::Key(_),
+                    ..
+                } => Some(Obj::Key(e.id)),
                 _ => None,
             });
             if let Some((o, path, cost)) = self.plan_any(g, i, &ks) {
@@ -741,7 +803,10 @@ impl Bot {
         }
         // 3. Levers and pads that open up more of the level (most first).
         let min_gain = (reach as i64 / 30).max(30);
-        let mut gains: Vec<_> = looks.iter().filter(|l| l.2 >= min_gain && tried(&l.0) < 2).collect();
+        let mut gains: Vec<_> = looks
+            .iter()
+            .filter(|l| l.2 >= min_gain && tried(&l.0) < 2)
+            .collect();
         gains.sort_by_key(|l| -l.2);
         if let Some(best) = gains.first() {
             let top = best.2;
@@ -773,8 +838,14 @@ impl Bot {
         // Levers and pads not tried since the area last grew.
         let trigs: Vec<_> = self
             .cands(g, |e| match e.kind {
-                Kind::Trigger { gate: None, id, mode, pressed, mover, .. }
-                    if id != crate::tower::LECTERN
+                Kind::Trigger {
+                    gate: None,
+                    id,
+                    mode,
+                    pressed,
+                    mover,
+                    ..
+                } if id != crate::tower::LECTERN
                         && !(mode == crate::triggers::TriggerMode::Latch && pressed)
                         // A release only switches its target off: not blindly.
                         && mode != crate::triggers::TriggerMode::Release
@@ -813,7 +884,9 @@ impl Bot {
             .cands(g, |e| match e.kind {
                 Kind::Pickup { kind, .. } => match kind {
                     PickupKind::Food(_) => None,
-                    PickupKind::Potion(_) if g.players[i].potions >= crate::game::MAX_POTIONS => None,
+                    PickupKind::Potion(_) if g.players[i].potions >= crate::game::MAX_POTIONS => {
+                        None
+                    }
                     PickupKind::Key(_) => None,
                     _ => Some(Obj::Pickup(e.id)),
                 },
@@ -829,9 +902,11 @@ impl Bot {
         // 6. Barrels and other breakables.
         let smash: Vec<_> = self
             .cands(g, |e| match &e.kind {
-                Kind::Container { chest: false, armor, .. } if *armor >= 0.0 && e.solid.is_some() => {
-                    Some(Obj::Smash(e.id))
-                }
+                Kind::Container {
+                    chest: false,
+                    armor,
+                    ..
+                } if *armor >= 0.0 && e.solid.is_some() => Some(Obj::Smash(e.id)),
                 _ => None,
             })
             .into_iter()
@@ -845,11 +920,16 @@ impl Bot {
         // for it to come round (up to 20 s each, a minute in all).
         if self.platform_wait < 60.0 {
             let start = self.nav.start_node(g, g.players[i].pos);
-            let reach_set = start.map(|s| self.nav.reachable(g, s, 400_000)).unwrap_or_default();
+            let reach_set = start
+                .map(|s| self.nav.reachable(g, s, 400_000))
+                .unwrap_or_default();
             let mut best: Option<(f32, u64, Vec3)> = None;
             for (o, c, ext) in self.nav.volatile(g) {
                 let key = Obj::Wait(o.max(0) as u64);
-                if o < 0 || self.waited.get(&(o as u64)).copied().unwrap_or(0.0) > 20.0 || self.failed.contains(&key) {
+                if o < 0
+                    || self.waited.get(&(o as u64)).copied().unwrap_or(0.0) > 20.0
+                    || self.failed.contains(&key)
+                {
                     continue;
                 }
                 for &n in &reach_set {
@@ -882,7 +962,10 @@ impl Bot {
             self.failed.retain(|o| matches!(o, Obj::Exit(_)));
             self.nav.blocked.clear();
             self.ran.clear();
-            let line = format!("enablers exhausted: going round again (round {})", self.rounds + 1);
+            let line = format!(
+                "enablers exhausted: going round again (round {})",
+                self.rounds + 1
+            );
             self.log(g, line);
             self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
             return Ok(());
@@ -892,7 +975,10 @@ impl Bot {
         if !self.nav.blocked.is_empty() && self.unblocks < 3 {
             self.unblocks += 1;
             self.nav.blocked.clear();
-            self.log(g, "no way found: forgetting blocked edges and looking again".into());
+            self.log(
+                g,
+                "no way found: forgetting blocked edges and looking again".into(),
+            );
             self.set_obj(g, i, Obj::Idle, Vec::new(), 0.0);
             return Ok(());
         }
@@ -986,7 +1072,11 @@ impl Bot {
                 Kind::Generator { .. } => {
                     ids.insert(e.id);
                 }
-                Kind::Container { chest: false, armor, .. } if *armor >= 0.0 => {
+                Kind::Container {
+                    chest: false,
+                    armor,
+                    ..
+                } if *armor >= 0.0 => {
                     ids.insert(e.id);
                 }
                 _ => {}
@@ -1085,24 +1175,43 @@ impl Bot {
     /// Pressing trigger `tid`: would the exit become reachable from where
     /// the hero then stands (riding the target if it stands on it), and how
     /// many more nodes could be reached than `base`.
-    fn lookahead(&mut self, g: &mut Game, tid: u64, exits: &[Goal], base: usize) -> Option<(bool, i64)> {
+    fn lookahead(
+        &mut self,
+        g: &mut Game,
+        tid: u64,
+        exits: &[Goal],
+        base: usize,
+    ) -> Option<(bool, i64)> {
         let t0 = std::time::Instant::now();
         let r = self.lookahead_inner(g, tid, exits, base);
         self.timing[2] += t0.elapsed().as_secs_f64();
         r
     }
 
-    fn lookahead_inner(&mut self, g: &mut Game, tid: u64, exits: &[Goal], base: usize) -> Option<(bool, i64)> {
+    fn lookahead_inner(
+        &mut self,
+        g: &mut Game,
+        tid: u64,
+        exits: &[Goal],
+        base: usize,
+    ) -> Option<(bool, i64)> {
         use crate::worldanim::wflags;
         let e = Self::ent(g, tid)?;
         let (mi, tpos, radius) = match e.kind {
-            Kind::Trigger { mover: Some(m), radius, .. } => (m, e.pos, radius),
+            Kind::Trigger {
+                mover: Some(m),
+                radius,
+                ..
+            } => (m, e.pos, radius),
             _ => return None,
         };
         let reach_r = radius + PLAYER_RADIUS + 0.45;
         let stand = self.nav.node_near(tpos, reach_r, 3.5)?;
         let stand_pos = self.nav.nodes[stand as usize].pos;
-        let under = g.collision.ground_tri(stand_pos, stand_pos.y + 0.5).map(|(_, t)| t);
+        let under = g
+            .collision
+            .ground_tri(stand_pos, stand_pos.y + 0.5)
+            .map(|(_, t)| t);
         // The whole collision as it is, to put back.
         let saved: Vec<([Vec3; 3], Vec3)> = g.collision.tris.iter().map(|t| (t.v, t.n)).collect();
         let saved_on = g.collision.enabled.clone();
@@ -1133,7 +1242,11 @@ impl Bot {
                     wa.restore_anim(o, 1, if to_end { 1e9 } else { 0.0 });
                     if let Some(f) = wa.flags.get_mut(o) {
                         *f = (*f & !(wflags::REVERSE | wflags::FORWARD))
-                            | if to_end { wflags::FORWARD } else { wflags::REVERSE };
+                            | if to_end {
+                                wflags::FORWARD
+                            } else {
+                                wflags::REVERSE
+                            };
                     }
                 }
             }
@@ -1177,18 +1290,31 @@ impl Bot {
             self.nav.invalidate(gr, lo, hi);
             let seed_pos = stand_pos + Vec3::Y * dy.unwrap_or(0.0);
             let seed = self.nav.node_near(seed_pos, 2.0, 2.0);
-            let r = seed.map(|s| self.nav.reachable(gr, s, 400_000)).unwrap_or_default();
-            let exit_ok = r
-                .iter()
-                .any(|&n| exits.iter().any(|gl| gl.holds(self.nav.nodes[n as usize].pos)));
+            let r = seed
+                .map(|s| self.nav.reachable(gr, s, 400_000))
+                .unwrap_or_default();
+            let exit_ok = r.iter().any(|&n| {
+                exits
+                    .iter()
+                    .any(|gl| gl.holds(self.nav.nodes[n as usize].pos))
+            });
             // Where to run for if the target only stays switched while held:
             // the newly reachable spot nearest an exit, else farthest away.
             let pts: Vec<Vec3> = r.iter().map(|&n| self.nav.nodes[n as usize].pos).collect();
             let pick = if exits.is_empty() {
-                pts.iter().copied().max_by(|a, b| xz(*a - stand_pos).length().total_cmp(&xz(*b - stand_pos).length()))
+                pts.iter().copied().max_by(|a, b| {
+                    xz(*a - stand_pos)
+                        .length()
+                        .total_cmp(&xz(*b - stand_pos).length())
+                })
             } else {
                 pts.iter().copied().min_by(|a, b| {
-                    let d = |p: Vec3| exits.iter().map(|gl| xz(p - gl.pos).length()).fold(f32::MAX, f32::min);
+                    let d = |p: Vec3| {
+                        exits
+                            .iter()
+                            .map(|gl| xz(p - gl.pos).length())
+                            .fold(f32::MAX, f32::min)
+                    };
                     d(*a).total_cmp(&d(*b))
                 })
             };
@@ -1256,7 +1382,11 @@ impl Bot {
                         "door#{id} at ({:.1},{:.1},{:.1}) did not open: hero {i} with {} keys pushed against it for 4 s from ({:.2},{:.2},{:.2}), {:.3} from its centre (opens within {:.3})",
                         dpos.x, dpos.y, dpos.z, keys, hp.x, hp.y, hp.z, (hp - dpos).length(), r
                     );
-                    self.anomalies.push(Anomaly { what: msg, tags: vec!["can't reach"], capture: true });
+                    self.anomalies.push(Anomaly {
+                        what: msg,
+                        tags: vec!["can't reach"],
+                        capture: true,
+                    });
                 }
                 (keys == 0 || pushed).then_some(false)
             }
@@ -1301,7 +1431,11 @@ impl Bot {
             Obj::Idle => (now - a.obj_t > 2.0).then_some(true),
             Obj::Exit(id) | Obj::Portal(id) => gone(id).then_some(false),
             Obj::Rotator(t) => {
-                let left = g.world_anim.untouched_rotators().iter().any(|x| x.2 as u64 == t);
+                let left = g
+                    .world_anim
+                    .untouched_rotators()
+                    .iter()
+                    .any(|x| x.2 as u64 == t);
                 (!left).then_some(true)
             }
             // Standing by: look again every second.
@@ -1485,7 +1619,10 @@ impl Bot {
                 // the same floor (a lift's pad rides the lift).
                 let toggle = matches!(
                     Self::ent(g, id).map(|e| &e.kind),
-                    Some(Kind::Trigger { mode: crate::triggers::TriggerMode::Toggle, .. })
+                    Some(Kind::Trigger {
+                        mode: crate::triggers::TriggerMode::Toggle,
+                        ..
+                    })
                 );
                 if let (true, Some(t)) = (toggle, target) {
                     let reach = match Self::ent(g, id).map(|e| &e.kind) {
@@ -1523,15 +1660,26 @@ impl Bot {
                 // set pad): once its target moves, run for the far side.
                 let held_pad = matches!(
                     Self::ent(g, id).map(|e| &e.kind),
-                    Some(Kind::Trigger { mode: crate::triggers::TriggerMode::Release | crate::triggers::TriggerMode::Set, .. })
+                    Some(Kind::Trigger {
+                        mode: crate::triggers::TriggerMode::Release
+                            | crate::triggers::TriggerMode::Set,
+                        ..
+                    })
                 );
-                if held_pad && now - a.arrived.unwrap() > 0.6 && self.run_to.contains_key(&id) && !self.ran.contains(&id) {
+                if held_pad
+                    && now - a.arrived.unwrap() > 0.6
+                    && self.run_to.contains_key(&id)
+                    && !self.ran.contains(&id)
+                {
                     self.ran.insert(id);
                     let line = format!("hero {i}: pad trigger#{id} held, running for the far side");
                     self.log(g, line);
                     let o = Obj::Run(id);
                     if let Some((gl, at)) = self.goals_of(g, o) {
-                        let path = self.plan_any(g, i, &[(o, gl, at)]).map(|p| p.1).unwrap_or_default();
+                        let path = self
+                            .plan_any(g, i, &[(o, gl, at)])
+                            .map(|p| p.1)
+                            .unwrap_or_default();
                         self.set_obj(g, i, o, path, 0.0);
                     }
                     return PlayerInput::default();
@@ -1625,7 +1773,8 @@ impl Bot {
                 });
                 if let Some((o, path, cost)) = self.plan_any(g, i, &gens) {
                     if cost < 40.0 {
-                        let line = format!("hero {i}: monsters keep coming; detour to {}", o.name());
+                        let line =
+                            format!("hero {i}: monsters keep coming; detour to {}", o.name());
                         self.log(g, line);
                         self.set_obj(g, i, o, path, cost);
                         return f;
@@ -1686,7 +1835,8 @@ impl Bot {
             for k in (a.wp + 1..=far).rev() {
                 let n = self.nav.nodes[a.path[k] as usize];
                 // Not across a transporter trip.
-                if (a.wp.max(1)..=k).any(|j| self.nav.pad_edge(a.path[j - 1], a.path[j]).is_some()) {
+                if (a.wp.max(1)..=k).any(|j| self.nav.pad_edge(a.path[j - 1], a.path[j]).is_some())
+                {
                     continue;
                 }
                 // Not a short cut past a secret icon.
@@ -1735,8 +1885,8 @@ impl Bot {
             if let Some(pp) = pad_goal {
                 pp
             } else {
-            a.on_pad_t = None;
-            self.nav.nodes[a.path[a.wp] as usize].pos
+                a.on_pad_t = None;
+                self.nav.nodes[a.path[a.wp] as usize].pos
             }
         } else {
             match a.target {
@@ -1771,7 +1921,11 @@ impl Bot {
                     a.path.len(),
                     g.players[i].act.cur
                 );
-                let pts: Vec<Vec3> = a.path.iter().map(|&n| self.nav.nodes[n as usize].pos).collect();
+                let pts: Vec<Vec3> = a
+                    .path
+                    .iter()
+                    .map(|&n| self.nav.nodes[n as usize].pos)
+                    .collect();
                 for (k, w) in pts.windows(2).enumerate() {
                     if (w[1] - w[0]).length() > 4.0 {
                         println!("    path gap at {k}: {:?} -> {:?}", w[0], w[1]);
@@ -1785,7 +1939,8 @@ impl Bot {
                 if let Some(o) = a.obj {
                     if !matches!(o, Obj::Follow | Obj::Idle | Obj::Boss) {
                         self.failed.insert(o);
-                        let msg = format!(
+                        let msg =
+                            format!(
                             "hero {i} stuck {} times going for {} at ({:.1},{:.1},{:.1}); given up",
                             a.stucks, o.name(), pos.x, pos.y, pos.z
                         );
@@ -1802,7 +1957,11 @@ impl Bot {
                 }
             }
         }
-        let mag = if a.wp >= a.path.len() && dist < 1.5 { 0.5 } else { 1.0 };
+        let mag = if a.wp >= a.path.len() && dist < 1.5 {
+            0.5
+        } else {
+            1.0
+        };
         // Keep to the planned line (the walk the nav checked): steer at a
         // point a little ahead on the segment from the last waypoint.
         let mut steer = d;
@@ -1904,7 +2063,11 @@ impl Bot {
             }
             let last = self.last_pos.get(i).copied().unwrap_or(p.pos);
             let jump = (p.pos - last).length();
-            let transporting = g.transport.heroes.get(i).is_some_and(|h| h.timer > 0.0 || h.counter > 0);
+            let transporting = g
+                .transport
+                .heroes
+                .get(i)
+                .is_some_and(|h| h.timer > 0.0 || h.counter > 0);
             // Moved by the game (a transporter, put back on the floor): replan.
             if jump > 3.0 {
                 if let Some(a) = self.agents.get_mut(i) {
@@ -1966,8 +2129,14 @@ impl Bot {
                 LevelEnd::SecretOver => Outcome::Completed,
             });
         }
-        if g.players.iter().any(|p| matches!(p.state, PlayerState::Dead { .. })) && g.debug_god {
-            return Some(Outcome::Died("a hero died (a blow bigger than the god-mode margin, or in god mode)".into()));
+        if g.players
+            .iter()
+            .any(|p| matches!(p.state, PlayerState::Dead { .. }))
+            && g.debug_god
+        {
+            return Some(Outcome::Died(
+                "a hero died (a blow bigger than the god-mode margin, or in god mode)".into(),
+            ));
         }
         // Pinned: hero 0 hasn't got 3 units from one spot in 150 s (outside
         // boss fights, timed levels and the exit wait).
@@ -1990,7 +2159,11 @@ impl Bot {
             }
         }
         // On the exit for long with nothing happening.
-        let on_exit = g.players.iter().filter(|p| p.state.active()).all(|p| p.exit.touch.is_some());
+        let on_exit = g
+            .players
+            .iter()
+            .filter(|p| p.state.active())
+            .all(|p| p.exit.touch.is_some());
         if on_exit && g.players.iter().any(|p| p.state.active()) {
             let t = *self.exit_since.get_or_insert(g.time);
             if g.time - t > 20.0 {
@@ -2040,14 +2213,27 @@ impl Bot {
                     format!("({:.1},{:.1},{:.1})", p.x, p.y, p.z)
                 })
                 .collect();
-            s += &format!("  path from waypoint {} of {}: {}\n", a.wp, a.path.len(), path.join(" "));
+            s += &format!(
+                "  path from waypoint {} of {}: {}\n",
+                a.wp,
+                a.path.len(),
+                path.join(" ")
+            );
         }
         s += "\nLast positions of hero 0 (one a second):\n";
         for (t, p) in &self.trail {
             s += &format!("  t={t:7.1}s ({:.2}, {:.2}, {:.2})\n", p.x, p.y, p.z);
         }
         s += "\nObjectives so far:\n";
-        for h in self.history.iter().rev().take(400).collect::<Vec<_>>().into_iter().rev() {
+        for h in self
+            .history
+            .iter()
+            .rev()
+            .take(400)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             s += &format!("  {h}\n");
         }
         s += &format!(
@@ -2056,7 +2242,11 @@ impl Bot {
         );
         s += &format!(
             "\nFailed objectives: {}\nBlocked edges: {}\nNav: {} live nodes, {} edge walks\n",
-            self.failed.iter().map(|o| o.name()).collect::<Vec<_>>().join(", "),
+            self.failed
+                .iter()
+                .map(|o| o.name())
+                .collect::<Vec<_>>()
+                .join(", "),
             self.nav.blocked.len(),
             self.nav.live_nodes(),
             self.nav.walks
@@ -2143,7 +2333,10 @@ impl Bot {
             .filter(|&n| self.nav.nodes[n as usize].alive)
             .collect();
         order.sort_by(|a, b| {
-            self.nav.nodes[*a as usize].pos.y.total_cmp(&self.nav.nodes[*b as usize].pos.y)
+            self.nav.nodes[*a as usize]
+                .pos
+                .y
+                .total_cmp(&self.nav.nodes[*b as usize].pos.y)
         });
         for n in order {
             let node = self.nav.nodes[n as usize];
@@ -2170,7 +2363,10 @@ impl Bot {
                 Kind::Trigger { pressed: false, .. } => [40, 80, 255],
                 Kind::Trigger { pressed: true, .. } => [0, 255, 255],
                 Kind::Door { .. } => [160, 90, 30],
-                Kind::Pickup { kind: PickupKind::Key(_), .. } => [255, 0, 255],
+                Kind::Pickup {
+                    kind: PickupKind::Key(_),
+                    ..
+                } => [255, 0, 255],
                 Kind::Generator { .. } => [255, 140, 0],
                 _ => continue,
             };
@@ -2185,7 +2381,11 @@ impl Bot {
         for p in &g.players {
             put(&mut rgba, self.nav.cell_of(p.pos), [255, 0, 0], 14);
         }
-        gdl_formats::Image { width: w, height: h, rgba }
+        gdl_formats::Image {
+            width: w,
+            height: h,
+            rgba,
+        }
     }
 }
 
@@ -2202,7 +2402,15 @@ pub fn wall_points(g: &Game, e: &crate::game::Entity) -> Option<Vec<Vec3>> {
     let mut pts = Vec::new();
     for t in tris {
         let c = (t.v[0] + t.v[1] + t.v[2]) / 3.0;
-        for p in [t.v[0], t.v[1], t.v[2], (t.v[0] + t.v[1]) * 0.5, (t.v[1] + t.v[2]) * 0.5, (t.v[2] + t.v[0]) * 0.5, c] {
+        for p in [
+            t.v[0],
+            t.v[1],
+            t.v[2],
+            (t.v[0] + t.v[1]) * 0.5,
+            (t.v[1] + t.v[2]) * 0.5,
+            (t.v[2] + t.v[0]) * 0.5,
+            c,
+        ] {
             pts.push(Vec3::new(p.x, floor, p.z));
         }
     }
@@ -2243,7 +2451,10 @@ impl Bot {
             .collect::<Vec<_>>()
             .join(" ");
         if !cracks.is_empty() {
-            out.push(format!("{} possible floor seams at the edge of the reachable area, e.g. {eg}", cracks.len()));
+            out.push(format!(
+                "{} possible floor seams at the edge of the reachable area, e.g. {eg}",
+                cracks.len()
+            ));
         }
         if out.is_empty() {
             String::new()

@@ -42,19 +42,19 @@ pub const PLAYER_HEIGHT: f32 = 5.0;
 pub const PLAYER_COL_HEIGHT: f32 = PLAYER_HEIGHT * 0.5;
 /// PlayerGetTarget: the farthest a target is looked for, and the melee reach
 /// (2 plus the player's radius, from the target's surface).
-const TARGET_RANGE: f32 = 30.0;
-const MELEE_REACH: f32 = 2.0 + PLAYER_RADIUS;
+pub(crate) const TARGET_RANGE: f32 = 30.0;
+pub(crate) const MELEE_REACH: f32 = 2.0 + PLAYER_RADIUS;
 /// The aim cone: dot >= 0.707 (0.5 on Easy).
-const AIM_CONE: f32 = 0.707;
+pub(crate) const AIM_CONE: f32 = 0.707;
 /// Turbo meter: fill per second, and the costs of the PWRB / PWRC moves.
-const TURBO_FILL: f32 = 2.0;
+pub(crate) const TURBO_FILL: f32 = 2.0;
 /// player_max_health: 100 per level above 1 plus 500, at most 9999. A new
 /// character starts full at level 1.
 pub fn max_health(level: u32) -> f32 {
     (100.0 * (level.max(1) - 1) as f32 + 500.0).min(9999.0)
 }
 /// Thrown weapons fly until they hit something; this only bounds strays.
-const PROJECTILE_LIFE: f32 = 3.0;
+pub(crate) const PROJECTILE_LIFE: f32 = 3.0;
 
 /// Small deterministic RNG (xorshift) so simulations are reproducible.
 #[derive(Clone)]
@@ -1225,6 +1225,8 @@ pub struct Game {
     /// Damage-row re-hits waiting out their delay, by (player, target).
     damg_cooldown: BTreeMap<(usize, u64), f32>,
     /// 0 Easy, 1 Medium, 2 Hard.
+    /// The rules this game plays by (rules.rs): classic unless the app says.
+    pub rules: crate::rules::Rules,
     pub difficulty: usize,
     /// The Multiplayer option: 0 Normal (shots pass heroes), 1 Shots Stun,
     /// 2 Shots Hurt.
@@ -1932,6 +1934,7 @@ impl Game {
             time: 0.0,
             frame: 0,
             rng: Rng(0x9E37_79B9_7F4A_7C15),
+            rules: crate::rules::Rules::default(),
             wave: None,
             worlds: Default::default(),
             scrolls: Vec::new(),
@@ -4392,20 +4395,25 @@ impl Game {
                 p.yaw
             };
             let hdir = Vec2::new(heading.sin(), heading.cos());
-            let cone = if self.difficulty == 0 { 0.5 } else { 0.707 };
+            let cone = if self.difficulty == 0 {
+                0.5
+            } else {
+                self.rules.aim_cone
+            };
             let found = targets
                 .iter()
                 .filter(|(t, _, _, _)| (t.y - p.pos.y).abs() < 5.0)
                 .filter_map(|(t, r, short, bump)| {
                     let d = Vec2::new(t.x - p.pos.x, t.z - p.pos.z);
                     let surf = d.length() - r;
-                    (surf < TARGET_RANGE && (d.length() < 0.5 || d.normalize().dot(hdir) >= cone))
+                    (surf < self.rules.target_range
+                        && (d.length() < 0.5 || d.normalize().dot(hdir) >= cone))
                         .then_some((surf, d, *short, t.y - p.pos.y, *bump))
                 })
                 .min_by(|a, b| a.0.total_cmp(&b.0));
             let (tdist, attack_yaw, short) = match found {
                 Some((dist, d, short, _, _)) => (dist, d.x.atan2(d.y), short),
-                None => (TARGET_RANGE, p.yaw, false),
+                None => (self.rules.target_range, p.yaw, false),
             };
             // PlayerGetTarget's attackDir climbs to the target.
             let aim_rise = found.map(|(_, d, _, dy, _)| dy.atan2(d.length()));
@@ -4575,7 +4583,7 @@ impl Game {
             p.act.prev_frame = frame;
             // The meter fills while not in a turbo move; a charge drains it.
             if p.act.action < 11 {
-                p.power = (p.power + TURBO_FILL * dt).min(100.0);
+                p.power = (p.power + self.rules.turbo_fill * dt).min(100.0);
                 // pmotion.c:1755: with 15 or more monsters on screen, a full
                 // meter says to use turbo (msg 110); at 40 with partners, to
                 // try a combo (111).
@@ -5369,7 +5377,8 @@ impl Game {
                 let (at, r) = Self::aim_point(e, pos + Vec3::Y * 2.5)?;
                 let d = Vec2::new(at.x - pos.x, at.z - pos.z);
                 let surf = d.length() - r;
-                (surf < MELEE_REACH && (d.length() < 0.5 || d.normalize().dot(dir) >= AIM_CONE))
+                (surf < self.rules.melee_reach
+                    && (d.length() < 0.5 || d.normalize().dot(dir) >= self.rules.aim_cone))
                     .then_some((i, surf))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -5650,7 +5659,7 @@ impl Game {
             if let Some(e) = ei.map(|i| &mut self.entities[i]) {
                 let first = match e.kind {
                     Kind::Effect { life } => life,
-                    _ => PROJECTILE_LIFE,
+                    _ => self.rules.projectile_life,
                 };
                 e.kind = Kind::Projectile {
                     owner: pi,
@@ -8909,6 +8918,7 @@ impl Game {
         };
         let f = |v: f32| v.to_bits().to_le_bytes();
         let v3 = |v: Vec3| [f(v.x), f(v.y), f(v.z)].concat();
+        put(&self.rules.digest().to_le_bytes());
         put(&self.frame.to_le_bytes());
         put(&self.rng.0.to_le_bytes());
         put(&f(self.time));

@@ -14,6 +14,8 @@ struct Args {
     assets: Vec<PathBuf>,
     /// --no-assets: ignore GDL_ASSETS and asset-packs/ folders.
     no_assets: bool,
+    /// --rules: the preset the game plays by (classic unless asked).
+    rules: gdl_engine::rules::Rules,
     level: String,
     players: Vec<(String, String)>,
     snapshot: Option<PathBuf>,
@@ -68,6 +70,7 @@ USAGE: gauntlet [OPTIONS]
                         wins). Without flags, $GDL_ASSETS and every folder in an
                         asset-packs/ directory beside the data, the executable or
                         here apply, in name order. --no-assets plays the disc alone.
+  --rules <preset>      The rules to play by: classic (the original, default) or remix
   --level <name>        Level to start in (default levelA1)
   --mute                No music or sound (also: GDL_MUTE=1)
   --players <list>      Comma list of CLASS[/COLOR], e.g. WAR,VAL/BLU (default WAR)
@@ -118,6 +121,7 @@ fn parse_args() -> Result<Args> {
         data: None,
         assets: Vec::new(),
         no_assets: false,
+        rules: gdl_engine::rules::Rules::default(),
         level: "levelA1".into(),
         players: Vec::new(),
         snapshot: None,
@@ -155,6 +159,11 @@ fn parse_args() -> Result<Args> {
             "--data" => a.data = Some(val()?.into()),
             "--assets" => a.assets.push(val()?.into()),
             "--no-assets" => a.no_assets = true,
+            "--rules" => {
+                let v = val()?;
+                a.rules = gdl_engine::rules::Rules::named(&v)
+                    .with_context(|| format!("--rules {v}: classic or remix"))?;
+            }
             "--level" => a.level = val()?,
             "--players" => {
                 a.players = val()?
@@ -354,6 +363,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
         None => game::Game::new(&fs, &args.level, &classes)?,
     };
+    g.rules = args.rules.clone();
     // --save-state [frame:]spec: when, and where to.
     let save_at: Option<(Option<u32>, PathBuf)> = args.save_state.as_ref().map(|v| {
         let (f, spec) = match v.split_once(':') {
@@ -1206,6 +1216,7 @@ fn main() -> Result<()> {
         mute: args.mute,
         save_dir: gdl_engine::save::MemCard::default_dir(),
         load_state: args.load_state,
+        rules: args.rules,
     })
 }
 

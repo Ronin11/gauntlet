@@ -42,6 +42,8 @@ pub struct Config {
     pub save_dir: Option<std::path::PathBuf>,
     /// A debug save state to start in (`--load-state`: a slot or a file).
     pub load_state: Option<String>,
+    /// The rules the games play by (classic unless asked otherwise).
+    pub rules: crate::rules::Rules,
 }
 
 struct Playing {
@@ -629,7 +631,14 @@ impl App {
         } = &mut r.screen
         {
             let (level, panels) = (level.clone(), panels.clone());
-            match start_game(fs, &r.gpu, &level, panels, r.prefs.difficulty) {
+            match start_game(
+                fs,
+                &r.gpu,
+                &level,
+                panels,
+                r.prefs.difficulty,
+                &self.cfg.rules,
+            ) {
                 Ok(mut p) => {
                     if let Some(carry) = &r.carry {
                         for (a, info) in p.game.players.iter_mut().zip(&p.panels) {
@@ -2120,6 +2129,7 @@ fn start_game(
     level: &str,
     panels: Vec<PanelInfo>,
     difficulty: usize,
+    rules: &crate::rules::Rules,
 ) -> Result<Playing> {
     // Sumner is the Wizard (character 2) with hidden_code "sum"; a hidden
     // character is its class with its own model.
@@ -2144,7 +2154,8 @@ fn start_game(
             None => None,
         })
         .collect();
-    let game = Game::new_heroes(fs, level, &classes, &models, difficulty)?;
+    let mut game = Game::new_heroes(fs, level, &classes, &models, difficulty)?;
+    game.rules = rules.clone();
     let scene = Scene::new(gpu, &game)?;
     Ok(Playing {
         game,

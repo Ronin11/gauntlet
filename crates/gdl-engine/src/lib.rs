@@ -3,8 +3,8 @@
 
 pub use gdl_sim::{
     ai, boss, camera, character, cheats, collision, critter, enemies, fs, game, heroes, hints,
-    interp, level, mesh, messages, missile, paction, powerups, progress, psys, save, savestate,
-    shadow, soundlib, stats, texanim, tower, transport, triggers, worldanim,
+    interp, level, mesh, messages, missile, paction, powerups, progress, psys, rules, save,
+    savestate, shadow, soundlib, stats, texanim, tower, transport, triggers, worldanim,
 };
 
 pub mod app;
