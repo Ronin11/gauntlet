@@ -26,6 +26,8 @@ struct Args {
     /// --modern-clip: pose the glTF from a keyframe clip instead of --seq.
     modern_clip: Option<PathBuf>,
     modern_time: f32,
+    /// --modern-roll JOINT:DEGREES (repeatable): twist a joint about the bone into it.
+    modern_roll: Vec<String>,
     seq: String,
     frame: f32,
     simulate: u32,
@@ -125,6 +127,7 @@ fn parse_args() -> Result<Args> {
         modern_ref: "READY".into(),
         modern_clip: None,
         modern_time: 0.0,
+        modern_roll: Vec::new(),
         seq: "READY".into(),
         frame: 0.0,
         simulate: 0,
@@ -166,6 +169,7 @@ fn parse_args() -> Result<Args> {
             "--modern-ref" => a.modern_ref = val()?,
             "--modern-clip" => a.modern_clip = Some(val()?.into()),
             "--modern-time" => a.modern_time = val()?.parse()?,
+            "--modern-roll" => a.modern_roll.push(val()?),
             "--seq" => a.seq = val()?,
             "--frame" => a.frame = val()?.parse()?,
             "--simulate" => a.simulate = val()?.parse()?,
@@ -302,7 +306,11 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
                         Some((f, n)) => (f, Some(n)),
                         None => (&*spec, None),
                     };
-                    let clip = gdl_modern::clip::Clip::load_named(file, hero.model(), name)?;
+                    let mut clip = gdl_modern::clip::Clip::load_named(file, hero.model(), name)?;
+                    for r in &args.modern_roll {
+                        let (j, d) = r.split_once(':').context("--modern-roll JOINT:DEGREES")?;
+                        clip.roll(hero.model(), j, d.parse()?)?;
+                    }
                     hero.mesh_clip(&clip, args.modern_time)?
                 }
                 None => hero.mesh(&cm.node_world(seq, args.frame))?,

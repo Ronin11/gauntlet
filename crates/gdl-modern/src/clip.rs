@@ -49,6 +49,8 @@ pub struct Clip {
     rest: Vec<(Vec3, Quat, Vec3)>,
     /// For joints with no joint parent: what sits above them (an armature node).
     above: Vec<Mat4>,
+    /// Extra turn of a joint in its own frame (a wrist roll).
+    rolls: Vec<(usize, Quat)>,
 }
 
 impl Clip {
@@ -124,7 +126,28 @@ impl Clip {
             tracks,
             rest,
             above,
+            rolls: Vec::new(),
         })
+    }
+
+    /// Roll `joint` by `degrees` about the bone that leads into it (a forearm
+    /// into its hand): what turns a sword held blade-up into one held
+    /// blade-forward, when the model was made with its arms out.
+    pub fn roll(&mut self, model: &ModernModel, joint: &str, degrees: f32) -> Result<()> {
+        let j = model
+            .joint(joint)
+            .with_context(|| format!("no joint {joint}"))?;
+        let p = model.joints[j].parent.context("joint has no parent")?;
+        let bone = model.joints[j].rest_world.w_axis.truncate()
+            - model.joints[p].rest_world.w_axis.truncate();
+        let axis = model.joints[j]
+            .rest_world
+            .inverse()
+            .transform_vector3(bone)
+            .normalize();
+        self.rolls
+            .push((j, Quat::from_axis_angle(axis, degrees.to_radians())));
+        Ok(())
     }
 
     /// Skin matrices (joint pose x inverse bind) at `time` seconds, looping.
@@ -149,7 +172,10 @@ impl Clip {
             let tr = &self.tracks[j];
             let (rt, rr, rs) = self.rest[j];
             let pos = tr.translation.at(t).map_or(rt, |(a, b, f)| a.lerp(b, f));
-            let rot = tr.rotation.at(t).map_or(rr, |(a, b, f)| a.slerp(b, f));
+            let mut rot = tr.rotation.at(t).map_or(rr, |(a, b, f)| a.slerp(b, f));
+            if let Some((_, q)) = self.rolls.iter().find(|(r, _)| *r == j) {
+                rot *= *q;
+            }
             let scl = tr.scale.at(t).map_or(rs, |(a, b, f)| a.lerp(b, f));
             let local = Mat4::from_scale_rotation_translation(scl, rot, pos);
             world[j] = match model.joints[j].parent {
