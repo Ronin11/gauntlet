@@ -183,7 +183,8 @@ impl ModernModel {
     /// thigh drags the thigh's skin along). Each joint belongs to the limb whose
     /// root joint (`limb_roots`) it descends from; a vertex keeps only the limb
     /// with the most weight on it (plus any joints outside every limb) and is
-    /// renormalised. Returns how many vertices changed.
+    /// renormalised, and triangles spanning two limbs are dropped. Returns how
+    /// many vertices and triangles changed.
     pub fn separate_limbs(&mut self, limb_roots: &[&str]) -> usize {
         let roots: Vec<usize> = limb_roots.iter().filter_map(|n| self.joint(n)).collect();
         let limb_of: Vec<Option<usize>> = (0..self.joints.len())
@@ -222,7 +223,29 @@ impl ModernModel {
             }
             changed += 1;
         }
-        changed
+        // The mesh can be welded across limbs (a hand resting on a thigh shares
+        // triangles with it); posed apart, those triangles stretch into a sheet.
+        let limb_of_vertex: Vec<Option<usize>> = self
+            .vertices
+            .iter()
+            .map(|v| {
+                (0..4)
+                    .filter(|&k| v.weights[k] > 0.0)
+                    .find_map(|k| limb_of[v.joints[k] as usize])
+            })
+            .collect();
+        let before = self.indices.len();
+        let mut kept = Vec::with_capacity(before);
+        for t in self.indices.chunks_exact(3) {
+            let limbs = t.iter().filter_map(|&i| limb_of_vertex[i as usize]);
+            let mut limbs = limbs.collect::<Vec<_>>();
+            limbs.dedup();
+            if limbs.len() < 2 {
+                kept.extend_from_slice(t);
+            }
+        }
+        self.indices = kept;
+        changed + (before - self.indices.len()) / 3
     }
 
     pub fn joint(&self, name: &str) -> Option<usize> {
