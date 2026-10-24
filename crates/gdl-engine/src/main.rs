@@ -26,7 +26,7 @@ struct Args {
     /// --modern-clip: pose the glTF from a keyframe clip instead of --seq.
     modern_clip: Option<PathBuf>,
     modern_time: f32,
-    /// --modern-roll JOINT:DEGREES (repeatable): twist a joint about the bone into it.
+    /// --modern-roll JOINT:DEGREES[:TOWARD] (repeatable): twist a joint about the bone into it (or out to TOWARD).
     modern_roll: Vec<String>,
     seq: String,
     frame: f32,
@@ -308,8 +308,10 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
                     };
                     let mut clip = gdl_modern::clip::Clip::load_named(file, hero.model(), name)?;
                     for r in &args.modern_roll {
-                        let (j, d) = r.split_once(':').context("--modern-roll JOINT:DEGREES")?;
-                        clip.roll(hero.model(), j, d.parse()?)?;
+                        let mut it = r.split(':');
+                        let (j, d, to) = (it.next(), it.next(), it.next());
+                        let (j, d) = j.zip(d).context("--modern-roll JOINT:DEGREES[:TOWARD]")?;
+                        clip.roll(hero.model(), j, to, d.parse()?)?;
                     }
                     hero.mesh_clip(&clip, args.modern_time)?
                 }

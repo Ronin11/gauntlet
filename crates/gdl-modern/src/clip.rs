@@ -130,16 +130,34 @@ impl Clip {
         })
     }
 
-    /// Roll `joint` by `degrees` about the bone that leads into it (a forearm
-    /// into its hand): what turns a sword held blade-up into one held
-    /// blade-forward, when the model was made with its arms out.
-    pub fn roll(&mut self, model: &ModernModel, joint: &str, degrees: f32) -> Result<()> {
+    /// Roll `joint` by `degrees` about a bone: the one leading into it (a
+    /// forearm into its hand), or, with `toward`, the one leading out to that
+    /// joint (a forearm's own length, toward its hand). This turns a sword held
+    /// blade-up into one held blade-forward, when the model was made with its
+    /// arms out.
+    pub fn roll(
+        &mut self,
+        model: &ModernModel,
+        joint: &str,
+        toward: Option<&str>,
+        degrees: f32,
+    ) -> Result<()> {
+        let at = |name: &str| {
+            let j = model
+                .joint(name)
+                .with_context(|| format!("no joint {name}"))?;
+            Ok::<_, anyhow::Error>(model.joints[j].rest_world.w_axis.truncate())
+        };
         let j = model
             .joint(joint)
             .with_context(|| format!("no joint {joint}"))?;
-        let p = model.joints[j].parent.context("joint has no parent")?;
-        let bone = model.joints[j].rest_world.w_axis.truncate()
-            - model.joints[p].rest_world.w_axis.truncate();
+        let bone = match toward {
+            Some(t) => at(t)? - at(joint)?,
+            None => {
+                let p = model.joints[j].parent.context("joint has no parent")?;
+                at(joint)? - model.joints[p].rest_world.w_axis.truncate()
+            }
+        };
         let axis = model.joints[j]
             .rest_world
             .inverse()
