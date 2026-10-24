@@ -32,6 +32,11 @@ pub struct Rules {
     pub target_range: f32,
     /// Seconds a stray thrown weapon flies before it is taken away.
     pub projectile_life: f32,
+    /// Seconds between the hits a monster takes while it stands in poison
+    /// gas. 0 is the original: one hit per phase of the cloud (its cooldown
+    /// runs to the phase's end), then only the fading tail. Heroes always
+    /// take a hit every half second.
+    pub gas_tick: f32,
 }
 
 impl Rules {
@@ -44,13 +49,16 @@ impl Rules {
             aim_cone: game::AIM_CONE,
             target_range: game::TARGET_RANGE,
             projectile_life: game::PROJECTILE_LIFE,
+            gas_tick: 0.0,
         }
     }
 
-    /// The remix: the classic values until a remix feature changes one.
+    /// The remix: the classic values, except that poison gas keeps hurting
+    /// the monsters in it, every half second as it does heroes.
     pub fn remix() -> Rules {
         Rules {
             preset: Preset::Remix,
+            gas_tick: 0.5,
             ..Rules::classic()
         }
     }
@@ -88,6 +96,7 @@ impl Rules {
             self.aim_cone,
             self.target_range,
             self.projectile_life,
+            self.gas_tick,
         ] {
             put(&v.to_bits().to_le_bytes());
         }
@@ -106,13 +115,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classic_is_the_default_and_remix_only_differs_by_name_for_now() {
+    fn classic_is_the_default_and_the_remix_differs_where_it_means_to() {
         assert_eq!(Rules::default(), Rules::classic());
         let remix = Rules::remix();
         assert_eq!(remix.preset, Preset::Remix);
         assert_eq!(
+            Rules::classic().gas_tick,
+            0.0,
+            "the original: once per phase"
+        );
+        assert_eq!(remix.gas_tick, 0.5);
+        assert_eq!(
             Rules {
                 preset: Preset::Classic,
+                gas_tick: 0.0,
                 ..remix.clone()
             },
             Rules::classic()

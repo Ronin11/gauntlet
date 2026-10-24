@@ -1052,7 +1052,8 @@ impl Game {
     /// a blast's radius grows from a third of damageradius to all of it and
     /// its damage falls from 1.5x to nothing. Heroes are hit again once
     /// their fxhittime passes (half a second for gas), monsters and items
-    /// once theirs (about the rest of the effect), critters once.
+    /// once theirs (about the rest of the effect; in gas, every
+    /// `Rules::gas_tick` seconds when that is set), critters once.
     fn update_blasts(&mut self, dt: f32) {
         let mut blasts = std::mem::take(&mut self.items.blasts);
         for b in &mut blasts {
@@ -1199,6 +1200,10 @@ impl Game {
         for (i, id, push, critter) in hits {
             if critter {
                 b.hit.push(id);
+            } else if b.dtype & DmgType::POISON_GAS != 0 && self.rules.gas_tick > 0.0 {
+                // The remix: gas keeps hurting the monsters in it, as it
+                // does heroes.
+                self.items.fxhit.insert(id, self.time + self.rules.gas_tick);
             } else if dmg > 2.0 {
                 self.items.fxhit.insert(id, self.time + fade);
             }
@@ -1834,6 +1839,57 @@ mod tests {
                 matches!(e.kind, Kind::Pickup { kind: PickupKind::Food(v), .. } if v == -100.0)
             );
         }
+    }
+
+    /// How often a monster held in a poison cloud takes a real hit (more
+    /// than the fading tail's 2 points) over the cloud's life.
+    fn gas_hits_on_a_grunt(fs: &GameFs, rules: crate::rules::Rules) -> usize {
+        let mut g = quiet(fs, &[is_poi]);
+        g.rules = rules;
+        let at = g.players[0].pos;
+        let a = copy_item(&mut g, is_poi, at + Vec3::new(3.0, 0.0, 0.0)).expect("a poison barrel");
+        let spot = at + Vec3::new(4.0, 0.0, 2.0);
+        let mon = grunt(&mut g, fs, spot);
+        let t = g.entities.iter().position(|e| e.id == mon).unwrap();
+        if let Kind::Enemy { hp, .. } = &mut g.entities[t].kind {
+            *hp = 10_000.0;
+        }
+        let hp = |g: &Game| match g.entities.iter().find(|e| e.id == mon).map(|e| &e.kind) {
+            Some(Kind::Enemy { hp, .. }) => *hp,
+            _ => 0.0,
+        };
+        let b = g.entities.iter().position(|e| e.id == a).unwrap();
+        g.world_hit(None, b, 50.0, Vec2::X, 0);
+        assert_eq!(g.items.blasts.len(), 1);
+        let mut hits = 0;
+        let mut last = hp(&g);
+        for _ in 0..(7 * 60) {
+            g.players[0].pos = at - Vec3::new(20.0, 0.0, 0.0);
+            if let Some(e) = g.entities.iter_mut().find(|e| e.id == mon) {
+                e.pos = spot;
+            }
+            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            let now = hp(&g);
+            if last - now > 2.0 {
+                hits += 1;
+            }
+            last = now;
+        }
+        assert!(g.items.blasts.is_empty(), "the cloud is gone");
+        hits
+    }
+
+    #[test]
+    fn poison_gas_keeps_hurting_monsters_in_the_remix() {
+        // The original hits a monster once per phase of the cloud (its hit
+        // cooldown runs to the phase's end) and then only with the fading
+        // tail of 2 points or less; the remix's gas_tick hits it again every
+        // half second, as gas does heroes.
+        let Some(fs) = data() else { return };
+        let classic = gas_hits_on_a_grunt(&fs, crate::rules::Rules::classic());
+        let remix = gas_hits_on_a_grunt(&fs, crate::rules::Rules::remix());
+        assert!(classic <= 2, "classic: one hit per phase: {classic}");
+        assert!(remix >= 5, "remix: a hit every half second: {remix}");
     }
 
     #[test]

@@ -65,7 +65,9 @@ disc image. The log names each pack as it is added.
 
 The rules are the other half of the split. `--rules classic` (the default) plays the
 GameCube original; `--rules remix` selects the modernised rules, which are the classic
-values until a remix feature changes one. Rules are a value the simulation reads
+values except where a remix feature changes one (so far: poison gas keeps hurting the
+monsters standing in it, every half second as it does heroes, where the original hits
+them once per phase of the cloud). Rules are a value the simulation reads
 (`crates/gdl-sim/src/rules.rs`), so a tunable moves in there only when something needs
 to change it, keeping its original value as the classic default.
 
