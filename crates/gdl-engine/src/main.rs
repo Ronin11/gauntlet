@@ -289,7 +289,8 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
         .collect();
     log::info!("sequences: {}", names.join(" "));
     let gpu = headless_gpu()?;
-    let mut gm = gpu.upload_mesh(&cm.mesh)?;
+    let cm_mesh = gdl_engine::overrides::with_parts(&cm.mesh, &cm.part_names);
+    let mut gm = gpu.upload_mesh(cm_mesh.as_ref().unwrap_or(&cm.mesh))?;
     // --simulate N: the global texture animations after N game frames.
     gm.animate_textures(args.simulate);
     let mut inst = gpu.new_instance(&gm);

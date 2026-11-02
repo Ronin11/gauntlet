@@ -107,7 +107,10 @@ impl Scene {
         let models = game
             .models
             .iter()
-            .map(|m| gpu.upload_mesh(&m.mesh))
+            .map(|m| match crate::overrides::with_parts(&m.mesh, &m.part_names) {
+                Some(mesh) => gpu.upload_mesh(&mesh),
+                None => gpu.upload_mesh(&m.mesh),
+            })
             .collect::<Result<Vec<_>>>()?;
         let players = game
             .players

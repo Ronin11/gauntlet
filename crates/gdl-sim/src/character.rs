@@ -78,6 +78,9 @@ pub struct Model {
     /// armour plate `<prefix>D<node>`): (part, node).
     alt_parts: Vec<(u16, usize)>,
     pub part_count: usize,
+    /// The object each part was built from, by part index (empty for frame
+    /// meshes of object animations). What a replacement part is named after.
+    pub part_names: Vec<String>,
     /// Sequence texmods and texmod nodes, linked to the mesh's flipbooks and
     /// parts (None when the model has none).
     texmods: Option<TexmodLinks>,
@@ -364,6 +367,7 @@ impl Model {
     ) -> Self {
         let mut b = MeshBuilder::new(objects, textures).with_texmods(texmods.0, texmods.1);
         let mut next_part: u16 = 0;
+        let mut part_names: Vec<String> = Vec::new();
         let mut node_part = vec![None; skeleton.nodes.len()];
         let defs = &objects.object_defs;
 
@@ -384,6 +388,7 @@ impl Model {
                     b.add_part(obj, Mat4::IDENTITY, next_part);
                     b.additive = false;
                     node_part[ni] = Some(next_part);
+                    part_names.push(defs[oi].name.clone());
                     next_part += 1;
                 }
             }
@@ -399,6 +404,7 @@ impl Model {
                 if let Some(obj) = objects.objects.get(d.obj_index.max(0) as usize) {
                     b.add_part(obj, Mat4::IDENTITY, next_part);
                     attachments.push((next_part, wrist));
+                    part_names.push(d.name.clone());
                     next_part += 1;
                 }
             }
@@ -410,6 +416,7 @@ impl Model {
                 if let Some(obj) = objects.objects.get(d.obj_index.max(0) as usize) {
                     b.add_part(obj, Mat4::IDENTITY, next_part);
                     alt_parts.push((next_part, ni));
+                    part_names.push(d.name.clone());
                     next_part += 1;
                 }
             }
@@ -444,6 +451,7 @@ impl Model {
                         for obj in (key.0..key.0 + key.1).map_while(|i| objects.objects.get(i)) {
                             b.add_part(obj, Mat4::IDENTITY, next_part);
                             parts.push(next_part);
+                            part_names.push(String::new());
                             next_part += 1;
                         }
                         b.additive = false;
@@ -468,6 +476,7 @@ impl Model {
             runs,
             alt_parts,
             part_count: next_part as usize,
+            part_names,
             texmods: None,
             psys: Vec::new(),
         };
@@ -558,6 +567,7 @@ impl Model {
             runs: Vec::new(),
             alt_parts: Vec::new(),
             part_count: 1,
+            part_names: names.first().map(|s| s.to_string()).into_iter().collect(),
             texmods: None,
             psys: Vec::new(),
         })

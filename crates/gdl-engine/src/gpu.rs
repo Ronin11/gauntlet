@@ -339,6 +339,9 @@ impl Gpu {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Linear,
+            // Floors and walls are seen at a grazing angle from the game's
+            // high camera; trilinear alone smears them into mud.
+            anisotropy_clamp: 16,
             ..Default::default()
         });
 

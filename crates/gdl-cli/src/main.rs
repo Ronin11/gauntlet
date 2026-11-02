@@ -23,6 +23,14 @@ enum Cmd {
     Objects { path: PathBuf },
     /// Decode every texture of a model directory (objects.ngc + textures.ngc) to PNGs
     Textures { dir: PathBuf, out: PathBuf },
+    /// Decode every texture to `<out>/tex/<content-hash>.png`, the layout an
+    /// override directory (`GDL_OVERRIDE`) is read back from, plus a manifest
+    Hashed { dir: PathBuf, out: PathBuf },
+    /// Write every object of a model directory as `<out>/parts/<NAME>.obj`
+    /// (object space, textures by content hash in `<out>/tex/`), the starting
+    /// point for a rebuilt part that the override directory loads back as
+    /// `parts/<NAME>.glb`
+    Parts { dir: PathBuf, out: PathBuf },
     /// Survey every objects.ngc under a directory: formats used, decode failures
     Survey { root: PathBuf },
     /// Summarise a WORLDS.PS2 level file
@@ -138,6 +146,41 @@ fn main() -> Result<()> {
                     Err(e) => eprintln!("bitmap {i}: {e:#}"),
                 }
             }
+        }
+        Cmd::Parts { dir, out } => export_parts(&dir, &out)?,
+        Cmd::Hashed { dir, out } => {
+            let objs = Objects::parse(&std::fs::read(dir.join("objects.ngc"))?)?;
+            let tex = std::fs::read(dir.join("textures.ngc"))?;
+            let tex_dir = out.join("tex");
+            std::fs::create_dir_all(&tex_dir)?;
+            let names: BTreeMap<u16, &str> = objs
+                .bitmap_defs
+                .iter()
+                .map(|d| (d.tex_index, d.name.as_str()))
+                .collect();
+            let mut manifest = String::new();
+            for (i, b) in objs.bitmaps.iter().enumerate() {
+                if b.flags & gdl_formats::objects::bitmap_flags::EXTERNAL != 0 || b.frame_count > 0
+                {
+                    continue;
+                }
+                match texture::decode_original(b, &tex) {
+                    Ok(img) => {
+                        let hash = img.content_hash();
+                        let name = names.get(&(i as u16)).copied().unwrap_or("");
+                        manifest.push_str(&format!(
+                            "{hash} {i:04} {:>3}x{:<3} f{:<3} {name}\n",
+                            img.width, img.height, b.format
+                        ));
+                        let path = tex_dir.join(format!("{hash}.png"));
+                        if !path.exists() {
+                            write_png(&path, &img)?;
+                        }
+                    }
+                    Err(e) => eprintln!("bitmap {i}: {e:#}"),
+                }
+            }
+            std::fs::write(out.join("manifest.txt"), manifest)?;
         }
         Cmd::Survey { root } => survey(&root)?,
         Cmd::Dol { dol, addrs } => {
@@ -330,6 +373,112 @@ fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `gdl parts`: each named object as a Wavefront OBJ in its own object space
+/// (the frame its skeleton node drives), with normals, UVs and one material per
+/// texture, plus `parts.txt` listing name, triangles, bounds and textures.
+fn export_parts(dir: &Path, out: &Path) -> Result<()> {
+    use std::fmt::Write as _;
+    let objs = Objects::parse(&std::fs::read(dir.join("objects.ngc"))?)?;
+    let tex = std::fs::read(dir.join("textures.ngc"))?;
+    let parts_dir = out.join("parts");
+    let tex_dir = out.join("tex");
+    std::fs::create_dir_all(&parts_dir)?;
+    std::fs::create_dir_all(&tex_dir)?;
+    // Texture slot -> content hash (its file name), decoded once.
+    let mut hashes: BTreeMap<u16, String> = BTreeMap::new();
+    let mut hash_of = |slot: u16| -> Option<String> {
+        if let Some(h) = hashes.get(&slot) {
+            return Some(h.clone());
+        }
+        let b = objs.bitmaps.get(slot as usize)?;
+        let img = texture::decode_ngc(b, &tex).ok()?;
+        let h = img.content_hash();
+        let path = tex_dir.join(format!("{h}.png"));
+        if !path.exists() {
+            write_png(&path, &img).ok()?;
+        }
+        hashes.insert(slot, h.clone());
+        Some(h)
+    };
+    let mut manifest = String::from("# name tris min max textures\n");
+    let mut written = 0;
+    for def in &objs.object_defs {
+        let Some(obj) = objs.objects.get(def.obj_index.max(0) as usize) else {
+            continue;
+        };
+        let mut o = String::new();
+        let mut mtl = String::new();
+        let (mut vbase, mut tris) = (1u32, 0usize);
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        let mut used = Vec::new();
+        writeln!(o, "# {} from {}", def.name, dir.display())?;
+        writeln!(o, "mtllib {}.mtl", def.name)?;
+        writeln!(o, "o {}", def.name)?;
+        for (si, (sub, stream)) in obj.sub_objects.iter().zip(&obj.geometry).enumerate() {
+            let m = match gdl_formats::Mesh::decode(stream) {
+                Ok(m) if !m.indices.is_empty() => m,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("{}: sub-object {si}: {e:#}", def.name);
+                    continue;
+                }
+            };
+            let mat = match hash_of(sub.tex_index) {
+                Some(h) => {
+                    if !used.contains(&h) {
+                        writeln!(mtl, "newmtl t_{h}\nmap_Kd ../tex/{h}.png\n")?;
+                        used.push(h.clone());
+                    }
+                    format!("t_{h}")
+                }
+                None => "none".to_string(),
+            };
+            for p in &m.positions {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+                writeln!(o, "v {} {} {}", p[0], p[1], p[2])?;
+            }
+            for uv in &m.uvs {
+                writeln!(o, "vt {} {}", uv[0], 1.0 - uv[1])?;
+            }
+            for n in &m.normals {
+                writeln!(o, "vn {} {} {}", n[0], n[1], n[2])?;
+            }
+            writeln!(o, "g {}_{si}\nusemtl {mat}", def.name)?;
+            for t in m.indices.chunks_exact(3) {
+                let [a, b, c] = [t[0] + vbase, t[1] + vbase, t[2] + vbase];
+                writeln!(o, "f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}")?;
+                tris += 1;
+            }
+            vbase += m.positions.len() as u32;
+        }
+        if tris == 0 {
+            continue;
+        }
+        std::fs::write(parts_dir.join(format!("{}.obj", def.name)), o)?;
+        std::fs::write(parts_dir.join(format!("{}.mtl", def.name)), mtl)?;
+        writeln!(
+            manifest,
+            "{} {tris} {:.3},{:.3},{:.3} {:.3},{:.3},{:.3} {}",
+            def.name,
+            lo[0],
+            lo[1],
+            lo[2],
+            hi[0],
+            hi[1],
+            hi[2],
+            used.join(",")
+        )?;
+        written += 1;
+    }
+    std::fs::write(out.join("parts.txt"), manifest)?;
+    println!("{written} parts -> {}", parts_dir.display());
     Ok(())
 }
 

@@ -140,8 +140,116 @@ fn untile(i: u32, w: u32, h: u32, bpp: u32) -> (u32, u32) {
     (tx * tw + within % tw, ty * th + within / tw)
 }
 
-/// Decode the top mip level of a GameCube bitmap from the textures file.
+/// Decode the top mip level of a GameCube bitmap from the textures file, then
+/// swap in a replacement from the override directory (`GDL_OVERRIDE`) if one
+/// exists for that image's content: `<dir>/tex/<content-hash>.png`. Every
+/// consumer (world, heroes, HUD) decodes through here, so an upscaled or
+/// repainted texture dropped in that directory shows up everywhere the original
+/// did, at whatever size it was painted.
 pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
+    let img = decode_original(b, textures)?;
+    if b.flags & bitmap_flags::EXTERNAL != 0 || b.frame_count > 0 {
+        return Ok(img);
+    }
+    Ok(override_for(&img.content_hash()).unwrap_or(img))
+}
+
+impl Image {
+    /// A stable id for this image's pixels (FNV-1a over size and RGBA), the
+    /// name an override file is looked up by.
+    pub fn content_hash(&self) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |b: u8| {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for b in self
+            .width
+            .to_le_bytes()
+            .into_iter()
+            .chain(self.height.to_le_bytes())
+        {
+            eat(b);
+        }
+        for &b in &self.rgba {
+            eat(b);
+        }
+        format!("{h:016x}")
+    }
+}
+
+static OVERRIDE_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+static OVERRIDE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static OVERRIDE_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The override directory, from `GDL_OVERRIDE`; `None` when unset or missing.
+pub fn override_dir() -> Option<&'static std::path::Path> {
+    OVERRIDE_DIR
+        .get_or_init(|| {
+            let p = std::path::PathBuf::from(std::env::var_os("GDL_OVERRIDE")?);
+            p.is_dir().then_some(p)
+        })
+        .as_deref()
+}
+
+/// How many decoded textures found an override, and how many didn't.
+pub fn override_stats() -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (OVERRIDE_HITS.load(Relaxed), OVERRIDE_MISSES.load(Relaxed))
+}
+
+fn override_for(hash: &str) -> Option<Image> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let path = override_dir()?.join("tex").join(format!("{hash}.png"));
+    let img = match read_png(&path) {
+        Ok(Some(img)) => img,
+        Ok(None) => {
+            OVERRIDE_MISSES.fetch_add(1, Relaxed);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("override {}: {e:#}", path.display());
+            OVERRIDE_MISSES.fetch_add(1, Relaxed);
+            return None;
+        }
+    };
+    OVERRIDE_HITS.fetch_add(1, Relaxed);
+    Some(img)
+}
+
+/// An 8-bit PNG as RGBA; `Ok(None)` when there is no such file.
+fn read_png(path: &std::path::Path) -> Result<Option<Image>> {
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut dec = png::Decoder::new(std::io::BufReader::new(f));
+    dec.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = dec.read_info()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf)?;
+    let px = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => px.to_vec(),
+        png::ColorType::Rgb => px.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => px
+            .chunks(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        png::ColorType::Grayscale => px.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        other => bail!("unsupported PNG colour type {other:?}"),
+    };
+    Ok(Some(Image {
+        width: info.width,
+        height: info.height,
+        rgba,
+    }))
+}
+
+/// Decode the top mip level of a GameCube bitmap from the textures file, with
+/// no override applied.
+pub fn decode_original(b: &Bitmap, textures: &[u8]) -> Result<Image> {
     let (w, h) = (b.width as u32, b.height as u32);
     if w == 0 || h == 0 || w > 1024 || h > 1024 {
         bail!("bad texture size {w}x{h}");

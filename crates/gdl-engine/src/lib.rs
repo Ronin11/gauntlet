@@ -23,6 +23,7 @@ pub mod modern;
 pub mod movie;
 pub mod options;
 pub mod optmenu;
+pub mod overrides;
 pub mod runner;
 pub mod scene;
 pub mod screen;

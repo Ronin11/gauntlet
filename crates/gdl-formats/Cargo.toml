@@ -7,6 +7,7 @@ description = "Parsers for Gauntlet Dark Legacy (GameCube) data files"
 
 [dependencies]
 anyhow.workspace = true
+png = "0.17"
 
 [dev-dependencies]
 png = "0.17"
