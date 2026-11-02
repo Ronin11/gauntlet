@@ -1,5 +1,6 @@
 //! Game state and simulation (independent of rendering).
 
+use crate::math::Det as _;
 use crate::character::{Animator, Model};
 use crate::collision::{Collision, Tri};
 use crate::fs::GameFs;
@@ -2665,7 +2666,7 @@ impl Game {
                 continue;
             }
             let a = sp.yaw + OCTANTS[d].to_radians();
-            let p = sp.pos + Vec3::new(a.sin(), 0.0, a.cos()) * dist;
+            let p = sp.pos + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * dist;
             let from = sp.pos + Vec3::Y * 2.0;
             if dist > 0.0 && self.collision.raycast(from, p + Vec3::Y * 2.0).is_some() {
                 continue;
@@ -2880,7 +2881,7 @@ impl Game {
                 }
                 Shape::Box { half } => {
                     // Work in the box's local frame.
-                    let (s, c) = e.yaw.sin_cos();
+                    let (s, c) = e.yaw.det_sin_cos();
                     let local = Vec2::new(d.x * c - d.y * s, d.x * s + d.y * c);
                     let clamped = local.clamp(-half, half);
                     let diff = local - clamped;
@@ -3021,7 +3022,7 @@ impl Game {
             // Placement rotations use the game's pitch/yaw/roll convention; items stand
             // upright, so reduce to the yaw that the rotation turns +z towards.
             let fwd = crate::character::ryp_matrix(inst.rot).transform_vector3(Vec3::Z);
-            let yaw = fwd.x.atan2(fwd.z);
+            let yaw = fwd.x.det_atan2(fwd.z);
             let p16 = |k: usize| i16::from_le_bytes([inst.params[k], inst.params[k + 1]]);
 
             match info.item_type {
@@ -3708,7 +3709,7 @@ impl Game {
     /// Camera-relative movement basis on the ground plane (forward, right), in game coordinates.
     pub fn camera_basis(&self) -> (Vec2, Vec2) {
         // Forward on the ground plane, and screen-right (accounting for the render-time X mirror).
-        let f = Vec2::new(-self.cam_yaw.sin(), -self.cam_yaw.cos());
+        let f = Vec2::new(-self.cam_yaw.det_sin(), -self.cam_yaw.det_cos());
         (f, Vec2::new(f.y, -f.x))
     }
 
@@ -4288,7 +4289,7 @@ impl Game {
             let joymag = wish.length().min(1.0);
             p.exit.joymag = joymag;
             let joyang = if joymag > 0.0 {
-                wish.x.atan2(wish.y)
+                wish.x.det_atan2(wish.y)
             } else {
                 p.yaw
             };
@@ -4299,7 +4300,7 @@ impl Game {
             let fire = inp.fire_stick(prefs.control_style);
             let fire_w = fwd * fire.y + right * fire.x;
             let firemag = fire_w.length().min(1.0);
-            let fireang = fire_w.x.atan2(fire_w.y);
+            let fireang = fire_w.x.det_atan2(fire_w.y);
             let mut ctx = crate::paction::Ctx {
                 joymag,
                 stick_yaw: wrap_angle(joyang - p.yaw),
@@ -4317,7 +4318,7 @@ impl Game {
             };
             // A combo partner: the nearest free hero within 5 in a 45 degree
             // cone ahead, at about the same height.
-            let facing = Vec2::new(p.yaw.sin(), p.yaw.cos());
+            let facing = Vec2::new(p.yaw.det_sin(), p.yaw.det_cos());
             let candidate = if p.grab_partner.is_none()
                 && p.grab_pending.is_none()
                 && p.fx.special & 0x400 == 0
@@ -4373,7 +4374,7 @@ impl Game {
                 reaction = r;
                 // Hit from behind: the forward fall.
                 if r >= 10 && p.hit_force.length() > 0.0 {
-                    let from = (-p.hit_force.x).atan2(-p.hit_force.z);
+                    let from = (-p.hit_force.x).det_atan2(-p.hit_force.z);
                     if wrap_angle(from - p.yaw).abs() > std::f32::consts::FRAC_PI_2 {
                         reaction += 1;
                     }
@@ -4394,7 +4395,7 @@ impl Game {
             } else {
                 p.yaw
             };
-            let hdir = Vec2::new(heading.sin(), heading.cos());
+            let hdir = Vec2::new(heading.det_sin(), heading.det_cos());
             let cone = if self.difficulty == 0 {
                 0.5
             } else {
@@ -4412,11 +4413,11 @@ impl Game {
                 })
                 .min_by(|a, b| a.0.total_cmp(&b.0));
             let (tdist, attack_yaw, short) = match found {
-                Some((dist, d, short, _, _)) => (dist, d.x.atan2(d.y), short),
+                Some((dist, d, short, _, _)) => (dist, d.x.det_atan2(d.y), short),
                 None => (self.rules.target_range, p.yaw, false),
             };
             // PlayerGetTarget's attackDir climbs to the target.
-            let aim_rise = found.map(|(_, d, _, dy, _)| dy.atan2(d.length()));
+            let aim_rise = found.map(|(_, d, _, dy, _)| dy.det_atan2(d.length()));
             // Strafing and blocking keep the stick's direction, and with Auto
             // Aim on so does the fire stick (pmotion.c:1584).
             let attack_yaw = if p.act.hud & 0xC000 != 0
@@ -4515,9 +4516,9 @@ impl Game {
                     pos: p.pos,
                     yaw: p.yaw,
                     aim: Vec3::new(
-                        attack_yaw.sin() * rise.cos(),
-                        rise.sin(),
-                        attack_yaw.cos() * rise.cos(),
+                        attack_yaw.det_sin() * rise.det_cos(),
+                        rise.det_sin(),
+                        attack_yaw.det_cos() * rise.det_cos(),
                     ),
                     target: aim_rise.is_some(),
                     bits: bits_now,
@@ -4610,7 +4611,7 @@ impl Game {
                     let gw = fwd * gi.stick.y + right * gi.stick.x;
                     if gw.length() > 0.0 {
                         movement = gw.length().min(1.0);
-                        mdir = gw.x.atan2(gw.y);
+                        mdir = gw.x.det_atan2(gw.y);
                     }
                 }
             }
@@ -4658,7 +4659,7 @@ impl Game {
             p.trial_move = Vec3::ZERO;
             if moving {
                 let yaw = walk.unwrap_or(p.yaw);
-                let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+                let dir = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
                 let mut target = p.pos + dir * speed * dt;
                 // PlayerCollideItems: walking into a monster stops the hero
                 // with Auto Attack on (to swing at it), else slides round
@@ -4708,7 +4709,7 @@ impl Game {
             }
             if !grabbed {
                 p.pos += p.knock_vel * dt;
-                p.knock_vel *= 0.667f32.powf(dt * 30.0);
+                p.knock_vel *= 0.667f32.det_powf(dt * 30.0);
                 p.trial_move = p.pos - start;
                 let (mut pos, wall) = Self::player_walls(&self.collision, p.pos);
                 // PlayerCollideFloor: a stairs floor up to 3 above the feet is
@@ -4870,7 +4871,7 @@ impl Game {
             damage *= 2.0;
             flags |= m::DMG_SUPER;
         }
-        let from = Vec3::new(t.yaw.sin(), 0.0, t.yaw.cos());
+        let from = Vec3::new(t.yaw.det_sin(), 0.0, t.yaw.det_cos());
         let mut dir = t.aim;
         let reach = m::modify_dpos(from, &mut dir, 0.0, ct, flags, t.target, charge);
         let hand = t.pos
@@ -5022,7 +5023,7 @@ impl Game {
                 },
                 model,
                 pt1,
-                v.x.atan2(v.z),
+                v.x.det_atan2(v.z),
             );
             if let Some(e) = self.entities.last_mut().filter(|e| e.id == id) {
                 e.scale = size;
@@ -5043,7 +5044,7 @@ impl Game {
         if tumble != 0.0 {
             pitch
         } else {
-            -vel.y.atan2(vel.x.hypot(vel.z))
+            -vel.y.det_atan2(vel.x.det_hypot(vel.z))
         }
     }
 
@@ -5242,7 +5243,7 @@ impl Game {
                     if combo_anim {
                         if self.players[i].act.hud & 0x20 == 0 {
                             let d = self.players[i].pos - self.players[partner].pos;
-                            self.players[partner].yaw = d.x.atan2(d.z);
+                            self.players[partner].yaw = d.x.det_atan2(d.z);
                             grab(self, i, partner);
                         }
                     } else if ph & 0x10 != 0 {
@@ -5285,7 +5286,7 @@ impl Game {
                     if cur == pa::COMBO_ACTIVE1 {
                         if self.players[i].act.hud & 0x20 == 0 {
                             let d = self.players[i].pos - self.players[partner].pos;
-                            self.players[partner].yaw = d.x.atan2(d.z);
+                            self.players[partner].yaw = d.x.det_atan2(d.z);
                             grab(self, i, partner);
                             self.players[i].act.hud |= 0x80;
                         }
@@ -5357,7 +5358,7 @@ impl Game {
     /// A swing lands (pmotion.c:2621): the one target in the facing cone within
     /// 3.5, for the melee damage times `mult` (x2 slow / step, x3 power).
     fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, bits: u32) {
-        let dir = Vec2::new(yaw.sin(), yaw.cos());
+        let dir = Vec2::new(yaw.det_sin(), yaw.det_cos());
         // PlayerGetTarget: the breakable wall the hero touches (its collision
         // item) comes before any monster.
         if let Some(w) = self.melee_wall(pi, pos, dir) {
@@ -5528,7 +5529,7 @@ impl Game {
         }
         let hand = p.pos + Vec3::Y * (PLAYER_HEIGHT * 0.5);
         let yaw = p.yaw;
-        let dir = |a: f32| Vec3::new((yaw + a).sin(), 0.0, (yaw + a).cos());
+        let dir = |a: f32| Vec3::new((yaw + a).det_sin(), 0.0, (yaw + a).det_cos());
         let sf = row.startframe as f32;
         let ef = if row.endframe < 0 || row.flags & 0x80 != 0 {
             sf
@@ -5631,7 +5632,7 @@ impl Game {
         }
         if row.kind == 2 && row.speed_min > 0.0 {
             let spd = 0.5 * (row.speed_max - row.speed_min) + row.speed_min;
-            let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+            let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
             // Level: the floor's slope (field_8BC) is not tracked. Flag 8's
             // PitchVec3 is set by no shipped row.
             let vel = if row.flags & 4 != 0 { fwd } else { fwd * spd };
@@ -5675,13 +5676,13 @@ impl Game {
                     hold: row.mintime,
                     morph,
                 };
-                e.yaw = vel.x.atan2(vel.z);
+                e.yaw = vel.x.det_atan2(vel.z);
                 e.pitch = Self::missile_pitch(vel, 0.0, 0.0);
             }
             return;
         }
         let at = fx.pos;
-        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
         let delay = row.delay.max(1.0 / 60.0);
         let hits: Vec<(usize, Vec2)> = self
             .entities
@@ -6499,7 +6500,7 @@ impl Game {
         };
         if let Some((_, scale)) = react.filter(|r| r.1 > 0.0) {
             *pushed += dir * scale;
-            *pushang = dir.x.atan2(dir.z) + std::f32::consts::PI;
+            *pushang = dir.x.det_atan2(dir.z) + std::f32::consts::PI;
             if *pushang > std::f32::consts::PI {
                 *pushang -= std::f32::consts::TAU;
             }
@@ -7096,7 +7097,7 @@ impl Game {
                         if pushed.x * pushed.x + pushed.z * pushed.z > 0.1 {
                             e.yaw = *pushang;
                         }
-                        *pushed *= 0.8f32.powf(dt * 30.0);
+                        *pushed *= 0.8f32.det_powf(dt * 30.0);
                         for c in [&mut pushed.x, &mut pushed.y, &mut pushed.z] {
                             if c.abs() < 0.01 {
                                 *c = 0.0;
@@ -7942,7 +7943,7 @@ impl Game {
                         e.alive = false;
                     } else {
                         e.pos = to;
-                        e.yaw = vel.x.atan2(vel.z);
+                        e.yaw = vel.x.det_atan2(vel.z);
                         e.pitch = Self::missile_pitch(*vel, *tumble, e.pitch + *tumble * dt);
                         proj_hits.push((
                             ei,
@@ -8018,7 +8019,7 @@ impl Game {
                                     < *radius + PLAYER_RADIUS
                                 && (pp.y - e.pos.y).abs() < 4.0
                             {
-                                let fwd = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
+                                let fwd = Vec3::new(e.yaw.det_sin(), 0.0, e.yaw.det_cos());
                                 trap_hits.push((
                                     pi,
                                     *dmg,
@@ -8626,7 +8627,7 @@ impl Game {
                 },
                 model,
                 from + dir * 3.0,
-                dir.x.atan2(dir.z),
+                dir.x.det_atan2(dir.z),
             );
         }
         // The suicide grunt's blast (enemy_dies: SuicideExplosion at its
@@ -9333,7 +9334,7 @@ mod tests {
             if let Kind::Enemy { cooldown, .. } = &mut kind {
                 *cooldown = 99.0;
             }
-            g.spawn(kind, model, p + Vec3::new(a.sin(), 0.0, a.cos()) * 7.0, 0.0);
+            g.spawn(kind, model, p + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * 7.0, 0.0);
         }
         g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
         g.players[0].power = 100.0;
@@ -10024,7 +10025,7 @@ mod tests {
             pi: 0,
             pos: p.pos,
             yaw: p.yaw,
-            aim: Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()),
+            aim: Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos()),
             target: false,
             bits: crate::paction::act::THROW,
             since_swing: 1.0,
@@ -10089,7 +10090,7 @@ mod tests {
         let want = p
             + Vec3::Y * 2.5
             + crate::missile::rotate_offset([-0.5, 0.5, 1.5], yaw)
-            + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 2.0;
+            + Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos()) * 2.0;
         assert!((m[0].0 - want).length() < 1e-3, "{:?} vs {want:?}", m[0].0);
         // Lobbed: rising, at the clamped missile speed across.
         let speed = g.players[0].derived.missile_speed.clamp(1.0, 100.0);
@@ -10131,7 +10132,7 @@ mod tests {
         g.player_start_missile(Throw { yaw, ..t });
         let mut turns: Vec<i32> = missiles(&g)
             .iter()
-            .map(|(_, v, _)| wrap_angle(v.x.atan2(v.z) - yaw).to_degrees().round() as i32)
+            .map(|(_, v, _)| wrap_angle(v.x.det_atan2(v.z) - yaw).to_degrees().round() as i32)
             .collect();
         turns.sort();
         assert_eq!(turns, [-30, -15, 0, 15, 30]);
@@ -10346,7 +10347,7 @@ mod tests {
             else {
                 continue;
             };
-            g.players[0].pos = pos + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 15.0 + Vec3::Y;
+            g.players[0].pos = pos + Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos()) * 15.0 + Vec3::Y;
             let hp = g.players[0].health;
             let mut ran = false;
             let mut gone = false;
@@ -10399,7 +10400,7 @@ mod tests {
         let p = g.players[0].pos;
         let (at, yaw) = (0..16)
             .map(|k| k as f32 * std::f32::consts::TAU / 16.0)
-            .map(|a| (p + Vec3::new(a.sin(), 0.0, a.cos()) * 16.0, a))
+            .map(|a| (p + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * 16.0, a))
             .find(|(q, _)| {
                 (1..=16).all(|s| {
                     let r = p + (*q - p) * (s as f32 / 16.0);
@@ -10459,7 +10460,7 @@ mod tests {
             };
             // Stand 12 units in front of it.
             let (pos, yaw) = archer;
-            g.players[0].pos = pos + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 12.0 + Vec3::Y;
+            g.players[0].pos = pos + Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos()) * 12.0 + Vec3::Y;
             let mut shots = 0;
             for _ in 0..600 {
                 g.update(1.0 / 60.0, &[PlayerInput::default()]);
@@ -10618,7 +10619,7 @@ mod tests {
         };
         // 30 along the facing, from (0, 1, 5) in the hero's frame; a super
         // (pass-through) shot of radius hitrad 10 with no hit record.
-        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
         assert!((*vel - fwd * 30.0).length() < 1e-3);
         assert!((e.pos - (p + Vec3::Y + fwd * 5.0)).length() < 1e-3);
         assert_eq!((*radius, pierced.is_some()), (10.0, true));
@@ -10663,7 +10664,7 @@ mod tests {
         // PlyrSfxWrapTime: frames 16, 19, 21, 23 and 25; the angle shrinks
         // to the facing.
         assert_eq!(dirs.len(), 5);
-        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
         assert!(dirs[0].dot(fwd).abs() < 0.05, "first goes out sideways");
         assert!(dirs.last().unwrap().dot(fwd) > 0.9, "last nearly ahead");
     }

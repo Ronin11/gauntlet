@@ -1776,6 +1776,7 @@ pub fn presets() -> Vec<PsysRecord> {
 
 #[cfg(test)]
 mod tests {
+    use crate::math::Det as _;
     use super::*;
 
     fn ctx<'a>(
@@ -1990,7 +1991,7 @@ mod tests {
         assert_eq!(a, Vec3::new(0.2, 0.0, 0.0));
         assert!((b - Vec3::new(0.0, 0.0, -0.04)).length() < 1e-7);
         let (s, c) = sin_cos(0.5);
-        assert!((s - 0.5f32.sin()).abs() < 1e-5 && (c - 0.5f32.cos()).abs() < 1e-5);
+        assert!((s - 0.5f32.det_sin()).abs() < 1e-5 && (c - 0.5f32.det_cos()).abs() < 1e-5);
         assert_eq!(PbRand(0).rand(), 0x269EC3 & 0x7FFF);
     }
 }

@@ -8,6 +8,7 @@
 //! (with AppendBigapePowerupsToScene, which places the Mikey, Hand of Death
 //! and Health Vampire pick-ups).
 
+use crate::math::Det as _;
 use super::*;
 use crate::powerups as pu;
 use glam::Mat4;
@@ -385,7 +386,7 @@ pub(crate) fn calc_target_dir(
     gravity: f32,
     lift: f32,
 ) {
-    let horizontal = v.x.hypot(v.z);
+    let horizontal = v.x.det_hypot(v.z);
     let norm = if horizontal > 0.001 {
         1.0 / horizontal
     } else {
@@ -623,7 +624,7 @@ impl Game {
             opacity(95)
         } else if special & pu::S_INVISIBLE != 0 {
             let v = if !(0.0..=3.0).contains(&alpha_time) || (8.0 * alpha_time) as i32 & 1 != 0 {
-                160 + (16.0 * (std::f32::consts::TAU * alpha_time).sin()) as i32
+                160 + (16.0 * (std::f32::consts::TAU * alpha_time).det_sin()) as i32
             } else {
                 0
             };
@@ -907,7 +908,7 @@ impl Game {
             .get(p.model)
             .map_or([0.0; 3], |d| d.fam_proj_offset);
         let hit = p.pos + m::rotate_offset((Vec3::from(offset) * p.worn.scale).into(), p.yaw);
-        let from = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
+        let from = Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos());
         let mut dir = aim;
         let reach = m::modify_dpos(
             from,
@@ -952,7 +953,7 @@ impl Game {
             },
             model,
             hit,
-            v.x.atan2(v.z),
+            v.x.det_atan2(v.z),
         );
     }
 
@@ -1137,7 +1138,7 @@ mod tests {
             pi: 0,
             pos: p.pos,
             yaw: p.yaw,
-            aim: Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()),
+            aim: Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos()),
             target: false,
             bits: crate::paction::act::THROW,
             since_swing: 1.0,
@@ -1177,7 +1178,7 @@ mod tests {
         let shots = shots_of(&g, fball);
         assert_eq!(shots.len(), 1, "one PHOENIX_FBALL");
         let (vel, damage, life) = shots[0];
-        assert!((vel.x.hypot(vel.z) - 35.0).abs() < 0.5, "{vel}");
+        assert!((vel.x.det_hypot(vel.z) - 35.0).abs() < 0.5, "{vel}");
         assert!((damage - 10.0 * ELEMENT_BONUS).abs() < 1e-4);
         assert!(life <= 3.0);
     }

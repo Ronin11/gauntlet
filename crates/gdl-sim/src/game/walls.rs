@@ -565,7 +565,7 @@ mod tests {
         };
         let _ = n;
         g.players[0].pos = p0;
-        g.players[0].yaw = toward.x.atan2(toward.y);
+        g.players[0].yaw = toward.x.det_atan2(toward.y);
         // The stick for a world direction (camera relative).
         let stick = |g: &Game| {
             let (f, r) = g.camera_basis();

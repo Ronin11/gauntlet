@@ -7,6 +7,7 @@
 //! order) and `shards` the 13 runestones, which is how tower.c names them too
 //! (its effect names are the other way round).
 
+use crate::math::Det as _;
 use crate::fs::GameFs;
 use crate::game::{Game, Kind, PlayerState, ScrollBox, CRYSTALS_NEEDED, GARG_NEEDED};
 use gdl_formats::text::TextRom;
@@ -96,9 +97,9 @@ pub fn locator_cam(g: &Game, id: u16) -> Option<(Vec3, Vec3)> {
         .find(|l| l.kind == LocatorType::TriggerCamera && l.next == id)?;
     let (pitch, yaw) = (l.rot[0], l.rot[1]);
     let dir = Vec3::new(
-        yaw.sin() * pitch.cos(),
-        -pitch.sin(),
-        yaw.cos() * pitch.cos(),
+        yaw.det_sin() * pitch.det_cos(),
+        -pitch.det_sin(),
+        yaw.det_cos() * pitch.det_cos(),
     );
     Some((Vec3::from(l.pos), dir))
 }

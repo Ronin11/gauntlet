@@ -2,6 +2,7 @@
 //! RegisterItemWobj and the per-frame world-object update). A trigger's target is a
 //! world object that slides up or down between two heights, or fades in and out.
 
+use crate::math::Det as _;
 use crate::collision::Collision;
 use crate::level::Level;
 use crate::worldanim::{wflags, WorldAnims};
@@ -189,9 +190,9 @@ pub fn trigger_camera(worlds: &gdl_formats::worlds::Worlds, id: u8) -> Option<(V
         .find(|l| l.kind == LocatorType::TriggerCamera && l.next == id as u16)?;
     let (pitch, yaw) = (l.rot[0], l.rot[1]);
     let dir = Vec3::new(
-        yaw.sin() * pitch.cos(),
-        -pitch.sin(),
-        yaw.cos() * pitch.cos(),
+        yaw.det_sin() * pitch.det_cos(),
+        -pitch.det_sin(),
+        yaw.det_cos() * pitch.det_cos(),
     );
     Some((Vec3::from(l.pos), dir, l.delay))
 }
@@ -693,7 +694,7 @@ pub(crate) mod tests {
             g.update(1.0 / 60.0, &[walk]);
         }
         let moved = g.players[0].pos - start;
-        assert!(moved.x.hypot(moved.z) < 0.5, "controls held");
+        assert!(moved.x.det_hypot(moved.z) < 0.5, "controls held");
         assert_eq!(g.camera_view().0, eye);
         assert!(g.trigger_camera_view().is_some());
         tick(&mut g, 600);

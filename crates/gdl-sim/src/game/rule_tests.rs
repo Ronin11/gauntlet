@@ -2,6 +2,7 @@
 //! level-up, chests and doors (fn_8005D730 cases 2 and 7), melee friendly
 //! fire (PlayerMotion_FindClosestPlayer) and activate_player.
 
+use crate::math::Det as _;
 use super::*;
 
 fn data() -> Option<GameFs> {
@@ -335,7 +336,7 @@ fn at_chest(fs: &GameFs, at: Vec3) -> (Game, u64, Vec3) {
             .unwrap();
         let (id, pos) = (e.id, e.pos);
         let a = side as f32 * std::f32::consts::FRAC_PI_4;
-        let stand = pos + Vec3::new(a.cos(), 0.0, a.sin()) * 2.8;
+        let stand = pos + Vec3::new(a.det_cos(), 0.0, a.det_sin()) * 2.8;
         for _ in 0..30 {
             g.players[0].pos = stand;
             g.update(1.0 / 60.0, &[PlayerInput::default()]);

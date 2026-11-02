@@ -1,6 +1,7 @@
 //! World collision: ground height queries and cylinder-vs-wall resolution against
 //! the level's collision triangles (which are stored in world space).
 
+use crate::math::Det as _;
 use glam::{Vec2, Vec3};
 
 #[derive(Clone, Copy, Debug)]
@@ -642,7 +643,7 @@ impl Collision {
         let mut dx = end.x - hit.at.x;
         let mut dz = end.z - hit.at.z;
         let mut dq = dpos.y * (end.y - fh) + dpos.x * dx + dpos.z * dz;
-        let mut d = dx.hypot(dz);
+        let mut d = dx.det_hypot(dz);
         if d >= 0.001 {
             let nrm = dpos.normalize_or_zero() * radius;
             end += nrm;
@@ -652,7 +653,7 @@ impl Collision {
                     dx = end.x - h.at.x;
                     dz = end.z - h.at.z;
                     dq = dpos.y * (end.y - h.at.y) + dpos.x * dx + dpos.z * dz;
-                    d = dx.hypot(dz);
+                    d = dx.det_hypot(dz);
                 }
                 None => {
                     d = radius;

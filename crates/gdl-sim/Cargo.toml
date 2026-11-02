@@ -12,6 +12,7 @@ path = "src/lib.rs"
 anyhow.workspace = true
 gdl-formats = { path = "../gdl-formats" }
 gcdisc = { path = "../gcdisc" }
-glam = { version = "0.30", features = ["bytemuck"] }
+glam = { version = "0.30", features = ["bytemuck", "libm", "scalar-math"] }
+libm = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"

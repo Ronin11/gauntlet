@@ -10,6 +10,7 @@
 //! critters standing on a 0x1000 object are parented to its node
 //! (PlayerCheckFloor / enemy / critter `MBNodeSetParent`) and are carried.
 
+use crate::math::Det as _;
 use crate::character::{pyr_matrix, ryp_matrix};
 use crate::collision::Collision;
 use crate::level::Level;
@@ -594,7 +595,7 @@ impl WorldAnims {
         }
         let to = m.transform_point3(at);
         let f = m.transform_vector3(Vec3::Z);
-        Some((to, f.x.atan2(f.z)))
+        Some((to, f.x.det_atan2(f.z)))
     }
 }
 
@@ -963,7 +964,7 @@ mod tests {
         // 0.5 degrees a tick: 30 degrees in a second, about the node.
         let d = g.world_anim.delta(o);
         let f = d.transform_vector3(Vec3::Z);
-        let turned = f.x.atan2(f.z).abs().to_degrees();
+        let turned = f.x.det_atan2(f.z).abs().to_degrees();
         assert!((turned - 30.0).abs() < 1.0, "turned {turned}");
         // Each vertex keeps its distance from the node (which its elevator
         // trigger may also have slid; the world is posed from load).

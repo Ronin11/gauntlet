@@ -6,6 +6,7 @@ license.workspace = true
 description = "Parsers for Gauntlet Dark Legacy (GameCube) data files"
 
 [dependencies]
+libm = "0.2"
 anyhow.workspace = true
 
 [dev-dependencies]

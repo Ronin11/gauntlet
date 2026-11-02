@@ -6,6 +6,7 @@
 //!
 //! A child of `game`, so it reaches the game's private state.
 
+use crate::math::Det as _;
 use super::*;
 use crate::psys::{streak_quad, Owner, Psys, Streak, StreakQuad};
 use gdl_formats::psys::enables;
@@ -281,7 +282,7 @@ impl Game {
             .and_then(|t| t.parse::<usize>().ok())
         {
             let p = &self.players[0];
-            let at = p.pos + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * 6.0;
+            let at = p.pos + Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos()) * 6.0;
             let dmg = 10.0 * self.tuning.trap_damage;
             self.start_explosion(at, ty, dmg);
             return true;
@@ -299,7 +300,7 @@ impl Game {
             return false;
         };
         let p = &self.players[0];
-        let at = p.pos + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * 4.0 + Vec3::Y * 2.0;
+        let at = p.pos + Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos()) * 4.0 + Vec3::Y * 2.0;
         let yaw = p.yaw;
         self.start_fx(row, at, yaw, 0.0).is_some()
     }

@@ -2,6 +2,7 @@
 //! StartMagicFX, StartThrowMagicFX, StartShieldFX, StartMagicHealFX,
 //! StartMagicPlayerFX), run as ProcessEffects runs them.
 
+use crate::math::Det as _;
 use super::*;
 
 /// lbl_80122088 + 3484 / 3504 / 3524 (magicid, throwid, shieldid) and FX 34,
@@ -192,13 +193,13 @@ impl Game {
                 // pw = 1.5 throw_str + 5 (throw_str is always 0 here); the
                 // bottle starts 2 ahead and 4 up, at 45 degrees.
                 let p = &self.players[pi];
-                let fwd = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
+                let fwd = Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos());
                 let pw = 1.5 * 0.0 + 5.0;
                 let at = pos + 2.0 * fwd + Vec3::Y * 4.0;
                 let vel = Vec3::new(fwd.x * 0.707, 0.707, fwd.z * 0.707) * pw;
                 let radius = 0.75 * power;
                 let model = self.magic_models.throw[c];
-                let entity = self.magic_entity(model, at, vel.x.atan2(vel.z), THROW_TIME, 1.0);
+                let entity = self.magic_entity(model, at, vel.x.det_atan2(vel.z), THROW_TIME, 1.0);
                 self.magic.push(MagicFx {
                     owner: pnum,
                     colour,
@@ -384,7 +385,7 @@ impl Game {
             .entity
             .and_then(|id| self.entities.iter_mut().find(|e| e.id == id))
         {
-            e.yaw = vel.x.atan2(vel.z);
+            e.yaw = vel.x.det_atan2(vel.z);
         }
         if burst {
             // The hit morph (fxhit = magicid): the MP blast, on the floor,

@@ -11,6 +11,7 @@
 //!
 //! A child of `game`, so it reaches the game's private state.
 
+use crate::math::Det as _;
 use super::*;
 
 /// fx_type values used here (effect.h).
@@ -752,7 +753,7 @@ impl Game {
             Kind::Effect { life: d.time },
             d.model,
             pos,
-            dir.x.atan2(dir.z),
+            dir.x.det_atan2(dir.z),
         );
         self.set_fx_alpha(id, d.alpha);
         let damage = ENEDEATH_DAMAGE * self.tuning.damage;

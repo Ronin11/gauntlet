@@ -27,6 +27,7 @@
 //! `key=value` fields), versioned; unknown keys are ignored and missing ones
 //! take defaults, so older and newer builds read each other's states.
 
+use crate::math::Det as _;
 use super::PanelInfo;
 use super::*;
 use crate::powerups::{MiniInv, Slot};
@@ -597,7 +598,7 @@ impl Game {
         for r in 1..=24 {
             for k in 0..16 {
                 let a = k as f32 * std::f32::consts::TAU / 16.0;
-                let q = pos + Vec3::new(a.cos() * r as f32, 0.0, a.sin() * r as f32);
+                let q = pos + Vec3::new(a.det_cos() * r as f32, 0.0, a.det_sin() * r as f32);
                 for dy in [0.0, 3.0, -3.0, 6.0] {
                     if let Some(p) = ok(q + Vec3::Y * dy) {
                         return p;

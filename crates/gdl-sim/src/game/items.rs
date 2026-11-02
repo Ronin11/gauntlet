@@ -8,6 +8,7 @@
 //!
 //! A child of `game`, so it reaches the game's private state.
 
+use crate::math::Det as _;
 use super::*;
 
 /// Item-info subtypes (items.c).
@@ -999,7 +1000,7 @@ impl Game {
                 } else {
                     gyaw - std::f32::consts::FRAC_PI_2
                 });
-                at + Vec3::new(a.sin(), 0.0, a.cos()) * 3.5
+                at + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * 3.5
             }
             _ => at,
         };

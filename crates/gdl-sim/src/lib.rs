@@ -22,6 +22,7 @@ pub mod hints;
 pub mod input;
 pub mod interp;
 pub mod level;
+pub mod math;
 pub mod mesh;
 pub mod messages;
 pub mod missile;
