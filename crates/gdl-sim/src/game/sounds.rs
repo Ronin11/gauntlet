@@ -937,7 +937,7 @@ mod tests {
         let mut heard = false;
         for _ in 0..300 {
             g.players[0].pos = pos + Vec3::new(4.0, 0.0, 0.0);
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             heard |= g.sfx.drain(..).any(|s| s == "#51");
         }
         let x = g.snd.xray[0].expect("no x-ray view");
@@ -954,7 +954,7 @@ mod tests {
             let mut v = Vec::new();
             for t in 0..240 {
                 g.players[0].health = hp;
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 v.extend(
                     g.sfx
                         .drain(..)

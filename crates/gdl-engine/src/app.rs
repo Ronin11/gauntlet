@@ -5,6 +5,7 @@ use crate::attract::{self, Attract};
 use crate::audio::Audio;
 use crate::fs::GameFs;
 use crate::game::Game;
+use crate::game::setup::{Command, LevelSetup};
 use crate::game::{LevelEnd, PlayerState};
 use crate::gpu::Gpu;
 use crate::hud::PanelInfo;
@@ -651,13 +652,13 @@ impl App {
                         r.checkpoint = r.carry.clone();
                     }
                     setup_heroes(&mut p.game, &p.panels, &r.carry, &r.heroes);
-                    p.game.friendly_fire = r.prefs.multiplayer;
-                    p.game.crystals = r.progress.crystals;
-                    p.game.garg_items = r.progress.garg_items;
-                    p.game.shards = r.progress.shards;
-                    p.game.runes = r.progress.runes;
-                    // The party's legend weapons; a boss fight may use one.
-                    p.game.set_legend_held(r.progress.legend);
+                    // The rules, the options that change play and the party's
+                    // finds, including the legend weapons a boss fight may use.
+                    p.game.apply_setup(&LevelSetup::new(
+                        &self.cfg.rules,
+                        r.prefs.multiplayer,
+                        &r.progress,
+                    ));
                     if let Some(dir) = p.game.boss_model_dir() {
                         let imgs = hud::boss_meter_images(fs, &dir);
                         p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
@@ -879,7 +880,7 @@ impl App {
                     }
                     let (eye, at) = cam.view();
                     play.game.fixed_camera = Some((eye, at));
-                    play.game.update(TICK, &[PlayerInput::default()]);
+                    play.game.update(&[PlayerInput::default()]);
                     play.game.cam_focus = at;
                     play.game.sfx.clear();
                     // attract_check_input: Start goes to the title; after a
@@ -997,9 +998,7 @@ impl App {
                                         }
                                     }
                                 }
-                                play.game.crystals = r.progress.crystals;
-                                play.game.garg_items = r.progress.garg_items;
-                                play.game.shards = r.progress.shards;
+                                play.game.resume_with(&r.progress);
                                 for (i, info) in play.panels.iter().enumerate() {
                                     if let Some(h) = &r.heroes[info.slot % 4] {
                                         play.game.msgs.set_help_disp(i, &h.help_disp);
@@ -1107,10 +1106,7 @@ impl App {
                                 // Leaving Sumner's menu: he waves the party off.
                                 if let Some(h) = pause.as_ref().and_then(|m| m.hints()) {
                                     r.progress.hints = h.state;
-                                    if let Some(mut sm) = play.game.sumner.take() {
-                                        sm.hints_closed(&mut play.game);
-                                        play.game.sumner = Some(sm);
-                                    }
+                                    play.game.command(Command::HintsClosed);
                                 }
                                 *pause = None
                             }
@@ -1120,10 +1116,7 @@ impl App {
                             OptionsAction::QuitLevel => {
                                 autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
                                 *pause = None;
-                                for p in &mut play.game.players {
-                                    p.state = PlayerState::InTower;
-                                }
-                                play.game.level_end = Some(LevelEnd::AllDead);
+                                play.game.command(Command::QuitLevel);
                             }
                             OptionsAction::ManageCharacter => {
                                 r.progress = live_progress(play, &r.progress);
@@ -1166,11 +1159,9 @@ impl App {
                         if !menu_drawing(pause) {
                             *pause = None;
                         }
-                    } else if let Some(b) = &mut play.game.scroll_box {
-                        // A scroll being read stops the game until its reader presses B.
-                        if b.update(&inputs) {
-                            play.game.scroll_box = None;
-                        }
+                    } else if play.game.scroll_box.is_some() {
+                        // A scroll being read: only its box runs.
+                        play.game.update(&inputs);
                     } else if let Some(src) = (play.game.wave == Some(TOWER_WAVE)
                         && !sumner_busy
                         && r.sources.len() < 4)
@@ -1215,14 +1206,19 @@ impl App {
                         // kept by panel slot (as select and do_vibe do).
                         for i in 0..4 {
                             let slot = play.panels.get(i).map_or(i, |p| p.slot);
-                            play.game.controls[i] = r.prefs.players[slot % 4];
+                            let prefs = r.prefs.players[slot % 4];
+                            if play.game.controls[i] != prefs {
+                                play.game.command(Command::SetControls { player: i, prefs });
+                            }
                         }
                         if r.acc < 2.0 * TICK {
                             // interp.rs: the tick being left, if not yet drawn.
                             play.scene.pre_tick(&r.gpu, &play.game);
                         }
-                        play.game.debug_god = r.debug.god;
-                        play.game.update(TICK, &inputs);
+                        if play.game.debug_god != r.debug.god {
+                            play.game.command(Command::DebugGod(r.debug.god));
+                        }
+                        play.game.update(&inputs);
                         r.bugs.observe(&play.game, &inputs);
                         play.intro += TICK;
                         // Debug save states: an autosave every minute of play.

@@ -928,7 +928,7 @@ mod tests {
             .unwrap();
         let v0 = g.collision.tris[tri].v;
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         let v1 = g.collision.tris[tri].v;
         let moved = (0..3).map(|k| (v1[k] - v0[k]).length()).fold(0.0, f32::max);
@@ -959,7 +959,7 @@ mod tests {
             .unwrap();
         let v0 = g.collision.tris[tri].v;
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         // 0.5 degrees a tick: 30 degrees in a second, about the node.
         let d = g.world_anim.delta(o);
@@ -994,7 +994,7 @@ mod tests {
         // hero standing under them, and the invisible G2BLOCKER1 box around
         // the cart faces outward, so it only keeps heroes from walking in).
         for _ in 0..10 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         let mid = |t: &crate::collision::Tri| (t.v[0] + t.v[1] + t.v[2]) / 3.0;
         let tri = g
@@ -1026,7 +1026,7 @@ mod tests {
         g.players[0].vy = 0.0;
         let input = [crate::input::PlayerInput::default()];
         for _ in 0..5 {
-            g.update(1.0 / 60.0, &input);
+            g.update(&input);
         }
         // Where the hero stands on the deck, in the deck's own frame.
         let local = |g: &crate::game::Game| {
@@ -1036,7 +1036,7 @@ mod tests {
         };
         let l0 = local(&g);
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &input);
+            g.update(&input);
         }
         let c1 = centre(&g);
         assert!(

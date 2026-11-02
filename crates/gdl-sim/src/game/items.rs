@@ -676,7 +676,7 @@ impl Game {
                 match owner {
                     Some(pi) => self.hit_entity(pi, t, power, push, false),
                     None => {
-                        let r = Self::apply_hit(&mut self.entities[t], power, push);
+                        let r = Self::apply_hit(&mut self.entities[t], power, push, self.magic_hit != 0);
                         self.barrel_hit(t);
                         if let Some((pos, item)) = r.drop {
                             self.spawn_content(pos, item);
@@ -922,7 +922,7 @@ impl Game {
                 let Kind::Enemy { state: was, .. } = self.entities[t].kind else {
                     return;
                 };
-                let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+                let r = Self::apply_hit(&mut self.entities[t], dmg, push, self.magic_hit != 0);
                 if !r.hit {
                     return;
                 }
@@ -935,7 +935,7 @@ impl Game {
                 }
             }
             (Kind::Generator { .. }, _) => {
-                let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+                let r = Self::apply_hit(&mut self.entities[t], dmg, push, self.magic_hit != 0);
                 let mut dropped = r.killed;
                 if !r.killed {
                     let thr = 10.0 * self.tuning.gen_health;
@@ -1570,7 +1570,7 @@ mod tests {
 
     fn step(g: &mut Game, secs: f32) {
         for _ in 0..(secs * 60.0) as usize {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
     }
 
@@ -1680,7 +1680,7 @@ mod tests {
         let (sid, ..) = shell(&g).expect("its pieces are left to break apart");
         let mut frames = Vec::new();
         for _ in 0..240 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             let (id, seq, frame) = shell(&g).expect("a plain barrel's pieces stay");
             assert_eq!(id, sid);
             frames.push((seq, frame));
@@ -1782,7 +1782,7 @@ mod tests {
             let mut last = start;
             for _ in 0..(4 * 60) {
                 g.players[0].pos = Vec3::new(centre.x + d, at.y, centre.z);
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 if g.players[0].health < last {
                     hurts += 1;
                 }
@@ -1822,7 +1822,7 @@ mod tests {
         let mut last = g.players[0].health;
         for _ in 0..(6 * 60) {
             g.players[0].pos = at;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if g.players[0].health < last {
                 hurts += 1;
             }
@@ -1869,7 +1869,7 @@ mod tests {
             if let Some(e) = g.entities.iter_mut().find(|e| e.id == mon) {
                 e.pos = spot;
             }
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             let now = hp(&g);
             if last - now > 2.0 {
                 hits += 1;
@@ -1985,7 +1985,7 @@ mod tests {
         g.damage_item(t, 10.0, DMG_EXPLODE, None);
         let mut blast = None;
         for _ in 0..180 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if let Some(b) = g.items.blasts.first() {
                 blast.get_or_insert((b.damage, b.radius));
             }
@@ -2170,7 +2170,7 @@ mod tests {
             _ => -1,
         };
         for _ in 0..10 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         // One egg laid (the left one): it waits.
         assert!(matches!(gen_of(&g, gen), Kind::Generator { chain, .. } if chain.flags == 1));
@@ -2183,7 +2183,7 @@ mod tests {
         assert!(matches!(gen_of(&g, gen), Kind::Generator { chain, .. }
             if chain.flags == 7 && chain.generated == 3));
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert_eq!(mode1(&g), 2, "hatched");
     }
@@ -2193,8 +2193,8 @@ mod tests {
         let Some(fs) = data() else { return };
         let mut g = quiet(&fs, &[]);
         let (gen, _) = generator(&mut g, &fs, 15);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         // generate_single: one lookout, at once and only one.
         let Kind::Generator { spawned, .. } = gen_of(&g, gen) else {
             panic!()
@@ -2204,7 +2204,7 @@ mod tests {
         let t = g.entities.iter().position(|e| e.id == id).unwrap();
         assert!(matches!(&g.entities[t].kind, Kind::Enemy { ai: 15, .. }));
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(matches!(gen_of(&g, gen), Kind::Generator { spawned, .. } if spawned.len() == 1));
         let t = g.entities.iter().position(|e| e.id == id).unwrap();

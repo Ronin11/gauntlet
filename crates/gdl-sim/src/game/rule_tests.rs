@@ -106,13 +106,13 @@ fn only_a_locked_chest_takes_a_key() {
     };
     let (mut g, id) = by_a_chest(&fs, true);
     for _ in 0..5 {
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     assert!(opened(&g, id));
     assert_eq!(g.players[0].keys, 0);
     let (mut g, id) = by_a_chest(&fs, false);
     for _ in 0..5 {
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     assert!(!opened(&g, id));
     assert_eq!(g.players[0].keys, 1);
@@ -130,19 +130,19 @@ fn a_door_opens_only_for_a_hero_walking_toward_it() {
     };
     // Up against the gate at z=27.9 (see locked_gate_blocks_until_key).
     for _ in 0..400 {
-        g.update(1.0 / 60.0, &[walk(&g, 1.0)]);
+        g.update(&[walk(&g, 1.0)]);
     }
     let doors = g.entities.len();
     // Turned round (a hero walks along its facing) and stepping away.
     g.players[0].keys = 1;
     g.players[0].yaw = std::f32::consts::PI;
     for _ in 0..3 {
-        g.update(1.0 / 60.0, &[walk(&g, -1.0)]);
+        g.update(&[walk(&g, -1.0)]);
     }
     assert_eq!(g.entities.len(), doors, "walking away leaves it shut");
     assert_eq!(g.players[0].keys, 1);
     for _ in 0..60 {
-        g.update(1.0 / 60.0, &[walk(&g, 1.0)]);
+        g.update(&[walk(&g, 1.0)]);
     }
     assert_eq!(g.players[0].keys, 0, "walking back opens it");
 }
@@ -169,7 +169,7 @@ fn the_altar_door_opens_to_a_hero_held_at_its_edge() {
             stick: g.stick_toward(to.normalize()),
             ..Default::default()
         };
-        g.update(1.0 / 60.0, &[input]);
+        g.update(&[input]);
         if !shut(&g) {
             break;
         }
@@ -214,7 +214,7 @@ fn the_citadel_portal_rides_the_tower_lift_up() {
     g.shards = 0x1FFF;
     g.enter_tower();
     for _ in 0..200 {
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     let up = portal(&g);
     assert!(
@@ -339,7 +339,7 @@ fn at_chest(fs: &GameFs, at: Vec3) -> (Game, u64, Vec3) {
         let stand = pos + Vec3::new(a.det_cos(), 0.0, a.det_sin()) * 2.8;
         for _ in 0..30 {
             g.players[0].pos = stand;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         if Vec2::new(p.x - pos.x, p.z - pos.z).length() < 2.9 && (p.y - pos.y).abs() < 1.0 {
@@ -366,7 +366,7 @@ fn an_opened_chest_lifts_its_lid_then_leaves_its_item_to_take() {
     };
     let model = chest(&g).unwrap().0.unwrap();
     let active = g.models[model].sequence("ACTIVE").unwrap();
-    let step = |g: &mut Game| g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    let step = |g: &mut Game| g.update(&[PlayerInput::default()]);
     step(&mut g);
     assert_eq!(g.players[0].keys, 0);
     let item = g
@@ -420,7 +420,7 @@ fn an_opened_gold_chest_gives_its_gold_on_touch() {
         }
     ));
     for _ in 0..300 {
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     assert_eq!(g.players[0].gold, 100, "TREAS_SILVER");
     assert!(!g.entities.iter().any(|e| e.id == id && e.alive));
@@ -459,7 +459,7 @@ fn trigger(g: &Game, id: u8) -> &Entity {
 
 fn step(g: &mut Game, n: usize) {
     for _ in 0..n {
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
 }
 
@@ -609,7 +609,7 @@ fn the_pad_in_a_swinging_lift_cabin_rides_with_it() {
     // A hero standing on it in the cabin sends the cabin back.
     for _ in 0..12 {
         g.players[0].pos = after + Vec3::Y * 0.2;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     assert!(!g.movers[m].active, "the pad toggled the cabin back");
     step(&mut g, 120);
@@ -674,11 +674,11 @@ fn random_contents_are_decided_when_the_level_is_placed() {
     let before: Vec<u64> = g.entities.iter().map(|e| e.id).collect();
     for _ in 0..40 {
         g.players[0].pos = chest.1 + Vec3::new(2.8, 0.3, 0.0);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     for _ in 0..240 {
         g.players[0].pos = chest.1 + Vec3::new(20.0, 0.3, 0.0);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     assert_eq!(g.players[0].keys, 0, "the key opened it");
     let out = g

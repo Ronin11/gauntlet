@@ -22,6 +22,7 @@ mod particles;
 #[cfg(test)]
 mod rule_tests;
 pub mod savestate;
+pub mod setup;
 pub mod sounds;
 pub mod unlock;
 pub(crate) mod walls;
@@ -57,10 +58,19 @@ pub fn max_health(level: u32) -> f32 {
 /// Thrown weapons fly until they hit something; this only bounds strays.
 pub(crate) const PROJECTILE_LIFE: f32 = 3.0;
 
+/// The length of a tick: the simulation runs at a fixed 60 Hz.
+pub const TICK: f32 = 1.0 / 60.0;
+
 /// Small deterministic RNG (xorshift) so simulations are reproducible.
 #[derive(Clone)]
 pub struct Rng(u64);
 impl Rng {
+    /// Mix a session's seed in. Zero leaves the sequence as it was.
+    pub fn mix(&mut self, seed: u64) {
+        let mixed = self.0 ^ seed;
+        // Xorshift never leaves an all-zero state.
+        self.0 = if mixed == 0 { self.0 } else { mixed };
+    }
     pub fn next_u32(&mut self) -> u32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -346,12 +356,6 @@ struct Spawn {
     /// The generator's ai and height (generate_enemy's spew and ang).
     ai: i32,
     height: f32,
-}
-
-thread_local! {
-    /// Set while a potion's effect is dealing its damage (DMG_MAGIC): its
-    /// element (1-4), else 0.
-    static MAGIC_HIT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// What one hit did.
@@ -1294,6 +1298,9 @@ pub struct Game {
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
     pub(crate) hit_from: Option<Vec3>,
+    /// Set while a potion's effect is dealing its damage (DMG_MAGIC): its
+    /// element (1-4), else 0.
+    pub(crate) magic_hit: u32,
     /// Player.hit_streak: generator monsters each hero has killed since
     /// last destroying a generator (PlayerDamagedEnemy / PlayerDamagedItem).
     pub(crate) gen_streak: [u32; 4],
@@ -2002,6 +2009,7 @@ impl Game {
             critter_wads: BTreeMap::new(),
             wizard_model: None,
             hit_from: None,
+            magic_hit: 0,
             gen_streak: [0; 4],
             nag: FollowNag::default(),
             effects: Default::default(),
@@ -3940,7 +3948,17 @@ impl Game {
         );
     }
 
-    pub fn update(&mut self, dt: f32, inputs: &[PlayerInput]) {
+    /// One tick of the game: every hero's input for it. The step is always
+    /// `TICK`, never the caller's choice, so no two peers can step differently.
+    pub fn update(&mut self, inputs: &[PlayerInput]) {
+        // A scroll being read stops the game until its reader presses B.
+        if let Some(b) = &mut self.scroll_box {
+            if b.update(inputs) {
+                self.scroll_box = None;
+            }
+            return;
+        }
+        let dt = TICK;
         // Rumbles are the caller's to take after each update.
         self.snd.rumble.clear();
         self.time += dt;
@@ -5936,7 +5954,7 @@ impl Game {
             } => Some((*hp, *strength == 2)),
             _ => None,
         };
-        let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+        let r = Self::apply_hit(&mut self.entities[t], dmg, push, self.magic_hit != 0);
         // AudioPlayEvt101: Death dies.
         if r.killed && r.tier == crate::enemies::DEATH && !r.generator {
             self.sfx_id(0x65);
@@ -5947,7 +5965,7 @@ impl Game {
         // without it the hero hears it can't be hurt (msg 0).
         if let (Some((hp, tier2)), true) = (death, r.hit) {
             let p = &mut self.players[pi];
-            if MAGIC_HIT.with(|m| m.get()) != 0 {
+            if self.magic_hit != 0 {
                 if p.level > 75 {
                     let k = 0.032 * (p.level - 75) as f32 + 0.2;
                     let cap = max_health(p.level);
@@ -5968,7 +5986,7 @@ impl Game {
         // damage_enemy's burst by the hit's element (the potion's, the
         // weapon's, or what the caller dealt).
         let dtype = self.effects.hit_dtype.take().unwrap_or_else(|| {
-            let magic = MAGIC_HIT.with(|m| m.get());
+            let magic = self.magic_hit;
             if magic != 0 {
                 magic | DmgType::MAGIC
             } else {
@@ -6092,7 +6110,7 @@ impl Game {
         }
         let (_, node) = c.surface(from, pos, yaw);
         let (part, colnode) = node.unwrap_or((0, usize::MAX));
-        let element = MAGIC_HIT.with(|m| m.get());
+        let element = self.magic_hit;
         let magic = element != 0;
         let mut flags = if magic {
             // The potion's element, for this critter's own affinity.
@@ -6553,7 +6571,7 @@ impl Game {
     }
 
     /// Damage one entity (fn_8004DC2C's reaction and push: `enemy_react`).
-    fn apply_hit(e: &mut Entity, dmg: f32, _push: Vec2) -> HitResult {
+    fn apply_hit(e: &mut Entity, dmg: f32, _push: Vec2, magic: bool) -> HitResult {
         let mut r = HitResult::default();
         match &mut e.kind {
             Kind::Enemy {
@@ -6566,7 +6584,7 @@ impl Game {
                 if *etype == crate::enemies::IT {
                     return r;
                 }
-                let dmg = if *etype == crate::enemies::DEATH && MAGIC_HIT.with(|m| m.get()) == 0 {
+                let dmg = if *etype == crate::enemies::DEATH && !magic {
                     1.0
                 } else if *etype == crate::enemies::DEATH {
                     999.0
@@ -8454,7 +8472,7 @@ impl Game {
                 // Hand of Death turns the blow back on the monster; Health Vampire
                 // does that too and heals the player by it.
                 if let Some(e) = self.entities.get_mut(ei) {
-                    Self::apply_hit(e, dmg, Vec2::ZERO);
+                    Self::apply_hit(e, dmg, Vec2::ZERO, self.magic_hit != 0);
                 }
                 if special & pu::S_VAMPIRE != 0 {
                     let p = &mut self.players[pi];
@@ -8917,12 +8935,26 @@ impl Game {
                 h = h.wrapping_mul(0x100000001b3);
             }
         };
-        let f = |v: f32| v.to_bits().to_le_bytes();
+        // x86 and ARM give NaNs different sign bits; a NaN is a NaN.
+        let f = |v: f32| (if v.is_nan() { f32::NAN } else { v }).to_bits().to_le_bytes();
         let v3 = |v: Vec3| [f(v.x), f(v.y), f(v.z)].concat();
         put(&self.rules.digest().to_le_bytes());
         put(&self.frame.to_le_bytes());
         put(&self.rng.0.to_le_bytes());
         put(&f(self.time));
+        put(&self.rules.digest().to_le_bytes());
+        put(&(self.friendly_fire as u32).to_le_bytes());
+        put(&[self.debug_god as u8]);
+        for c in self.crystals.iter().chain(&self.garg_items) {
+            put(&c.to_le_bytes());
+        }
+        for v in [self.shards, self.runes, self.boss_runes, self.legend_held] {
+            put(&v.to_le_bytes());
+        }
+        for c in &self.controls {
+            put(&(c.control_style as u32).to_le_bytes());
+            put(&[c.rumble as u8, c.auto_aim as u8, c.auto_attack as u8]);
+        }
         put(&(self.players.len() as u32).to_le_bytes());
         for p in &self.players {
             put(&v3(p.pos));
@@ -8984,7 +9016,7 @@ mod tests {
         g.entities.clear();
         // Let the player settle on the ground, facing +z.
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let class = g
@@ -9014,7 +9046,7 @@ mod tests {
                 attack_pressed: true,
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, &[fire]);
+            g.update(&[fire]);
             if !g.entities.iter().any(|e| e.id == id) {
                 break;
             }
@@ -9032,7 +9064,7 @@ mod tests {
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
         g.entities.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
@@ -9055,7 +9087,7 @@ mod tests {
         use crate::paction::p as pa;
         let mut seen = Vec::new();
         for _ in 0..90 {
-            g.update(1.0 / 60.0, &[hold]);
+            g.update(&[hold]);
             let cur = g.players[0].act.cur;
             if seen.last() != Some(&cur) {
                 seen.push(cur);
@@ -9073,7 +9105,7 @@ mod tests {
         g.entities.clear();
         g.pending_enemies.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
@@ -9119,7 +9151,7 @@ mod tests {
             }
             assert!((pushed.z - push).abs() < 1e-3, "{dtype:x}: {pushed}");
             for _ in 0..30 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             let moved = g.entities[t].pos.z - start.z;
             assert!(moved >= least, "{dtype:x}: moved {moved}");
@@ -9171,7 +9203,7 @@ mod tests {
             g.entities.clear();
             g.pending_enemies.clear();
             for _ in 0..30 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             let model = g.classes[class].model(1);
             let mut kind = g.new_enemy(class, tier, EnemyState::Chase);
@@ -9201,7 +9233,7 @@ mod tests {
         g.players[0].level = 10;
         let hp = g.players[0].health;
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = &g.players[0];
         assert!(p.level < 10, "drained a level away: {} {}", p.level, p.exp);
@@ -9226,7 +9258,7 @@ mod tests {
         let mut faded = false;
         let y0 = g.entities[t].pos.y;
         for _ in 0..120 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if let Some(e) = g.entities.iter().find(|e| e.id == id) {
                 rose |= e.pos.y > y0 + 3.0;
                 faded |= e.fade < 0.5 && e.fade > 0.0;
@@ -9271,7 +9303,7 @@ mod tests {
         let mut at = None;
         for f in 0..(48 * 60) {
             g.msgs.shown = None;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if g.sfx.iter().any(|s| s.contains("S_FOLLOW")) {
                 assert!(at.is_none(), "once per quiet stretch");
                 at = Some(f);
@@ -9338,7 +9370,7 @@ mod tests {
         }
         g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
         g.players[0].power = 100.0;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(110));
         // A swing at a breakable wall (the nameless obstacle 0x2A) the hero
         // stands against (A1SHOOTW#1, to the +x): it takes multiple hits (20).
@@ -9369,15 +9401,15 @@ mod tests {
         g.pending_enemies.clear();
         let idle = [PlayerInput::default()];
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
         use crate::paction::p as pa;
         let p0 = g.players[0].pos;
         g.damage_player(0, 10.0, 0);
-        g.update(1.0 / 60.0, &idle);
+        g.update(&idle);
         assert_eq!(g.players[0].act.cur, pa::HIT_REACT);
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
         // Knocked down from behind (the hero faces +z): the forward fall, a push
         // forward, then up again.
@@ -9385,7 +9417,7 @@ mod tests {
         g.damage_player(0, 10.0, DmgType::KNOCKDOWN);
         let mut seen = vec![];
         for _ in 0..180 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
             let c = g.players[0].act.cur;
             if seen.last() != Some(&c) {
                 seen.push(c);
@@ -9406,7 +9438,7 @@ mod tests {
         g.pending_enemies.clear();
         let idle = [PlayerInput::default(), PlayerInput::default()];
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
         // The Wizard faces +z with the Warrior 3 ahead.
         let base = g.players[0].pos;
@@ -9424,7 +9456,7 @@ mod tests {
         let mut partner_anims = vec![];
         let mut linked = false;
         for _ in 0..240 {
-            g.update(1.0 / 60.0, &z);
+            g.update(&z);
             linked |= g.players[1].grab_partner == Some(0);
             let c = g.players[1].act.cur;
             if partner_anims.last() != Some(&c) {
@@ -9448,7 +9480,7 @@ mod tests {
         g.pending_enemies.clear();
         let idle = [PlayerInput::default(), PlayerInput::default()];
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
         let base = g.players[0].pos;
         g.players[0].yaw = 0.0;
@@ -9464,7 +9496,7 @@ mod tests {
         use crate::paction::p as pa;
         let mut seen = vec![];
         for _ in 0..600 {
-            g.update(1.0 / 60.0, &z);
+            g.update(&z);
             let c = g.players[1].act.cur;
             if seen.last() != Some(&c) {
                 seen.push(c);
@@ -9565,7 +9597,7 @@ mod tests {
             for _ in 0..30 {
                 g.players[0].pos.x = at.x;
                 g.players[0].pos.z = at.z;
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             let e = g.entities.iter().find(|e| e.id == id).unwrap();
             assert!(
@@ -9612,7 +9644,7 @@ mod tests {
         for _ in 0..600 {
             g.players[0].pos.x = pos.x;
             g.players[0].pos.z = pos.z;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if g.players[0].health < last {
                 hits += 1;
             }
@@ -9651,7 +9683,7 @@ mod tests {
             for _ in 0..1200 {
                 g.players[0].pos.x = pos.x;
                 g.players[0].pos.z = pos.z;
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 if let Some(Kind::Hazard { cycle, .. }) =
                     g.entities.iter().find(|e| e.id == id).map(|e| &e.kind)
                 {
@@ -9685,7 +9717,7 @@ mod tests {
         };
         let mut throws = 0;
         for _ in 0..300 {
-            g.update(1.0 / 60.0, &[hold]);
+            g.update(&[hold]);
             throws += g.sfx.drain(..).filter(|s| s.ends_with("THROW")).count();
         }
         // THROW1S cut at frame 2, THROW1, THROW1R, all rate 24 (37.5 frames a
@@ -9719,12 +9751,12 @@ mod tests {
         // Run into the lever.
         g.players[0].pos = lever + Vec3::new(0.0, 0.5, 1.2);
         for _ in 0..10 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(g.movers[wall].active, "lever pulled");
         g.players[0].pos = lever + Vec3::new(0.0, 0.5, 30.0);
         for _ in 0..120 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         // door_switch latches: the wall sinks 4 units and stays down.
         assert!(
@@ -9771,7 +9803,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..400 {
-            g.update(1.0 / 60.0, &[walk(&g)]);
+            g.update(&[walk(&g)]);
         }
         assert!(
             g.players[0].pos.z < 27.0,
@@ -9780,7 +9812,7 @@ mod tests {
         );
         g.players[0].keys = 1;
         for _ in 0..200 {
-            g.update(1.0 / 60.0, &[walk(&g)]);
+            g.update(&[walk(&g)]);
         }
         assert!(
             g.players[0].pos.z > 29.0,
@@ -9802,9 +9834,9 @@ mod tests {
             magic_pressed: true,
             ..Default::default()
         };
-        g.update(1.0 / 60.0, &[magic]);
+        g.update(&[magic]);
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let after = g.entities.iter().filter(|e| near(e)).count();
         assert_eq!(g.players[0].potions, 0);
@@ -9844,7 +9876,7 @@ mod tests {
                 ..Default::default()
             };
             for _ in 0..ticks {
-                g.update(1.0 / 60.0, &[inp]);
+                g.update(&[inp]);
             }
         };
         g.players[0].pos = Vec3::new(0.0, 0.0, 55.0);
@@ -9940,7 +9972,7 @@ mod tests {
         };
         let step = |g: &mut Game, n: usize| {
             for _ in 0..n {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
         };
         let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
@@ -10018,7 +10050,7 @@ mod tests {
         let mut g = Game::new(fs, "levelA1", &[(class, "RED")]).unwrap();
         g.entities.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = &g.players[0];
         let t = Throw {
@@ -10051,7 +10083,7 @@ mod tests {
         g.sfx.clear();
         let mut heard = false;
         for _ in 0..240 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             heard |= g.sfx.drain(..).any(|s| s == "S_WEAPONHITSTON");
         }
         assert!(missiles(&g).is_empty() && heard);
@@ -10099,7 +10131,7 @@ mod tests {
         let start = m[0].0;
         let (mut top, mut last) = (start.y, start);
         for _ in 0..180 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             match missiles(&g).first() {
                 Some(&(pos, _v, _)) => {
                     top = top.max(pos.y);
@@ -10127,7 +10159,7 @@ mod tests {
             .powerups
             .add(crate::powerups::WEAPON, crate::powerups::W_5WAY, 0.0, 45.0);
         g.players[0].powerups.slots[0].state = crate::powerups::ON;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let yaw = g.players[0].yaw;
         g.player_start_missile(Throw { yaw, ..t });
         let mut turns: Vec<i32> = missiles(&g)
@@ -10166,13 +10198,13 @@ mod tests {
             45.0,
         );
         g.players[0].powerups.slots[0].state = crate::powerups::ON;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let yaw = g.players[0].yaw;
         g.player_start_missile(Throw { yaw, ..t });
         let mut bounced = false;
         for _ in 0..120 {
             let before = missiles(&g);
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             let after = missiles(&g);
             if let (Some(b), Some(a)) = (before.first(), after.first()) {
                 bounced |= b.1.y < 0.0 && a.1.y > 0.0;
@@ -10204,7 +10236,7 @@ mod tests {
         };
         let mut most = 0;
         for _ in 0..40 {
-            g.update(1.0 / 60.0, &[attack]);
+            g.update(&[attack]);
             let n = g
                 .entities
                 .iter()
@@ -10227,7 +10259,7 @@ mod tests {
             .map(|e| e.pos)
             .expect("A6 has a secret icon");
         g.players[0].pos = icon;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         // S3 (Space) is the secret realm's third level.
         assert_eq!(g.level_end, Some(LevelEnd::Secret(0xC02)));
         let s = Game::new(&fs, "levelS3", &[("WAR", "RED")]).unwrap();
@@ -10247,7 +10279,7 @@ mod tests {
         g.sfx.clear();
         let mut heard = Vec::new();
         for _ in 0..(10 * 60) {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             heard.extend(
                 g.sfx
                     .drain(..)
@@ -10305,7 +10337,7 @@ mod tests {
         let mut walked = BTreeSet::new();
         let mut last: BTreeMap<u64, Vec3> = BTreeMap::new();
         for _ in 0..900 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             for e in &g.entities {
                 if let Kind::Enemy { brain, .. } = &e.kind {
                     *algs.entry(brain.alg()).or_default() += 1;
@@ -10353,7 +10385,7 @@ mod tests {
             let mut gone = false;
             let mut seen = None;
             for _ in 0..900 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 let grunt = g.entities.iter().find(|e| {
                     e.alive && matches!(&e.kind, Kind::Enemy { strength: 6, brain, .. } if brain.alg() == 18)
                 });
@@ -10390,7 +10422,7 @@ mod tests {
             .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
         g.pending_enemies.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let class = g.classes.iter().position(|c| c.name == "DEM").unwrap();
         // A level-3 generator's demon (gen ai 0): move_logic30.
@@ -10417,7 +10449,7 @@ mod tests {
         let mut shots = 0;
         let mut closest = f32::MAX;
         for _ in 0..600 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             shots += g
                 .entities
                 .iter()
@@ -10463,7 +10495,7 @@ mod tests {
             g.players[0].pos = pos + Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos()) * 12.0 + Vec3::Y;
             let mut shots = 0;
             for _ in 0..600 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 shots += g
                     .entities
                     .iter()
@@ -10682,7 +10714,7 @@ mod tests {
         g.entities.retain(|e| e.id == gid);
         g.pending_enemies.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let e = g.entities.iter_mut().find(|e| e.id == gid).unwrap();
@@ -10723,7 +10755,7 @@ mod tests {
             let sf = row.startframe as f32;
             g.fire_damage_row(0, &row, sf - 1.0, sf, None);
             for _ in 0..60 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             let hp = generator_hp(&g, gid).unwrap();
             assert!(
@@ -10753,7 +10785,7 @@ mod tests {
                     attack_pressed: f == 5,
                     ..Default::default()
                 };
-                g.update(1.0 / 60.0, &[inp]);
+                g.update(&[inp]);
                 acts.push(g.players[0].act.cur);
             }
             assert!(acts.contains(&act), "turbo move {act} played");
@@ -10779,7 +10811,7 @@ mod tests {
                     slow_pressed: f % 60 == 30,
                     ..Default::default()
                 };
-                g.update(1.0 / 60.0, &[inp]);
+                g.update(&[inp]);
                 heard.extend(g.sfx.drain(..).filter(|s| s.contains("TURBO")));
             }
             assert!(!heard.is_empty(), "{class}: no turbo sounds");
@@ -10807,18 +10839,18 @@ mod tests {
         g.players[0].pos = s.pos + Vec3::new(s.radius + 6.0, 0.0, 0.0);
         g.players[0].health = 10_000.0;
         for _ in 0..300 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(waiting(&g), "still a statue beside a hero");
         g.players[0].pos = s.pos;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         assert!(!waiting(&g), "bumped awake");
         // In view, Death takes the statue's place.
         let death = |e: &Entity| matches!(e.kind, Kind::Enemy { etype, .. } if etype == crate::enemies::DEATH);
         let mut made = false;
         for _ in 0..240 {
             g.players[0].pos = s.pos;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             made |= g.entities.iter().any(death);
         }
         assert!(made, "Death made");
@@ -10834,7 +10866,7 @@ mod tests {
         g.entities.clear();
         g.pending_enemies.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
@@ -10877,7 +10909,7 @@ mod tests {
                 .unwrap()
                 .pos;
             for _ in 0..90 {
-                g.update(1.0 / 60.0, &[walk]);
+                g.update(&[walk]);
                 let cur = g.players[0].act.cur;
                 swung |= matches!(cur, pa::QUICK | pa::KICK | pa::STEP);
                 passed |= g.players[0].pos.z > grunt.z + 0.5;
@@ -10899,13 +10931,13 @@ mod tests {
         };
         // The Default style ignores the C-stick.
         for _ in 0..20 {
-            g.update(1.0 / 60.0, &[fire]);
+            g.update(&[fire]);
         }
         assert!(g.players[0].yaw.abs() < 0.1, "default: still facing +z");
         g.controls[0].control_style = crate::input::TWIN_STICK;
         let mut swung = false;
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[fire]);
+            g.update(&[fire]);
             swung |= g.players[0].act.motion == 0x0F;
         }
         assert!(
@@ -10921,7 +10953,7 @@ mod tests {
         };
         let mut strafed = false;
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[both]);
+            g.update(&[both]);
             strafed |= (0x11..=0x14).contains(&g.players[0].act.motion);
         }
         assert!(strafed, "strafing attack");
@@ -10947,7 +10979,7 @@ mod tests {
                 ..Default::default()
             };
             for _ in 0..10 {
-                g.update(1.0 / 60.0, &[atk]);
+                g.update(&[atk]);
             }
             let turned = g.players[0].yaw > 0.2;
             assert_eq!(turned, aim, "auto aim {aim}");
@@ -10997,7 +11029,7 @@ mod tests {
         let mut g = Game::new(&fs, "levelA1", &[("ARC", "BLU")]).unwrap();
         assert!(g.players[0].proj_model.is_some());
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
     }
 
@@ -11010,7 +11042,7 @@ mod tests {
         let mut a = Game::new(&fs, "levelA1", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
         for _ in 0..240 {
             let inputs = bot_inputs(&a);
-            a.update(1.0 / 60.0, &inputs);
+            a.update(&inputs);
         }
         let mut b = a.clone();
         assert_eq!(a.fingerprint(), b.fingerprint(), "a fresh clone matches");
@@ -11018,8 +11050,8 @@ mod tests {
             let ia = bot_inputs(&a);
             let ib = bot_inputs(&b);
             assert_eq!(ia, ib, "frame {frame}: the bots see the same game");
-            a.update(1.0 / 60.0, &ia);
-            b.update(1.0 / 60.0, &ib);
+            a.update(&ia);
+            b.update(&ib);
             if frame % 60 == 59 {
                 assert_eq!(
                     a.fingerprint(),
@@ -11048,8 +11080,8 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint(), "fresh games match");
         for frame in 0..900 {
             let inputs = bot_inputs(&a);
-            a.update(1.0 / 60.0, &inputs);
-            b.update(1.0 / 60.0, &inputs);
+            a.update(&inputs);
+            b.update(&inputs);
             if frame % 60 == 59 {
                 assert_eq!(
                     a.fingerprint(),

@@ -472,7 +472,7 @@ mod tests {
         while standing(&g, id).is_some() && blasts < 5 {
             g.start_explosion(at, 24, 30.0 * g.tuning.trap_damage);
             for _ in 0..90 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             blasts += 1;
             if blasts == 1 {
@@ -487,7 +487,7 @@ mod tests {
         let at = g.entities[t].pos + Vec3::new(0.0, 1.0, -2.0);
         g.start_explosion(at, 25, 10.0 * g.tuning.trap_damage);
         for _ in 0..240 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert_eq!(standing(&g, id).map(|w| w.health), Some(25));
     }
@@ -504,7 +504,7 @@ mod tests {
         let hand = g.players[0].pos + Vec3::Y * 2.5;
         assert_eq!(g.start_missile_fan(0, hand, dir, 0.0, 10.0, 0, 1.0, 1.0), 1);
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert_eq!(
             standing(&g, id).map(|w| w.health),
@@ -576,7 +576,7 @@ mod tests {
                 stick: stick(&g),
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, std::slice::from_ref(&push));
+            g.update(std::slice::from_ref(&push));
         }
         let stopped = g.players[0].pos;
         assert!(
@@ -593,7 +593,7 @@ mod tests {
                 attack_pressed: frames % 20 == 0,
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, std::slice::from_ref(&attack));
+            g.update(std::slice::from_ref(&attack));
             frames += 1;
             let h = standing(&g, id).map_or(0, |w| w.health);
             hits += (h < last) as usize;
@@ -609,7 +609,7 @@ mod tests {
                 stick: stick(&g),
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, std::slice::from_ref(&push));
+            g.update(std::slice::from_ref(&push));
         }
         let through = g.players[0].pos - p0;
         assert!(

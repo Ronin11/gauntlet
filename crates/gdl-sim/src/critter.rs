@@ -3114,7 +3114,7 @@ mod tests {
                     if let Some(e) = g.entities.iter().find(|e| e.id == id) {
                         g.players[0].pos = e.pos + yaw_dir(e.yaw) * 5.0;
                     }
-                    g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                    g.update(&[crate::input::PlayerInput::default()]);
                     hurt += 500.0 - g.players[0].health;
                     if let Some(Kind::Critter(c)) =
                         g.entities.iter().find(|e| e.id == id).map(|e| &e.kind)
@@ -3158,7 +3158,7 @@ mod tests {
                     .count();
                 for _ in 0..600 {
                     g.players[0].health = 500.0;
-                    g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                    g.update(&[crate::input::PlayerInput::default()]);
                 }
                 assert!(
                     g.entities.iter().all(|e| e.id != id),

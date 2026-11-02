@@ -590,7 +590,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
             let (eye, at) = cam.view();
             g.fixed_camera = Some((eye, at));
-            g.update(1.0 / 60.0, &[input::PlayerInput::default()]);
+            g.update(&[input::PlayerInput::default()]);
             g.cam_focus = at;
             g.sfx.clear();
             if f % 300 == 0 {
@@ -601,15 +601,12 @@ fn snapshot_game(args: &Args) -> Result<()> {
         if args.kill_boss_at == Some(f) {
             g.kill_boss();
         }
-        if let Some(b) = &mut g.scroll_box {
-            let press = box_close.is_some_and(|n| b.ticks + 1 >= n);
+        if let Some(b) = &g.scroll_box {
             let inp = input::PlayerInput {
-                b_pressed: press,
+                b_pressed: box_close.is_some_and(|n| b.ticks + 1 >= n),
                 ..Default::default()
             };
-            if b.update(&vec![inp; g.players.len()]) {
-                g.scroll_box = None;
-            }
+            g.update(&vec![inp; g.players.len()]);
             continue;
         }
         if args.magic_at == Some(f) {
@@ -654,7 +651,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
         }
         let ended = g.level_end.is_some();
-        g.update(1.0 / 60.0, &inputs);
+        g.update(&inputs);
         bugs.observe(&g, &inputs);
         for s in &g.sfx {
             gdl_engine::bugreport::sound(s);
@@ -763,7 +760,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
     {
-        g.update(1.0 / 60.0, &[input::PlayerInput::default()]);
+        g.update(&[input::PlayerInput::default()]);
         let t0 = std::time::Instant::now();
         sc.sync(&gpu, &g);
         let t1 = std::time::Instant::now();

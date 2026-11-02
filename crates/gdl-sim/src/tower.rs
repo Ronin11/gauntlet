@@ -996,17 +996,11 @@ mod tests {
 
     fn run(g: &mut Game, ticks: u32) {
         for _ in 0..ticks {
-            if let Some(b) = &mut g.scroll_box {
-                let inp = crate::input::PlayerInput {
-                    b_pressed: b.ticks >= 20,
-                    ..Default::default()
-                };
-                if b.update(&[inp]) {
-                    g.scroll_box = None;
-                }
-                continue;
-            }
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            let inp = crate::input::PlayerInput {
+                b_pressed: g.scroll_box.as_ref().is_some_and(|b| b.ticks >= 20),
+                ..Default::default()
+            };
+            g.update(&[inp]);
         }
     }
 
@@ -1140,7 +1134,7 @@ mod tests {
                 stick,
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, &[inp]);
+            g.update(&[inp]);
             top = top.max(g.players[0].pos.y);
             if g.sumner.as_ref().unwrap().gwiz_seq == 3 {
                 break;

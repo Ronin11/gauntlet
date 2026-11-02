@@ -1610,7 +1610,7 @@ mover root=2 active=1
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
         for _ in 0..2400 {
             let inp = g.bot_input(0);
-            g.update(1.0 / 60.0, &[inp]);
+            g.update(&[inp]);
             g.scroll_box = None;
         }
         // Make sure something changed: take a placed pickup and kill a
@@ -1626,7 +1626,7 @@ mover root=2 active=1
             m.active = true;
         }
         for _ in 0..120 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         g.players[0].gold = 777;
         g.players[0].keys = 4;

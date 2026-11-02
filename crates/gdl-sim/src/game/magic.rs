@@ -552,11 +552,11 @@ impl Game {
         let at = self.entities[t].pos;
         match fx.owner.filter(|&pi| pi < self.players.len()) {
             Some(pi) => {
-                MAGIC_HIT.with(|m| m.set(fx.colour as u32));
+                self.magic_hit = fx.colour as u32;
                 self.hit_from = Some(fx.pos);
                 self.hit_entity(pi, t, dmg * ELEMENT_BONUS, push.normalize_or_zero(), false);
                 self.hit_from = None;
-                MAGIC_HIT.with(|m| m.set(0));
+                self.magic_hit = 0;
                 if fx.heal {
                     if let Some(b) = before {
                         let after = hp(&self.entities[t]).unwrap_or(0.0).max(0.0);
@@ -677,7 +677,7 @@ mod tests {
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
         g.entities.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let class = g.classes.iter().position(|c| c.name == "GRU")?;
         let model = g.classes[class].model(1);
@@ -744,12 +744,12 @@ mod tests {
             magic_pressed: true,
             ..Default::default()
         };
-        g.update(1.0 / 60.0, &[press]);
+        g.update(&[press]);
         let mut thrown = None;
         let mut burst = None;
         let mut started = false;
         for f in 0..240 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             started |= g
                 .entities
                 .iter()
@@ -810,7 +810,7 @@ mod tests {
         let mut last = hp(&g, id);
         let mut t = 0.0;
         while !g.magic.is_empty() {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             t += 1.0 / 60.0;
             let now = hp(&g, id);
             if now < last {
@@ -848,7 +848,7 @@ mod tests {
         let mut hits = 0;
         let mut last = hp(&g, id);
         for _ in 0..200 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             let now = hp(&g, id);
             if now < last {
                 hits += 1;
@@ -877,7 +877,7 @@ mod tests {
             "MAGICHEALTH on the hero"
         );
         while !g.magic.is_empty() {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(g.players[0].health > 100.0, "{}", g.players[0].health);
     }

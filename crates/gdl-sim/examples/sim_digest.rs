@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         };
         for _ in 0..ticks {
             let inputs: Vec<_> = (0..g.players.len()).map(|i| g.bot_input(i)).collect();
-            g.update(1.0 / 60.0, &inputs);
+            g.update(&inputs);
         }
         println!("{level} {:016x}", g.fingerprint());
     }

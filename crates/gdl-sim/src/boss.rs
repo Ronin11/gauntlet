@@ -2585,7 +2585,7 @@ mod tests {
                 // Keep the hero alive and in place: only the boss acts.
                 g.players[0].health = hp0;
                 let before = g.players[0].health;
-                g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                g.update(&[crate::input::PlayerInput::default()]);
                 hurt += (before - g.players[0].health).max(0.0);
                 if let Some((_, c)) = g.boss_critter() {
                     let p = &c.parts[0];
@@ -2615,7 +2615,7 @@ mod tests {
         for _ in 0..450 {
             g.players[0].health = hp0;
             let input = g.bot_input(0);
-            g.update(1.0 / 60.0, &[input]);
+            g.update(&[input]);
         }
         assert!(g.boss.as_ref().unwrap().active, "Skorne never woke");
         let (eye, at, _) = g.boss_camera_view().expect("boss camera");
@@ -2640,7 +2640,7 @@ mod tests {
         let (mut held, mut thrown) = (false, false);
         for _ in 0..900 {
             let input = g.bot_input(0);
-            g.update(1.0 / 60.0, &[input]);
+            g.update(&[input]);
             let now = g.entities.iter().any(
                 |e| matches!(&e.kind, Kind::Critter(c) if c.parts.iter().any(|q| q.grab == 0)),
             );
@@ -2661,9 +2661,7 @@ mod tests {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
         for _ in 0..30 {
-            g.update(
-                1.0 / 60.0,
-                &[
+            g.update(&[
                     crate::input::PlayerInput::default(),
                     crate::input::PlayerInput::default(),
                 ],
@@ -2671,9 +2669,7 @@ mod tests {
         }
         let partner = g.players[0].pos;
         g.players[1].pos = Vec3::new(partner.x, g.level.worlds.min_bounds[1] - 1.0, partner.z);
-        g.update(
-            1.0 / 60.0,
-            &[
+        g.update(&[
                 crate::input::PlayerInput::default(),
                 crate::input::PlayerInput::default(),
             ],
@@ -2698,7 +2694,7 @@ mod tests {
         g.boss_death(at);
         let mut seen2 = false;
         for _ in 0..1200 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             seen2 |= g.entities.iter().any(|e| e.alive && e.model == k2);
         }
         assert!(seen2);
@@ -2723,7 +2719,7 @@ mod tests {
             let mut seen = false;
             for _ in 0..2400 {
                 g.players[0].health = 500.0;
-                g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                g.update(&[crate::input::PlayerInput::default()]);
                 seen |= g
                     .entities
                     .iter()
@@ -2761,7 +2757,7 @@ mod tests {
             {
                 return;
             }
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         panic!("the boss never woke");
     }
@@ -2808,7 +2804,7 @@ mod tests {
         let mut caption = false;
         for _ in 0..6000 {
             g.players[0].health = 500.0;
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             coins = coins.max(
                 g.entities
                     .iter()
@@ -2883,7 +2879,7 @@ mod tests {
         // throw, and the hit kills the second head.
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..1800 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             seen.insert(g.legend_state());
         }
         assert!(
@@ -2913,7 +2909,7 @@ mod tests {
     fn yeti_pound_raises_the_safe_rock_nearest_the_target() {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelI5", &[("WAR", "RED")]).unwrap();
-        g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        g.update(&[crate::input::PlayerInput::default()]);
         let r = rocks(&g);
         assert!(r.len() >= 5, "{} rocks", r.len());
         assert!(r.iter().all(|r| r.strength == -1 && r.entity.is_none()));
@@ -2922,7 +2918,7 @@ mod tests {
         let at = g.safe_rock_spout2(0, 0.5).expect("a rock erupts");
         assert!((at - r[3].pos).length() < 1e-3);
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         let r = rocks(&g);
         let id = r[3].entity.expect("the rock rose");
@@ -2937,7 +2933,7 @@ mod tests {
         let mut risen = 0;
         for _ in 0..3600 {
             g.players[0].health = 500.0;
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             risen = risen.max(rocks(&g).iter().filter(|r| r.entity.is_some()).count());
         }
         assert!(risen >= 1, "no rock rose in a minute of fighting");
@@ -2949,7 +2945,7 @@ mod tests {
     fn plague_fiend_spouts_at_every_safe_rock() {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelK5", &[("WAR", "RED")]).unwrap();
-        g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        g.update(&[crate::input::PlayerInput::default()]);
         let r = rocks(&g);
         assert!(!r.is_empty());
         assert!(r.iter().all(|r| r.strength == 3 && r.entity.is_some()));
@@ -2965,7 +2961,7 @@ mod tests {
     fn dragon_safe_rock_hides_the_three_way_shot() {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelB6", &[("WAR", "RED")]).unwrap();
-        g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+        g.update(&[crate::input::PlayerInput::default()]);
         let models = g.boss.as_ref().unwrap().safe_rock_models;
         assert!(models.iter().all(|m| m.is_some()), "{models:?}");
         let r = rocks(&g);
@@ -3001,7 +2997,7 @@ mod tests {
                     stick: g.stick_toward(Vec2::new(to.x, to.z)).normalize_or_zero(),
                     ..Default::default()
                 };
-                g.update(1.0 / 60.0, &[input]);
+                g.update(&[input]);
                 if !g.entities.iter().any(|e| e.id == icon && e.alive) {
                     return true;
                 }
@@ -3020,7 +3016,7 @@ mod tests {
             };
             assert_eq!(g.entities[t].model, models[rocks(&g)[ri].strength as usize]);
             g.hit_entity(0, t, 30.0, Vec2::ZERO, true);
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             let s = rocks(&g)[ri].strength;
             if seen.last() != Some(&s) {
                 seen.push(s);
@@ -3061,7 +3057,7 @@ mod tests {
         let mut held = false;
         for _ in 0..1800 {
             g.players[0].health = 500.0;
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             held |= g.boss.as_ref().unwrap().legend_hold.is_some();
         }
         assert!(held, "the bellows were held");
@@ -3076,7 +3072,7 @@ mod tests {
         let mut threw = false;
         for _ in 0..1800 {
             g.players[0].health = 500.0;
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             // The javelin goes with the holder's forced PWRA_THROW (boss 38).
             threw |= g.players[0].act.cur == crate::paction::p::PWRA_THROW;
             assert!(!shot || threw);
@@ -3096,7 +3092,7 @@ mod tests {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelB6", &[("WAR", "RED")]).unwrap();
         for _ in 0..600 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         let c = g.boss.as_ref().unwrap().cam.unwrap();
         let fwd = cam_forward(c.yaw, c.pitch);
@@ -3158,7 +3154,7 @@ mod tests {
                 stick: Vec2::new(0.6, 0.0),
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, &[walk]);
+            g.update(&[walk]);
             let view = g.camera_view();
             assert_eq!(view.2, crate::camera::NEAR);
             if let Some(a) = prev.filter(|a: &crate::interp::Cam| {
@@ -3242,7 +3238,7 @@ mod tests {
         let mut escorts = 0;
         for _ in 0..3600 {
             g.players[0].health = 500.0;
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             escorts = escorts.max(
                 g.entities
                     .iter()
@@ -3282,7 +3278,7 @@ mod tests {
         face_boss(&mut g, 10.0);
         for _ in 0..300 {
             g.players[0].pos.z = g.players[0].pos.z.min(pad.z - 6.0);
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         assert!(!g.boss.as_ref().unwrap().active, "{}", boss_state(&g));
         assert_eq!(g.boss_critter().unwrap().1.parts[0].state, 0);
@@ -3292,7 +3288,7 @@ mod tests {
         for f in 0..600 {
             // Held on the pad: the arena's walls push a hero off some of them.
             g.players[0].pos = pad;
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             if g.boss_critter().unwrap().1.parts[0].state == 3 {
                 woke = Some(f);
                 break;
@@ -3325,7 +3321,7 @@ mod tests {
                     }
                 }
                 g.players[0].health = 999.0;
-                g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                g.update(&[crate::input::PlayerInput::default()]);
                 let (e, c) = g.boss_critter().unwrap();
                 let model = &g.models[e.model.unwrap()];
                 let body = glam::Mat4::from_translation(e.pos) * glam::Mat4::from_rotation_y(e.yaw);
@@ -3369,7 +3365,7 @@ mod tests {
         wake(&mut g);
         let mut checked = 0;
         for _ in 0..10 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
             let (_, c) = g.boss_critter().unwrap();
             let aiming = c.parts.iter().filter(|p| !p.targets.is_empty()).count();
             if c.parts[0].pattern < 0 && !c.parts[0].targets.is_empty() {

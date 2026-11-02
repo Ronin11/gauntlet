@@ -317,15 +317,12 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
     });
     let outcome = loop {
         // A scroll's text box pauses the game until B.
-        if let Some(b) = &mut g.scroll_box {
-            let press = b.ticks >= 20;
+        if let Some(b) = &g.scroll_box {
             let inp = PlayerInput {
-                b_pressed: press,
+                b_pressed: b.ticks >= 20,
                 ..Default::default()
             };
-            if b.update(&vec![inp; n]) {
-                g.scroll_box = None;
-            }
+            g.update(&vec![inp; n]);
             continue;
         }
         let inputs = match bot.inputs(&mut g) {
@@ -388,7 +385,7 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
                 println!("saved state {f} at t={:.1}", g.time);
             }
         }
-        g.update(1.0 / 60.0, &inputs);
+        g.update(&inputs);
         rec.observe(&g, &inputs);
         for s in g.sfx.drain(..) {
             crate::bugreport::sound(&s);
@@ -451,7 +448,7 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
 fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
     let ignore = nav::HashSet::default();
     g.players[0].pos = from;
-    g.update(1.0 / 60.0, &vec![PlayerInput::default(); g.players.len()]);
+    g.update(&vec![PlayerInput::default(); g.players.len()]);
     let start = g.players[0].pos;
     let w = nav::WalkWorld {
         col: &g.collision,
@@ -560,7 +557,7 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
         let stick = g.stick_toward(d.normalize_or_zero());
         let mut inp = vec![PlayerInput::default(); g.players.len()];
         inp[0].stick = stick;
-        g.update(1.0 / 60.0, &inp);
+        g.update(&inp);
         if t % 10 == 0 {
             println!(
                 "  tick {t}: {:?} act {}",
@@ -869,7 +866,7 @@ mod tests {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelB1", &[("WAR", "RED")]).unwrap();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let from = g.players[0].pos;
         let to = from + glam::Vec3::new(6.0, 0.0, 0.0);
@@ -891,7 +888,7 @@ mod tests {
                 stick: g.stick_toward(d.normalize_or_zero()),
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, &[inp]);
+            g.update(&[inp]);
         }
         let game = g.players[0].pos;
         assert!(

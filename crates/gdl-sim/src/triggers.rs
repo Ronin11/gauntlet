@@ -592,7 +592,7 @@ pub(crate) mod tests {
     fn tick(g: &mut Game, n: usize) {
         let idle = vec![PlayerInput::default(); g.players.len()];
         for _ in 0..n {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
     }
 
@@ -691,7 +691,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         for _ in 0..40 {
-            g.update(1.0 / 60.0, &[walk]);
+            g.update(&[walk]);
         }
         let moved = g.players[0].pos - start;
         assert!(moved.x.det_hypot(moved.z) < 0.5, "controls held");
@@ -709,9 +709,7 @@ pub(crate) mod tests {
         tick(g, 10);
         for _ in 0..n {
             let stick = g.stick_toward(dir);
-            g.update(
-                1.0 / 60.0,
-                &[PlayerInput {
+            g.update(&[PlayerInput {
                     stick,
                     ..Default::default()
                 }],

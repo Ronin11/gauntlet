@@ -1215,7 +1215,7 @@ mod tests {
         let mut g = Game::new(fs, level, &[("WAR", "RED")]).unwrap();
         g.entities.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         g.entities
             .retain(|e| !matches!(e.kind, Kind::Effect { .. }));
@@ -1348,7 +1348,7 @@ mod tests {
             );
             g.effects.missiles.insert(id, (0, dtype));
             for _ in 0..60 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 if !g.entities.iter().any(|e| e.id == id && e.alive) {
                     break;
                 }
@@ -1379,11 +1379,11 @@ mod tests {
         g.damage_player(0, 20.0, 0);
         assert_eq!(effects(&g).len(), 1);
         g.players[0].pos += Vec3::X;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let e = g.entities.iter().find(|e| e.id == id).unwrap();
         assert!((e.pos - g.players[0].pos).length() < 0.2);
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(!g.entities.iter().any(|e| e.id == id && e.alive), "gone");
     }
@@ -1442,12 +1442,12 @@ mod tests {
         let mut seen = false;
         for f in 0..20 {
             let b_pressed = f == 0;
-            g.update(1.0 / 60.0, &[PlayerInput { b_pressed, ..hold }]);
+            g.update(&[PlayerInput { b_pressed, ..hold }]);
             seen |= g.effects.block_shield[0].is_some();
         }
         assert!(seen, "the shield showed while blocking");
         for _ in 0..240 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert_eq!(g.effects.block_shield[0], None, "and went after");
     }
@@ -1469,7 +1469,7 @@ mod tests {
         assert_eq!((b.dtype, b.radius, b.flags), (33, 5.0, 0x2B));
         let hp = g.players[0].health;
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(g.players[0].health < hp, "it reached the hero");
     }
@@ -1489,7 +1489,7 @@ mod tests {
         let hp = g.players[0].health;
         let mut morphed = None;
         for f in 0..600 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             let Some(e) = g.entities.iter().find(|e| e.id == id && e.alive) else {
                 break;
             };
@@ -1513,7 +1513,7 @@ mod tests {
         let m = g.fx_def(FX_ENTER).unwrap().model;
         let mut seen = 0;
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             seen += g
                 .entities
                 .iter()

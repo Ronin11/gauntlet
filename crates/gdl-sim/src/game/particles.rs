@@ -487,7 +487,7 @@ mod tests {
 
     fn tick(g: &mut Game, n: usize) {
         for _ in 0..n {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
     }
 
