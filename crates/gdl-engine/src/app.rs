@@ -4,8 +4,8 @@
 use crate::attract::{self, Attract};
 use crate::audio::Audio;
 use crate::fs::GameFs;
-use crate::game::Game;
 use crate::game::setup::{Command, LevelSetup};
+use crate::game::Game;
 use crate::game::{LevelEnd, PlayerState};
 use crate::gpu::Gpu;
 use crate::hud::PanelInfo;

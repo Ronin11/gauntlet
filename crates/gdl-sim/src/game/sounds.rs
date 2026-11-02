@@ -150,7 +150,7 @@ pub(crate) struct HeroSound {
     streak_time: f32,
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct SoundState {
     pub(crate) heroes: [HeroSound; 4],
     /// damage_player's mode for the next call (2 tile / thrown, 3 poison
@@ -178,6 +178,17 @@ pub struct SoundState {
     taunt_shard: usize,
     /// Damage tiles' subtypes (rawSubtype, FLAMEH in realm 3 as 6), by entity.
     pub(crate) tile_sub: BTreeMap<u64, (i32, i32)>,
+}
+
+impl SoundState {
+    /// This state without what the engine owns: the rumbles it takes each
+    /// tick and the compass switch it sets from its local options.
+    pub(crate) fn simulated(&self) -> SoundState {
+        let mut s = self.clone();
+        s.rumble.clear();
+        s.show_compass = false;
+        s
+    }
 }
 
 /// The id ambient loop for Death's drain (AudioPlayEvt102Follow).

@@ -14,6 +14,7 @@ struct Args {
     assets: Vec<PathBuf>,
     /// --no-assets: ignore GDL_ASSETS and asset-packs/ folders.
     no_assets: bool,
+    compat: bool,
     /// --rules: the preset the game plays by (classic unless asked).
     rules: gdl_engine::rules::Rules,
     level: String,
@@ -80,6 +81,7 @@ Controls: left stick / WASD move, A / J attack, X / Shift turbo,
           F11 fullscreen, Esc quit.
 
 Testing:
+  --compat              Print what two copies must share to play together, and exit
   --snapshot <png>      Render one frame headless and exit
   --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
                         select:load|save|result|char (memory card screens),
@@ -121,6 +123,7 @@ fn parse_args() -> Result<Args> {
         data: None,
         assets: Vec::new(),
         no_assets: false,
+        compat: false,
         rules: gdl_engine::rules::Rules::default(),
         level: "levelA1".into(),
         players: Vec::new(),
@@ -159,6 +162,7 @@ fn parse_args() -> Result<Args> {
             "--data" => a.data = Some(val()?.into()),
             "--assets" => a.assets.push(val()?.into()),
             "--no-assets" => a.no_assets = true,
+            "--compat" => a.compat = true,
             "--rules" => {
                 let v = val()?;
                 a.rules = gdl_engine::rules::Rules::named(&v)
@@ -1206,6 +1210,11 @@ fn main() -> Result<()> {
         };
     }
     let fs = open_fs(&args)?;
+    if args.compat {
+        let local = gdl_sim::compat::Compat::local(&fs, &args.rules, gdl_engine::bugreport::BUILD)?;
+        println!("{local}");
+        return Ok(());
+    }
     app::run(app::Config {
         fs,
         level: args.level,

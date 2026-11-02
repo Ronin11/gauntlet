@@ -2,10 +2,10 @@
 //! cycle, its health meters, the boss camera, the death spews and shard, the
 //! legend-weapon sequence, and the good wizard who ends the level.
 
-use crate::math::Det as _;
 use crate::character::Model;
 use crate::critter::Critter;
 use crate::game::{Game, Kind, LevelEnd, PickupKind, PlayerState};
+use crate::math::Det as _;
 use gdl_formats::wdata::BossCamDef;
 use glam::{Vec2, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -418,7 +418,7 @@ impl Game {
             }
         });
         // Debugging aid: GDL_NO_BOSS_CAMERA keeps the level camera.
-        if std::env::var_os("GDL_NO_BOSS_CAMERA").is_some() {
+        if crate::compat::sim_env("GDL_NO_BOSS_CAMERA").is_some() {
             boss.cam = None;
         }
         self.boss = Some(boss);
@@ -2662,18 +2662,16 @@ mod tests {
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
         for _ in 0..30 {
             g.update(&[
-                    crate::input::PlayerInput::default(),
-                    crate::input::PlayerInput::default(),
-                ],
-            );
+                crate::input::PlayerInput::default(),
+                crate::input::PlayerInput::default(),
+            ]);
         }
         let partner = g.players[0].pos;
         g.players[1].pos = Vec3::new(partner.x, g.level.worlds.min_bounds[1] - 1.0, partner.z);
         g.update(&[
-                crate::input::PlayerInput::default(),
-                crate::input::PlayerInput::default(),
-            ],
-        );
+            crate::input::PlayerInput::default(),
+            crate::input::PlayerInput::default(),
+        ]);
         let p = g.players[1].pos;
         assert!(
             p.distance(partner) < 6.0 && (p.y - partner.y).abs() <= 3.0,

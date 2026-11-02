@@ -71,6 +71,26 @@ them once per phase of the cloud). Rules are a value the simulation reads
 (`crates/gdl-sim/src/rules.rs`), so a tunable moves in there only when something needs
 to change it, keeping its original value as the classic default.
 
+## Determinism
+
+Two copies of the game given the same inputs stay identical to the bit, on any platform:
+that is what networked play will stand on. The simulation is a fixed 60 Hz tick, takes its
+trigonometry from the pure-Rust `libm` crate rather than the platform's C library, and
+changes only through values that can be shared (`LevelSetup` before the first tick, `Command`
+between ticks). The debug menu and headless tools still write into the game directly.
+
+```sh
+# A digest per level after 30 s of bots playing: compare two builds with diff.
+cargo run -p gdl-sim --release --example sim_digest -- --data game-data > a.txt
+# Add --sections to name what differs.
+
+# What two copies must share to play together: build, game files, rules, debug switches.
+gauntlet --compat
+
+# Every level, the whole state, twice over.
+cargo test -p gdl-sim --release -- --ignored every_level
+```
+
 ## Debug menu (developer tool)
 
 Not part of the original. **F1** on the keyboard, or on a gamepad **hold L + R + Z and

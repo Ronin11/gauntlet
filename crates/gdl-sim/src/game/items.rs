@@ -8,7 +8,6 @@
 //!
 //! A child of `game`, so it reaches the game's private state.
 
-use crate::math::Det as _;
 use super::*;
 
 /// Item-info subtypes (items.c).
@@ -210,7 +209,7 @@ pub struct Bag {
 }
 
 /// The item state that rides along with the game.
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct ItemsState {
     pub blasts: Vec<Blast>,
     pub bags: Vec<Bag>,
@@ -234,8 +233,7 @@ pub struct ItemsState {
 /// gGameOptions.items (a debug option; GDL_ITEMS): a player count every item
 /// is placed for exactly, 0 for the real one.
 pub(super) fn items_option() -> usize {
-    std::env::var("GDL_ITEMS")
-        .ok()
+    crate::compat::sim_env("GDL_ITEMS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
 }
@@ -676,7 +674,12 @@ impl Game {
                 match owner {
                     Some(pi) => self.hit_entity(pi, t, power, push, false),
                     None => {
-                        let r = Self::apply_hit(&mut self.entities[t], power, push, self.magic_hit != 0);
+                        let r = Self::apply_hit(
+                            &mut self.entities[t],
+                            power,
+                            push,
+                            self.magic_hit != 0,
+                        );
                         self.barrel_hit(t);
                         if let Some((pos, item)) = r.drop {
                             self.spawn_content(pos, item);

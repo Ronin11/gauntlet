@@ -25,8 +25,8 @@
 //!   the screen less the bottom 64 of 448 lines (`InitCamera` / `ChangeWindow`,
 //!   which the status panels cover), and is centred in that window.
 
-use crate::math::Det as _;
 use crate::game::{Game, PlayerState};
+use crate::math::Det as _;
 use glam::{Mat4, Vec3};
 use std::f32::consts::PI;
 

@@ -1,8 +1,8 @@
 //! Animated models: rigid-part skeletons (players, many monsters, items) and
 //! object animations that swap whole meshes per frame (grunts, barrels, ...).
 
-use crate::math::Det as _;
 use crate::fs::GameFs;
+use crate::math::Det as _;
 use crate::mesh::{MeshBuilder, MeshData, PartFx, TexBank};
 use crate::texanim::{self, SeqState};
 use anyhow::{Context, Result};

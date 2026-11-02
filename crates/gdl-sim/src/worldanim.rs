@@ -10,10 +10,10 @@
 //! critters standing on a 0x1000 object are parented to its node
 //! (PlayerCheckFloor / enemy / critter `MBNodeSetParent`) and are carried.
 
-use crate::math::Det as _;
 use crate::character::{pyr_matrix, ryp_matrix};
 use crate::collision::Collision;
 use crate::level::Level;
+use crate::math::Det as _;
 use gdl_formats::anim::Track;
 use glam::{Mat4, Vec3};
 
@@ -44,7 +44,7 @@ pub mod wflags {
 use wflags::*;
 
 /// One `struct worldanim` and its run state.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Anim {
     obj: usize,
     nframes: i16,
@@ -55,7 +55,7 @@ struct Anim {
 }
 
 /// A rotator item (items.c rotdata): turns its target's node about Y.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Rotator {
     target: usize,
     /// Radians per 60 Hz tick.
@@ -74,7 +74,7 @@ struct Rotator {
     radius: f32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct WorldAnims {
     /// Live WorldObj.flags.
     pub flags: Vec<u32>,

@@ -12,7 +12,7 @@ pub struct Tri {
     pub owner: i32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Collision {
     pub tris: Vec<Tri>,
     pub enabled: Vec<bool>,
@@ -33,7 +33,7 @@ pub struct Collision {
     dynamic: Vec<DynGroup>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct DynGroup {
     centre: Vec2,
     radius: f32,

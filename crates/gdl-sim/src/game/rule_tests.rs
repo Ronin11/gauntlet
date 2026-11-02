@@ -2,7 +2,6 @@
 //! level-up, chests and doors (fn_8005D730 cases 2 and 7), melee friendly
 //! fire (PlayerMotion_FindClosestPlayer) and activate_player.
 
-use crate::math::Det as _;
 use super::*;
 
 fn data() -> Option<GameFs> {

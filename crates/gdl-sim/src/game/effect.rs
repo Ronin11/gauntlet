@@ -11,7 +11,6 @@
 //!
 //! A child of `game`, so it reaches the game's private state.
 
-use crate::math::Det as _;
 use super::*;
 
 /// fx_type values used here (effect.h).
@@ -256,7 +255,7 @@ pub(crate) struct LiveFx {
 }
 
 /// The effect system's state (EffectInfo, the live pool's bookkeeping).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct Effects {
     pub defs: Vec<Option<FxDef>>,
     /// EnemyFxPage.hitfx / deathfx: GENHIT / GENDIE custom rows by monster type.

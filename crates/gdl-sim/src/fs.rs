@@ -11,6 +11,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub struct GameFs {
@@ -32,6 +33,10 @@ pub const PACKS_ENV: &str = "GDL_ASSETS";
 /// working directory holds asset packs, one per subdirectory, applied in
 /// name order (number them to choose the layering).
 pub const PACKS_DIR: &str = "asset-packs";
+
+/// Folders only the engine reads (full-motion video and streamed music):
+/// peers with different ones still simulate alike. Lower case, as compared.
+const NOT_SIMULATED: [&str; 2] = ["vqmovies/", "streams/"];
 
 impl GameFs {
     /// Open a disc image (`.iso`/`.gcm`) or a directory. A directory may be the
@@ -246,6 +251,66 @@ impl GameFs {
         }
     }
 
+    /// Every file of the game data and the packs, relative to the `Gauntlet/`
+    /// folder and sorted without regard to case; one entry for a file a pack
+    /// replaces.
+    pub fn list_files(&self) -> Vec<String> {
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        let mut add = |rel: String| {
+            files.entry(rel.to_ascii_lowercase()).or_insert(rel);
+        };
+        match &self.source {
+            Source::Dir(root) => walk(root, "", &mut add),
+            Source::Disc(_, d) => d
+                .borrow()
+                .entries
+                .iter()
+                .filter(|e| !e.is_dir)
+                .filter_map(|e| e.path.strip_prefix("Gauntlet/"))
+                .for_each(|p| add(p.to_string())),
+        }
+        for pack in &self.packs {
+            walk(pack, "", &mut add);
+        }
+        files.into_values().collect()
+    }
+
+    /// A digest of everything the simulation can read: the game files as the
+    /// packs leave them, and the executable's tables. Same on any platform,
+    /// from a disc image or an extracted folder. Reads every file it covers.
+    pub fn content_digest(&self) -> Result<u64> {
+        let mut h: u64 = 0xcbf29ce484222325;
+        // 8 bytes at a time: a level's worth of files byte by byte is slow.
+        let mut put = |bytes: &[u8]| {
+            let chunks = bytes.chunks_exact(8);
+            let tail = chunks.remainder();
+            for c in chunks {
+                h ^= u64::from_le_bytes(c.try_into().unwrap());
+                h = h.wrapping_mul(0x100000001b3);
+                h ^= h >> 29;
+            }
+            for &b in tail {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h ^= bytes.len() as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        for rel in self.list_files() {
+            let lower = rel.to_ascii_lowercase();
+            if NOT_SIMULATED.iter().any(|d| lower.starts_with(d)) {
+                continue;
+            }
+            put(lower.as_bytes());
+            put(&self.read(&rel)?);
+        }
+        // Absent only for test data: a real game can't load without it.
+        if let Ok(dol) = self.read_dol() {
+            put(&dol);
+        }
+        Ok(h)
+    }
+
     /// Names of the subdirectories of `rel`, in the game data and the packs.
     pub fn list_dirs(&self, rel: &str) -> Vec<String> {
         let mut out: Vec<String> = match &self.source {
@@ -272,6 +337,23 @@ impl GameFs {
         }
         out.sort();
         out
+    }
+}
+
+/// Every file under `dir`, as paths relative to `root` with `/` separators.
+/// Dotfiles are the file manager's, not the game's.
+fn walk(dir: &Path, prefix: &str, add: &mut impl FnMut(String)) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let rel = format!("{prefix}{name}");
+        if e.path().is_dir() {
+            walk(&e.path(), &format!("{rel}/"), add);
+        } else {
+            add(rel);
+        }
     }
 }
 
@@ -321,6 +403,47 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
+    }
+
+    #[test]
+    fn the_content_digest_follows_what_the_game_would_read() {
+        let data = temp_dir("digest");
+        put(&data, "LEVELS/levelA1/WORLDS.PS2", b"worlds");
+        put(&data, "VQMOVIES/intro.vq", b"a movie");
+        let fs = GameFs::open(&data).unwrap();
+        let base = fs.content_digest().unwrap();
+        assert_eq!(fs.content_digest().unwrap(), base, "stable");
+
+        // A movie doesn't change the simulation, nor a file manager's litter.
+        put(&data, "VQMOVIES/intro.vq", b"another movie");
+        put(&data, "LEVELS/.DS_Store", b"litter");
+        assert_eq!(fs.content_digest().unwrap(), base);
+
+        // A level file does, on the disc or from a pack.
+        let mut packed = GameFs::open(&data).unwrap();
+        let pack = temp_dir("digest-pack");
+        put(&pack, "levels/LEVELA1/worlds.ps2", b"other worlds");
+        packed.add_pack(&pack);
+        assert_ne!(
+            packed.content_digest().unwrap(),
+            base,
+            "a pack's replacement"
+        );
+        assert_eq!(
+            packed.list_files().len(),
+            fs.list_files().len(),
+            "one file, replaced"
+        );
+
+        // A pack that replaces a file with the same bytes changes nothing.
+        put(&pack, "levels/LEVELA1/worlds.ps2", b"worlds");
+        assert_eq!(packed.content_digest().unwrap(), base);
+
+        let extra = temp_dir("digest-extra");
+        put(&extra, "ITEMS/NEW/objects.ngc", b"new");
+        let mut added = GameFs::open(&data).unwrap();
+        added.add_pack(&extra);
+        assert_ne!(added.content_digest().unwrap(), base, "a pack's new file");
     }
 
     #[test]

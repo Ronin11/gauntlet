@@ -2,9 +2,9 @@
 //! RegisterItemWobj and the per-frame world-object update). A trigger's target is a
 //! world object that slides up or down between two heights, or fades in and out.
 
-use crate::math::Det as _;
 use crate::collision::Collision;
 use crate::level::Level;
+use crate::math::Det as _;
 use crate::worldanim::{wflags, WorldAnims};
 use glam::Vec3;
 
@@ -247,7 +247,7 @@ pub fn tower_camera_index(id: u8) -> bool {
 }
 
 /// A world object (with its children) moved by triggers.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Mover {
     pub root: usize,
     pub objects: Vec<usize>,
@@ -710,10 +710,9 @@ pub(crate) mod tests {
         for _ in 0..n {
             let stick = g.stick_toward(dir);
             g.update(&[PlayerInput {
-                    stick,
-                    ..Default::default()
-                }],
-            );
+                stick,
+                ..Default::default()
+            }]);
         }
     }
 

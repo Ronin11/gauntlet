@@ -6,7 +6,6 @@
 //!
 //! A child of `game`, so it reaches the game's private state.
 
-use crate::math::Det as _;
 use super::*;
 use crate::psys::{streak_quad, Owner, Psys, Streak, StreakQuad};
 use gdl_formats::psys::enables;

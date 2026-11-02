@@ -7,7 +7,7 @@
 use glam::{Vec2, Vec3};
 
 /// One placed transporter (transdata).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Pad {
     pub pos: Vec3,
     pub radius: f32,
@@ -38,7 +38,7 @@ pub enum Step {
     Arrive(Vec3),
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Transport {
     pub pads: Vec<Pad>,
     pub heroes: Vec<HeroTransport>,

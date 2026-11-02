@@ -15,9 +15,9 @@
 //! theirs, and visual effects are the effect atrees of the monster directory
 //! played once.
 
-use crate::math::Det as _;
 use crate::character::{Animator, Model};
 use crate::game::{Game, Kind};
+use crate::math::Det as _;
 use gdl_formats::critter::{CritterWad, Damage, Move, Vis};
 use glam::{Mat4, Vec2, Vec3};
 use std::sync::Arc;
@@ -318,7 +318,10 @@ fn yaw_dir(yaw: f32) -> Vec3 {
 
 /// GetYawPitch.
 fn yaw_pitch(v: Vec3) -> (f32, f32) {
-    (v.x.det_atan2(v.z), v.y.det_atan2(Vec2::new(v.x, v.z).length()))
+    (
+        v.x.det_atan2(v.z),
+        v.y.det_atan2(Vec2::new(v.x, v.z).length()),
+    )
 }
 
 /// ExtractPYR (ml_fmath.c) on a node's local matrix. It undoes

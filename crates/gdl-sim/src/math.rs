@@ -90,9 +90,30 @@ mod tests {
     /// The platform functions the simulation must not call, and the file
     /// allowed to mention them.
     const FORBIDDEN: &[&str] = &[
-        ".sin(", ".cos(", ".tan(", ".asin(", ".acos(", ".atan(", ".atan2(", ".sin_cos(",
-        ".sinh(", ".cosh(", ".tanh(", ".hypot(", ".powf(", ".powi(", ".exp(", ".exp2(",
-        ".exp_m1(", ".ln(", ".ln_1p(", ".log(", ".log2(", ".log10(", ".cbrt(", ".mul_add(",
+        ".sin(",
+        ".cos(",
+        ".tan(",
+        ".asin(",
+        ".acos(",
+        ".atan(",
+        ".atan2(",
+        ".sin_cos(",
+        ".sinh(",
+        ".cosh(",
+        ".tanh(",
+        ".hypot(",
+        ".powf(",
+        ".powi(",
+        ".exp(",
+        ".exp2(",
+        ".exp_m1(",
+        ".ln(",
+        ".ln_1p(",
+        ".log(",
+        ".log2(",
+        ".log10(",
+        ".cbrt(",
+        ".mul_add(",
     ];
 
     fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

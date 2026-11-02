@@ -2,7 +2,6 @@
 //! StartMagicFX, StartThrowMagicFX, StartShieldFX, StartMagicHealFX,
 //! StartMagicPlayerFX), run as ProcessEffects runs them.
 
-use crate::math::Det as _;
 use super::*;
 
 /// lbl_80122088 + 3484 / 3504 / 3524 (magicid, throwid, shieldid) and FX 34,

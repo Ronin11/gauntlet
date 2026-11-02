@@ -11,6 +11,7 @@ pub mod camera;
 pub mod character;
 pub mod cheats;
 pub mod collision;
+pub mod compat;
 pub mod critter;
 pub mod enemies;
 pub mod fs;

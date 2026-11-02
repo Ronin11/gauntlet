@@ -1475,7 +1475,7 @@ pub enum Owner {
 }
 
 /// Every particle system of the level, with what their draws share.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Particles {
     /// MBPsysStartFrame's frame counter.
     pub frame: u32,
@@ -1776,8 +1776,8 @@ pub fn presets() -> Vec<PsysRecord> {
 
 #[cfg(test)]
 mod tests {
-    use crate::math::Det as _;
     use super::*;
+    use crate::math::Det as _;
 
     fn ctx<'a>(
         rng: &'a mut PbRand,

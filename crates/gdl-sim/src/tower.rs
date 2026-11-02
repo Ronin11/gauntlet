@@ -7,9 +7,9 @@
 //! order) and `shards` the 13 runestones, which is how tower.c names them too
 //! (its effect names are the other way round).
 
-use crate::math::Det as _;
 use crate::fs::GameFs;
 use crate::game::{Game, Kind, PlayerState, ScrollBox, CRYSTALS_NEEDED, GARG_NEEDED};
+use crate::math::Det as _;
 use gdl_formats::text::TextRom;
 use gdl_formats::worlds::LocatorType;
 use glam::Vec3;
@@ -172,7 +172,7 @@ const TEMPLE_PORTAL: u32 = 0x500;
 const HELL_PORTAL: u32 = 0x600;
 const CITADEL_PORTAL: u32 = 0x803;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Sumner {
     /// The resident Sumner at the lectern, and his idle sequence (lbl_80344C90).
     gwiz: Option<u64>,

@@ -8,7 +8,6 @@
 //! (with AppendBigapePowerupsToScene, which places the Mikey, Hand of Death
 //! and Health Vampire pick-ups).
 
-use crate::math::Det as _;
 use super::*;
 use crate::powerups as pu;
 use glam::Mat4;

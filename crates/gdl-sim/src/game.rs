@@ -1,11 +1,11 @@
 //! Game state and simulation (independent of rendering).
 
-use crate::math::Det as _;
 use crate::character::{Animator, Model};
 use crate::collision::{Collision, Tri};
 use crate::fs::GameFs;
 use crate::input::PlayerInput;
 use crate::level::Level;
+use crate::math::Det as _;
 use crate::triggers::{trigger_flags, Mover, TriggerMode};
 use anyhow::Result;
 use gdl_formats::anim::Anim;
@@ -14,6 +14,7 @@ use gdl_formats::Objects;
 use glam::{Vec2, Vec3};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod digest;
 pub(crate) mod effect;
 mod exits;
 pub(crate) mod items;
@@ -383,7 +384,7 @@ pub enum LevelEnd {
     SecretOver,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Player {
     pub model: usize,
     pub pos: Vec3,
@@ -781,7 +782,7 @@ pub(crate) struct PlyrSfx {
 
 /// An effect parented to a hero's model (DoPlyrSfx's SfxSetParent): it keeps
 /// its place in the hero's frame.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct FxFollow {
     id: u64,
     player: usize,
@@ -1042,7 +1043,7 @@ pub enum Shape {
     },
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Entity {
     pub id: u64,
     pub solid: Option<Shape>,
@@ -1428,7 +1429,7 @@ impl ItemCycle {
 
 /// A placed monster waiting to come into view (an ENE item before
 /// fn_80060114 turns it into an enemy).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct PendingEnemy {
     kind: Kind,
     model: Option<usize>,
@@ -8936,7 +8937,11 @@ impl Game {
             }
         };
         // x86 and ARM give NaNs different sign bits; a NaN is a NaN.
-        let f = |v: f32| (if v.is_nan() { f32::NAN } else { v }).to_bits().to_le_bytes();
+        let f = |v: f32| {
+            (if v.is_nan() { f32::NAN } else { v })
+                .to_bits()
+                .to_le_bytes()
+        };
         let v3 = |v: Vec3| [f(v.x), f(v.y), f(v.z)].concat();
         put(&self.rules.digest().to_le_bytes());
         put(&self.frame.to_le_bytes());
@@ -9366,7 +9371,12 @@ mod tests {
             if let Kind::Enemy { cooldown, .. } = &mut kind {
                 *cooldown = 99.0;
             }
-            g.spawn(kind, model, p + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * 7.0, 0.0);
+            g.spawn(
+                kind,
+                model,
+                p + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * 7.0,
+                0.0,
+            );
         }
         g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
         g.players[0].power = 100.0;

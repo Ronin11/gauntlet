@@ -27,7 +27,6 @@
 //! `key=value` fields), versioned; unknown keys are ignored and missing ones
 //! take defaults, so older and newer builds read each other's states.
 
-use crate::math::Det as _;
 use super::PanelInfo;
 use super::*;
 use crate::powerups::{MiniInv, Slot};
