@@ -32,6 +32,10 @@ pub struct Opts {
     /// Probe: put hero 0 at a spot and walk it to another, comparing the
     /// game with the nav's walking simulation.
     pub probe: Option<(glam::Vec3, Vec<glam::Vec3>)>,
+    /// Tour: a snapshot of what the player sees every this many game seconds
+    /// (`tour-NNN.png` in the level's folder, with `tour.txt` saying where
+    /// each was taken), so a level can be looked over as it is played.
+    pub snap: Option<f32>,
 }
 
 /// One level's result.
@@ -58,6 +62,8 @@ gauntlet --run-level <name|all|realm letter|a,b,c> [options]
   --runner-state <file>      start from a save state (e.g. a report's stuck.state)
   --runner-probe x,y,z:x,y,z walk hero 0 from one spot to another and compare
                              the game with the nav graph's walking simulation
+  --runner-snap <secs>       a snapshot of the play every N game seconds
+                             (tour-NNN.png and tour.txt in the level's folder)
   --data <ISO|DIR>
 gauntlet --runner-merge <dir>  rebuild <dir>/summary.md from per-level results";
 
@@ -85,6 +91,7 @@ fn parse(args: &[String]) -> Result<Opts> {
         capture: true,
         state: None,
         probe: None,
+        snap: None,
     };
     let mut it = args.iter();
     let mut spec = String::new();
@@ -114,6 +121,7 @@ fn parse(args: &[String]) -> Result<Opts> {
             "--runner-no-capture" => o.capture = false,
             "--data" => o.data = Some(val()?.into()),
             "--runner-state" => o.state = Some(val()?.into()),
+            "--runner-snap" => o.snap = Some(val()?.parse()?),
             "--runner-probe" => {
                 let v = val()?;
                 let p: Vec<f32> = v
@@ -315,7 +323,34 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
         let (t, f) = v.split_once(':')?;
         Some((t.parse().ok()?, f.to_string()))
     });
+    let mut tour = String::new();
+    let mut next_snap = 0.0f32;
+    let mut snaps = 0;
     let outcome = loop {
+        // The tour's snapshots, with where and after what each was taken.
+        if let Some(dt) = o.snap {
+            if g.time >= next_snap {
+                next_snap = g.time + dt;
+                match render(fs, &g, &o.party) {
+                    Ok(img) => {
+                        let name = format!("tour-{snaps:03}.png");
+                        crate::bugreport::write_png(&level_dir.join(&name), &img)?;
+                        let p = g.players[0].pos;
+                        tour.push_str(&format!(
+                            "{name}\tt={:.0}s\tpos {:.1},{:.1},{:.1}\t{}\n",
+                            g.time,
+                            p.x,
+                            p.y,
+                            p.z,
+                            bot.used.last().map_or("", |s| s.as_str())
+                        ));
+                        std::fs::write(level_dir.join("tour.txt"), &tour)?;
+                        snaps += 1;
+                    }
+                    Err(e) => log::warn!("tour snapshot: {e:#}"),
+                }
+            }
+        }
         // A scroll's text box pauses the game until B.
         if let Some(b) = &g.scroll_box {
             let inp = PlayerInput {
@@ -673,7 +708,7 @@ fn render(fs: &GameFs, g: &Game, party: &[(String, String)]) -> Result<gdl_forma
     let gpu = headless_gpu()?;
     let mut sc = crate::scene::Scene::new(&gpu, g)?;
     sc.sync(&gpu, g);
-    let (w, h) = (960u32, 540u32);
+    let (w, h) = (800u32, 600u32);
     let globals = sc.globals(g, w as f32 / h as f32);
     let hud = crate::hud::Hud::new(
         &gpu.device,
