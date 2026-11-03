@@ -62,6 +62,37 @@ It doesn't solve the level for you: keys, doors and levers are yours. Heroes can
 the camera's view, so if it ever gets cut off (a lift it missed), go back for it. It can't be
 added from the menus yet.
 
+## Playing over the network
+
+```sh
+gauntlet --host 7777                           # Wait for one other player on port 7777
+gauntlet --host 7777 --net-players 4           # ...or up to three
+gauntlet --join 192.168.1.20:7777              # Join them
+```
+
+Everyone needs the same build, the same disc and asset packs, and the same rules; the host
+turns away anyone who differs and says why. The host needs the port open to the others, TCP and
+UDP (forwarded on the router, over the internet). Then everyone chooses heroes on the usual
+player select screen, and plays.
+
+It is lockstep: every machine runs the whole game, and a tick runs once everyone's buttons for
+it have arrived. So all see the same game, menus included (one player's pause menu pauses and
+shows for all, as on one television), and what you press takes effect a few ticks later, chosen
+from the connection's round trip (`--net-delay` sets it by hand, in sixtieths of a second). A
+slow machine or connection slows everyone; nobody runs ahead. Each machine keeps its own
+volume, and a recording of each level (`--record`), the same on every machine.
+
+Machines compare a fingerprint of the game every two seconds, and "OUT OF SYNC" on the screen
+and in the log means they differ, which is a bug worth reporting with the recordings.
+
+- **Leaving:** choose Quit Game in the menu and you leave at once; the others play on. Heroes of
+  those who have gone drop out of the level and the party.
+- **A lost connection:** after 15 seconds the machine is given up on. With two playing the other
+  plays on. With three or four the game ends for everyone: nothing can tell which of the last
+  ticks each machine got that player's buttons for, and they could no longer be the same game.
+- **Heroes:** a network game starts with new heroes and saves nothing to the memory card, and
+  nobody new can join once it has started.
+
 ## Asset packs
 
 The disc is the original game. An **asset pack** is a folder laid out like the disc's
@@ -364,6 +395,7 @@ crates/gdl-formats  Game file formats: objects/meshes, textures, worlds, animati
 crates/gdl-cli      `gdl` tool: ls/extract the disc, inspect and convert assets, read DOL data
 crates/gdl-sim      The simulation: game rules, levels, heroes, monsters, the camera and
                     save data; deterministic, with no window, GPU or audio
+crates/gdl-net      Network play: the lobby, and everyone's inputs for each tick (GGRS, lockstep)
 crates/gdl-engine   The game: renderer (wgpu), screens, input devices, audio, HUD, on gdl-sim
 ```
 

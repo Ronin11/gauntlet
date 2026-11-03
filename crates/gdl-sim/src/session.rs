@@ -240,6 +240,8 @@ pub struct Session {
     pub rules: Option<Rules>,
     pub difficulty: usize,
     pub friendly_fire: usize,
+    /// Slots whose players have left: their heroes play no more levels.
+    leavers: Vec<usize>,
     /// Sounds to play, drained by the engine.
     pub sfx: Vec<String>,
     /// What happened since the engine last looked, drained by it.
@@ -337,6 +339,11 @@ impl Session {
         self.game = Some(Box::new(game));
         self.paused = None;
         self.phase = Phase::Playing;
+        for slot in self.leavers.clone() {
+            if let Some(i) = self.panels.iter().position(|p| p.slot == slot) {
+                self.command(fs, Decision::Game(Command::PlayerLeft(i)));
+            }
+        }
         Ok(())
     }
 
@@ -415,6 +422,30 @@ impl Session {
         self.events.push(Event::Loading);
     }
 
+    /// This slot's player has left the game for good: their hero leaves the
+    /// level, or any level to come, and the party when that level ends.
+    pub fn player_left(&mut self, fs: &GameFs, slot: usize) {
+        if !self.leavers.contains(&slot) {
+            self.leavers.push(slot);
+        }
+        let Some(i) = self.panels.iter().position(|p| p.slot == slot) else {
+            return;
+        };
+        if self.paused == Some(i) {
+            self.paused = None;
+        }
+        if self.game.is_some() {
+            self.command(fs, Decision::Game(Command::PlayerLeft(i)));
+        }
+        if let Some(s) = &mut self.suspended {
+            let c = Command::PlayerLeft(i);
+            if let Some(rec) = &mut s.recording {
+                rec.command(&c);
+            }
+            s.game.command(c);
+        }
+    }
+
     /// Is a level waiting for the party to come back?
     pub fn has_waiting(&self) -> bool {
         self.suspended.is_some()
@@ -470,6 +501,8 @@ impl Session {
                 self.carry = Some(c.carry);
                 self.heroes = c.heroes;
                 self.progress = c.progress;
+                self.leavers
+                    .retain(|slot| c.panels.iter().any(|p| p.slot == *slot));
                 // Player select always leads into the tower.
                 self.enter_level(TOWER.to_string(), c.panels);
             }
@@ -886,6 +919,27 @@ impl Session {
             }
             None => self.enter_select(),
         }
+    }
+
+    /// A cheap check that two sessions are the same, cheap enough to send every
+    /// few seconds of play; [`Session::digest`] looks deeper.
+    pub fn fingerprint(&self) -> u32 {
+        let text = format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {}",
+            self.phase,
+            self.paused,
+            self.panels,
+            self.progress,
+            self.carry,
+            self.leavers,
+            self.game.as_ref().map_or(0, |g| g.fingerprint()),
+        );
+        let mut h: u32 = 0x811c9dc5;
+        for b in text.bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
+        h
     }
 
     /// The state peers must agree on, as one number.
@@ -1323,6 +1377,88 @@ mod tests {
             .map(|(g, _)| g.level.name.clone())
             .collect();
         assert_eq!(names, ["levelA1", "levelS1"]);
+    }
+
+    /// Someone gone from a network game: their hero leaves the level at once,
+    /// and the party when the level ends, and the game goes on without them.
+    #[test]
+    fn a_player_who_has_left_is_out_of_the_level_and_then_the_party() {
+        let Some(fs) = data() else { return };
+        let mut s = in_tower(&fs);
+        s.events.clear();
+        let idle = [PackedInput::default(); 2];
+        s.player_left(&fs, 1);
+        let g = s.game.as_deref().unwrap();
+        assert_eq!(g.players[1].state, PlayerState::InTower);
+        assert!(g.players[1].quit);
+        assert!(g.players[0].state.active());
+        for _ in 0..30 {
+            s.update(&fs, &idle);
+        }
+        // The other hero keeps the level going.
+        assert!(s.game.as_deref().unwrap().level_end.is_none());
+        s.command(&fs, Decision::Game(Command::QuitLevel));
+        s.update(&fs, &idle);
+        assert_eq!(s.panels.len(), 1);
+        assert_eq!(s.panels[0].slot, 0);
+        assert!(s.carry.as_ref().unwrap()[1].is_none());
+        assert!(s
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::PlayersLeft(l) if l == &[1])));
+    }
+
+    /// Someone who goes between levels is out of the next one from its start.
+    #[test]
+    fn a_player_who_left_between_levels_is_not_in_the_next_one() {
+        let Some(fs) = data() else { return };
+        let mut s = in_tower(&fs);
+        s.warp(TOWER.to_string(), Vec::new);
+        assert!(matches!(s.phase, Phase::Loading { .. }));
+        s.player_left(&fs, 0);
+        s.load(&fs).unwrap();
+        let g = s.game.as_deref().unwrap();
+        assert_eq!(g.players[0].state, PlayerState::InTower);
+        assert!(g.players[1].state.active());
+    }
+
+    /// Left in a level, it is in that level's recording, which still replays.
+    #[test]
+    fn a_game_someone_left_replays_to_the_bit() {
+        let Some(fs) = data() else { return };
+        let mut s = in_tower(&fs);
+        let idle = [PackedInput::default(); 2];
+        for _ in 0..30 {
+            s.update(&fs, &idle);
+        }
+        s.player_left(&fs, 1);
+        for _ in 0..30 {
+            s.update(&fs, &idle);
+        }
+        let rec = s.recording.clone().unwrap();
+        let g = s.game.as_deref().unwrap();
+        let compat = crate::compat::Compat::local(&fs, &s.rules(), "test").unwrap();
+        let back = Replay::from_text(&rec.to_text(g, &compat)).unwrap();
+        assert!(back.to_text(g, &compat).contains(" left 1"));
+        let verdict = back.check(&fs, Some(&compat)).unwrap();
+        assert!(verdict.matches(), "{verdict:?}");
+    }
+
+    /// Two sessions fed the same have the same fingerprint, and it sees more
+    /// than the level.
+    #[test]
+    fn the_fingerprint_sees_the_session_and_not_only_the_level() {
+        let Some(fs) = data() else { return };
+        let mut a = in_tower(&fs);
+        let mut b = in_tower(&fs);
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        let idle = [PackedInput::default(); 2];
+        a.update(&fs, &idle);
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        b.update(&fs, &idle);
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        b.paused = Some(1);
+        assert_ne!(a.fingerprint(), b.fingerprint());
     }
 
     #[test]

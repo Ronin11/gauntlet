@@ -23,6 +23,15 @@ pub enum Source {
     Device(u64),
     /// No device: the app gets this hero's input from the loyal follower.
     Companion,
+    /// A player of a network game, by player number: what the network says
+    /// they press this tick, this machine's own player included.
+    Net(usize),
+}
+
+/// A network game: this tick's inputs for everyone, which is all the game sees.
+struct NetInputs {
+    me: usize,
+    inputs: Vec<PlayerInput>,
 }
 
 /// Android key codes for gamepad buttons (android.view.KeyEvent).
@@ -57,6 +66,7 @@ pub struct Input {
     /// The rumble playing on each pad (dropping an effect stops it).
     #[cfg(not(target_os = "android"))]
     rumbles: HashMap<PadId, gilrs::ff::Effect>,
+    net: Option<NetInputs>,
 }
 
 impl Default for Input {
@@ -92,7 +102,56 @@ impl Input {
             dev_pressed: Vec::new(),
             #[cfg(not(target_os = "android"))]
             rumbles: HashMap::new(),
+            net: None,
         }
+    }
+
+    /// From now on the game sees only the network's inputs, for these players.
+    pub fn start_net(&mut self, me: usize, players: usize) {
+        self.net = Some(NetInputs {
+            me,
+            inputs: vec![PlayerInput::default(); players],
+        });
+    }
+
+    pub fn end_net(&mut self) {
+        self.net = None;
+    }
+
+    /// This tick's inputs, from the network.
+    pub fn set_net_inputs(&mut self, inputs: &[PackedInput]) {
+        if let Some(n) = &mut self.net {
+            n.inputs = inputs.iter().map(PackedInput::unpack).collect();
+        }
+    }
+
+    /// What this machine's player is pressing, on any of its controllers, for
+    /// the network to carry. Hands over the presses, once.
+    pub fn take_local(&mut self, escape: bool) -> PackedInput {
+        let mut m = PackedInput::default();
+        for src in self.device_sources() {
+            let p = self.read(src).pack();
+            m.buttons |= p.buttons;
+            if m.stick == [0, 0] {
+                m.stick = p.stick;
+            }
+            if m.fire == [0, 0] {
+                m.fire = p.fire;
+            }
+            if m.dpad == [0, 0] {
+                m.dpad = p.dpad;
+            }
+        }
+        if escape {
+            let start = PlayerInput {
+                start_pressed: true,
+                start: true,
+                ..Default::default()
+            };
+            m.buttons |= start.pack().buttons;
+        }
+        self.clear_presses();
+        m
     }
 
     /// do_vibe: rumble a pad at `strength` (0..1) for `ms`, replacing what it
@@ -103,6 +162,14 @@ impl Input {
         #[cfg(not(target_os = "android"))]
         {
             use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Repeat, Replay, Ticks};
+            // This machine's own player of a network game: their first pad.
+            let src = match (src, &self.net) {
+                (Source::Net(i), Some(n)) if i == n.me => match self.pads().first() {
+                    Some(&id) => Source::Pad(id),
+                    None => return,
+                },
+                _ => src,
+            };
             let (Source::Pad(id), Some(g)) = (src, &mut self.gilrs) else {
                 return;
             };
@@ -220,6 +287,13 @@ impl Input {
 
     /// Every input source that could join a game.
     pub fn sources(&self) -> Vec<Source> {
+        if let Some(n) = &self.net {
+            return (0..n.inputs.len()).map(Source::Net).collect();
+        }
+        self.device_sources()
+    }
+
+    fn device_sources(&self) -> Vec<Source> {
         let mut v = vec![Source::Keyboard];
         v.extend(self.pads().into_iter().map(Source::Pad));
         v.extend(self.devices().into_iter().map(Source::Device));
@@ -229,6 +303,11 @@ impl Input {
     pub fn read(&self, src: Source) -> PlayerInput {
         match src {
             Source::Companion => PlayerInput::default(),
+            Source::Net(i) => self
+                .net
+                .as_ref()
+                .and_then(|n| n.inputs.get(i).copied())
+                .unwrap_or_default(),
             Source::Keyboard => {
                 let mut v = Vec2::ZERO;
                 if self.held(KeyCode::KeyW) || self.held(KeyCode::ArrowUp) {
@@ -397,8 +476,15 @@ impl Input {
         }
     }
 
-    /// Clear per-frame edge state.
+    /// Clear per-frame edge state. In a network game presses last until the
+    /// network has them ([`Input::take_local`]), however long a tick waits.
     pub fn end_frame(&mut self) {
+        if self.net.is_none() {
+            self.clear_presses();
+        }
+    }
+
+    fn clear_presses(&mut self) {
         self.pressed.clear();
         #[cfg(not(target_os = "android"))]
         self.pad_pressed.clear();
@@ -417,6 +503,7 @@ pub fn source_name(s: &Source, pads: &[PadId]) -> String {
         },
         Source::Device(_) => "device".into(),
         Source::Companion => "companion".into(),
+        Source::Net(i) => format!("net {i}"),
     }
 }
 
@@ -461,4 +548,53 @@ pub fn bind_sources(
     out.into_iter()
         .map(|o| o.unwrap_or(Source::Keyboard))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tick of a network game can wait a long time for the others. A press
+    /// must reach the network, once, however many frames go by first.
+    #[test]
+    fn in_a_network_game_a_press_lasts_until_the_network_has_it() {
+        let mut i = Input::new();
+        i.start_net(0, 2);
+        i.key(KeyCode::Space, true);
+        i.key(KeyCode::Space, false);
+        // Frames go by, waiting.
+        i.end_frame();
+        i.end_frame();
+        let first = i.take_local(false).unpack();
+        assert!(first.attack_pressed, "the press was lost");
+        assert!(!first.attack, "it was let go of");
+        assert!(!i.take_local(false).unpack().attack_pressed, "only once");
+    }
+
+    #[test]
+    fn the_game_sees_only_what_the_network_says() {
+        let mut i = Input::new();
+        i.start_net(1, 2);
+        assert_eq!(i.sources(), [Source::Net(0), Source::Net(1)]);
+        // This machine's own keyboard reaches the game only by the network.
+        i.key(KeyCode::KeyW, true);
+        assert_eq!(i.read(Source::Net(1)), PlayerInput::default());
+        let mine = i.take_local(false);
+        assert!(mine.unpack().stick.y > 0.9);
+        i.set_net_inputs(&[PackedInput::default(), mine]);
+        assert_eq!(i.read(Source::Net(1)).stick, mine.unpack().stick);
+        assert_eq!(i.read(Source::Net(0)), PlayerInput::default());
+        // Out of the network game, the keyboard is back.
+        i.end_net();
+        assert!(i.sources().contains(&Source::Keyboard));
+        assert!(i.read(Source::Keyboard).stick.y > 0.9);
+    }
+
+    #[test]
+    fn esc_is_start_to_the_network() {
+        let mut i = Input::new();
+        i.start_net(0, 2);
+        assert!(i.take_local(true).unpack().start_pressed);
+        assert!(!i.take_local(false).unpack().start_pressed);
+    }
 }

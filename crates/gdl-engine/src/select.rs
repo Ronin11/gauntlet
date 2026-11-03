@@ -562,6 +562,15 @@ impl Select {
         Some(col)
     }
 
+    /// This player has gone: the others don't wait for them.
+    pub fn drop_source(&mut self, src: Source) {
+        for p in &mut self.players {
+            if p.as_ref().is_some_and(|p| p.source == src) {
+                *p = None;
+            }
+        }
+    }
+
     /// Input sources in column order, for the game that follows.
     pub fn sources(&self) -> Vec<Source> {
         self.players.iter().flatten().map(|p| p.source).collect()

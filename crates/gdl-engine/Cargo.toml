@@ -16,6 +16,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 gdl-formats = { path = "../gdl-formats" }
 gdl-sim = { path = "../gdl-sim" }
+gdl-net = { path = "../gdl-net" }
 gdl-modern = { path = "../gdl-modern" }
 wgpu = "25"
 winit = "0.30"

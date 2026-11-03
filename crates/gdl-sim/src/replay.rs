@@ -779,6 +779,9 @@ fn write_command(o: &mut String, tick: u32, c: &Command) {
         Command::HintsClosed => {
             let _ = writeln!(o, "{tick} hints_closed");
         }
+        Command::PlayerLeft(player) => {
+            let _ = writeln!(o, "{tick} left {player}");
+        }
         Command::DebugGod(on) => {
             let _ = writeln!(o, "{tick} god {}", *on as u8);
         }
@@ -825,6 +828,7 @@ fn read_command_line(out: &mut Vec<(u32, Command)>, tick: &str, rest: &str) -> R
         }
         "quit" => Command::QuitLevel,
         "hints_closed" => Command::HintsClosed,
+        "left" => Command::PlayerLeft(rest.parse()?),
         "god" => Command::DebugGod(rest == "1"),
         "party" => {
             let finds = match w.as_slice() {
@@ -1021,6 +1025,7 @@ mod tests {
             },
             Command::QuitLevel,
             Command::HintsClosed,
+            Command::PlayerLeft(1),
             Command::DebugGod(true),
             party,
         ];

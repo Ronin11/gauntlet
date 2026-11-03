@@ -26,6 +26,10 @@ struct Args {
     level: String,
     players: Vec<(String, String)>,
     companion: Option<(String, String)>,
+    /// --host / --join: a network game.
+    net: Option<app::NetSpec>,
+    net_players: usize,
+    net_delay: Option<usize>,
     snapshot: Option<PathBuf>,
     eye: Option<Vec3>,
     at: Option<Vec3>,
@@ -95,6 +99,11 @@ USAGE: gauntlet [OPTIONS]
   --players <list>      Comma list of CLASS[/COLOR], e.g. WAR,VAL/BLU (default WAR)
                         Classes: WAR VAL WIZ ARC (and unlockables)
   --companion <hero>    A loyal follower plays beside you, CLASS[/COLOR], e.g. VAL/BLU
+  --host <port>         Host a network game: wait for the others on this port (open
+                        it to them, TCP and UDP), then all choose heroes together
+  --net-players <n>     How many play, with the host: 2 to 4 (default 2)
+  --net-delay <ticks>   Input delay, instead of what the connection suggests
+  --join <host:port>    Join a network game; the same build, disc and rules are needed
 
 Controls: left stick / WASD move, A / J attack, X / Shift turbo,
           F11 fullscreen, Esc quit.
@@ -105,7 +114,7 @@ Testing:
   --replay <file>       Watch a recording (a bug report's replay.txt); Esc quits
   --replay-check <file> Play a recording headless, compare it, and exit (1 if it differs)
   --snapshot <png>      Render one frame headless and exit
-  --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
+  --screen <name>       Snapshot a screen: title, titlemenu, select, loading, net, pause,
                         select:load|save|result|char (memory card screens),
                         debug[:main|warp|progress|unlocks|party|level|bug|states[:row]]
                         (the developer debug menu over --level),
@@ -154,6 +163,9 @@ fn parse_args() -> Result<Args> {
         level: "levelA1".into(),
         players: Vec::new(),
         companion: None,
+        net: None,
+        net_players: 2,
+        net_delay: None,
         snapshot: None,
         eye: None,
         at: None,
@@ -214,6 +226,21 @@ fn parse_args() -> Result<Args> {
                     "--companion: no class {c}"
                 );
                 a.companion = Some((c, col.to_ascii_uppercase()));
+            }
+            "--host" => {
+                let port = val()?;
+                let port = port
+                    .parse()
+                    .with_context(|| format!("--host {port}: a port number"))?;
+                a.net = Some(app::NetSpec::Host { port });
+            }
+            "--join" => a.net = Some(app::NetSpec::Join { addr: val()? }),
+            "--net-players" => {
+                a.net_players = val()?.parse().context("--net-players: 2 to 4")?;
+                anyhow::ensure!((2..=4).contains(&a.net_players), "--net-players: 2 to 4");
+            }
+            "--net-delay" => {
+                a.net_delay = Some(val()?.parse().context("--net-delay: ticks of delay")?);
             }
             "--players" => {
                 a.players = val()?
@@ -409,7 +436,10 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
                         None => Ok(Vec3::ZERO),
                     }
                 };
-                anyhow::ensure!(f.len() >= 4, "--modern-attach FILE:JOINT:LENGTH:GRIP[:ROT[:SHIFT]]");
+                anyhow::ensure!(
+                    f.len() >= 4,
+                    "--modern-attach FILE:JOINT:LENGTH:GRIP[:ROT[:SHIFT]]"
+                );
                 // ROT is x,y,z degrees, or aim=x,y,z[,twist]: where the far end points.
                 let (mut aim, mut twist, mut rotate) = (None, 0.0, Vec3::ZERO);
                 if !f.get(4).is_some_and(|r| r.starts_with("aim=")) {
@@ -417,7 +447,8 @@ fn snapshot_character(args: &Args, spec: &str) -> Result<()> {
                 }
                 if let Some(a) = f.get(4).and_then(|r| r.strip_prefix("aim=")) {
                     let mut n = a.split(',').map(|x| x.parse::<f32>());
-                    let mut next = || -> Result<f32> { Ok(n.next().context("aim=x,y,z[,twist]")??) };
+                    let mut next =
+                        || -> Result<f32> { Ok(n.next().context("aim=x,y,z[,twist]")??) };
                     aim = Some(Vec3::new(next()?, next()?, next()?));
                     twist = next().unwrap_or(0.0);
                     rotate = Vec3::ZERO;
@@ -924,7 +955,10 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 .with_context(|| format!("no level {code} in the realm tables"))?;
             let mut clock = mapscreen::MapClock::new(&fs, &g.worlds, wave);
             let m = mapscreen::MapScreen::new(&fs, &gpu, &mut hud, &clock);
-            println!("map screen {code} (wave {wave:#x}), music {:?}", clock.music);
+            println!(
+                "map screen {code} (wave {wave:#x}), music {:?}",
+                clock.music
+            );
             for t in 1..=ticks {
                 let done = clock.update();
                 for s in clock.sfx.drain(..) {
@@ -1146,6 +1180,11 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 }
             }
             Some("loading") => menu::draw_loading(&mut screen::Scr::new(&mut canvas, &hud.ui, 40)),
+            Some("net") => {
+                let mut s = screen::Scr::new(&mut canvas, &hud.ui, 40);
+                menu::draw_loading(&mut s);
+                app::draw_net_line(&mut s, "Waiting for the other players...");
+            }
             Some(name) if name.starts_with("gamemenu") || name.starts_with("towermenu") => {
                 let mut s = screen::Scr::new(&mut canvas, &hud.ui, 100);
                 hud::build(&mut s, &g, &panels);
@@ -1361,7 +1400,32 @@ fn main() -> Result<()> {
         Some(path) => Some(gdl_sim::replay::Replay::read(path)?),
         None => None,
     };
+    let net = match &args.net {
+        Some(spec) => {
+            anyhow::ensure!(
+                args.players.is_empty()
+                    && args.companion.is_none()
+                    && args.replay.is_none()
+                    && args.load_state.is_none(),
+                "a network game can't start with --players, --companion, --replay or --load-state"
+            );
+            let save_dir = gdl_engine::save::MemCard::default_dir();
+            let lobby = app::NetLobby {
+                spec,
+                players: args.net_players,
+                delay: args.net_delay,
+            };
+            Some(app::find_players(
+                &lobby,
+                &fs,
+                &args.rules,
+                save_dir.as_deref(),
+            )?)
+        }
+        None => None,
+    };
     app::run(app::Config {
+        net,
         replay,
         record: args.record,
         fs,

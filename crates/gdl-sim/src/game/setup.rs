@@ -153,6 +153,9 @@ pub enum Command {
     DebugGod(bool),
     /// The party came back to this level.
     PartyBack(Box<PartyBack>),
+    /// This player has left the game (their machine has gone): their hero
+    /// leaves the level at once, and the party when the level ends.
+    PlayerLeft(usize),
 }
 
 impl Game {
@@ -174,6 +177,13 @@ impl Game {
             Command::SetControls { player, prefs } => {
                 if let Some(slot) = self.controls.get_mut(player) {
                     *slot = prefs;
+                }
+            }
+            Command::PlayerLeft(player) => {
+                if let Some(p) = self.players.get_mut(player) {
+                    p.state = PlayerState::InTower;
+                    p.tower_choice = false;
+                    p.quit = true;
                 }
             }
             Command::QuitLevel => {

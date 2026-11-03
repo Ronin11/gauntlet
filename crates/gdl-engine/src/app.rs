@@ -26,6 +26,7 @@ use crate::session::{Carry, Chosen, Decision, Event, Heroes, Phase, Session};
 use crate::ui::UiAssets;
 use anyhow::{Context, Result};
 use gdl_formats::wdata::TOWER_WAVE;
+use gdl_net::lobby::Roster;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -55,6 +56,239 @@ pub struct Config {
     pub replay: Option<Replay>,
     /// Keep each level's recording in this folder (`--record`).
     pub record: Option<std::path::PathBuf>,
+    /// A network game, agreed in the lobby (`--host`, `--join`).
+    pub net: Option<Roster>,
+}
+
+/// How to find a network game.
+#[derive(Clone, Debug)]
+pub enum NetSpec {
+    Host { port: u16 },
+    Join { addr: String },
+}
+
+pub struct NetLobby<'a> {
+    pub spec: &'a NetSpec,
+    pub players: usize,
+    pub delay: Option<usize>,
+}
+
+/// Wait for the other players, before there is a window. They must have this
+/// same copy of the game.
+pub fn find_players(
+    lobby: &NetLobby,
+    fs: &GameFs,
+    rules: &crate::rules::Rules,
+    save_dir: Option<&std::path::Path>,
+) -> Result<Roster> {
+    let compat = Compat::local(fs, rules, crate::bugreport::BUILD)?;
+    let mut prefs = Prefs::default();
+    if let Some(o) = MemCard::open(save_dir).opts() {
+        prefs.apply_game_opts(&o);
+    }
+    let say = |line: &str| println!("{line}");
+    match lobby.spec {
+        NetSpec::Host { port } => gdl_net::lobby::host(
+            &gdl_net::lobby::Host {
+                port: *port,
+                players: lobby.players,
+                delay: lobby.delay,
+                difficulty: prefs.difficulty,
+                friendly_fire: prefs.multiplayer,
+                compat,
+                controls: prefs.players[0],
+            },
+            say,
+        ),
+        NetSpec::Join { addr } => gdl_net::lobby::join(addr, &compat, &prefs.players[0], say),
+    }
+}
+
+/// How long something said about the network stays on the screen, in seconds.
+const NET_NOTE_FOR: f32 = 5.0;
+
+/// A network game going on.
+struct NetPlay {
+    net: gdl_net::Net,
+    /// This machine's own options and memory card, kept aside: the game goes by
+    /// what everyone agreed, and writes nothing to the card.
+    own_prefs: Prefs,
+    own_card: MemCard,
+    /// Esc, to hand to the network as this player's Start.
+    escape: bool,
+    /// Something to say on the screen, and until when.
+    note: Option<(String, Instant)>,
+    /// A fingerprint has differed: this game can't be trusted any more.
+    desync: bool,
+}
+
+/// The agreed options, with this machine's own for what is only its own.
+fn agreed_prefs(own: &Prefs, roster: &Roster) -> Prefs {
+    let mut p = Prefs::default();
+    p.music_vol = own.music_vol;
+    p.sfx_vol = own.sfx_vol;
+    p.stereo = own.stereo;
+    p.compass = own.compass;
+    p.difficulty = roster.difficulty;
+    p.multiplayer = roster.friendly_fire;
+    for (slot, c) in roster.controls.iter().enumerate().take(4) {
+        p.players[slot] = *c;
+    }
+    p
+}
+
+/// Into player select with everyone, as every machine does at the same moment.
+fn start_net(r: &mut Running, roster: &Roster) -> Result<Screen> {
+    let net = gdl_net::Net::start(roster)?;
+    let n = roster.addrs.len();
+    r.input.start_net(roster.me, n);
+    let own_prefs = r.prefs.clone();
+    r.prefs = agreed_prefs(&own_prefs, roster);
+    let own_card = std::mem::replace(&mut r.card, MemCard::in_memory());
+    r.sources = (0..n).map(Source::Net).collect();
+    r.session = Session::new(
+        r.session.rules(),
+        r.prefs.difficulty,
+        r.prefs.multiplayer,
+        Progress::default(),
+    );
+    r.session.phase = Phase::Select;
+    let s = &r.session;
+    let party = party_for(&r.card, &None, &s.heroes, &s.progress, &r.prefs);
+    let mut sel = Select::with_first(Source::Net(0)).with_party(party);
+    for i in 1..n {
+        sel.join(Source::Net(i));
+    }
+    r.net = Some(NetPlay {
+        net,
+        own_prefs,
+        own_card,
+        escape: false,
+        note: None,
+        desync: false,
+    });
+    Ok(Screen::Select(sel))
+}
+
+/// Back to this machine alone, with its own options and card.
+fn end_net(r: &mut Running) {
+    if let Some(mut np) = r.net.take() {
+        // What this player set for their own ears stays.
+        np.own_prefs.music_vol = r.prefs.music_vol;
+        np.own_prefs.sfx_vol = r.prefs.sfx_vol;
+        np.own_prefs.stereo = r.prefs.stereo;
+        np.own_prefs.compass = r.prefs.compass;
+        r.prefs = np.own_prefs;
+        r.card = np.own_card;
+        r.input.end_net();
+        r.sources.clear();
+    }
+}
+
+/// The next tick of a network game, if everyone's input for it is here.
+fn net_tick(r: &mut Running, fs: &GameFs) -> Result<bool> {
+    let Some(np) = r.net.as_mut() else {
+        return Ok(true);
+    };
+    if np.net.wants_input() {
+        let local = r.input.take_local(std::mem::take(&mut np.escape));
+        let session = &r.session;
+        np.net.give(local, || session.fingerprint())?;
+    }
+    let Some(frame) = np.net.tick()? else {
+        return Ok(false);
+    };
+    r.input.set_net_inputs(&frame.inputs);
+    for player in frame.left {
+        player_gone(r, fs, player);
+    }
+    Ok(true)
+}
+
+/// This player has gone, as of this tick on every machine.
+fn player_gone(r: &mut Running, fs: &GameFs, player: usize) {
+    let src = Source::Net(player);
+    let index = r.sources.iter().position(|s| *s == src);
+    if let Some(i) = index {
+        if let Screen::Playing { pause, .. } = &mut r.screen {
+            if pause.as_ref().is_some_and(|m| menu_owner(m) == i) {
+                if pause.as_ref().and_then(|m| m.hints()).is_some() {
+                    r.session.command(fs, Decision::Game(Command::HintsClosed));
+                }
+                *pause = None;
+            }
+        }
+        if let Some(slot) = r.session.panels.get(i).map(|p| p.slot) {
+            r.session.player_left(fs, slot);
+        }
+    }
+    if let Screen::Select(sel) = &mut r.screen {
+        sel.drop_source(src);
+    }
+    if let Some(np) = &mut r.net {
+        np.note = Some((format!("Player {} has left", player + 1), Instant::now()));
+    }
+}
+
+/// What the network has to say.
+fn net_events(r: &mut Running, fs: &GameFs) {
+    let Some(np) = r.net.as_mut() else {
+        return;
+    };
+    np.net.poll();
+    let mut lost = None;
+    for e in np.net.events() {
+        log::info!("network: {e:?}");
+        let note = match e {
+            gdl_net::NetEvent::Connected => None,
+            gdl_net::NetEvent::Quiet { player } => {
+                Some(format!("Nothing from player {}...", player + 1))
+            }
+            gdl_net::NetEvent::Back { player } => Some(format!("Player {} is back", player + 1)),
+            gdl_net::NetEvent::Desync { player, frame } => {
+                log::error!("network: out of sync with player {player} at tick {frame}");
+                np.desync = true;
+                None
+            }
+            gdl_net::NetEvent::Lost { player } => {
+                lost = Some(player);
+                None
+            }
+        };
+        if let Some(n) = note {
+            np.note = Some((n, Instant::now()));
+        }
+    }
+    if let Some(player) = lost {
+        // The game can't go on safely, here or on any machine still in it.
+        log::error!("network: lost player {player}: the game is over");
+        end_net(r);
+        r.session.command(fs, Decision::QuitGame);
+    }
+}
+
+/// A line about the network at the top of the screen.
+fn draw_net_status(s: &mut Scr, np: &NetPlay) {
+    let line = if np.desync {
+        "OUT OF SYNC".to_string()
+    } else if !np.net.connected() {
+        "Connecting to the other players...".to_string()
+    } else if np.net.waiting_for().as_secs_f32() > 0.5 {
+        "Waiting for the other players...".to_string()
+    } else {
+        match &np.note {
+            Some((n, at)) if at.elapsed().as_secs_f32() < NET_NOTE_FOR => n.clone(),
+            _ => return,
+        }
+    };
+    draw_net_line(s, &line);
+}
+
+/// A line of news about the network, centred at the top of the screen.
+pub fn draw_net_line(s: &mut Scr, line: &str) {
+    let w = s.text_width(crate::ui::FONT_8X8, 1.0, line);
+    let x = 256.0 - (w * 0.5).floor();
+    s.text(1.0, x, 12.0, crate::ui::FONT_8X8, 0xFFFFFF, 0, line);
 }
 
 /// What the engine keeps for the level the session is running.
@@ -228,6 +462,14 @@ fn session_events(r: &mut Running, fs: &GameFs) -> Option<Screen> {
                 let mut sel = Select::from_game(&s.panels, &r.sources)
                     .with_party(party)
                     .companion_ready();
+                // Nobody waits for someone who has gone.
+                if let Some(np) = &r.net {
+                    for src in r.sources.iter().copied() {
+                        if matches!(src, Source::Net(p) if np.net.is_gone(p)) {
+                            sel.drop_source(src);
+                        }
+                    }
+                }
                 // check_active_players: a new pad joined in the tower.
                 if let Some(src) = r.joining.take() {
                     sel.join(src);
@@ -512,6 +754,7 @@ struct Running {
     last: Instant,
     acc: f32,
     window: Arc<Window>,
+    net: Option<NetPlay>,
 }
 
 struct App {
@@ -654,7 +897,12 @@ impl App {
             last: Instant::now(),
             acc: 0.0,
             window,
+            net: None,
         };
+        if let Some(roster) = self.cfg.net.take() {
+            r.screen = start_net(&mut r, &roster)?;
+            r.audio.play_select_music(&self.cfg.fs);
+        }
         // --replay: straight into the recorded level.
         if let Some(replay) = self.cfg.replay.take() {
             let ours = Compat::local(
@@ -807,6 +1055,17 @@ impl App {
         r.last = now;
         let time = now.duration_since(self.started).as_secs_f32();
 
+        // A network game ends with its game: on the title or attract screens
+        // this machine is on its own; and one who is leaving goes when they may.
+        let net_over = matches!(
+            r.screen,
+            Screen::Title(_) | Screen::Attract | Screen::Legal(_)
+        ) || r.net.as_ref().is_some_and(|np| np.net.may_go());
+        if net_over {
+            end_net(r);
+        }
+        net_events(r, fs);
+
         for id in r.input.poll() {
             // Hot-plugged pad: give it to the keyboard's player if that is the
             // only one, otherwise ignore (players are fixed for this session).
@@ -887,6 +1146,10 @@ impl App {
             r.acc = 0.0;
         }
 
+        // Ticks owed to a game that had to wait aren't all run at once.
+        if r.net.is_some() {
+            r.acc = r.acc.min(6.0 * TICK);
+        }
         let frame = match r.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -904,14 +1167,23 @@ impl App {
         // Fixed-rate simulation and menu input.
         let mut escape = std::mem::take(&mut r.escape);
         let mut next: Option<Screen> = None;
+        // In a network game Esc is this player's Start, like any other button.
+        if let Some(np) = &mut r.net {
+            np.escape |= std::mem::take(&mut escape);
+        }
         while r.acc >= TICK && next.is_none() {
+            // Everyone's inputs for the tick, or wait for them.
+            if !net_tick(r, fs)? {
+                break;
+            }
             let all: Vec<(Source, PlayerInput)> = r
                 .input
                 .sources()
                 .into_iter()
                 .map(|s| (s, r.input.read(s)))
                 .collect();
-            if reset_held(&mut r.reset_hold, &all) {
+            let in_net = r.net.is_some();
+            if !in_net && reset_held(&mut r.reset_hold, &all) {
                 // OSResetSystem: the game boots again; only the memory card
                 // (and the options) remain.
                 r.reset_hold.clear();
@@ -931,7 +1203,7 @@ impl App {
                 continue;
             }
             // The debug menu, while open, has the tick (the game is frozen).
-            let debug = if r.watch.is_none() {
+            let debug = if r.watch.is_none() && !in_net {
                 debug_tick(r, fs, &all, escape)
             } else {
                 None
@@ -980,7 +1252,7 @@ impl App {
                 r.acc -= TICK;
                 continue;
             }
-            r.idle = if !saver_counts(&r.screen) || changed || r.watch.is_some() {
+            r.idle = if !saver_counts(&r.screen) || changed || r.watch.is_some() || in_net {
                 0
             } else {
                 r.idle + 1
@@ -1159,6 +1431,12 @@ impl App {
                         .iter()
                         .map(|s| match s {
                             Source::Companion => crate::runner::companion::shop_input(t).pack(),
+                            // Someone gone shops the same way: they leave it.
+                            Source::Net(p)
+                                if r.net.as_ref().is_some_and(|np| np.net.is_gone(*p)) =>
+                            {
+                                crate::runner::companion::shop_input(t).pack()
+                            }
                             _ => r.input.read(*s).pack(),
                         })
                         .collect();
@@ -1243,8 +1521,34 @@ impl App {
                                 r.session.command(fs, Decision::OpenShop(mode));
                             }
                             OptionsAction::QuitGame => {
-                                autosave_session(&r.session, &r.sources, &r.input, &r.save_dir);
-                                r.session.command(fs, Decision::QuitGame);
+                                // In a network game only the one who chose it
+                                // leaves; for the others the game goes on.
+                                let quitter = match (&r.net, r.sources.get(owner)) {
+                                    (Some(np), Some(Source::Net(p))) if *p != np.net.me() => {
+                                        Some(*p)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(p) = quitter {
+                                    if let Some(np) = &mut r.net {
+                                        np.net.drop_player(p);
+                                        np.note = Some((
+                                            format!("Player {} has left", p + 1),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                    *pause = None;
+                                    if let Some(slot) = r.session.panels.get(owner).map(|i| i.slot)
+                                    {
+                                        r.session.player_left(fs, slot);
+                                    }
+                                } else {
+                                    if let Some(np) = &mut r.net {
+                                        np.net.leave();
+                                    }
+                                    autosave_session(&r.session, &r.sources, &r.input, &r.save_dir);
+                                    r.session.command(fs, Decision::QuitGame);
+                                }
                             }
                             OptionsAction::None => {}
                         }
@@ -1305,7 +1609,7 @@ impl App {
                             }
                         }
                         let god = r.session.game.as_ref().is_some_and(|g| g.debug_god);
-                        if !watching && god != r.debug.god {
+                        if !watching && r.net.is_none() && god != r.debug.god {
                             r.session
                                 .command(fs, Decision::Game(Command::DebugGod(r.debug.god)));
                         }
@@ -1324,7 +1628,10 @@ impl App {
                             // Debug save states: an autosave every minute of play.
                             if game.time < r.autosaved {
                                 r.autosaved = game.time;
-                            } else if !watching && game.time - r.autosaved >= AUTOSAVE_EVERY {
+                            } else if !watching
+                                && r.net.is_none()
+                                && game.time - r.autosaved >= AUTOSAVE_EVERY
+                            {
                                 r.autosaved = game.time;
                                 autosave_due = true;
                             }
@@ -1565,6 +1872,9 @@ impl App {
             let mut s = Scr::new(&mut canvas, &r.hud.ui, ticks);
             r.debug.draw_overlay(&mut s);
             r.debug.draw(&mut s);
+            if let Some(np) = &r.net {
+                draw_net_status(&mut s, np);
+            }
         }
         if !in_game {
             r.gpu.render(
