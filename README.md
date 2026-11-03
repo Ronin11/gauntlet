@@ -44,6 +44,24 @@ counts as a controller (Enter). In the tower, a new controller can join with Sta
 Other options: `--level levelB1` to start elsewhere, `--players WAR,VAL/BLU` to skip the
 join screen, `--mute`. See `gauntlet --help`. Sound starts at 20% of the original's level (the Audio options scale on top); `GDL_VOLUME=0.5` sets another level.
 
+## Playing with a loyal follower
+
+```sh
+gauntlet --companion VAL                       # Title screen as usual; it joins you, ready
+gauntlet --players WAR --companion VAL/BLU     # Straight into a level
+```
+
+A computer-played hero, for when there is nobody else to play with. It has no powers you lack:
+it sees the game and presses the same buttons, so a game with it records and replays like any
+other, and it can run out of health like you can. It stays close, fights what comes near you,
+and leaves the loot to you, except food when it is hurt worse than you are. It goes to an exit
+only once you are waiting on one, and never takes a secret level by itself. If you fall and it
+is still standing, it makes for the nearest exit so the party can go on.
+
+It doesn't solve the level for you: keys, doors and levers are yours. Heroes can't walk out of
+the camera's view, so if it ever gets cut off (a lift it missed), go back for it. It can't be
+added from the menus yet.
+
 ## Asset packs
 
 The disc is the original game. An **asset pack** is a folder laid out like the disc's

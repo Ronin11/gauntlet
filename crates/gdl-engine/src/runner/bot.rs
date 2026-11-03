@@ -2287,7 +2287,7 @@ fn log_to(history: &mut Vec<String>, verbose: bool, g: &Game, s: String) {
 }
 
 /// Distance from p to the segment a-b.
-fn seg_dist(a: Vec2, b: Vec2, p: Vec2) -> f32 {
+pub fn seg_dist(a: Vec2, b: Vec2, p: Vec2) -> f32 {
     let ab = b - a;
     let t = if ab.length_squared() > 1e-6 {
         ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)

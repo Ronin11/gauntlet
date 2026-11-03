@@ -21,6 +21,8 @@ pub enum Source {
     Pad(PadId),
     /// A controller that reports buttons as key events (Android), by device id.
     Device(u64),
+    /// No device: the app gets this hero's input from the loyal follower.
+    Companion,
 }
 
 /// Android key codes for gamepad buttons (android.view.KeyEvent).
@@ -226,6 +228,7 @@ impl Input {
 
     pub fn read(&self, src: Source) -> PlayerInput {
         match src {
+            Source::Companion => PlayerInput::default(),
             Source::Keyboard => {
                 let mut v = Vec2::ZERO;
                 if self.held(KeyCode::KeyW) || self.held(KeyCode::ArrowUp) {
@@ -413,6 +416,7 @@ pub fn source_name(s: &Source, pads: &[PadId]) -> String {
             None => "pad".into(),
         },
         Source::Device(_) => "device".into(),
+        Source::Companion => "companion".into(),
     }
 }
 
@@ -431,6 +435,7 @@ pub fn bind_sources(
         let mut t = h.source.split_whitespace();
         let want = match (t.next(), t.next().and_then(|n| n.parse::<usize>().ok())) {
             (Some("keyboard"), _) => Some(Source::Keyboard),
+            (Some("companion"), _) => Some(Source::Companion),
             (Some("pad"), Some(n)) => pads.get(n).map(|&p| Source::Pad(p)),
             _ => None,
         };
@@ -440,7 +445,11 @@ pub fn bind_sources(
         }
     }
     // Then the controllers playing now, then any pad, then the keyboard.
-    let mut spare: Vec<Source> = current.to_vec();
+    let mut spare: Vec<Source> = current
+        .iter()
+        .copied()
+        .filter(|s| *s != Source::Companion)
+        .collect();
     spare.extend(pads.iter().map(|&p| Source::Pad(p)));
     spare.push(Source::Keyboard);
     for o in out.iter_mut().filter(|o| o.is_none()) {

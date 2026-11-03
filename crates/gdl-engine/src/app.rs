@@ -41,6 +41,8 @@ pub struct Config {
     pub level: String,
     /// Players chosen on the command line; empty shows the title and join screens.
     pub players: Vec<(String, String)>,
+    /// A loyal follower's class and colour (`--companion`).
+    pub companion: Option<(String, String)>,
     pub mute: bool,
     /// Where the memory card's save file is kept (None: saves last only
     /// for this run).
@@ -123,6 +125,27 @@ fn write_recording(r: &mut Running, fs: &GameFs, game: &Game, rec: &Replay) {
     }
 }
 
+/// What each hero presses this tick: their controller, or the follower's mind.
+fn party_inputs(
+    input: &Input,
+    sources: &[Source],
+    game: Option<&Game>,
+    brain: &mut Option<crate::runner::companion::Companion>,
+) -> Vec<PlayerInput> {
+    use crate::runner::companion::Companion;
+    let mut inputs: Vec<PlayerInput> = sources.iter().map(|s| input.read(*s)).collect();
+    let follower = sources.iter().position(|s| *s == Source::Companion);
+    if let (Some(pi), Some(g)) = (follower, game) {
+        if !brain.as_ref().is_some_and(|c| c.is_for(g, pi)) {
+            *brain = Some(Companion::new(g, pi));
+        }
+        if let Some(c) = brain {
+            inputs[pi] = c.input(g);
+        }
+    }
+    inputs
+}
+
 /// The screen being left takes its music and textures with it.
 fn leave_screen(r: &mut Running) {
     match &mut r.screen {
@@ -193,12 +216,18 @@ fn session_events(r: &mut Running, fs: &GameFs) -> Option<Screen> {
                     i += 1;
                     !left.contains(&(i - 1))
                 });
+                // The follower doesn't play on alone.
+                if r.sources.iter().all(|s| *s == Source::Companion) {
+                    r.session.command(fs, Decision::QuitGame);
+                }
             }
             Event::Select => {
                 leave_screen(r);
                 let s = &r.session;
                 let party = party_for(&r.card, &s.carry, &s.heroes, &s.progress, &r.prefs);
-                let mut sel = Select::from_game(&s.panels, &r.sources).with_party(party);
+                let mut sel = Select::from_game(&s.panels, &r.sources)
+                    .with_party(party)
+                    .companion_ready();
                 // check_active_players: a new pad joined in the tower.
                 if let Some(src) = r.joining.take() {
                     sel.join(src);
@@ -438,6 +467,9 @@ struct Running {
     suspended: Option<Box<Playing>>,
     /// A new pad that has asked to join in the tower.
     joining: Option<Source>,
+    /// The loyal follower's brain for this level, and its ticks in a shop.
+    companion: Option<crate::runner::companion::Companion>,
+    companion_ticks: u32,
     /// A recording being watched instead of played.
     watch: Option<Watch>,
     /// Where `--record` keeps recordings.
@@ -556,6 +588,9 @@ impl App {
             if sources.len() < n {
                 sources.push(Source::Keyboard);
             }
+            if self.cfg.companion.is_some() {
+                sources.push(Source::Companion);
+            }
             (Screen::Loading { shown: false }, sources)
         };
         // init_prefs, then check_prefs_loaded: the options saved on the card.
@@ -572,7 +607,9 @@ impl App {
             Progress::default(),
         );
         if !self.cfg.players.is_empty() {
-            session.panels = panels_for(&self.cfg.players);
+            let mut players = self.cfg.players.clone();
+            players.extend(self.cfg.companion.clone());
+            session.panels = panels_for(&players);
             session.phase = Phase::Loading {
                 level: self.cfg.level.clone(),
             };
@@ -591,6 +628,8 @@ impl App {
             prefs,
             suspended: None,
             joining: None,
+            companion: None,
+            companion_ticks: 0,
             watch: None,
             record_dir: self.cfg.record.clone(),
             compat: None,
@@ -1045,7 +1084,13 @@ impl App {
                         r.suspended = None;
                         let s = &r.session;
                         let party = party_for(&r.card, &None, &s.heroes, &s.progress, &r.prefs);
-                        next = Some(Screen::Select(Select::with_first(src).with_party(party)));
+                        let mut sel = Select::with_first(src).with_party(party);
+                        if let Some((class, colour)) = &self.cfg.companion {
+                            let info =
+                                panels_for(&[Default::default(), (class.clone(), colour.clone())]);
+                            sel.add_companion(info[1].class, info[1].colour);
+                        }
+                        next = Some(Screen::Select(sel));
                     } else if t.timed_out {
                         r.audio.stop();
                         r.attract = std::mem::take(&mut r.attract).after_title();
@@ -1107,8 +1152,16 @@ impl App {
                     }
                 }
                 Screen::Shop { .. } => {
-                    let packed: Vec<_> =
-                        r.sources.iter().map(|s| r.input.read(*s).pack()).collect();
+                    r.companion_ticks = r.companion_ticks.wrapping_add(1);
+                    let t = r.companion_ticks;
+                    let packed: Vec<_> = r
+                        .sources
+                        .iter()
+                        .map(|s| match s {
+                            Source::Companion => crate::runner::companion::shop_input(t).pack(),
+                            _ => r.input.read(*s).pack(),
+                        })
+                        .collect();
                     r.session.update(fs, &packed);
                 }
                 Screen::Playing { play, pause } => {
@@ -1116,8 +1169,12 @@ impl App {
                     if watching && escape {
                         el.exit();
                     }
-                    let inputs: Vec<PlayerInput> =
-                        r.sources.iter().map(|s| r.input.read(*s)).collect();
+                    let inputs = party_inputs(
+                        &r.input,
+                        &r.sources,
+                        r.session.game.as_deref(),
+                        &mut r.companion,
+                    );
                     let game = r.session.game.as_deref();
                     let sumner_busy = game
                         .and_then(|g| g.sumner.as_ref())

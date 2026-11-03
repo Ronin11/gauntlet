@@ -25,6 +25,7 @@ struct Args {
     rules: gdl_engine::rules::Rules,
     level: String,
     players: Vec<(String, String)>,
+    companion: Option<(String, String)>,
     snapshot: Option<PathBuf>,
     eye: Option<Vec3>,
     at: Option<Vec3>,
@@ -93,6 +94,7 @@ USAGE: gauntlet [OPTIONS]
   --mute                No music or sound (also: GDL_MUTE=1)
   --players <list>      Comma list of CLASS[/COLOR], e.g. WAR,VAL/BLU (default WAR)
                         Classes: WAR VAL WIZ ARC (and unlockables)
+  --companion <hero>    A loyal follower plays beside you, CLASS[/COLOR], e.g. VAL/BLU
 
 Controls: left stick / WASD move, A / J attack, X / Shift turbo,
           F11 fullscreen, Esc quit.
@@ -151,6 +153,7 @@ fn parse_args() -> Result<Args> {
         rules: gdl_engine::rules::Rules::default(),
         level: "levelA1".into(),
         players: Vec::new(),
+        companion: None,
         snapshot: None,
         eye: None,
         at: None,
@@ -202,6 +205,16 @@ fn parse_args() -> Result<Args> {
                     .with_context(|| format!("--rules {v}: classic or remix"))?;
             }
             "--level" => a.level = val()?,
+            "--companion" => {
+                let v = val()?;
+                let (c, col) = v.split_once('/').unwrap_or((&v, ""));
+                let c = c.to_ascii_uppercase();
+                anyhow::ensure!(
+                    gdl_engine::select::CLASSES.contains(&c.as_str()),
+                    "--companion: no class {c}"
+                );
+                a.companion = Some((c, col.to_ascii_uppercase()));
+            }
             "--players" => {
                 a.players = val()?
                     .split(',')
@@ -1354,6 +1367,7 @@ fn main() -> Result<()> {
         fs,
         level: args.level,
         players: args.players,
+        companion: args.companion,
         mute: args.mute,
         save_dir: gdl_engine::save::MemCard::default_dir(),
         load_state: args.load_state,
