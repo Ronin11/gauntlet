@@ -15,6 +15,12 @@ struct Args {
     /// --no-assets: ignore GDL_ASSETS and asset-packs/ folders.
     no_assets: bool,
     compat: bool,
+    /// --replay: watch a recording.
+    replay: Option<PathBuf>,
+    /// --replay-check: play a recording headless and compare.
+    replay_check: Option<PathBuf>,
+    /// --record: keep a recording of each level played in this folder.
+    record: Option<PathBuf>,
     /// --rules: the preset the game plays by (classic unless asked).
     rules: gdl_engine::rules::Rules,
     level: String,
@@ -93,6 +99,9 @@ Controls: left stick / WASD move, A / J attack, X / Shift turbo,
 
 Testing:
   --compat              Print what two copies must share to play together, and exit
+  --record <dir>        Keep a recording of each level played in this folder
+  --replay <file>       Watch a recording (a bug report's replay.txt); Esc quits
+  --replay-check <file> Play a recording headless, compare it, and exit (1 if it differs)
   --snapshot <png>      Render one frame headless and exit
   --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
                         select:load|save|result|char (memory card screens),
@@ -136,6 +145,9 @@ fn parse_args() -> Result<Args> {
         assets: Vec::new(),
         no_assets: false,
         compat: false,
+        replay: None,
+        replay_check: None,
+        record: None,
         rules: gdl_engine::rules::Rules::default(),
         level: "levelA1".into(),
         players: Vec::new(),
@@ -181,6 +193,9 @@ fn parse_args() -> Result<Args> {
             "--assets" => a.assets.push(val()?.into()),
             "--no-assets" => a.no_assets = true,
             "--compat" => a.compat = true,
+            "--replay" => a.replay = Some(val()?.into()),
+            "--replay-check" => a.replay_check = Some(val()?.into()),
+            "--record" => a.record = Some(val()?.into()),
             "--rules" => {
                 let v = val()?;
                 a.rules = gdl_engine::rules::Rules::named(&v)
@@ -1275,6 +1290,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
             screen: "playing (headless)",
             frames: simulate as u64,
             via: "GDL_BUGREPORT",
+            replay: None,
         };
         let out = gdl_engine::bugreport::file(&dir, &report, Some(&img))?;
         println!("bug report {}", out.display());
@@ -1308,7 +1324,27 @@ fn main() -> Result<()> {
         println!("{local}");
         return Ok(());
     }
+    if let Some(path) = &args.replay_check {
+        let replay = gdl_sim::replay::Replay::read(path)?;
+        let local = gdl_sim::compat::Compat::local(
+            &fs,
+            &replay.start.setup.rules,
+            gdl_engine::bugreport::BUILD,
+        )?;
+        let verdict = replay.check(&fs, Some(&local))?;
+        println!("{verdict}");
+        if !verdict.matches() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let replay = match &args.replay {
+        Some(path) => Some(gdl_sim::replay::Replay::read(path)?),
+        None => None,
+    };
     app::run(app::Config {
+        replay,
+        record: args.record,
         fs,
         level: args.level,
         players: args.players,

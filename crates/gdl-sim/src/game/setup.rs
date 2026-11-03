@@ -17,7 +17,7 @@ use crate::progress::Progress;
 use crate::rules::Rules;
 
 /// What a level starts with, beyond its files and the party's heroes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LevelSetup {
     pub rules: Rules,
     /// Mixed into the game's random numbers. Zero keeps the fixed sequence
@@ -47,8 +47,100 @@ impl LevelSetup {
     }
 }
 
+/// Everything a level is started from: enough to start the same level again
+/// on another machine or another day. The engine fills it from its session and
+/// starts every level through it, so a recording can't miss anything.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LevelStart {
+    pub level: String,
+    /// 0 Easy, 1 Medium, 2 Hard.
+    pub difficulty: usize,
+    pub panels: Vec<PanelInfo>,
+    /// By slot: what each hero brings.
+    pub carry: [Option<Carried>; 4],
+    /// By slot: each hero's messages seen (the save's help_disp).
+    pub help_disp: [Option<[u8; 256]>; 4],
+    pub setup: LevelSetup,
+    /// What the tower reads from the party's progress.
+    pub progress: Progress,
+    /// The experience in the heroes' other saved classes: Sumner welcomes only
+    /// a party with none.
+    pub saved_exp: Vec<u32>,
+    /// A debug save state to start from.
+    pub state: Option<savestate::SaveState>,
+}
+
+impl LevelStart {
+    /// The game, and whether Sumner's welcome is due in it.
+    pub fn build(&self, fs: &GameFs) -> Result<(Game, bool)> {
+        let heroes: Vec<_> = self.panels.iter().map(PanelInfo::hero).collect();
+        let classes: Vec<(&str, &str)> = heroes.iter().map(|h| (h.0, h.1)).collect();
+        let models: Vec<Option<&str>> = heroes.iter().map(|h| h.2).collect();
+        let mut g = Game::new_heroes(fs, &self.level, &classes, &models, self.difficulty)?;
+        g.rules = self.setup.rules.clone();
+        for (i, (info, p)) in self.panels.iter().zip(&mut g.players).enumerate() {
+            let slot = info.slot % 4;
+            if let Some(c) = &self.carry[slot] {
+                p.restore(c);
+            }
+            if info.class == crate::stats::SUMNER {
+                p.sumner = true;
+                let c = self.carry[slot].clone();
+                p.restore(&c.unwrap_or_else(Carried::sumner));
+            } else if info.hidden.is_none() {
+                crate::cheats::apply_cheats(&info.name, p);
+            }
+            if let Some(h) = &self.help_disp[slot] {
+                g.msgs.set_help_disp(i, h);
+            }
+        }
+        // The rules, the options that change play and the party's finds,
+        // including the legend weapons a boss fight may use.
+        g.apply_setup(&self.setup);
+        let mut welcome = false;
+        if g.wave == Some(gdl_formats::wdata::TOWER_WAVE) {
+            let progress = &self.progress;
+            g.close_portals(|w| progress.portal_open(w));
+            g.enter_tower();
+            g.set_start(progress.tower_start());
+            // sumnerUpdatePresence: the welcome is for a new party's first
+            // visit (no experience in any class of any player's save).
+            let exps = g
+                .players
+                .iter()
+                .map(|p| p.exp)
+                .chain(self.saved_exp.iter().copied());
+            welcome = crate::tower::welcome_due(progress, exps);
+            let entry = crate::tower::Entry {
+                welcome,
+                banked_runes: progress.banked_runes,
+                banked_shards: progress.banked_shards,
+                last_beaten: progress.last_beaten,
+            };
+            let sumner = crate::tower::Sumner::new(fs, &mut g, entry);
+            g.sumner = Some(Box::new(sumner));
+        }
+        if let Some(st) = &self.state {
+            st.apply(&mut g);
+        }
+        Ok((g, welcome))
+    }
+}
+
+/// What the party brings back to a level that waited for it: from the shop,
+/// or from a secret level.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PartyBack {
+    /// Per player, what they now carry.
+    pub carried: Vec<Option<Carried>>,
+    /// Back from a secret level: the party's finds (crystals, gargoyle items,
+    /// shards) and each player's messages seen.
+    pub finds: Option<([i32; 9], [i32; 3], u16)>,
+    pub help_disp: Vec<Option<[u8; 256]>>,
+}
+
 /// A change to a running game from outside it, applied between ticks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// A player changed their Controls options.
     SetControls { player: usize, prefs: PlayerPrefs },
@@ -59,6 +151,8 @@ pub enum Command {
     HintsClosed,
     /// The debug menu's no-damage switch.
     DebugGod(bool),
+    /// The party came back to this level.
+    PartyBack(Box<PartyBack>),
 }
 
 impl Game {
@@ -73,13 +167,6 @@ impl Game {
         self.shards = s.shards;
         self.runes = s.runes;
         self.set_legend_held(s.legend_held);
-    }
-
-    /// The party's finds, given back to a level resumed from a secret level.
-    pub fn resume_with(&mut self, p: &Progress) {
-        self.crystals = p.crystals;
-        self.garg_items = p.garg_items;
-        self.shards = p.shards;
     }
 
     pub fn command(&mut self, c: Command) {
@@ -102,6 +189,25 @@ impl Game {
                 }
             }
             Command::DebugGod(on) => self.debug_god = on,
+            Command::PartyBack(b) => {
+                // The level ended to let the party go, and goes on.
+                self.level_end = None;
+                for (p, c) in self.players.iter_mut().zip(&b.carried) {
+                    if let Some(c) = c {
+                        p.restore(c);
+                    }
+                }
+                if let Some((crystals, garg_items, shards)) = b.finds {
+                    self.crystals = crystals;
+                    self.garg_items = garg_items;
+                    self.shards = shards;
+                }
+                for (i, h) in b.help_disp.iter().enumerate() {
+                    if let Some(h) = h {
+                        self.msgs.set_help_disp(i, h);
+                    }
+                }
+            }
         }
     }
 }

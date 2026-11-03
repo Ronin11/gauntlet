@@ -16,7 +16,7 @@ pub const LEGEND: i32 = 41;
 pub const RUNE: i32 = 42;
 
 /// The pickers' positions; the general one lasts the session (hints_inited).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HintState {
     inited: bool,
     general_index: i32,

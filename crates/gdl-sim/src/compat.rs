@@ -84,6 +84,27 @@ impl Compat {
         })
     }
 
+    /// Everything that differs: a replay plays anyway, and says so.
+    pub fn differences(&self, theirs: &Compat) -> Vec<Mismatch> {
+        let mut out = Vec::new();
+        if self.build != theirs.build {
+            out.push(Mismatch::Build {
+                ours: self.build.clone(),
+                theirs: theirs.build.clone(),
+            });
+        }
+        if self.content != theirs.content {
+            out.push(Mismatch::Content);
+        }
+        if self.rules != theirs.rules {
+            out.push(Mismatch::Rules);
+        }
+        if self.env != theirs.env {
+            out.push(Mismatch::Env);
+        }
+        out
+    }
+
     pub fn check(&self, theirs: &Compat) -> Result<(), Mismatch> {
         if self.build != theirs.build {
             return Err(Mismatch::Build {

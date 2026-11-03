@@ -44,6 +44,97 @@ pub struct PlayerInput {
     pub inv: crate::powerups::DPad,
 }
 
+/// One player's input for one tick, as it travels and is recorded: what the
+/// simulation actually sees. Sticks have 255 positions, as a GameCube pad's do,
+/// so two machines (or a replay) can't differ in a stick's last bits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PackedInput {
+    pub stick: [i8; 2],
+    pub fire: [i8; 2],
+    pub dpad: [i8; 2],
+    pub buttons: u32,
+}
+
+fn pack_axis(v: f32) -> i8 {
+    (v.clamp(-1.0, 1.0) * 127.0).round() as i8
+}
+
+fn pack_stick(v: Vec2) -> [i8; 2] {
+    [pack_axis(v.x), pack_axis(v.y)]
+}
+
+fn unpack_stick(v: [i8; 2]) -> Vec2 {
+    Vec2::new(v[0] as f32 / 127.0, v[1] as f32 / 127.0)
+}
+
+impl PlayerInput {
+    pub fn pack(&self) -> PackedInput {
+        let bits = [
+            self.attack,
+            self.attack_pressed,
+            self.magic_pressed,
+            self.turbo,
+            self.b_pressed,
+            self.slow_pressed,
+            self.slow,
+            self.magic,
+            self.charge_pressed,
+            self.charge,
+            self.strafe,
+            self.strafe_pressed,
+            self.combo,
+            self.start_pressed,
+            self.start,
+            self.inv.up,
+            self.inv.down,
+            self.inv.left,
+            self.inv.right,
+        ];
+        let mut buttons = 0;
+        for (i, on) in bits.into_iter().enumerate() {
+            buttons |= (on as u32) << i;
+        }
+        PackedInput {
+            stick: pack_stick(self.stick),
+            fire: pack_stick(self.fire),
+            dpad: pack_stick(self.dpad),
+            buttons,
+        }
+    }
+}
+
+impl PackedInput {
+    pub fn unpack(&self) -> PlayerInput {
+        let on = |i: u32| self.buttons & (1 << i) != 0;
+        PlayerInput {
+            stick: unpack_stick(self.stick),
+            attack: on(0),
+            attack_pressed: on(1),
+            magic_pressed: on(2),
+            turbo: on(3),
+            b_pressed: on(4),
+            slow_pressed: on(5),
+            slow: on(6),
+            magic: on(7),
+            charge_pressed: on(8),
+            charge: on(9),
+            strafe: on(10),
+            strafe_pressed: on(11),
+            combo: on(12),
+            start_pressed: on(13),
+            fire: unpack_stick(self.fire),
+            start: on(14),
+            dpad: unpack_stick(self.dpad),
+            inv: crate::powerups::DPad {
+                up: on(15),
+                down: on(16),
+                left: on(17),
+                right: on(18),
+            },
+        }
+    }
+}
+
 /// The pad's buttons as ReadControls' level bits (the PS2 report scePadRead
 /// builds from the GameCube pad: A cross, B triangle, X circle, Y square, L
 /// L1, R R1, Z R2).

@@ -2,9 +2,10 @@
 //! original game data. The desktop binary (`gauntlet`) and the Android app both use it.
 
 pub use gdl_sim::{
-    ai, boss, camera, character, cheats, collision, critter, enemies, fs, game, heroes, hints,
-    interp, level, mesh, messages, missile, paction, powerups, progress, psys, rules, save,
-    savestate, shadow, soundlib, stats, texanim, tower, transport, triggers, worldanim,
+    ai, boss, camera, character, cheats, collision, compat, critter, enemies, fs, game, heroes,
+    hints, interp, level, mesh, messages, missile, paction, powerups, progress, psys, replay,
+    rules, save, savestate, shadow, soundlib, stats, texanim, tower, transport, triggers,
+    worldanim,
 };
 
 pub mod app;
