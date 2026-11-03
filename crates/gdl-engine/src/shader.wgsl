@@ -5,6 +5,8 @@ struct Globals {
     // rgb = fog colour, w = fog density
     fog: vec4<f32>,
     camera_pos: vec4<f32>,
+    // x = relief normal strength, y = parallax depth in texture units
+    relief: vec4<f32>,
 };
 
 struct Model {
@@ -21,6 +23,8 @@ struct Model {
 @group(1) @binding(1) var s_diffuse: sampler;
 @group(1) @binding(2) var t_light: texture_2d<f32>;
 @group(1) @binding(3) var s_light: sampler;
+// Relief map: rgb = tangent-space normal (x along +u, y along +v), a = height.
+@group(1) @binding(4) var t_bump: texture_2d<f32>;
 @group(2) @binding(0) var<uniform> m: Model;
 
 struct VsIn {
@@ -53,18 +57,75 @@ fn vs_main(v: VsIn) -> VsOut {
     return o;
 }
 
+// Tangent frame from the screen-space derivatives of position and uv
+// (Schüler's cotangent frame): no vertex tangents needed.
+fn cotangent_frame(n: vec3<f32>, p: vec3<f32>, uv: vec2<f32>) -> mat3x3<f32> {
+    let dp1 = dpdx(p);
+    let dp2 = dpdy(p);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    let dp2perp = cross(dp2, n);
+    let dp1perp = cross(n, dp1);
+    let t = dp2perp * duv1.x + dp1perp * duv2.x;
+    let b = dp2perp * duv1.y + dp1perp * duv2.y;
+    let invmax = inverseSqrt(max(dot(t, t), dot(b, b)));
+    return mat3x3<f32>(t * invmax, b * invmax, n);
+}
+
 fn shade(v: VsOut) -> vec4<f32> {
-    let tex = textureSample(t_diffuse, s_diffuse, v.uv);
+    let n0 = normalize(v.normal);
+    let ddx = dpdx(v.uv);
+    let ddy = dpdy(v.uv);
+    var uv = v.uv;
+    var nb = n0;
+    if (g.relief.x > 0.0 || g.relief.y > 0.0) {
+        let tbn = cotangent_frame(n0, v.world, v.uv);
+        if (g.relief.y > 0.0) {
+            // Steep parallax: march down through the height field along the
+            // view ray until it is under the surface, then interpolate.
+            let vw = normalize(g.camera_pos.xyz - v.world);
+            let vt = vec3<f32>(dot(tbn[0], vw), dot(tbn[1], vw), dot(n0, vw));
+            let steps = 12.0;
+            let delta = vt.xy / max(vt.z, 0.25) * g.relief.y / steps;
+            var depth = 0.0;
+            var h = 1.0 - textureSampleGrad(t_bump, s_diffuse, uv, ddx, ddy).a;
+            var i = 0;
+            loop {
+                if (depth >= h || i >= 12) {
+                    break;
+                }
+                uv -= delta;
+                depth += 1.0 / steps;
+                h = 1.0 - textureSampleGrad(t_bump, s_diffuse, uv, ddx, ddy).a;
+                i += 1;
+            }
+            if (i > 0) {
+                let prev = uv + delta;
+                let after = h - depth;
+                let before = (1.0 - textureSampleGrad(t_bump, s_diffuse, prev, ddx, ddy).a)
+                    - (depth - 1.0 / steps);
+                let w = clamp(after / (after - before), 0.0, 1.0);
+                uv = mix(uv, prev, w);
+            }
+        }
+        let bn = textureSampleGrad(t_bump, s_diffuse, uv, ddx, ddy).xyz * 2.0 - 1.0;
+        nb = normalize(tbn * normalize(vec3<f32>(bn.xy * g.relief.x, bn.z)));
+    }
+    let tex = textureSampleGrad(t_diffuse, s_diffuse, uv, ddx, ddy);
+    let l = normalize(g.light.xyz);
+    let lit_flat = g.light.w + (1.0 - g.light.w) * max(dot(n0, l), 0.0);
+    let lit_bump = g.light.w + (1.0 - g.light.w) * max(dot(nb, l), 0.0);
+    // Baked lighting keeps its level; the relief only shifts it locally.
+    let relief = clamp(lit_bump / max(lit_flat, 0.05), 0.4, 1.6);
     var rgb = tex.rgb * m.tint.rgb;
     if (m.params.x > 0.5) {
         // Lightmapped world geometry: the lightmap carries the baked lighting.
         let lm = textureSample(t_light, s_light, v.lm_uv).rgb;
-        rgb = rgb * lm;
+        rgb = rgb * lm * relief;
     } else if (m.params.y > 0.5) {
-        rgb = rgb * v.color.rgb * 2.0;
+        rgb = rgb * v.color.rgb * 2.0 * relief;
     } else {
-        let ndl = max(dot(normalize(v.normal), normalize(g.light.xyz)), 0.0);
-        rgb = rgb * (g.light.w + (1.0 - g.light.w) * ndl);
+        rgb = rgb * lit_bump;
     }
     let dist = distance(v.world, g.camera_pos.xyz);
     let fog = 1.0 - exp(-g.fog.w * dist);

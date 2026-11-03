@@ -30,6 +30,7 @@ pub fn with_parts(mesh: &MeshData, part_names: &[String]) -> Option<MeshData> {
         indices: mesh.indices.clone(),
         batches: Vec::new(),
         textures: mesh.textures.clone(),
+        bumps: mesh.bumps.clone(),
         tex_anims: mesh.tex_anims.clone(),
         seq_anims: mesh.seq_anims.clone(),
         bounds_min: mesh.bounds_min,
@@ -58,6 +59,7 @@ pub fn with_parts(mesh: &MeshData, part_names: &[String]) -> Option<MeshData> {
                 height: t.height,
                 rgba: t.rgba,
             });
+            out.bumps.push(None);
             out.textures.len() - 1
         });
         let base = out.vertices.len() as u32;

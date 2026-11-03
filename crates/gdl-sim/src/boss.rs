@@ -469,7 +469,7 @@ impl Game {
                 let tex = fs.read(&format!("{dir}/textures.ngc")).ok()?;
                 let def = objs.bitmap_defs.iter().find(|d| d.name == "SEETHROUGH")?;
                 let bm = objs.bitmaps.get(def.tex_index as usize)?;
-                gdl_formats::texture::decode_ngc(bm, &tex).ok()
+                gdl_formats::texture::decode_ngc_override(bm, &tex).ok()
             })();
             if let Some(b) = self.boss.as_mut() {
                 b.seethrough = img;

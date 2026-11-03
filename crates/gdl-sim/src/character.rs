@@ -449,10 +449,19 @@ impl Model {
                         // Glow/fire nodes use additive "fb_add" blending.
                         b.additive = node.mb_flags & (1 << 23) != 0;
                         let mut parts = Vec::new();
-                        for obj in (key.0..key.0 + key.1).map_while(|i| objects.objects.get(i)) {
+                        for (i, obj) in (key.0..key.0 + key.1)
+                            .map_while(|i| objects.objects.get(i).map(|o| (i, o)))
+                        {
                             b.add_part(obj, Mat4::IDENTITY, next_part);
                             parts.push(next_part);
-                            part_names.push(String::new());
+                            // Named after the frame's object (`BAROBJIDLE15F01`),
+                            // so a replacement part can stand in for it.
+                            part_names.push(
+                                defs.iter()
+                                    .find(|d| d.obj_index == i as i16)
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_default(),
+                            );
                             next_part += 1;
                         }
                         b.additive = false;

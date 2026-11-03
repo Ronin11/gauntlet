@@ -140,18 +140,20 @@ fn untile(i: u32, w: u32, h: u32, bpp: u32) -> (u32, u32) {
     (tx * tw + within % tw, ty * th + within / tw)
 }
 
-/// Decode the top mip level of a GameCube bitmap from the textures file, then
-/// swap in a replacement from the override directory (`GDL_OVERRIDE`) if one
-/// exists for that image's content: `<dir>/tex/<content-hash>.png`. Every
-/// consumer (world, heroes, HUD) decodes through here, so an upscaled or
-/// repainted texture dropped in that directory shows up everywhere the original
-/// did, at whatever size it was painted.
+/// Decode the top mip level of a GameCube bitmap from the textures file, as
+/// the disc has it. The front end and HUD blit sub-rectangles of these in
+/// original pixel units, so they must never see a replacement.
 pub fn decode_ngc(b: &Bitmap, textures: &[u8]) -> Result<Image> {
-    let img = decode_original(b, textures)?;
-    if b.flags & bitmap_flags::EXTERNAL != 0 || b.frame_count > 0 {
-        return Ok(img);
-    }
-    Ok(override_for(&img.content_hash()).unwrap_or(img))
+    decode_original(b, textures)
+}
+
+/// [`decode_ngc`], then swap in a replacement from the override directory
+/// (`GDL_OVERRIDE`) if one exists for that image's content:
+/// `<dir>/tex/<content-hash>.png`. Mesh textures (world, heroes, items) decode
+/// through here, so an upscaled or repainted texture dropped in that directory
+/// shows up everywhere a mesh used the original, at whatever size it was painted.
+pub fn decode_ngc_override(b: &Bitmap, textures: &[u8]) -> Result<Image> {
+    decode_ngc_bump(b, textures).map(|(img, _)| img)
 }
 
 impl Image {
@@ -215,6 +217,34 @@ fn override_for(hash: &str) -> Option<Image> {
     };
     OVERRIDE_HITS.fetch_add(1, Relaxed);
     Some(img)
+}
+
+/// The relief map painted beside an override (`<dir>/tex/<hash>.n.png`):
+/// RGB = tangent-space normal (x along +u, y along +v, z out of the surface),
+/// A = height with 1 the top surface.
+pub fn bump_for(hash: &str) -> Option<Image> {
+    let path = override_dir()?.join("tex").join(format!("{hash}.n.png"));
+    match read_png(&path) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("bump {}: {e:#}", path.display());
+            None
+        }
+    }
+}
+
+/// [`decode_ngc`] plus the bitmap's relief map, when the override directory
+/// has one beside the replacement texture.
+pub fn decode_ngc_bump(b: &Bitmap, textures: &[u8]) -> Result<(Image, Option<Image>)> {
+    let img = decode_original(b, textures)?;
+    if b.flags & bitmap_flags::EXTERNAL != 0 || b.frame_count > 0 {
+        return Ok((img, None));
+    }
+    let hash = img.content_hash();
+    Ok(match override_for(&hash) {
+        Some(o) => (o, bump_for(&hash)),
+        None => (img, None),
+    })
 }
 
 /// An 8-bit PNG as RGBA; `Ok(None)` when there is no such file.

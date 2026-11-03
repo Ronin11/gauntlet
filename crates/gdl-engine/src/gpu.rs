@@ -20,6 +20,26 @@ pub struct Globals {
     pub light: [f32; 4],
     pub fog: [f32; 4],
     pub camera_pos: [f32; 4],
+    /// x = relief normal strength, y = parallax depth (texture units); both 0
+    /// draws flat, as the original did.
+    pub relief: [f32; 4],
+}
+
+/// `GDL_RELIEF=<normal strength>,<parallax depth>`; unset is `1,0.015`, `0`
+/// (or anything unparsable) turns the relief maps off. Deeper parallax than
+/// about 0.02 digs trenches into the floors, which tile over several metres.
+fn relief() -> [f32; 4] {
+    static RELIEF: std::sync::OnceLock<[f32; 4]> = std::sync::OnceLock::new();
+    *RELIEF.get_or_init(|| {
+        let Some(s) = std::env::var_os("GDL_RELIEF") else {
+            return [1.0, 0.015, 0.0, 0.0];
+        };
+        let s = s.to_string_lossy();
+        let mut it = s.split(',').map(|x| x.trim().parse::<f32>().unwrap_or(0.0));
+        let n = it.next().unwrap_or(0.0);
+        let p = it.next().unwrap_or(if n > 0.0 { 0.015 } else { 0.0 });
+        [n, p, 0.0, 0.0]
+    })
 }
 
 #[repr(C)]
@@ -49,6 +69,8 @@ pub struct Gpu {
     model_layout: wgpu::BindGroupLayout,
     sampler_repeat: wgpu::Sampler,
     white: wgpu::TextureView,
+    /// The relief map of a texture without one: facing out, at the top.
+    flat: wgpu::TextureView,
     /// Sprite pipelines by [blend][z compare][z write] (pbBlitSetDrawRegs).
     sprite: Vec<wgpu::RenderPipeline>,
 }
@@ -255,7 +277,13 @@ impl Gpu {
         };
         let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material"),
-            entries: &[tex_entry(0), samp_entry(1), tex_entry(2), samp_entry(3)],
+            entries: &[
+                tex_entry(0),
+                samp_entry(1),
+                tex_entry(2),
+                samp_entry(3),
+                tex_entry(4),
+            ],
         });
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -422,6 +450,7 @@ impl Gpu {
         }
 
         let white = upload_texture(&device, &queue, &Image::solid(4, 4, [255, 255, 255, 255]));
+        let flat = upload_texture(&device, &queue, &Image::solid(4, 4, [128, 128, 255, 255]));
         Gpu {
             device,
             queue,
@@ -435,18 +464,26 @@ impl Gpu {
             model_layout,
             sampler_repeat,
             white,
+            flat,
             sprite,
         }
     }
 
-    fn material(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
+    /// A material bind group: diffuse, lightmap (white when none) and relief
+    /// map (flat when none).
+    fn material_bg(
+        &self,
+        diffuse: &wgpu::TextureView,
+        lightmap: &wgpu::TextureView,
+        bump: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.material_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(view),
+                    resource: wgpu::BindingResource::TextureView(diffuse),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -454,14 +491,22 @@ impl Gpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.white),
+                    resource: wgpu::BindingResource::TextureView(lightmap),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(bump),
+                },
             ],
         })
+    }
+
+    fn material(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.material_bg(view, &self.white, &self.flat)
     }
 
     fn sprite_buffers(&self, quads: usize) -> (wgpu::Buffer, wgpu::Buffer) {
@@ -534,6 +579,16 @@ impl Gpu {
             .map(|t| self.upload_texture(t))
             .collect();
         let view = |i: Option<usize>| i.and_then(|i| views.get(i)).unwrap_or(&self.white);
+        let bumps: Vec<Option<wgpu::TextureView>> = mesh
+            .bumps
+            .iter()
+            .map(|b| b.as_ref().map(|b| self.upload_texture(b)))
+            .collect();
+        let bump = |i: Option<usize>| {
+            i.and_then(|i| bumps.get(i))
+                .and_then(|b| b.as_ref())
+                .unwrap_or(&self.flat)
+        };
         let mut materials = Vec::new();
         let mut batches = Vec::new();
         let mut keys: Vec<(Option<usize>, Option<usize>)> = Vec::new();
@@ -543,28 +598,7 @@ impl Gpu {
                 Some(i) => i,
                 None => {
                     keys.push(key);
-                    materials.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.material_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(view(texture)),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(view(lightmap)),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
-                            },
-                        ],
-                    }));
+                    materials.push(self.material_bg(view(texture), view(lightmap), bump(texture)));
                     materials.len() - 1
                 }
             }
@@ -698,28 +732,7 @@ impl Gpu {
     /// A material showing `img` (for [`Instance::alt_tex`]).
     pub fn texture_material(&self, img: &Image) -> std::sync::Arc<wgpu::BindGroup> {
         let view = self.upload_texture(img);
-        std::sync::Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.material_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.white),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler_repeat),
-                },
-            ],
-        }))
+        std::sync::Arc::new(self.material(&view))
     }
 
     pub fn depth_view(&self, width: u32, height: u32) -> wgpu::TextureView {
@@ -1001,6 +1014,7 @@ pub fn globals(view_proj: Mat4, camera: Vec3, fog_color: [f32; 3], fog_density: 
         light: [0.4, 1.0, 0.3, 0.45],
         fog: [fog_color[0], fog_color[1], fog_color[2], fog_density],
         camera_pos: [camera.x, camera.y, camera.z, 1.0],
+        relief: relief(),
     }
 }
 

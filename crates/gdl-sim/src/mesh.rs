@@ -38,6 +38,9 @@ pub struct MeshData {
     pub indices: Vec<u32>,
     pub batches: Vec<Batch>,
     pub textures: Vec<Image>,
+    /// Relief map of each texture (same index; RGB normal, A height), from
+    /// the override directory; shorter or all-`None` when there are none.
+    pub bumps: Vec<Option<Image>>,
     /// Animated textures (the bank's global texmods), in texmod order.
     pub tex_anims: Vec<TexAnim>,
     /// Flipbooks of the bank's sequence texmods and texmod nodes, shown per
@@ -217,12 +220,12 @@ impl<'a> MeshBuilder<'a> {
             return *s;
         }
         let TexBank { objects, textures } = self.bank(bank);
-        let img = objects.bitmaps.get(index as usize).and_then(|b| {
-            match texture::decode_ngc(b, textures) {
-                Ok(img) => Some(img),
+        let (img, bump) = objects.bitmaps.get(index as usize).map_or((None, None), |b| {
+            match texture::decode_ngc_bump(b, textures) {
+                Ok((img, bump)) => (Some(img), bump),
                 Err(e) => {
                     log::debug!("texture {bank}/{index}: {e:#}");
-                    None
+                    (None, None)
                 }
             }
         });
@@ -232,6 +235,7 @@ impl<'a> MeshBuilder<'a> {
         });
         let slot = img.map(|img| {
             self.data.textures.push(img);
+            self.data.bumps.push(bump);
             self.data.textures.len() - 1
         });
         self.tex_slots.insert((bank, index), slot);
