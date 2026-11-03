@@ -14,7 +14,9 @@
 //!   messages, sounds, trigger and mover changes, pickups, damage, deaths,
 //!   level changes, debug menu actions, and a per-second input summary);
 //! - `screenshot.png`: the last frame (without the debug menu);
-//! - `save.txt` and a copy of the memory card file.
+//! - `save.txt` and a copy of the memory card file;
+//! - `replay.txt`: the level from its start, to play back
+//!   (`gauntlet --replay` to watch, `--replay-check` to compare; replay.rs).
 //!
 //! Reports go to `<save dir>/bugs/<YYYYMMDD-HHMMSS>-<level>/` (UTC time):
 //! `$XDG_DATA_HOME/gauntlet-rs/bugs` (default `~/.local/share/gauntlet-rs/bugs`)
@@ -864,6 +866,8 @@ pub struct Report<'a> {
     pub frames: u64,
     /// Where it was filed from (the menu, GDL_BUGREPORT).
     pub via: &'a str,
+    /// The running level's recording, as a file.
+    pub replay: Option<&'a str>,
 }
 
 /// (year, month, day, hour, minute, second) of a Unix time (UTC).
@@ -896,7 +900,7 @@ pub fn stamp(secs: u64) -> String {
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
-fn unix_now() -> u64 {
+pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -974,8 +978,15 @@ pub fn report_md(r: &Report, secs: u64) -> String {
     let _ = writeln!(s, "- Tags: **{tags}**");
     let _ = writeln!(
         s,
-        "- Files: report.md, nearby.txt, events.log (last {KEEP_SECS:.0} s), screenshot.png, save.txt, memcard copy"
+        "- Files: report.md, nearby.txt, events.log (last {KEEP_SECS:.0} s), screenshot.png, save.txt, memcard copy{}",
+        if r.replay.is_some() { ", replay.txt" } else { "" }
     );
+    if r.replay.is_some() {
+        let _ = writeln!(
+            s,
+            "- Replay: `gauntlet --replay replay.txt` plays the level up to this report; `gauntlet --replay-check replay.txt` compares it headless"
+        );
+    }
     if let Some(g) = r.game {
         game_section(&mut s, g, r);
     } else {
@@ -1703,6 +1714,9 @@ pub fn file(root: &Path, r: &Report, shot: Option<&gdl_formats::Image>) -> Resul
     }
     std::fs::write(dir.join("events.log"), events_text())?;
     std::fs::write(dir.join("save.txt"), save_txt(r))?;
+    if let Some(text) = r.replay {
+        std::fs::write(dir.join("replay.txt"), text)?;
+    }
     if let Some(card) = r.card_file.filter(|p| p.exists()) {
         let name = card
             .file_name()
@@ -1827,6 +1841,7 @@ mod tests {
             screen: "title",
             frames: 42,
             via: "test",
+            replay: None,
         };
         let md = report_md(&r, 0);
         assert!(md.starts_with("# Bug report: (none)"), "{md}");
@@ -1858,6 +1873,32 @@ mod tests {
         let dir2 = file(&root, &r, None).unwrap();
         assert_ne!(dir, dir2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_report_carries_the_replay() {
+        let progress = Progress::default();
+        let prefs = Prefs::default();
+        let root = std::env::temp_dir().join(format!("gdl-bug-replay-{}", std::process::id()));
+        let r = Report {
+            game: None,
+            panels: &[],
+            progress: Some(&progress),
+            heroes: &[None, None, None, None],
+            prefs: Some(&prefs),
+            card_file: None,
+            tags: &["stuck", "wrong look"],
+            screen: "title",
+            frames: 42,
+            via: "test",
+            replay: Some("gauntlet-replay 1\n"),
+        };
+        let dir = file(&root, &r, None).unwrap();
+        let text = std::fs::read_to_string(dir.join("replay.txt")).unwrap();
+        assert!(text.starts_with("gauntlet-replay"));
+        let md = std::fs::read_to_string(dir.join("report.md")).unwrap();
+        assert!(md.contains("--replay replay.txt"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -91,6 +91,24 @@ gauntlet --compat
 cargo test -p gdl-sim --release -- --ignored every_level
 ```
 
+## Replays
+
+A level's recording is how it started and what every player pressed. Played on the same
+build and files it is the same game to the bit; played on a newer build, it shows whether a
+fix changed what happened. Sticks reach the simulation at 255 positions per axis, so nothing
+is lost in the recording.
+
+```sh
+gauntlet --record replays/             # Keep a recording of each level played
+gauntlet --replay FILE                 # Watch one; Esc quits. Nothing is saved
+gauntlet --replay-check FILE           # Headless: compare, exit 1 if it differs
+```
+
+The check names the second in which a game drifted (the file holds a fingerprint per second)
+and the parts of the final state that differ. It says when the file came from another build
+or other game files, but plays it anyway. If the debug menu changes the running game (warp
+aside, which starts a new level), the recording stops at that tick and says so.
+
 ## Debug menu (developer tool)
 
 Not part of the original. **F1** on the keyboard, or on a gamepad **hold L + R + Z and
@@ -128,6 +146,7 @@ Each report is a folder `<YYYYMMDD-HHMMSS>-<level>` (UTC) of plain text and PNG,
 and to the app's external files folder on Android, pulled with
 `adb pull /sdcard/Android/data/com.gauntletrs.game/files/bugs`. Code: `bugreport.rs`.
 
+- `replay.txt`: the level from its start up to the report, to watch or check (see Replays).
 - `report.md`: time, build (`git describe`), screen, tags, level/wave/realm, every player
   (class, colour, slot, level, health, gold, keys, potions, power-ups, state, position,
   yaw, floor triangle and the object it belongs to, animation), camera eye/at, progress,

@@ -7,7 +7,7 @@ use gdl_formats::wdata::TOWER_WAVE;
 /// tower start locator used when coming back from that realm.
 pub const CRYSTAL_ORDER: [u32; 12] = [13, 7, 2, 1, 11, 4, 3, 9, 10, 5, 6, 8];
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Progress {
     /// Per realm type, a bit per level index beaten (towerRecordLevelBeaten).
     pub beaten: [u16; 16],

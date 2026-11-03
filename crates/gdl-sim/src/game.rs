@@ -3,7 +3,7 @@
 use crate::character::{Animator, Model};
 use crate::collision::{Collision, Tri};
 use crate::fs::GameFs;
-use crate::input::PlayerInput;
+use crate::input::{PackedInput, PlayerInput};
 use crate::level::Level;
 use crate::math::Det as _;
 use crate::triggers::{trigger_flags, Mover, TriggerMode};
@@ -1117,7 +1117,7 @@ impl MonsterClass {
 }
 
 /// A joined player's place on the HUD.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelInfo {
     /// Column 0..3 (the player's slot).
     pub slot: usize,
@@ -1129,6 +1129,28 @@ pub struct PanelInfo {
     pub class: usize,
     /// A hidden character's row in `cheats::HIDDEN` (hidden_code).
     pub hidden: Option<usize>,
+}
+
+impl PanelInfo {
+    /// The class, colour and hidden model this panel plays
+    /// (`Game::new_heroes`' arguments). Sumner is the Wizard with his own
+    /// model; a hidden character is its class with its own model.
+    pub fn hero(&self) -> (&'static str, &'static str, Option<&'static str>) {
+        let class = if self.class >= 16 {
+            "WIZ"
+        } else {
+            crate::heroes::CLASSES
+                .get(self.class)
+                .copied()
+                .unwrap_or("WAR")
+        };
+        let model = match self.hidden {
+            _ if self.class >= 16 => Some("SUM"),
+            Some(h) => crate::cheats::HIDDEN.get(h).map(|h| h.dir),
+            None => None,
+        };
+        (class, crate::heroes::COLOURS[self.colour % 4], model)
+    }
 }
 
 #[derive(Clone)]
@@ -3952,6 +3974,16 @@ impl Game {
     /// One tick of the game: every hero's input for it. The step is always
     /// `TICK`, never the caller's choice, so no two peers can step differently.
     pub fn update(&mut self, inputs: &[PlayerInput]) {
+        let packed: Vec<PackedInput> = inputs.iter().map(PlayerInput::pack).collect();
+        self.update_packed(&packed);
+    }
+
+    /// One tick on inputs as they travel and are recorded. Everything goes
+    /// through here, so no tick ever sees more of a stick than a peer or a
+    /// replay would.
+    pub fn update_packed(&mut self, packed: &[PackedInput]) {
+        let inputs: Vec<PlayerInput> = packed.iter().map(PackedInput::unpack).collect();
+        let inputs = inputs.as_slice();
         // A scroll being read stops the game until its reader presses B.
         if let Some(b) = &mut self.scroll_box {
             if b.update(inputs) {

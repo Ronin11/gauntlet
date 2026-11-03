@@ -786,10 +786,8 @@ impl DebugMenu {
                 Action::None
             }
             Item::God => {
+                // The app passes it on as a command, so a recording sees it.
                 self.god = !self.god;
-                if let Some(g) = ctx.game.as_deref_mut() {
-                    g.debug_god = self.god;
-                }
                 Action::None
             }
             Item::HeroClass | Item::Skin => {
@@ -1991,11 +1989,12 @@ mod tests {
                 .iter()
                 .any(|s| s.flags == pu::W_3WAY && s.time > 0.0));
         }
-        // God mode reaches the level.
+        // God mode is the app's to pass on, and stops the damage.
         m.apply(Item::God, 0, &mut ctx);
-        assert!(ctx.game.as_deref().unwrap().debug_god);
+        assert!(m.god);
         {
             let g = ctx.game.as_deref_mut().unwrap();
+            g.debug_god = m.god;
             let hp = g.players[0].health;
             g.damage_player(0, 50.0, 0);
             assert_eq!(g.players[0].health, hp, "no damage in god mode");

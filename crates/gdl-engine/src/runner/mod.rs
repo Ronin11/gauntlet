@@ -599,6 +599,7 @@ fn capture(
         screen: "playing (level runner)",
         frames: g.frame as u64,
         via: "level runner",
+        replay: None,
     };
     let bugs = level_dir.join("bugs");
     std::fs::create_dir_all(&bugs)?;

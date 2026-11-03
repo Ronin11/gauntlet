@@ -42,7 +42,7 @@ pub const VERSION: u32 = 1;
 pub const SLOTS: [&str; 3] = ["1", "2", "3"];
 pub const AUTOSAVE: &str = "autosave";
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SaveState {
     pub version: u32,
     /// The level's directory ("levelA1") and wave.
@@ -59,7 +59,7 @@ pub struct SaveState {
 }
 
 /// One hero: the HUD panel that makes it, its controller, and its state.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct HeroState {
     pub panel: PanelInfo,
     /// "keyboard", "pad <n>" (the n-th connected pad) or "device".
@@ -714,24 +714,11 @@ impl SaveState {
         self.heroes
             .iter()
             .map(|h| {
-                let p = &h.panel;
-                let class = if p.class >= 16 {
-                    "WIZ"
-                } else {
-                    crate::heroes::CLASSES
-                        .get(p.class)
-                        .copied()
-                        .unwrap_or("WAR")
-                };
-                let model = match p.hidden {
-                    _ if p.class >= 16 => Some("SUM".to_string()),
-                    Some(k) => crate::cheats::HIDDEN.get(k).map(|h| h.dir.to_string()),
-                    None => None,
-                };
+                let (class, colour, model) = h.panel.hero();
                 (
                     class.to_string(),
-                    crate::heroes::COLOURS[p.colour % 4].to_string(),
-                    model,
+                    colour.to_string(),
+                    model.map(str::to_string),
                 )
             })
             .collect()
@@ -1305,7 +1292,7 @@ fn parse_v3(s: &str) -> Option<Vec3> {
 }
 
 /// Names may hold spaces: written with %20 and friends.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut o = String::new();
     for c in s.chars() {
         match c {
@@ -1318,7 +1305,7 @@ fn esc(s: &str) -> String {
     o
 }
 
-fn unesc(s: &str) -> String {
+pub(crate) fn unesc(s: &str) -> String {
     let b = s.as_bytes();
     let mut o = Vec::new();
     let mut i = 0;
