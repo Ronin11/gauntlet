@@ -111,13 +111,34 @@ impl Game {
         if let Some(i) = self.particles.texture_named(name) {
             return Some(i);
         }
-        let img = crate::mesh::decode_bitmap(&self.level.objects, &self.level.textures_file, name)
-            .or_else(|| {
-                self.psys_banks
-                    .iter()
-                    .find_map(|b| crate::mesh::decode_bitmap(&b.0, &b.1, name))
-            })?;
-        Some(self.particles.texture(name, img))
+        let (img, frames) = crate::mesh::decode_bitmap_frames(
+            &self.level.objects,
+            &self.level.textures_file,
+            name,
+        )
+        .or_else(|| {
+            self.psys_banks
+                .iter()
+                .find_map(|b| crate::mesh::decode_bitmap_frames(&b.0, &b.1, name))
+        })?;
+        let i = self.particles.texture(name, img);
+        log::debug!("psys texture {name}: {} frames", frames.len());
+        if !frames.is_empty() {
+            // The bank's texmod says how fast the frames turn (2 is usual).
+            let rate = self
+                .level
+                .texmods
+                .iter()
+                .find(|tm| tm.name.eq_ignore_ascii_case(name))
+                .map_or(2, |tm| tm.rate);
+            let n = frames.len();
+            let first = self.particles.textures.len();
+            for (k, f) in frames.into_iter().enumerate() {
+                self.particles.texture(&format!("{name}#{k}"), f);
+            }
+            self.particles.flips.insert(i, (first, n, rate));
+        }
+        Some(i)
     }
 
     /// An entity's node frame as drawn (the scene's transform).

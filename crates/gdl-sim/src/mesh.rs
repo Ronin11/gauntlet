@@ -375,7 +375,37 @@ impl<'a> MeshBuilder<'a> {
 /// `MBOX_FindTexture` in one bank: the named bitmap, decoded.
 pub fn decode_bitmap(objects: &Objects, textures: &[u8], name: &str) -> Option<Image> {
     let i = find_bitmap(objects, name)?;
-    texture::decode_ngc(objects.bitmaps.get(i as usize)?, textures).ok()
+    texture::decode_ngc_override(objects.bitmaps.get(i as usize)?, textures).ok()
+}
+
+/// [`decode_bitmap`] plus the frames of a flipbook (a bitmap with
+/// `frame_count`), which the game shows in turn with `MBSetRomTexture`: the
+/// bitmaps that follow its first frame (the one sharing the header's data).
+/// The image returned is the first frame, so a flipbook's user never sees the
+/// header's stand-in.
+pub fn decode_bitmap_frames(
+    objects: &Objects,
+    textures: &[u8],
+    name: &str,
+) -> Option<(Image, Vec<Image>)> {
+    let i = find_bitmap(objects, name)? as usize;
+    let b = objects.bitmaps.get(i)?;
+    let n = b.frame_count as usize;
+    if n == 0 || b.flags & gdl_formats::objects::bitmap_flags::EXTERNAL != 0 {
+        return Some((texture::decode_ngc_override(b, textures).ok()?, Vec::new()));
+    }
+    let first = objects.bitmaps.iter().enumerate().position(|(k, f)| {
+        k != i
+            && f.frame_count == 0
+            && f.tex_pointer == b.tex_pointer
+            && (f.width, f.height) == (b.width, b.height)
+    })?;
+    let frames: Vec<Image> = (first..first + n)
+        .filter_map(|k| objects.bitmaps.get(k))
+        .filter_map(|f| texture::decode_ngc_override(f, textures).ok())
+        .collect();
+    let img = frames.first()?.clone();
+    Some((img, frames))
 }
 
 /// A bitmap's index by name (the bank's texture definitions, `texcmp` ignores case).

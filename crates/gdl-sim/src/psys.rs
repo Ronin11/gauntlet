@@ -1487,6 +1487,9 @@ pub struct Particles {
     /// Particle textures by registry index, and their names.
     pub textures: Vec<gdl_formats::Image>,
     names: Vec<String>,
+    /// Flipbook textures (`DoTexMods` swaps their frames in): registry index
+    /// of the animated texture -> (its first frame's index, frames, rate).
+    pub flips: std::collections::BTreeMap<usize, (usize, usize, i32)>,
     /// allocPsys: particle2_a and particle2_xp (fb_add's).
     pub default_tex: [Option<usize>; 2],
     /// main.dol's psysPresetTable.
@@ -1514,6 +1517,7 @@ impl Default for Particles {
             systems: Vec::new(),
             textures: Vec::new(),
             names: Vec::new(),
+            flips: Default::default(),
             default_tex: [None; 2],
             presets: presets(),
             streak_tex: None,
@@ -1603,6 +1607,13 @@ impl Particles {
                 } else {
                     self.default_tex[0]
                 }
+            });
+            // A flipbook shows the frame its texmod has reached.
+            let tex = tex.map(|t| match self.flips.get(&t) {
+                Some(&(first, n, rate)) if n > 0 => {
+                    first + crate::texanim::steps(rate, self.frame) as usize % n
+                }
+                _ => t,
             });
             out.push(SpriteBatch {
                 tex,
