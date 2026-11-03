@@ -6,8 +6,8 @@ use gdl_formats::audio::{parse_sound_names, BANKS};
 use gdl_formats::sequence::{render_call, CallPlayer, DcsBank, PlayParams, Rendered, OUTPUT_RATE};
 use std::path::{Path, PathBuf};
 
-const DEFAULT_AUDIO: &str = "/home/ronin/Projects/gauntlet-rs/game-data/files/Gauntlet/AUDIO";
-const DEFAULT_OUT: &str = "/home/ronin/.cache/claude-tmp/claude-1000/-home-ronin/dea31ce5-88e6-4ac1-b203-6dd1ecdf6375/scratchpad/music";
+const DEFAULT_AUDIO: &str = "game-data/files/Gauntlet/AUDIO";
+const DEFAULT_OUT: &str = "out/music";
 
 fn write_wav(
     path: &Path,
