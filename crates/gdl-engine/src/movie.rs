@@ -4,6 +4,7 @@
 
 use crate::fs::GameFs;
 use crate::input::PlayerInput;
+use crate::session::MovieClock;
 use anyhow::{Context, Result};
 use gdl_formats::movie::{Avi, MovieAudio, VideoDecoder};
 
@@ -13,13 +14,10 @@ pub struct Movie {
     dec: VideoDecoder,
     /// Video chunks decoded so far.
     shown: usize,
-    time: f32,
-    /// Frames left after a skip (PlayVQMovie stops 2-3 frames after the press).
-    stopping: Option<u32>,
+    /// When frames are due and when the movie ends.
+    clock: MovieClock,
     /// The soundtrack, taken by the caller to start playback.
     pub audio: Option<MovieAudio>,
-    /// A button was held last tick (skips need a fresh press).
-    held: bool,
     /// The picture changed since the caller last uploaded it.
     pub dirty: bool,
 }
@@ -33,15 +31,14 @@ impl Movie {
         anyhow::ensure!(avi.width() == 512, "{name}.avi is not 512 wide");
         let dec = VideoDecoder::for_avi(&avi)?;
         let audio = avi.decode_audio(&bytes).ok().flatten();
+        let clock = MovieClock::new(avi.video_chunks.len(), avi.frame_rate());
         Ok(Movie {
             bytes,
             avi,
             dec,
             shown: 0,
-            time: 0.0,
-            stopping: None,
+            clock,
             audio,
-            held: true,
             dirty: false,
         })
     }
@@ -56,36 +53,20 @@ impl Movie {
 
     /// Advance by `dt` seconds. Returns true once the movie has ended.
     pub fn update(&mut self, dt: f32, inputs: &[PlayerInput]) -> bool {
-        let pressed = inputs.iter().any(|i| {
-            i.attack
-                || i.attack_pressed
-                || i.magic_pressed
-                || i.b_pressed
-                || i.start_pressed
-                || i.turbo
-        });
-        if pressed && !self.held && self.stopping.is_none() {
-            self.stopping = Some(3);
-        }
-        self.held = pressed;
-        self.time += dt;
-        let want =
-            ((self.time * self.avi.frame_rate()) as usize + 1).min(self.avi.video_chunks.len());
-        while self.shown < want {
+        let done = self.clock.update(dt, inputs);
+        self.show(self.clock.shown);
+        done
+    }
+
+    /// Decode up to frame `n`, as a clock kept elsewhere says.
+    pub fn show(&mut self, n: usize) {
+        while self.shown < n.min(self.avi.video_chunks.len()) {
             let r = self.avi.video_chunks[self.shown].clone();
             if let Err(e) = self.dec.decode(&self.bytes[r]) {
                 log::warn!("movie frame {}: {e:#}", self.shown);
             }
             self.shown += 1;
             self.dirty = true;
-            if let Some(n) = &mut self.stopping {
-                *n -= 1;
-                if *n == 0 {
-                    return true;
-                }
-            }
         }
-        self.shown >= self.avi.video_chunks.len()
-            && self.time * self.avi.frame_rate() >= self.avi.video_chunks.len() as f32
     }
 }

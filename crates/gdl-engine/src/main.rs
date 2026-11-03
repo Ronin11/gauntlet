@@ -909,11 +909,12 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 .worlds
                 .wave_of_dir(code)
                 .with_context(|| format!("no level {code} in the realm tables"))?;
-            let mut m = mapscreen::MapScreen::new(&fs, &gpu, &mut hud, &g.worlds, wave);
-            println!("map screen {code} (wave {wave:#x}), music {:?}", m.music);
+            let mut clock = mapscreen::MapClock::new(&fs, &g.worlds, wave);
+            let m = mapscreen::MapScreen::new(&fs, &gpu, &mut hud, &clock);
+            println!("map screen {code} (wave {wave:#x}), music {:?}", clock.music);
             for t in 1..=ticks {
-                let done = m.update();
-                for s in m.sfx.drain(..) {
+                let done = clock.update();
+                for s in clock.sfx.drain(..) {
                     println!("tick {t}: sfx {s}");
                 }
                 if done {
@@ -921,7 +922,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     break;
                 }
             }
-            Some((m, ticks))
+            Some((m, clock, ticks))
         }
         None => None,
     };
@@ -963,7 +964,8 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 .and_then(|w| g.worlds.level(w))
                 .cloned();
             let party = shop::demo_party();
-            let mut s = shop::Shop::new(&fs, &gpu, &mut hud, party, level, mode, final_stats);
+            let mut s = shop::Shop::new(&fs, party, level, mode, final_stats);
+            let icons = shop::load_icons(&fs, &gpu, &mut hud, &s);
             if let Some(c) = s.collections.first_mut() {
                 c.fangs = 3;
                 c.crystals = [15, 40, 0, 0, 0, 0, 0, 0];
@@ -1013,7 +1015,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     c.gold, c.keys, c.potions, c.health, c.bonus
                 );
             }
-            Some((s, ticks))
+            Some((s, icons, ticks))
         }
         _ => None,
     };
@@ -1210,13 +1212,17 @@ fn snapshot_game(args: &Args) -> Result<()> {
                 return;
             }
             Some(name) if name == "shop" || name.starts_with("shop:") => {
-                if let Some((sh, ticks)) = &shop_screen {
-                    sh.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, *ticks));
+                if let Some((sh, bank, ticks)) = &shop_screen {
+                    shop::ShopView { shop: sh, bank }.draw(&mut screen::Scr::new(
+                        &mut canvas,
+                        &hud.ui,
+                        *ticks,
+                    ));
                 }
             }
             Some(s) if s.starts_with("map:") => {
-                if let Some((m, ticks)) = &map_screen {
-                    m.draw(&mut screen::Scr::new(&mut canvas, &hud.ui, *ticks));
+                if let Some((m, clock, ticks)) = &map_screen {
+                    m.draw(clock, &mut screen::Scr::new(&mut canvas, &hud.ui, *ticks));
                 }
             }
             _ => {}

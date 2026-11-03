@@ -4,7 +4,7 @@
 pub use gdl_sim::{
     ai, boss, camera, character, cheats, collision, compat, critter, enemies, fs, game, heroes,
     hints, interp, level, mesh, messages, missile, paction, powerups, progress, psys, replay,
-    rules, save, savestate, shadow, soundlib, stats, texanim, tower, transport, triggers,
+    rules, save, savestate, session, shadow, soundlib, stats, texanim, tower, transport, triggers,
     worldanim,
 };
 

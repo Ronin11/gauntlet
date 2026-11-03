@@ -1,13 +1,14 @@
-//! Windowed game: winit event loop, wgpu surface, fixed-timestep simulation, and the
-//! screens (title -> hero select -> loading -> playing, with a pause menu).
+//! Windowed game: winit event loop, wgpu surface, the fixed-timestep loop, and the
+//! screens. What happens in a game is the session's (gdl_sim::session); this draws it, sounds
+//! it, and turns what players choose in the menus into its decisions.
 
 use crate::attract::{self, Attract};
 use crate::audio::Audio;
 use crate::compat::Compat;
 use crate::fs::GameFs;
-use crate::game::setup::{Command, LevelSetup, LevelStart, PartyBack};
+use crate::game::setup::Command;
 use crate::game::Game;
-use crate::game::{LevelEnd, PlayerState};
+use crate::game::PlayerState;
 use crate::gpu::Gpu;
 use crate::hud::PanelInfo;
 use crate::hud::{self, Hud};
@@ -16,11 +17,12 @@ use crate::menu::{self, Title};
 use crate::options::{Options, OptionsAction, Prefs};
 use crate::progress::Progress;
 use crate::replay::{Playback, Replay};
-use crate::save::{HeroSave, MemCard};
+use crate::save::MemCard;
 use crate::savestate::{self, SaveState};
 use crate::scene::{Scene, CLEAR};
 use crate::screen::Scr;
 use crate::select::{Select, CLASSES, COLOURS};
+use crate::session::{Carry, Chosen, Decision, Event, Heroes, Phase, Session};
 use crate::ui::UiAssets;
 use anyhow::{Context, Result};
 use gdl_formats::wdata::TOWER_WAVE;
@@ -53,43 +55,19 @@ pub struct Config {
     pub record: Option<std::path::PathBuf>,
 }
 
+/// What the engine keeps for the level the session is running.
 struct Playing {
-    game: Game,
     scene: Scene,
-    panels: Vec<PanelInfo>,
     /// Seconds played, for fading out the loading art.
     intro: f32,
     /// The boss's health-meter textures (boss levels).
     boss_bank: Option<crate::hud::TexBank>,
-    /// This level's recording, from its start (none for a flyby or a watched
-    /// recording). It waits with the level during a secret level.
-    recording: Option<Replay>,
 }
 
-impl Playing {
-    /// One tick. The game and its recording see the same inputs.
-    fn step(&mut self, inputs: &[PlayerInput]) {
-        let packed: Vec<_> = inputs.iter().map(PlayerInput::pack).collect();
-        self.game.update_packed(&packed);
-        if let Some(rec) = &mut self.recording {
-            rec.tick(&packed, &self.game);
-        }
-    }
-
-    fn command(&mut self, c: Command) {
-        if let Some(rec) = &mut self.recording {
-            rec.command(&c);
-        }
-        self.game.command(c);
-    }
-
-    /// What the party carries, per player, by the slots in `carry`.
-    fn carried_from(&self, carry: &Option<Carry>) -> Vec<Option<crate::game::Carried>> {
-        self.panels
-            .iter()
-            .map(|info| carry.as_ref().and_then(|c| c[info.slot % 4].clone()))
-            .collect()
-    }
+/// An attract-mode flyby's level, which is no part of any session.
+struct FlybyPlay {
+    game: Game,
+    scene: Scene,
 }
 
 /// A recording being watched (`--replay`).
@@ -124,41 +102,170 @@ fn local_compat(r: &mut Running, fs: &GameFs, rules: &crate::rules::Rules) -> Re
     Ok(c)
 }
 
-/// Keep the level's recording in the `--record` folder.
-fn keep_recording(r: &mut Running, fs: &GameFs, rules: &crate::rules::Rules) {
+/// Keep a level's recording in the `--record` folder.
+fn write_recording(r: &mut Running, fs: &GameFs, game: &Game, rec: &Replay) {
     let Some(dir) = r.record_dir.clone() else {
         return;
     };
-    let compat = match local_compat(r, fs, rules) {
+    let rules = r.session.rules();
+    let compat = match local_compat(r, fs, &rules) {
         Ok(c) => c,
         Err(e) => {
             log::warn!("recording: {e:#}");
             return;
         }
     };
-    let Screen::Playing { play, .. } = &r.screen else {
-        return;
-    };
-    let Some(rec) = &play.recording else {
-        return;
-    };
-    let name = crate::bugreport::folder_name(crate::bugreport::unix_now(), &play.game.level.name);
+    let name = crate::bugreport::folder_name(crate::bugreport::unix_now(), &game.level.name);
     let path = dir.join(format!("{name}.replay"));
-    match rec.write(&path, &play.game, &compat) {
+    match rec.write(&path, game, &compat) {
         Ok(()) => log::info!("recording kept in {}", path.display()),
         Err(e) => log::warn!("recording: {e:#}"),
     }
 }
 
-/// Health, score, keys and potions carried from one level to the next.
-/// Indexed by slot (column), so players keep their stats whoever joins.
-type Carry = [Option<crate::game::Carried>; 4];
+/// The screen being left takes its music and textures with it.
+fn leave_screen(r: &mut Running) {
+    match &mut r.screen {
+        Screen::Map { map } => {
+            r.audio.stop();
+            map.release(&mut r.hud);
+        }
+        Screen::Shop { bank } => {
+            r.audio.stop();
+            r.hud.free_bank(std::mem::take(bank));
+        }
+        Screen::Intro { .. } => r.audio.stop(),
+        _ => {}
+    }
+}
 
-/// Whether a level start refreshes the players' checkpoint (save_backup):
-/// start_level skips PlayerSaveState in the secret levels (realm 12), and
-/// PlayerSaveState(i, 1) keeps the old backup in waves 5/1 and 6/1.
-fn checkpoint_at(wave: Option<u32>) -> bool {
-    !matches!(wave, Some(0x501 | 0x601)) && wave.is_none_or(|w| w >> 8 != 12)
+/// What the session has done since we last looked: the screens, music and
+/// textures that follow from it. Returns the next screen, if it changes.
+fn session_events(r: &mut Running, fs: &GameFs) -> Option<Screen> {
+    let mut next = None;
+    for ev in std::mem::take(&mut r.session.events) {
+        match ev {
+            Event::LevelGone { game, recording } => {
+                if let Some(rec) = &recording {
+                    write_recording(r, fs, &game, rec);
+                }
+                if let Screen::Playing { play, .. } = &mut r.screen {
+                    if let Some(bank) = play.boss_bank.take() {
+                        r.hud.free_bank(bank);
+                    }
+                }
+                // Nothing waits any more: nor does what we kept to draw it.
+                if !r.session.has_waiting() {
+                    if let Some(bank) = r.suspended.take().and_then(|mut p| p.boss_bank.take()) {
+                        r.hud.free_bank(bank);
+                    }
+                }
+            }
+            Event::LevelSuspended => {
+                if matches!(r.screen, Screen::Playing { .. }) {
+                    if let Screen::Playing { play, .. } =
+                        std::mem::replace(&mut r.screen, Screen::Legal(0))
+                    {
+                        r.suspended = Some(play);
+                    }
+                }
+            }
+            Event::Resumed { from_shop } => {
+                leave_screen(r);
+                if let Some(play) = r.suspended.take() {
+                    let streams = if from_shop {
+                        vec!["tower".to_string()]
+                    } else {
+                        r.session
+                            .game
+                            .as_ref()
+                            .and_then(|g| g.wave.map(|w| g.worlds.music(w)))
+                            .unwrap_or_default()
+                    };
+                    r.audio.play_streams(fs, &streams);
+                    r.last = Instant::now();
+                    next = Some(Screen::Playing { play, pause: None });
+                }
+            }
+            Event::PlayersLeft(left) => {
+                let mut i = 0;
+                r.sources.retain(|_| {
+                    i += 1;
+                    !left.contains(&(i - 1))
+                });
+            }
+            Event::Select => {
+                leave_screen(r);
+                let s = &r.session;
+                let party = party_for(&r.card, &s.carry, &s.heroes, &s.progress, &r.prefs);
+                let mut sel = Select::from_game(&s.panels, &r.sources).with_party(party);
+                // check_active_players: a new pad joined in the tower.
+                if let Some(src) = r.joining.take() {
+                    sel.join(src);
+                }
+                next = Some(Screen::Select(sel));
+            }
+            Event::Loading => {
+                leave_screen(r);
+                next = Some(Screen::Loading { shown: false });
+            }
+            Event::Map { .. } => {
+                leave_screen(r);
+                if let Phase::Map { clock, .. } = &r.session.phase {
+                    let map = crate::mapscreen::MapScreen::new(fs, &r.gpu, &mut r.hud, clock);
+                    match &clock.music {
+                        Some(m) => r.audio.play_bank_music(fs, m),
+                        None => r.audio.stop(),
+                    }
+                    next = Some(Screen::Map { map: Box::new(map) });
+                }
+            }
+            Event::Movie { name } => {
+                leave_screen(r);
+                r.audio.stop();
+                let mut movie = crate::movie::Movie::open(fs, &name).ok();
+                if let Some(a) = movie.as_mut().and_then(|m| m.audio.take()) {
+                    r.audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
+                }
+                next = Some(Screen::Intro {
+                    movie: movie.map(Box::new),
+                });
+            }
+            Event::Shop => {
+                leave_screen(r);
+                if let Phase::Shop { shop, .. } = &r.session.phase {
+                    match shop.music() {
+                        Some(m) => r.audio.play_bank_music(fs, &m),
+                        None => r.audio.stop(),
+                    }
+                    next = Some(Screen::Shop {
+                        bank: crate::shop::load_icons(fs, &r.gpu, &mut r.hud, shop),
+                    });
+                }
+            }
+            Event::GameOver => {
+                leave_screen(r);
+                r.audio.stop();
+                next = Some(game_over_screen(fs));
+            }
+            // Sumner's lectern: HintMenu.
+            Event::HintMenu(pi) => {
+                if let (Screen::Playing { pause, .. }, Some(g)) =
+                    (&mut r.screen, r.session.game.as_deref())
+                {
+                    let hints = crate::hints::Hints::new(
+                        r.session.progress.hints,
+                        hint_facts(&r.session.progress, g),
+                        fs.read("TEXT/HINTS_E.ROM")
+                            .ok()
+                            .and_then(|d| gdl_formats::text::TextRom::parse(&d).ok()),
+                    );
+                    *pause = Some(Options::hint_menu(pi, hints));
+                }
+            }
+        }
+    }
+    next
 }
 
 /// padUpdate's gPadResetHoldTimer: a pad holding exactly Start + X + B
@@ -246,10 +353,6 @@ fn quit_level_disabled(wave: Option<u32>) -> bool {
     wave.is_some_and(|w| w >> 8 == 0xC)
 }
 
-/// Each column's save image (Player.save), kept between visits to player
-/// select.
-type Heroes = [Option<HeroSave>; 4];
-
 /// What player select starts with: the card, each column's carried state and
 /// save image, and the party's progress.
 fn party_for(
@@ -271,56 +374,6 @@ fn party_for(
     }
 }
 
-/// player select opened from the tower: the players as they are now.
-fn party_in_game(
-    play: &Playing,
-    card: &MemCard,
-    heroes: &Heroes,
-    progress: &Progress,
-    prefs: &Prefs,
-) -> crate::select::Party {
-    let mut carry: Carry = Default::default();
-    for (info, p) in play.panels.iter().zip(&play.game.players) {
-        carry[info.slot % 4] = Some(p.carried());
-    }
-    let progress = live_progress(play, progress);
-    let mut heroes = heroes.clone();
-    bank_heroes(&play.game, &play.panels, &mut heroes);
-    party_for(card, &Some(carry), &heroes, &progress, prefs)
-}
-
-/// The party's progress as it stands in the level being played, with what
-/// Sumner has banked in the tower so far: a hero saved from the tower (or the
-/// tower re-entered after player select) keeps the speeches already given.
-fn live_progress(play: &Playing, progress: &Progress) -> Progress {
-    let mut progress = progress.clone();
-    progress.crystals = play.game.crystals;
-    progress.garg_items = play.game.garg_items;
-    progress.shards = play.game.shards;
-    progress.runes |= play.game.runes | play.game.boss_runes;
-    progress.legend = play.game.legend_held;
-    if let Some(sm) = &play.game.sumner {
-        (progress.banked_runes, progress.banked_shards) = sm.banked();
-        progress.last_beaten = sm.last_beaten();
-    }
-    progress
-}
-
-/// What lives in each player's save image during play goes back to the
-/// column's hero: the secret classes unlocked (save.class_unlock) and the
-/// messages seen (save.help_disp).
-fn bank_heroes(game: &Game, panels: &[PanelInfo], heroes: &mut Heroes) {
-    for (i, (info, p)) in panels.iter().zip(&game.players).enumerate() {
-        let h = heroes[info.slot % 4]
-            .get_or_insert_with(|| HeroSave::new(&info.name, info.class.min(15), info.colour));
-        h.class_unlock |= p.class_unlock;
-        h.help_disp = game.msgs.help_disp(i);
-    }
-}
-
-/// A level's heroes as their saves and names make them: playable Sumner's
-/// loadout, the messages each has seen, and the name cheats
-/// (set_hidden_player from load_player_geo).
 enum Screen {
     /// The licence screen shown at power-on, for this many more ticks.
     Legal(u32),
@@ -329,7 +382,7 @@ enum Screen {
     /// An attract-mode level flyby (MA_FLYBY): the level with no heroes, seen
     /// from the flyby camera, for this many ticks so far.
     Flyby {
-        play: Box<Playing>,
+        play: Box<FlybyPlay>,
         cam: Box<crate::flyby::FlybyCam>,
         ticks: u32,
     },
@@ -340,36 +393,23 @@ enum Screen {
     },
     Title(Title),
     Select(Select),
-    /// The loading art is shown for one frame, then the level loads.
+    /// The loading art is shown for one frame, then the level the session
+    /// names loads.
     Loading {
-        level: String,
-        panels: Vec<PanelInfo>,
         shown: bool,
     },
-    /// The map screen (init_mapscreen) while the next level "loads", then its
-    /// intro movie.
+    /// The map screen (init_mapscreen) while the next level "loads", with the
+    /// session's clock.
     Map {
         map: Box<crate::mapscreen::MapScreen>,
-        movie: String,
-        level: String,
-        panels: Vec<PanelInfo>,
-        /// Back from a secret level: resume the suspended level afterwards.
-        resume: bool,
     },
-    /// The shop: after a level (then player select and the tower), or from
-    /// the Tower Menu (then back to the tower as it was).
+    /// The session's shop, and its icons not in the front-end banks.
     Shop {
-        shop: Box<crate::shop::Shop>,
-        panels: Vec<PanelInfo>,
-        from_menu: bool,
+        bank: crate::hud::TexBank,
     },
-    /// A level's intro movie (init_gamemovie), then the level; or an ending
-    /// movie ("garm", "victory"), then `after` (the shop).
+    /// A movie the session is running (init_gamemovie, or "garm", "victory").
     Intro {
-        movie: Box<crate::movie::Movie>,
-        level: String,
-        panels: Vec<PanelInfo>,
-        after: Option<Box<Screen>>,
+        movie: Option<Box<crate::movie::Movie>>,
     },
     Playing {
         play: Box<Playing>,
@@ -391,10 +431,13 @@ struct Running {
     music_now: usize,
     music_switch: Option<usize>,
     music_fade: f32,
-    /// The party's realm progress.
-    progress: Progress,
-    /// The level a secret icon was found in, kept while the secret level runs.
+    /// The party, the level and what comes next.
+    session: Session,
+    /// A level waiting in the session for the party to come back: what we keep
+    /// to draw it.
     suspended: Option<Box<Playing>>,
+    /// A new pad that has asked to join in the tower.
+    joining: Option<Source>,
     /// A recording being watched instead of played.
     watch: Option<Watch>,
     /// Where `--record` keeps recordings.
@@ -403,13 +446,8 @@ struct Running {
     compat: Option<Compat>,
     /// Options settings (volumes, difficulty, controls).
     prefs: Prefs,
-    /// Each player's health, gold, keys and potions now, and as they were when
-    /// the current level started (restored for players who die in it).
-    carry: Option<Carry>,
-    checkpoint: Option<Carry>,
-    /// The memory card in Slot A, and each column's save image.
+    /// The memory card in Slot A.
     card: MemCard,
-    heroes: Heroes,
     /// The current movie frame's texture.
     movie_tex: Option<crate::ui::Tex>,
     /// The menus' 3D arrow.
@@ -436,10 +474,8 @@ struct Running {
     /// Frames drawn.
     frames: u64,
     /// Debug save states (savestate.rs): the folder they are kept under
-    /// (states/ in it), the state to apply once its level has loaded, and
-    /// the level time of the last autosave.
+    /// (states/ in it), and the level time of the last autosave.
     save_dir: Option<std::path::PathBuf>,
-    pending_state: Option<SaveState>,
     autosaved: f32,
     last: Instant,
     acc: f32,
@@ -520,12 +556,7 @@ impl App {
             if sources.len() < n {
                 sources.push(Source::Keyboard);
             }
-            let screen = Screen::Loading {
-                level: self.cfg.level.clone(),
-                panels: panels_for(&self.cfg.players),
-                shown: false,
-            };
-            (screen, sources)
+            (Screen::Loading { shown: false }, sources)
         };
         // init_prefs, then check_prefs_loaded: the options saved on the card.
         let card = MemCard::open(self.cfg.save_dir.as_deref());
@@ -534,6 +565,18 @@ impl App {
             prefs.apply_game_opts(&o);
         }
         audio.set_volumes(&prefs);
+        let mut session = Session::new(
+            self.cfg.rules.clone(),
+            prefs.difficulty,
+            prefs.multiplayer,
+            Progress::default(),
+        );
+        if !self.cfg.players.is_empty() {
+            session.panels = panels_for(&self.cfg.players);
+            session.phase = Phase::Loading {
+                level: self.cfg.level.clone(),
+            };
+        }
         let mut r = Running {
             surface,
             config,
@@ -544,16 +587,14 @@ impl App {
             music_now: 0,
             music_switch: None,
             music_fade: 1.0,
-            progress: Progress::default(),
+            session,
             prefs,
             suspended: None,
+            joining: None,
             watch: None,
             record_dir: self.cfg.record.clone(),
             compat: None,
-            carry: None,
-            checkpoint: None,
             card,
-            heroes: Default::default(),
             movie_tex: None,
             cursor,
             hud,
@@ -570,7 +611,6 @@ impl App {
             bugs: Default::default(),
             frames: 0,
             save_dir: self.cfg.save_dir.clone(),
-            pending_state: None,
             autosaved: 0.0,
             last: Instant::now(),
             acc: 0.0,
@@ -585,13 +625,14 @@ impl App {
             )
             .map_err(|e| log::warn!("--replay: {e:#}"))
             .ok();
-            r.progress = replay.start.progress.clone();
             r.sources = vec![Source::Keyboard; replay.start.panels.len()];
-            r.screen = Screen::Loading {
+            r.session.progress = replay.start.progress.clone();
+            r.session.panels = replay.start.panels.clone();
+            r.session.phase = Phase::Loading {
                 level: replay.start.level.clone(),
-                panels: replay.start.panels.clone(),
-                shown: false,
             };
+            r.session.start_override = Some(replay.start.clone());
+            r.screen = Screen::Loading { shown: false };
             r.watch = Some(Watch {
                 replay,
                 playback: Playback::new(),
@@ -605,7 +646,7 @@ impl App {
             match SaveState::read(&path) {
                 Ok(st) => {
                     log::info!("loading state {}: {}", path.display(), st.summary());
-                    r.screen = begin_state(&mut r, st);
+                    r.screen = begin_state(&mut r, &self.cfg.fs, st);
                 }
                 Err(e) => log::error!("--load-state: {e:#}"),
             }
@@ -698,7 +739,9 @@ impl ApplicationHandler for App {
         // A recording being watched leaves nothing behind.
         if let Some(r) = self.run.as_mut().filter(|r| r.watch.is_none()) {
             autosave(r);
-            keep_recording(r, &self.cfg.fs, &self.cfg.rules);
+            if let (Some(game), Some(rec)) = (r.session.game.take(), r.session.recording.take()) {
+                write_recording(r, &self.cfg.fs, &game, &rec);
+            }
         }
         if let Some(r) = self.run.take() {
             let _ = r.gpu.device.poll(wgpu::PollType::Wait);
@@ -736,53 +779,50 @@ impl App {
         }
 
         // A level load blocks, so it happens on the frame after the loading art showed.
-        if let Screen::Loading {
-            level,
-            panels,
-            shown: true,
-        } = &mut r.screen
-        {
-            let (level, panels) = (level.clone(), panels.clone());
-            let start = match &r.watch {
-                Some(w) => w.replay.start.clone(),
-                None => level_start(r, &level, panels.clone(), &self.cfg.rules),
+        if matches!(r.screen, Screen::Loading { shown: true }) {
+            let level = match &r.session.phase {
+                Phase::Loading { level } => level.clone(),
+                _ => String::new(),
             };
-            match start_level(fs, &r.gpu, &start) {
-                Ok((mut p, welcome)) => {
-                    if r.watch.is_none() {
-                        p.recording = Some(Replay::new(start));
-                    }
-                    if checkpoint_at(p.game.wave) || r.checkpoint.is_none() {
-                        r.checkpoint = r.carry.clone();
-                    }
-                    if let Some(dir) = p.game.boss_model_dir() {
+            let state = r.session.pending_state.as_ref().map(SaveState::summary);
+            if r.watch.is_none() {
+                r.session.command(
+                    fs,
+                    Decision::Settings {
+                        difficulty: r.prefs.difficulty,
+                        friendly_fire: r.prefs.multiplayer,
+                    },
+                );
+            }
+            let loaded = r.session.load(fs).and_then(|()| {
+                let g = r.session.game.as_deref().context("no level")?;
+                Ok(Playing {
+                    scene: Scene::new(&r.gpu, g)?,
+                    intro: 0.0,
+                    boss_bank: None,
+                })
+            });
+            match loaded {
+                Ok(mut p) => {
+                    let Some(game) = r.session.game.as_deref() else {
+                        anyhow::bail!("the level has gone");
+                    };
+                    if let Some(dir) = game.boss_model_dir() {
                         let imgs = hud::boss_meter_images(fs, &dir);
                         p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
-                    } else if p.game.realm() == Some(12) {
+                    } else if game.realm() == Some(12) {
                         // A secret level has no boss: its overlay bank holds the
                         // coin icons.
                         let imgs = hud::coin_images(fs);
                         p.boss_bank = Some(r.hud.load_images(&r.gpu.device, &r.gpu.queue, &imgs));
                     }
-                    match p.game.wave {
-                        Some(TOWER_WAVE) => {
-                            r.progress.entered_tower = true;
-                            r.progress.welcomed |= welcome;
-                        }
-                        Some(w) => r.progress.last_realm = Some(w >> 8),
-                        None => {}
-                    }
                     // A debug save state: the level's changes and the party.
-                    if let Some(st) = r.pending_state.take() {
-                        r.autosaved = p.game.time;
-                        log::info!("state applied: {}", st.summary());
+                    if let Some(st) = state {
+                        r.autosaved = game.time;
+                        log::info!("state applied: {st}");
                     }
                     log::info!("entering {level}");
-                    let streams = p
-                        .game
-                        .wave
-                        .map(|w| p.game.worlds.music(w))
-                        .unwrap_or_default();
+                    let streams = game.wave.map(|w| game.worlds.music(w)).unwrap_or_default();
                     r.music_now = 0;
                     r.music_switch = None;
                     r.music_fade = 1.0;
@@ -797,6 +837,8 @@ impl App {
                 }
                 Err(e) => {
                     log::error!("loading {level}: {e:#}");
+                    r.session.game = None;
+                    r.session.phase = Phase::Idle;
                     r.screen = Screen::Title(Title::default());
                     r.audio.play_select_music(fs);
                 }
@@ -823,7 +865,6 @@ impl App {
         // Fixed-rate simulation and menu input.
         let mut escape = std::mem::take(&mut r.escape);
         let mut next: Option<Screen> = None;
-        let mut menu_shop: Option<(crate::shop::Shop, Vec<PanelInfo>)> = None;
         while r.acc >= TICK && next.is_none() {
             let all: Vec<(Source, PlayerInput)> = r
                 .input
@@ -836,13 +877,14 @@ impl App {
                 // (and the options) remain.
                 r.reset_hold.clear();
                 r.audio.stop();
-                r.progress = Progress::default();
-                r.carry = None;
-                r.checkpoint = None;
+                r.session = Session::new(
+                    self.cfg.rules.clone(),
+                    r.prefs.difficulty,
+                    r.prefs.multiplayer,
+                    Progress::default(),
+                );
                 r.suspended = None;
-                r.heroes = Default::default();
                 r.attract = Attract::new();
-                menu_shop = None;
                 next = Some(Screen::Legal(120));
                 escape = false;
                 r.input.end_frame();
@@ -851,7 +893,7 @@ impl App {
             }
             // The debug menu, while open, has the tick (the game is frozen).
             let debug = if r.watch.is_none() {
-                debug_tick(r, fs, &all, escape, &self.cfg.rules)
+                debug_tick(r, fs, &all, escape)
             } else {
                 None
             };
@@ -873,20 +915,20 @@ impl App {
                     r.saver = None;
                     r.idle = 0;
                     match &r.screen {
-                        Screen::Shop { shop, .. } => {
-                            if let Some(m) = shop.music() {
-                                r.audio.play_bank_music(fs, &m);
+                        Screen::Shop { .. } => {
+                            if let Phase::Shop { shop, .. } = &r.session.phase {
+                                if let Some(m) = shop.music() {
+                                    r.audio.play_bank_music(fs, &m);
+                                }
                             }
                         }
                         Screen::Select(_) => r.audio.play_select_music(fs),
-                        Screen::Playing { play, .. } => {
-                            let streams = play
-                                .game
-                                .wave
-                                .map(|w| play.game.worlds.music(w))
-                                .unwrap_or_default();
-                            if !r.audio.play_streams(fs, &streams) {
-                                r.audio.play_level_music(fs, &play.game.level.name);
+                        Screen::Playing { .. } => {
+                            if let Some(g) = &r.session.game {
+                                let streams = g.wave.map(|w| g.worlds.music(w)).unwrap_or_default();
+                                if !r.audio.play_streams(fs, &streams) {
+                                    r.audio.play_level_music(fs, &g.level.name);
+                                }
                             }
                         }
                         _ => {}
@@ -993,12 +1035,16 @@ impl App {
                         // A new game from the title: a new party with nothing done
                         // (loaded heroes bring theirs in player select), or
                         // what the debug menu set on the title.
-                        r.progress = r.debug.new_game_progress();
-                        r.carry = None;
-                        r.checkpoint = None;
+                        r.session = Session::new(
+                            self.cfg.rules.clone(),
+                            r.prefs.difficulty,
+                            r.prefs.multiplayer,
+                            r.debug.new_game_progress(),
+                        );
+                        r.session.phase = Phase::Select;
                         r.suspended = None;
-                        r.heroes = Default::default();
-                        let party = party_for(&r.card, &None, &r.heroes, &r.progress, &r.prefs);
+                        let s = &r.session;
+                        let party = party_for(&r.card, &None, &s.heroes, &s.progress, &r.prefs);
                         next = Some(Screen::Select(Select::with_first(src).with_party(party)));
                     } else if t.timed_out {
                         r.audio.stop();
@@ -1016,6 +1062,7 @@ impl App {
                     if escape || sel.leave {
                         r.card = sel.card().clone();
                         r.prefs.players = sel.controls();
+                        r.session.phase = Phase::Idle;
                         next = Some(Screen::Title(Title::default()));
                     } else if sel.update(&all).is_some() {
                         r.sources = sel.sources();
@@ -1031,129 +1078,38 @@ impl App {
                             c.activate(info.class);
                             carry[info.slot % 4] = Some(c);
                         }
-                        r.carry = Some(carry);
                         // A loaded hero's achievements join the party's.
-                        sel.merge_progress(&mut r.progress);
-                        r.heroes = sel.heroes();
+                        let mut progress = r.session.progress.clone();
+                        sel.merge_progress(&mut progress);
                         r.card = sel.card().clone();
                         r.prefs.players = sel.controls();
-                        // Player select always leads into the tower.
-                        next = Some(Screen::Loading {
-                            level: "levelL1".into(),
+                        let chosen = Chosen {
                             panels,
-                            shown: false,
-                        });
+                            carry,
+                            heroes: sel.heroes(),
+                            progress,
+                        };
+                        r.session
+                            .command(fs, Decision::PartyChosen(Box::new(chosen)));
                     }
                 }
                 Screen::Loading { .. } => {}
-                Screen::Map {
-                    map,
-                    movie,
-                    level,
-                    panels,
-                    resume,
-                } => {
-                    let done = map.update();
-                    for snd in map.sfx.drain(..) {
-                        r.audio.play(fs, &snd);
+                Screen::Map { .. } => r.session.update(fs, &[]),
+                Screen::Intro { movie } => {
+                    if escape {
+                        r.session.command(fs, Decision::SkipMovie);
+                    } else {
+                        let packed: Vec<_> = all.iter().map(|(_, i)| i.pack()).collect();
+                        r.session.update(fs, &packed);
                     }
-                    if done {
-                        r.audio.stop();
-                        map.release(&mut r.hud);
-                        next = Some(match r.suspended.take().filter(|_| *resume) {
-                            // Back where the secret was found, with what was
-                            // gained there.
-                            Some(mut play) => {
-                                let help_disp = play
-                                    .panels
-                                    .iter()
-                                    .map(|info| {
-                                        r.heroes[info.slot % 4].as_ref().map(|h| h.help_disp)
-                                    })
-                                    .collect();
-                                let p = &r.progress;
-                                let back = PartyBack {
-                                    carried: play.carried_from(&r.carry),
-                                    finds: Some((p.crystals, p.garg_items, p.shards)),
-                                    help_disp,
-                                };
-                                play.command(Command::PartyBack(Box::new(back)));
-                                let streams = play
-                                    .game
-                                    .wave
-                                    .map(|w| play.game.worlds.music(w))
-                                    .unwrap_or_default();
-                                r.audio.play_streams(fs, &streams);
-                                r.last = Instant::now();
-                                Screen::Playing { play, pause: None }
-                            }
-                            None => intro_or_level(fs, &mut r.audio, movie, level, panels),
-                        });
+                    if let (Some(m), Phase::Movie { clock, .. }) = (movie, &r.session.phase) {
+                        m.show(clock.shown);
                     }
                 }
-                Screen::Intro {
-                    movie,
-                    level,
-                    panels,
-                    after,
-                } => {
-                    let inputs: Vec<PlayerInput> = all.iter().map(|(_, i)| *i).collect();
-                    if escape || movie.update(TICK, &inputs) {
-                        r.audio.stop();
-                        next = Some(match after.take() {
-                            Some(s) => {
-                                if let Screen::Shop { shop, .. } = &*s {
-                                    if let Some(m) = shop.music() {
-                                        r.audio.play_bank_music(fs, &m);
-                                    }
-                                }
-                                *s
-                            }
-                            None => Screen::Loading {
-                                level: level.clone(),
-                                panels: panels.clone(),
-                                shown: false,
-                            },
-                        });
-                    }
-                }
-                Screen::Shop {
-                    shop,
-                    panels,
-                    from_menu,
-                } => {
-                    let inputs: Vec<PlayerInput> =
-                        r.sources.iter().map(|s| r.input.read(*s)).collect();
-                    let done = shop.update(&inputs);
-                    for snd in shop.sfx.drain(..) {
-                        r.audio.play(fs, &snd);
-                    }
-                    if done {
-                        // What was bought goes with each player.
-                        let mut carry = r.carry.clone().unwrap_or_default();
-                        for (info, c) in panels.iter().zip(shop.players()) {
-                            carry[info.slot % 4] = Some(c);
-                        }
-                        r.carry = Some(carry);
-                        shop.release(&mut r.hud);
-                        r.audio.stop();
-                        next = Some(match r.suspended.take().filter(|_| *from_menu) {
-                            Some(mut play) => {
-                                let back = PartyBack {
-                                    carried: play.carried_from(&r.carry),
-                                    ..Default::default()
-                                };
-                                play.command(Command::PartyBack(Box::new(back)));
-                                r.audio.play_streams(fs, &["tower".into()]);
-                                Screen::Playing { play, pause: None }
-                            }
-                            None => {
-                                Screen::Select(Select::from_game(panels, &r.sources).with_party(
-                                    party_for(&r.card, &r.carry, &r.heroes, &r.progress, &r.prefs),
-                                ))
-                            }
-                        });
-                    }
+                Screen::Shop { .. } => {
+                    let packed: Vec<_> =
+                        r.sources.iter().map(|s| r.input.read(*s).pack()).collect();
+                    r.session.update(fs, &packed);
                 }
                 Screen::Playing { play, pause } => {
                     let watching = r.watch.is_some();
@@ -1162,11 +1118,34 @@ impl App {
                     }
                     let inputs: Vec<PlayerInput> =
                         r.sources.iter().map(|s| r.input.read(*s)).collect();
-                    let sumner_busy = play
-                        .game
-                        .sumner
-                        .as_ref()
+                    let game = r.session.game.as_deref();
+                    let sumner_busy = game
+                        .and_then(|g| g.sumner.as_ref())
                         .is_some_and(|s| s.controls_locked());
+                    let wave = game.and_then(|g| g.wave);
+                    let scrolling = game.is_some_and(|g| g.scroll_box.is_some());
+                    let active = |i: usize| {
+                        game.and_then(|g| g.players.get(i))
+                            .is_some_and(|p| p.state.active())
+                    };
+                    let joiner = (!watching
+                        && wave == Some(TOWER_WAVE)
+                        && !sumner_busy
+                        && r.sources.len() < 4)
+                        .then(|| {
+                            all.iter()
+                                .find(|(s, i)| {
+                                    !r.sources.contains(s) && (i.start_pressed || i.attack_pressed)
+                                })
+                                .map(|(s, _)| *s)
+                        })
+                        .flatten();
+                    // OptionsStart: a playing player's Start opens the Game Menu,
+                    // or the Tower Menu in the tower.
+                    let opener = (0..inputs.len())
+                        .find(|&i| inputs[i].start_pressed && !sumner_busy && active(i))
+                        .or(escape.then_some(0))
+                        .filter(|_| !watching);
                     if let Some(menu) = pause {
                         // The menu's owner drives it; Esc acts as their Start.
                         let owner = menu_owner(menu);
@@ -1180,8 +1159,8 @@ impl App {
                             OptionsAction::Closed => {
                                 // Leaving Sumner's menu: he waves the party off.
                                 if let Some(h) = pause.as_ref().and_then(|m| m.hints()) {
-                                    r.progress.hints = h.state;
-                                    play.command(Command::HintsClosed);
+                                    r.session.progress.hints = h.state;
+                                    r.session.command(fs, Decision::Game(Command::HintsClosed));
                                 }
                                 *pause = None
                             }
@@ -1189,210 +1168,171 @@ impl App {
                             // "Abort Level?" Yes: everyone is put out of the level
                             // and the party goes back to the tower.
                             OptionsAction::QuitLevel => {
-                                autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
+                                autosave_session(&r.session, &r.sources, &r.input, &r.save_dir);
                                 *pause = None;
-                                play.command(Command::QuitLevel);
+                                r.session.command(fs, Decision::Game(Command::QuitLevel));
                             }
                             OptionsAction::ManageCharacter => {
-                                r.progress = live_progress(play, &r.progress);
-                                let party =
-                                    party_in_game(play, &r.card, &r.heroes, &r.progress, &r.prefs);
-                                next = Some(Screen::Select(
-                                    Select::from_game(&play.panels, &r.sources).with_party(party),
-                                ));
+                                r.session.command(fs, Decision::ManageParty);
                             }
                             // TODO: the shop and the inventory screen (shop.c).
                             OptionsAction::Shop | OptionsAction::Inventory => {
-                                // init_shop(1 / 2) from the tower: the tower waits.
                                 let mode = if action == OptionsAction::Shop {
                                     crate::shop::ShopMode::FromMenu
                                 } else {
                                     crate::shop::ShopMode::Inventory
                                 };
-                                let party: Vec<_> = play
-                                    .panels
-                                    .iter()
-                                    .zip(&play.game.players)
-                                    .map(|(info, p)| (info.clone(), p.carried(), p.carried()))
-                                    .collect();
-                                let shop = crate::shop::Shop::new(
-                                    fs, &r.gpu, &mut r.hud, party, None, mode, false,
-                                );
-                                if let Some(m) = shop.music() {
-                                    r.audio.play_bank_music(fs, &m);
-                                }
                                 *pause = None;
-                                menu_shop = Some((shop, play.panels.clone()));
+                                r.session.command(fs, Decision::OpenShop(mode));
                             }
                             OptionsAction::QuitGame => {
-                                autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
-                                r.audio.stop();
-                                next = Some(game_over_screen(fs));
+                                autosave_session(&r.session, &r.sources, &r.input, &r.save_dir);
+                                r.session.command(fs, Decision::QuitGame);
                             }
                             OptionsAction::None => {}
                         }
                         if !menu_drawing(pause) {
                             *pause = None;
                         }
-                    } else if play.game.scroll_box.is_some() {
-                        // A scroll being read: only its box runs.
-                        match &mut r.watch {
-                            Some(w) => w.step(&mut play.game),
-                            None => play.step(&inputs),
+                        if pause.is_none() {
+                            r.session.command(fs, Decision::Unpause);
                         }
-                    } else if let Some(src) = (!watching
-                        && play.game.wave == Some(TOWER_WAVE)
-                        && !sumner_busy
-                        && r.sources.len() < 4)
-                        .then(|| {
-                            all.iter()
-                                .find(|(s, i)| {
-                                    !r.sources.contains(s) && (i.start_pressed || i.attack_pressed)
-                                })
-                                .map(|(s, _)| *s)
-                        })
-                        .flatten()
-                    {
+                    } else if scrolling {
+                        // A scroll being read: only its box runs.
+                        match (&mut r.watch, r.session.game.as_deref_mut()) {
+                            (Some(w), Some(g)) => w.step(g),
+                            _ => {
+                                let packed: Vec<_> = inputs.iter().map(|i| i.pack()).collect();
+                                r.session.update(fs, &packed);
+                            }
+                        }
+                    } else if let Some(src) = joiner {
                         // check_active_players: a new pad joins in the tower, which
                         // opens player select for it (init_player_select(1)).
-                        r.progress = live_progress(play, &r.progress);
-                        let party = party_in_game(play, &r.card, &r.heroes, &r.progress, &r.prefs);
-                        let mut sel = Select::from_game(&play.panels, &r.sources).with_party(party);
-                        sel.join(src);
-                        next = Some(Screen::Select(sel));
-                    } else if let Some(owner) = (0..inputs.len())
-                        .find(|&i| {
-                            inputs[i].start_pressed
-                                && !sumner_busy
-                                && play.game.players[i].state.active()
-                        })
-                        .or(escape.then_some(0))
-                        .filter(|_| !watching)
-                    {
-                        // OptionsStart: a playing player's Start opens the Game
-                        // Menu, or the Tower Menu in the tower.
+                        r.joining = Some(src);
+                        r.session.command(fs, Decision::ManageParty);
+                    } else if let Some(owner) = opener {
                         r.audio.play(fs, "S_OPTMENUSEL");
-                        let slot = play.panels.get(owner).map_or(owner, |p| p.slot);
-                        *pause = Some(if play.game.wave == Some(TOWER_WAVE) {
+                        let slot = r.session.panels.get(owner).map_or(owner, |p| p.slot);
+                        r.session.command(fs, Decision::Pause(owner));
+                        *pause = Some(if wave == Some(TOWER_WAVE) {
                             Options::tower(owner).with_slot(slot)
                         } else {
                             let mut o = Options::game(owner).with_slot(slot);
                             // No "Quit Level" in the secret levels (realm 0xC).
-                            o.set_quit_level_enabled(!quit_level_disabled(play.game.wave));
+                            o.set_quit_level_enabled(!quit_level_disabled(wave));
                             o
                         });
                     } else {
                         // PlayerControl[i]: each player's Controls options,
                         // kept by panel slot (as select and do_vibe do).
                         for i in 0..4 {
-                            let slot = play.panels.get(i).map_or(i, |p| p.slot);
+                            let slot = r.session.panels.get(i).map_or(i, |p| p.slot);
                             let prefs = r.prefs.players[slot % 4];
-                            if r.watch.is_none() && play.game.controls[i] != prefs {
-                                play.command(Command::SetControls { player: i, prefs });
+                            let differs = r
+                                .session
+                                .game
+                                .as_ref()
+                                .is_some_and(|g| g.controls[i] != prefs);
+                            if !watching && differs {
+                                r.session.command(
+                                    fs,
+                                    Decision::Game(Command::SetControls { player: i, prefs }),
+                                );
                             }
                         }
                         if r.acc < 2.0 * TICK {
                             // interp.rs: the tick being left, if not yet drawn.
-                            play.scene.pre_tick(&r.gpu, &play.game);
-                        }
-                        if r.watch.is_none() && play.game.debug_god != r.debug.god {
-                            play.command(Command::DebugGod(r.debug.god));
-                        }
-                        match &mut r.watch {
-                            Some(w) => w.step(&mut play.game),
-                            None => play.step(&inputs),
-                        }
-                        r.bugs.observe(&play.game, &inputs);
-                        play.intro += TICK;
-                        // Debug save states: an autosave every minute of play.
-                        if play.game.time < r.autosaved {
-                            r.autosaved = play.game.time;
-                        } else if !watching && play.game.time - r.autosaved >= AUTOSAVE_EVERY {
-                            r.autosaved = play.game.time;
-                            autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
-                        }
-                        // do_vibe: only for players with the Vibration option on.
-                        for v in play.game.snd.rumble.drain(..) {
-                            let slot = play.panels.get(v.player).map_or(v.player, |p| p.slot);
-                            if r.prefs.players[slot % 4].rumble {
-                                if let Some(&src) = r.sources.get(v.player) {
-                                    let k = crate::game::sounds::VIBE[v.strength.min(4)];
-                                    r.input.rumble(src, k, v.ticks * 1000 / 60);
-                                }
+                            if let Some(g) = r.session.game.as_deref() {
+                                play.scene.pre_tick(&r.gpu, g);
                             }
                         }
-                        // AudioMusicVolUpdate / AudioSetupLevelStreams: a new music
-                        // area fades the stream out (3/127 a tick; or switches at
-                        // once), plays the area's stream, and fades back in.
-                        let (want, how) = play.game.music_area;
-                        if want != r.music_now && r.music_switch != Some(want) {
-                            r.music_switch = Some(want);
+                        let god = r.session.game.as_ref().is_some_and(|g| g.debug_god);
+                        if !watching && god != r.debug.god {
+                            r.session
+                                .command(fs, Decision::Game(Command::DebugGod(r.debug.god)));
                         }
-                        if let Some(area) = r.music_switch {
-                            if how >= 2 || r.music_fade <= 3.0 / 127.0 {
-                                if let Some(w) = play.game.wave {
-                                    let (streams, n) = play.game.worlds.music_area(w, area);
-                                    if n > 1 {
-                                        r.audio.play_streams(fs, &streams);
+                        match (&mut r.watch, r.session.game.as_deref_mut()) {
+                            (Some(w), Some(g)) => w.step(g),
+                            _ => {
+                                let packed: Vec<_> = inputs.iter().map(|i| i.pack()).collect();
+                                r.session.update(fs, &packed);
+                            }
+                        }
+                        // The level may have just ended.
+                        let mut autosave_due = false;
+                        if let Some(game) = r.session.game.as_deref_mut() {
+                            r.bugs.observe(game, &inputs);
+                            play.intro += TICK;
+                            // Debug save states: an autosave every minute of play.
+                            if game.time < r.autosaved {
+                                r.autosaved = game.time;
+                            } else if !watching && game.time - r.autosaved >= AUTOSAVE_EVERY {
+                                r.autosaved = game.time;
+                                autosave_due = true;
+                            }
+                            // do_vibe: only for players with the Vibration option on.
+                            for v in game.snd.rumble.drain(..) {
+                                let slot =
+                                    r.session.panels.get(v.player).map_or(v.player, |p| p.slot);
+                                if r.prefs.players[slot % 4].rumble {
+                                    if let Some(&src) = r.sources.get(v.player) {
+                                        let k = crate::game::sounds::VIBE[v.strength.min(4)];
+                                        r.input.rumble(src, k, v.ticks * 1000 / 60);
                                     }
                                 }
-                                r.music_now = area;
-                                r.music_switch = None;
-                            } else {
-                                r.music_fade = (r.music_fade - 3.0 / 127.0).max(0.0);
                             }
-                        } else if r.music_fade < 1.0 {
-                            r.music_fade = (r.music_fade + 8.0 / 127.0).min(1.0);
-                        }
-                        r.audio.set_music_fade(r.music_fade);
-                        for (id, name, vol) in play.game.ambient_levels() {
-                            r.audio.ambient(fs, id, name, vol);
-                        }
-                        // Sumner's lectern: HintMenu.
-                        if let Some(pi) = play
-                            .game
-                            .sumner
-                            .as_mut()
-                            .and_then(|s| s.hint_request.take())
-                        {
-                            let hints = crate::hints::Hints::new(
-                                r.progress.hints,
-                                hint_facts(&r.progress, &play.game),
-                                fs.read("TEXT/HINTS_E.ROM")
-                                    .ok()
-                                    .and_then(|d| gdl_formats::text::TextRom::parse(&d).ok()),
-                            );
-                            *pause = Some(Options::hint_menu(pi, hints));
-                        }
-                        if std::mem::take(&mut play.game.world_changed) {
-                            if let Ok(sc) = Scene::new(&r.gpu, &play.game) {
-                                play.scene = sc;
+                            // AudioMusicVolUpdate / AudioSetupLevelStreams: a new music
+                            // area fades the stream out (3/127 a tick; or switches at
+                            // once), plays the area's stream, and fades back in.
+                            let (want, how) = game.music_area;
+                            if want != r.music_now && r.music_switch != Some(want) {
+                                r.music_switch = Some(want);
                             }
+                            if let Some(area) = r.music_switch {
+                                if how >= 2 || r.music_fade <= 3.0 / 127.0 {
+                                    if let Some(w) = game.wave {
+                                        let (streams, n) = game.worlds.music_area(w, area);
+                                        if n > 1 {
+                                            r.audio.play_streams(fs, &streams);
+                                        }
+                                    }
+                                    r.music_now = area;
+                                    r.music_switch = None;
+                                } else {
+                                    r.music_fade = (r.music_fade - 3.0 / 127.0).max(0.0);
+                                }
+                            } else if r.music_fade < 1.0 {
+                                r.music_fade = (r.music_fade + 8.0 / 127.0).min(1.0);
+                            }
+                            r.audio.set_music_fade(r.music_fade);
+                            for (id, name, vol) in game.ambient_levels() {
+                                r.audio.ambient(fs, id, name, vol);
+                            }
+                            if std::mem::take(&mut game.world_changed) {
+                                if let Ok(sc) = Scene::new(&r.gpu, game) {
+                                    play.scene = sc;
+                                }
+                            }
+                        }
+                        if autosave_due {
+                            autosave_session(&r.session, &r.sources, &r.input, &r.save_dir);
                         }
                     }
                 }
+            }
+            for snd in r.session.sfx.drain(..) {
+                crate::bugreport::sound(&snd);
+                r.audio.play(fs, &snd);
+            }
+            if let Some(s) = session_events(r, fs) {
+                next = Some(s);
             }
             escape = false;
             r.input.end_frame();
             r.acc -= TICK;
         }
-        if let Some((shop, panels)) = menu_shop.take() {
-            let old = std::mem::replace(
-                &mut r.screen,
-                Screen::Shop {
-                    shop: Box::new(shop),
-                    panels,
-                    from_menu: true,
-                },
-            );
-            if let Screen::Playing { play, .. } = old {
-                r.suspended = Some(play);
-            }
-        }
         if let Some(s) = next {
-            if !matches!(s, Screen::Playing { .. }) && r.watch.is_none() {
-                keep_recording(r, fs, &self.cfg.rules);
-            }
             // Out of a level, the music plays at full volume again.
             if !matches!(s, Screen::Playing { .. }) {
                 r.music_fade = 1.0;
@@ -1462,9 +1402,22 @@ impl App {
                 // (LOGO_B is placed at (368, -304), off the top of the screen.)
                 s.glow_text(1.0, -256.0, 320.0, "Press Start");
             }
-            Screen::Map { map, .. } => map.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
-            Screen::Shop { shop, .. } => shop.draw(&mut Scr::new(&mut canvas, &r.hud.ui, ticks)),
-            Screen::Intro { movie, .. } => {
+            Screen::Map { map } => {
+                if let Phase::Map { clock, .. } = &r.session.phase {
+                    map.draw(clock, &mut Scr::new(&mut canvas, &r.hud.ui, ticks));
+                }
+            }
+            Screen::Shop { bank } => {
+                if let Phase::Shop { shop, .. } = &r.session.phase {
+                    crate::shop::ShopView { shop, bank }.draw(&mut Scr::new(
+                        &mut canvas,
+                        &r.hud.ui,
+                        ticks,
+                    ));
+                }
+            }
+            Screen::Intro { movie: None } => {}
+            Screen::Intro { movie: Some(movie) } => {
                 if movie.dirty {
                     movie.dirty = false;
                     let (w, h) = movie.size();
@@ -1485,17 +1438,21 @@ impl App {
                 *shown = true;
             }
             Screen::Playing { play, pause } => {
+                let Some(game) = r.session.game.as_deref_mut() else {
+                    frame.present();
+                    return Ok(());
+                };
                 in_game = true;
                 let p = &mut **play;
-                for snd in p.game.sfx.drain(..) {
+                for snd in game.sfx.drain(..) {
                     crate::bugreport::sound(&snd);
                     r.audio.play(fs, &snd);
                 }
                 // fn_80052134: the compass hides while the options are open.
-                p.game.snd.show_compass = r.prefs.compass && pause.is_none();
-                p.scene.sync(&r.gpu, &p.game);
+                game.snd.show_compass = r.prefs.compass && pause.is_none();
+                p.scene.sync(&r.gpu, &*game);
                 // Smooth at any refresh: between the last two ticks (interp.rs).
-                p.scene.blend(&p.game, r.acc / TICK);
+                p.scene.blend(&*game, r.acc / TICK);
                 // The game draws a 4:3 picture; keep it, centred, in any window.
                 let (w, h) = (r.config.width as f32, r.config.height as f32);
                 let k = (w / 512.0).min(h / 384.0);
@@ -1505,37 +1462,37 @@ impl App {
                     512.0 * k,
                     384.0 * k,
                 ];
-                let g = p.scene.globals(&p.game, 4.0 / 3.0);
+                let g = p.scene.globals(&*game, 4.0 / 3.0);
                 r.gpu.render_viewport(
                     &view,
                     &r.depth,
                     &g,
                     CLEAR,
-                    &p.scene.draws(&p.game),
+                    &p.scene.draws(&*game),
                     Some(vp),
                     Some(p.scene.sprites()),
                 );
                 hud::build(
                     &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
-                    &p.game,
-                    &p.panels,
+                    &*game,
+                    &r.session.panels,
                 );
                 hud::build_coins(
                     &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
-                    &p.game,
-                    &p.panels,
+                    &*game,
+                    &r.session.panels,
                     p.boss_bank.as_ref(),
                 );
                 hud::build_boss(
                     &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
-                    &p.game,
+                    &*game,
                     p.boss_bank.as_ref(),
                 );
                 let fade = menu::loading_fade(p.intro);
                 if fade < 255 {
                     menu::transition(&mut Scr::new(&mut canvas, &r.hud.ui, ticks), fade);
                 }
-                if let Some(b) = &p.game.scroll_box {
+                if let Some(b) = &game.scroll_box {
                     menu::draw_scroll(
                         &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
                         b.text(),
@@ -1598,269 +1555,6 @@ impl App {
         frame.present();
         r.frames += 1;
 
-        // A recording being watched goes nowhere when its level ends.
-        if r.watch.is_some() {
-            return Ok(());
-        }
-        if matches!(&r.screen, Screen::Playing { play, .. } if play.game.level_end.is_some()) {
-            keep_recording(r, fs, &self.cfg.rules);
-        }
-        // A finished level: tower portals lead to their level (after its intro
-        // movie); a level leads back to the tower through player select.
-        // A secret icon: the level is kept as it is, to come back to when the
-        // secret level's time runs out (SaveAllRecords / LoadAllRecords).
-        let secret = match &mut r.screen {
-            Screen::Playing { play, .. } => match play.game.level_end {
-                Some(LevelEnd::Secret(w)) => Some(Some(w)),
-                Some(LevelEnd::SecretOver) => Some(None),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(to) = secret {
-            let Screen::Playing { mut play, .. } =
-                std::mem::replace(&mut r.screen, Screen::Legal(0))
-            else {
-                unreachable!()
-            };
-            play.game.level_end = None;
-            bank_heroes(&play.game, &play.panels, &mut r.heroes);
-            if to.is_none() {
-                if let Some(bank) = play.boss_bank.take() {
-                    r.hud.free_bank(bank);
-                }
-            }
-            r.progress.crystals = play.game.crystals;
-            r.progress.garg_items = play.game.garg_items;
-            r.progress.shards = play.game.shards;
-            r.progress.legend = play.game.legend_held;
-            let mut carry: Carry = Default::default();
-            for (p, info) in play.game.players.iter().zip(&play.panels) {
-                carry[info.slot % 4] = Some(p.carried());
-            }
-            r.carry = Some(carry);
-            let panels = play.panels.clone();
-            let map_wave = to.or(play.game.wave).unwrap_or(0xC00);
-            let map = crate::mapscreen::MapScreen::new(
-                fs,
-                &r.gpu,
-                &mut r.hud,
-                &play.game.worlds,
-                map_wave,
-            );
-            r.audio.stop();
-            let level = to.and_then(|w| play.game.worlds.dir(w)).unwrap_or_default();
-            if to.is_some() {
-                r.suspended = Some(play);
-            }
-            r.screen = Screen::Map {
-                map: Box::new(map),
-                movie: String::new(),
-                level,
-                panels,
-                resume: to.is_none(),
-            };
-            return Ok(());
-        }
-        if let Screen::Playing { play, .. } = &mut r.screen {
-            if let Some(end) = play.game.level_end.take() {
-                bank_heroes(&play.game, &play.panels, &mut r.heroes);
-                // Crystals are kept whether or not the level was finished.
-                r.progress.crystals = play.game.crystals;
-                r.progress.garg_items = play.game.garg_items;
-                r.progress.shards = play.game.shards;
-                r.progress.legend = play.game.legend_held;
-                // BossDeath: PlayerGiveRune, the boss's shard (a "rune" in the code).
-                r.progress.runes |= play.game.boss_runes | play.game.runes;
-                if let Some(bank) = play.boss_bank.take() {
-                    r.hud.free_bank(bank);
-                }
-                // A death on a Guardian's level counts as an attempt at it (more
-                // of its hint unlocks).
-                if let Some(w) = play.game.wave.filter(|&w| w != TOWER_WAVE) {
-                    let last = play
-                        .game
-                        .worlds
-                        .realm(w >> 8)
-                        .map_or(0, |r| r.levels.len().saturating_sub(1));
-                    if (w & 0xFF) as usize == last {
-                        for _ in 0..play.game.deaths {
-                            r.progress.record_boss_death(w >> 8);
-                        }
-                    }
-                }
-                if let Some(sm) = &play.game.sumner {
-                    (r.progress.banked_runes, r.progress.banked_shards) = sm.banked();
-                    r.progress.last_beaten = sm.last_beaten();
-                }
-                let checkpoint = r.checkpoint.clone().unwrap_or_default();
-                // Players who died in the level get back what they had at its start.
-                let mut carry: Carry = Default::default();
-                for (p, info) in play.game.players.iter().zip(&play.panels) {
-                    let slot = info.slot % 4;
-                    carry[slot] = match (p.state, &checkpoint[slot]) {
-                        (PlayerState::InTower, Some(c)) => Some(c.clone()),
-                        _ => Some(p.carried()),
-                    };
-                }
-                r.carry = Some(carry);
-                // Players who chose "Quit Game" while dead leave the party.
-                let mut panels = Vec::new();
-                let mut sources = Vec::new();
-                for (i, info) in play.panels.iter().enumerate() {
-                    if play.game.players.get(i).is_some_and(|p| p.quit) {
-                        if let Some(c) = r.carry.as_mut() {
-                            c[info.slot % 4] = None;
-                        }
-                        continue;
-                    }
-                    panels.push(info.clone());
-                    if let Some(s) = r.sources.get(i) {
-                        sources.push(*s);
-                    }
-                }
-                r.sources = sources;
-                if panels.is_empty() {
-                    // Nobody left playing: game over (MG_OVER), then the attract
-                    // loop's fail movie.
-                    r.audio.stop();
-                    r.screen = game_over_screen(fs);
-                    return Ok(());
-                }
-                let wave = play.game.wave;
-                let worlds = std::mem::take(&mut play.game.worlds);
-                let tower = "levelL1".to_string();
-                r.screen = match (wave, end) {
-                    (Some(TOWER_WAVE), LevelEnd::Exit(Some(w))) => {
-                        let level = worlds.dir(w).unwrap_or(tower);
-                        let movie = worlds.level(w).map(|l| l.movie.clone()).unwrap_or_default();
-                        let map =
-                            crate::mapscreen::MapScreen::new(fs, &r.gpu, &mut r.hud, &worlds, w);
-                        match &map.music {
-                            Some(m) => r.audio.play_bank_music(fs, m),
-                            None => r.audio.stop(),
-                        }
-                        Screen::Map {
-                            map: Box::new(map),
-                            movie,
-                            level,
-                            panels,
-                            resume: false,
-                        }
-                    }
-                    (Some(TOWER_WAVE), _) => Screen::Loading {
-                        level: tower,
-                        panels,
-                        shown: false,
-                    },
-                    // Handled above, before the level is torn down.
-                    (_, LevelEnd::Secret(_) | LevelEnd::SecretOver) => unreachable!(),
-                    (_, LevelEnd::AllDead) => Screen::Loading {
-                        level: tower,
-                        panels,
-                        shown: false,
-                    },
-                    (w, LevelEnd::Exit(dest)) => {
-                        if let Some(w) = w {
-                            let (rune, legend) =
-                                worlds.level(w).map_or((0, 0), |l| (l.rune, l.legend));
-                            r.progress.record_beaten(w, rune, legend);
-                        }
-                        match dest.and_then(|d| Some((d, worlds.dir(d)?))) {
-                            // E1 -> E2 and F1 -> F2 chain straight on, through the
-                            // map screen.
-                            Some((d, level)) => {
-                                let movie =
-                                    worlds.level(d).map(|l| l.movie.clone()).unwrap_or_default();
-                                let map = crate::mapscreen::MapScreen::new(
-                                    fs, &r.gpu, &mut r.hud, &worlds, d,
-                                );
-                                match &map.music {
-                                    Some(m) => r.audio.play_bank_music(fs, m),
-                                    None => r.audio.stop(),
-                                }
-                                Screen::Map {
-                                    map: Box::new(map),
-                                    movie,
-                                    level,
-                                    panels,
-                                    resume: false,
-                                }
-                            }
-                            // init_shop(0): the tally and the shop, then player
-                            // select and the tower. After Garm, Final Stats.
-                            None => {
-                                let carry = r.carry.clone().unwrap_or_default();
-                                let start = r.checkpoint.clone().unwrap_or_default();
-                                let party: Vec<_> = panels
-                                    .iter()
-                                    .map(|info| {
-                                        let now = carry[info.slot % 4]
-                                            .clone()
-                                            .unwrap_or_else(crate::game::Carried::new_character);
-                                        let was =
-                                            start[info.slot % 4].clone().unwrap_or(now.clone());
-                                        (info.clone(), now, was)
-                                    })
-                                    .collect();
-                                let shop = crate::shop::Shop::new(
-                                    fs,
-                                    &r.gpu,
-                                    &mut r.hud,
-                                    party,
-                                    w.and_then(|w| worlds.level(w)).cloned(),
-                                    crate::shop::ShopMode::AfterLevel,
-                                    w == Some(0x803),
-                                );
-                                let ending = match w {
-                                    Some(0x601) => "garm",
-                                    Some(0x803) => "victory",
-                                    _ => "",
-                                };
-                                let movie = (!ending.is_empty())
-                                    .then(|| crate::movie::Movie::open(fs, ending).ok())
-                                    .flatten();
-                                match movie {
-                                    // After Skorne in the Underworld, "garm"; after
-                                    // Garm, "victory"; then the shop (gamemain.c).
-                                    Some(mut m) => {
-                                        r.audio.stop();
-                                        if let Some(a) = m.audio.take() {
-                                            r.audio.play_once(
-                                                a.pcm,
-                                                a.channels as u16,
-                                                a.playback_rate,
-                                            );
-                                        }
-                                        Screen::Intro {
-                                            movie: Box::new(m),
-                                            level: String::new(),
-                                            panels: panels.clone(),
-                                            after: Some(Box::new(Screen::Shop {
-                                                shop: Box::new(shop),
-                                                panels,
-                                                from_menu: false,
-                                            })),
-                                        }
-                                    }
-                                    None => {
-                                        match shop.music() {
-                                            Some(m) => r.audio.play_bank_music(fs, &m),
-                                            None => r.audio.stop(),
-                                        }
-                                        Screen::Shop {
-                                            shop: Box::new(shop),
-                                            panels,
-                                            from_menu: false,
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                };
-            }
-        }
         Ok(())
     }
 }
@@ -1874,7 +1568,6 @@ fn debug_tick(
     fs: &GameFs,
     all: &[(Source, PlayerInput)],
     escape: bool,
-    rules: &crate::rules::Rules,
 ) -> Option<Option<Screen>> {
     use crate::debugmenu::{self, Action, Ctx};
     let f1 = r.input.just_pressed(KeyCode::F1);
@@ -1901,19 +1594,23 @@ fn debug_tick(
     }
     r.idle = 0;
     // The menu can change the game: a recording can't follow that.
-    let before = match &r.screen {
-        Screen::Playing { play, .. } => Some(play.game.fingerprint()),
-        _ => None,
-    };
-    let (game, panels) = match &mut r.screen {
-        Screen::Playing { play, .. } => (Some(&mut play.game), Some(&mut play.panels)),
-        _ => (None, None),
+    let in_level = matches!(r.screen, Screen::Playing { .. });
+    let before = r
+        .session
+        .game
+        .as_ref()
+        .filter(|_| in_level)
+        .map(|g| g.fingerprint());
+    let (game, panels) = if in_level {
+        (r.session.game.as_deref_mut(), Some(&mut r.session.panels))
+    } else {
+        (None, None)
     };
     let mut ctx = Ctx {
-        progress: &mut r.progress,
+        progress: &mut r.session.progress,
         game,
         panels,
-        heroes: &mut r.heroes,
+        heroes: &mut r.session.heroes,
         compass: &mut r.prefs.compass,
     };
     if opening.is_some() {
@@ -1927,9 +1624,9 @@ fn debug_tick(
         let inputs: Vec<PlayerInput> = all.iter().map(|(_, i)| *i).collect();
         r.debug.update(&inputs, &mut ctx)
     };
-    if let (Some(before), Screen::Playing { play, .. }) = (before, &mut r.screen) {
-        if play.game.fingerprint() != before {
-            if let Some(rec) = &mut play.recording {
+    if let (Some(before), Some(g)) = (before, r.session.game.as_deref()) {
+        if g.fingerprint() != before {
+            if let Some(rec) = &mut r.session.recording {
                 rec.taint("the debug menu changed the game");
             }
         }
@@ -1941,19 +1638,22 @@ fn debug_tick(
             Some(None)
         }
         Action::Close => {
-            let tower = matches!(&r.screen,
-                Screen::Playing { play, .. } if play.game.wave == Some(TOWER_WAVE));
+            let tower = matches!(r.screen, Screen::Playing { .. })
+                && r.session
+                    .game
+                    .as_ref()
+                    .is_some_and(|g| g.wave == Some(TOWER_WAVE));
             // The tower is reloaded so its portals and barriers follow the
             // progress set.
-            Some((dirty && tower).then(|| debug_warp(r, "levelL1".into())))
+            Some((dirty && tower).then(|| debug_warp(r, fs, "levelL1".into())))
         }
         Action::Warp(level) => {
             r.debug.close();
-            Some(Some(debug_warp(r, level)))
+            Some(Some(debug_warp(r, fs, level)))
         }
         Action::FileBug(tags) => {
             r.debug.tower_dirty = dirty;
-            let res = file_bug(r, fs, &tags, rules);
+            let res = file_bug(r, fs, &tags);
             if let Err(e) = &res {
                 log::warn!("bug report: {e}");
             }
@@ -1975,7 +1675,7 @@ fn debug_tick(
                 Ok(st) => {
                     log::info!("loading state {}: {}", path.display(), st.summary());
                     r.debug.close();
-                    Some(Some(begin_state(r, st)))
+                    Some(Some(begin_state(r, fs, st)))
                 }
                 Err(e) => {
                     r.debug.report(format!("No state {slot}: {e:#}"));
@@ -1991,26 +1691,26 @@ const AUTOSAVE_EVERY: f32 = 60.0;
 
 /// Write a debug save state of the running level to `slot` (or a file).
 fn save_state(r: &Running, slot: &str) -> Result<std::path::PathBuf> {
-    let Screen::Playing { play, .. } = &r.screen else {
+    if !matches!(r.screen, Screen::Playing { .. }) {
         anyhow::bail!("not in a level");
-    };
-    write_state(play, &r.sources, &r.input, &r.progress, &r.save_dir, slot)
+    }
+    write_state(&r.session, &r.sources, &r.input, &r.save_dir, slot)
 }
 
 fn write_state(
-    play: &Playing,
+    session: &Session,
     sources: &[Source],
     input: &Input,
-    progress: &Progress,
     save_dir: &Option<std::path::PathBuf>,
     slot: &str,
 ) -> Result<std::path::PathBuf> {
+    let game = session.game.as_deref().context("not in a level")?;
     let pads = input.pads();
     let names: Vec<String> = sources
         .iter()
         .map(|s| crate::input::source_name(s, &pads))
         .collect();
-    let st = SaveState::capture(&play.game, &play.panels, &names, progress);
+    let st = SaveState::capture(game, &session.panels, &names, &session.progress);
     let path = savestate::resolve(slot, save_dir.as_deref());
     st.write(&path)?;
     Ok(path)
@@ -2019,30 +1719,25 @@ fn write_state(
 /// The autosave slot, written when a level is quit (and every minute of
 /// play), so `--load-state autosave` picks up after a crash or a rebuild.
 fn autosave(r: &Running) {
-    if let Screen::Playing { play, .. } = &r.screen {
-        autosave_play(play, &r.sources, &r.input, &r.progress, &r.save_dir);
+    if matches!(r.screen, Screen::Playing { .. }) {
+        autosave_session(&r.session, &r.sources, &r.input, &r.save_dir);
     }
 }
 
-fn autosave_play(
-    play: &Playing,
+fn autosave_session(
+    session: &Session,
     sources: &[Source],
     input: &Input,
-    progress: &Progress,
     save_dir: &Option<std::path::PathBuf>,
 ) {
+    let Some(game) = session.game.as_deref() else {
+        return;
+    };
     // Not a finished level or a party that is all out of it.
-    if play.game.level_end.is_some() || play.game.players.iter().all(|p| !p.state.active()) {
+    if game.level_end.is_some() || game.players.iter().all(|p| !p.state.active()) {
         return;
     }
-    match write_state(
-        play,
-        sources,
-        input,
-        progress,
-        save_dir,
-        savestate::AUTOSAVE,
-    ) {
+    match write_state(session, sources, input, save_dir, savestate::AUTOSAVE) {
         Ok(p) => log::info!("autosaved {}", p.display()),
         Err(e) => log::warn!("autosave: {e:#}"),
     }
@@ -2050,31 +1745,12 @@ fn autosave_play(
 
 /// Start a debug save state: its party, controllers and progress, then its
 /// level (the changes are applied once it has loaded).
-fn begin_state(r: &mut Running, st: SaveState) -> Screen {
+fn begin_state(r: &mut Running, fs: &GameFs, st: SaveState) -> Screen {
     r.audio.stop();
-    r.suspended = None;
-    if let Screen::Playing { mut play, .. } = std::mem::replace(&mut r.screen, Screen::Legal(0)) {
-        if let Some(bank) = play.boss_bank.take() {
-            r.hud.free_bank(bank);
-        }
-    }
     r.sources = crate::input::bind_sources(&st.heroes, &r.input.pads(), &r.sources);
-    r.progress = st.progress.clone();
-    let mut carry: Carry = Default::default();
-    for h in &st.heroes {
-        carry[h.panel.slot % 4] = Some(h.carried());
-    }
-    r.carry = Some(carry);
-    r.checkpoint = r.carry.clone();
     r.prefs.difficulty = st.difficulty.min(2);
-    let panels: Vec<PanelInfo> = st.heroes.iter().map(|h| h.panel.clone()).collect();
-    let level = st.level.clone();
-    r.pending_state = Some(st);
-    Screen::Loading {
-        level,
-        panels,
-        shown: false,
-    }
+    r.session.begin_state(st);
+    session_events(r, fs).unwrap_or(Screen::Loading { shown: false })
 }
 
 /// The debug menu's "File bug report" (bugreport.rs; not in the original).
@@ -2082,16 +1758,18 @@ fn file_bug(
     r: &mut Running,
     fs: &GameFs,
     tags: &[&'static str],
-    rules: &crate::rules::Rules,
 ) -> std::result::Result<std::path::PathBuf, String> {
-    let compat = local_compat(r, fs, rules)
+    let rules = r.session.rules();
+    let compat = local_compat(r, fs, &rules)
         .map_err(|e| log::warn!("bug report replay: {e:#}"))
         .ok();
-    let replay = match (&r.screen, &compat) {
-        (Screen::Playing { play, .. }, Some(c)) => play
-            .recording
-            .as_ref()
-            .map(|rec| rec.to_text(&play.game, c)),
+    let level = r
+        .session
+        .game
+        .as_deref()
+        .filter(|_| matches!(r.screen, Screen::Playing { .. }));
+    let replay = match (level, &r.session.recording, &compat) {
+        (Some(g), Some(rec), Some(c)) => Some(rec.to_text(g, c)),
         _ => None,
     };
     let root = crate::bugreport::dir().ok_or("no folder for reports")?;
@@ -2102,8 +1780,9 @@ fn file_bug(
             None
         }
     };
-    let (game, panels): (Option<&Game>, &[PanelInfo]) = match &r.screen {
-        Screen::Playing { play, .. } => (Some(&play.game), &play.panels),
+    let (game, panels): (Option<&Game>, &[PanelInfo]) = match (&r.screen, r.session.game.as_deref())
+    {
+        (Screen::Playing { .. }, Some(g)) => (Some(g), &r.session.panels),
         _ => (None, &[]),
     };
     let screen = match &r.screen {
@@ -2123,8 +1802,8 @@ fn file_bug(
     let report = crate::bugreport::Report {
         game,
         panels,
-        progress: Some(&r.progress),
-        heroes: &r.heroes,
+        progress: Some(&r.session.progress),
+        heroes: &r.session.heroes,
         prefs: Some(&r.prefs),
         card_file: r.card.path(),
         tags,
@@ -2141,29 +1820,32 @@ fn bug_screenshot(r: &Running) -> Result<Option<gdl_formats::Image>> {
     let Screen::Playing { play, .. } = &r.screen else {
         return Ok(None);
     };
+    let Some(game) = r.session.game.as_deref() else {
+        return Ok(None);
+    };
     let p = &**play;
     let (w, h) = (1024, 768);
     let ticks = 100;
-    let globals = p.scene.globals(&p.game, 4.0 / 3.0);
+    let globals = p.scene.globals(game, 4.0 / 3.0);
     let draw = |view: &wgpu::TextureView| {
         let mut canvas = hud::Canvas::new(w, h);
         hud::build(
             &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
-            &p.game,
-            &p.panels,
+            game,
+            &r.session.panels,
         );
         hud::build_coins(
             &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
-            &p.game,
-            &p.panels,
+            game,
+            &r.session.panels,
             p.boss_bank.as_ref(),
         );
         hud::build_boss(
             &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
-            &p.game,
+            game,
             p.boss_bank.as_ref(),
         );
-        if let Some(b) = &p.game.scroll_box {
+        if let Some(b) = &game.scroll_box {
             menu::draw_scroll(
                 &mut Scr::new(&mut canvas, &r.hud.ui, ticks),
                 b.text(),
@@ -2177,7 +1859,7 @@ fn bug_screenshot(r: &Running) -> Result<Option<gdl_formats::Image>> {
         h,
         &globals,
         CLEAR,
-        &p.scene.draws(&p.game),
+        &p.scene.draws(game),
         Some(p.scene.sprites()),
         Some(&draw),
     )?;
@@ -2197,34 +1879,14 @@ fn bug_screenshot(r: &Running) -> Result<Option<gdl_formats::Image>> {
 
 /// The debug menu's warp: the party (as it is now) into `level`; from the
 /// title, a Warrior on the controller that opened the menu.
-fn debug_warp(r: &mut Running, level: String) -> Screen {
+fn debug_warp(r: &mut Running, fs: &GameFs, level: String) -> Screen {
     r.audio.stop();
-    r.suspended = None;
-    let panels = match std::mem::replace(&mut r.screen, Screen::Legal(0)) {
-        Screen::Playing { mut play, .. } => {
-            bank_heroes(&play.game, &play.panels, &mut r.heroes);
-            let mut carry: Carry = Default::default();
-            for (p, info) in play.game.players.iter().zip(&play.panels) {
-                carry[info.slot % 4] = Some(p.carried());
-            }
-            r.carry = Some(carry);
-            if let Some(bank) = play.boss_bank.take() {
-                r.hud.free_bank(bank);
-            }
-            play.panels.clone()
-        }
-        _ => {
-            r.sources = vec![r.debug.owner.unwrap_or(Source::Keyboard)];
-            r.carry = None;
-            r.checkpoint = None;
-            panels_for(&[("WAR".into(), "RED".into())])
-        }
-    };
-    Screen::Loading {
-        level,
-        panels,
-        shown: false,
+    if r.session.game.is_none() {
+        r.sources = vec![r.debug.owner.unwrap_or(Source::Keyboard)];
     }
+    r.session
+        .warp(level, || panels_for(&[("WAR".into(), "RED".into())]));
+    session_events(r, fs).unwrap_or(Screen::Loading { shown: false })
 }
 
 fn panels_for(players: &[(String, String)]) -> Vec<PanelInfo> {
@@ -2239,54 +1901,6 @@ fn panels_for(players: &[(String, String)]) -> Vec<PanelInfo> {
             hidden: None,
         })
         .collect()
-}
-
-/// What the session starts this level from.
-fn level_start(
-    r: &Running,
-    level: &str,
-    panels: Vec<PanelInfo>,
-    rules: &crate::rules::Rules,
-) -> LevelStart {
-    let hero = |info: &PanelInfo| r.heroes[info.slot % 4].as_ref();
-    let saved_exp = panels
-        .iter()
-        .filter_map(hero)
-        .flat_map(|h| h.classes.iter())
-        .filter_map(|c| c.carried.as_ref().map(|k| k.exp))
-        .collect();
-    let mut help_disp = [None; 4];
-    for info in &panels {
-        help_disp[info.slot % 4] = hero(info).map(|h| h.help_disp);
-    }
-    LevelStart {
-        level: level.to_string(),
-        difficulty: r.prefs.difficulty,
-        panels,
-        carry: r.carry.clone().unwrap_or_default(),
-        help_disp,
-        setup: LevelSetup::new(rules, r.prefs.multiplayer, &r.progress),
-        progress: r.progress.clone(),
-        saved_exp,
-        state: r.pending_state.clone(),
-    }
-}
-
-/// The level, ready to draw, and whether Sumner's welcome is due in it.
-fn start_level(fs: &GameFs, gpu: &Gpu, start: &LevelStart) -> Result<(Playing, bool)> {
-    let (game, welcome) = start.build(fs)?;
-    let scene = Scene::new(gpu, &game)?;
-    Ok((
-        Playing {
-            game,
-            scene,
-            panels: start.panels.clone(),
-            intro: 0.0,
-            boss_bank: None,
-            recording: None,
-        },
-        welcome,
-    ))
 }
 
 pub fn run(cfg: Config) -> Result<()> {
@@ -2335,37 +1949,6 @@ fn game_over_screen(fs: &GameFs) -> Screen {
         .and_then(|r| r.messages.get(169).and_then(|m| m.lines.first().cloned()))
         .unwrap_or_else(|| "GAME OVER".into());
     Screen::GameOver { ticks: 0, text }
-}
-
-/// init_gamemovie: the level's intro movie if it has one, else straight to it.
-fn intro_or_level(
-    fs: &GameFs,
-    audio: &mut Audio,
-    movie: &str,
-    level: &str,
-    panels: &[PanelInfo],
-) -> Screen {
-    let intro = (!movie.is_empty())
-        .then(|| crate::movie::Movie::open(fs, movie).ok())
-        .flatten();
-    match intro {
-        Some(mut m) => {
-            if let Some(a) = m.audio.take() {
-                audio.play_once(a.pcm, a.channels as u16, a.playback_rate);
-            }
-            Screen::Intro {
-                movie: Box::new(m),
-                level: level.to_string(),
-                panels: panels.to_vec(),
-                after: None,
-            }
-        }
-        None => Screen::Loading {
-            level: level.to_string(),
-            panels: panels.to_vec(),
-            shown: false,
-        },
-    }
 }
 
 /// What Sumner's hint pickers ask about the party.
@@ -2437,14 +2020,7 @@ fn attract_event(
                 game.cam_focus = cam.view().1;
                 let scene = Scene::new(gpu, &game)?;
                 Ok(Screen::Flyby {
-                    play: Box::new(Playing {
-                        game,
-                        scene,
-                        panels: Vec::new(),
-                        intro: 0.0,
-                        boss_bank: None,
-                        recording: None,
-                    }),
+                    play: Box::new(FlybyPlay { game, scene }),
                     cam: Box::new(cam),
                     ticks: 0,
                 })
@@ -2465,6 +2041,8 @@ fn attract_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::setup::LevelStart;
+    use crate::save::HeroSave;
 
     fn data() -> Option<GameFs> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game-data");
@@ -2485,6 +2063,7 @@ mod tests {
     /// character without its cheats; and what they bring back.
     #[test]
     fn heroes_go_into_a_level_and_back() {
+        use crate::session::bank_heroes;
         let Some(fs) = data() else { return };
         let panels = [
             panel(0, "BOB", 16, None),
@@ -2581,16 +2160,5 @@ mod tests {
         assert!(quit_level_disabled(Some(0xC02)));
         assert!(!quit_level_disabled(Some(0x102)));
         assert!(!quit_level_disabled(None));
-    }
-
-    #[test]
-    fn checkpoints_skip_two_waves_and_the_secret_levels() {
-        assert!(checkpoint_at(Some(0x500)));
-        assert!(checkpoint_at(Some(0x502)));
-        assert!(!checkpoint_at(Some(0x501)));
-        assert!(!checkpoint_at(Some(0x601)));
-        assert!(!checkpoint_at(Some(0xC03)));
-        assert!(checkpoint_at(Some(0xD00)));
-        assert!(checkpoint_at(None));
     }
 }

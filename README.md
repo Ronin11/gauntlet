@@ -91,6 +91,16 @@ gauntlet --compat
 cargo test -p gdl-sim --release -- --ignored every_level
 ```
 
+### The session
+
+Everything from the party's first level to game over runs in `gdl_sim::session::Session`:
+the party and what it carries, level ends, the shop, the map and movie timing, secret levels
+and the freeze of a pause. It moves only on one tick's inputs and on recorded decisions, it can
+be cloned, and `Session::digest` fingerprints it, so peers walking the same road stay the same.
+The engine draws what it reads back and acts on the events the session reports. Player select
+and the pause menu stay in the engine, since they read a player's own memory card and options;
+they report what was chosen as decisions.
+
 ## Replays
 
 A level's recording is how it started and what every player pressed. Played on the same

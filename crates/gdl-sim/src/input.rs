@@ -44,6 +44,42 @@ pub struct PlayerInput {
     pub inv: crate::powerups::DPad,
 }
 
+/// controls.c rep_speed: ticks between auto-repeats while a direction is held.
+const REP_SPEED: [u32; 13] = [30, 20, 10, 6, 3, 3, 3, 3, 2, 2, 2, 2, 1];
+
+/// Directions with the game's auto-repeat edges (PlayerControls).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Repeat {
+    held: (i32, i32),
+    count: u32,
+    index: usize,
+}
+
+impl Repeat {
+    /// This tick's presses and repeats: (x, y) each -1, 0 or 1, y = 1 meaning up.
+    pub fn edges(&mut self, input: &PlayerInput) -> (i32, i32) {
+        let q = |v: f32| (v > 0.5) as i32 - (v < -0.5) as i32;
+        let now = (q(input.stick.x), q(input.stick.y));
+        if now == (0, 0) || now != self.held {
+            let e = (
+                if now.0 != self.held.0 { now.0 } else { 0 },
+                if now.1 != self.held.1 { now.1 } else { 0 },
+            );
+            self.held = now;
+            self.count = 0;
+            self.index = 0;
+            return e;
+        }
+        self.count += 1;
+        if self.count >= REP_SPEED[self.index] {
+            self.count -= REP_SPEED[self.index];
+            self.index = (self.index + 1).min(REP_SPEED.len() - 1);
+            return now;
+        }
+        (0, 0)
+    }
+}
+
 /// One player's input for one tick, as it travels and is recorded: what the
 /// simulation actually sees. Sticks have 255 positions, as a GameCube pad's do,
 /// so two machines (or a replay) can't differ in a stick's last bits.
