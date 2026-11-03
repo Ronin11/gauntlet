@@ -26,6 +26,7 @@
 //!   which the status panels cover), and is centred in that window.
 
 use crate::game::{Game, PlayerState};
+use crate::math::Det as _;
 use glam::{Mat4, Vec3};
 use std::f32::consts::PI;
 
@@ -70,7 +71,7 @@ pub fn wrap(a: f32) -> f32 {
 /// tan of half the horizontal and the vertical view angles. MBWindowZoom:
 /// hang = 2 atan(0.75 * height / 448 * tan(ang / 2)) for the 384-line window.
 pub fn half_tans() -> (f32, f32) {
-    let th = (FOV_H * 0.5).tan();
+    let th = (FOV_H * 0.5).det_tan();
     (th, 0.75 * ((SCREEN_H - STRIP) / SCREEN_H) * th)
 }
 
@@ -81,7 +82,7 @@ pub fn projection(aspect: f32, near: f32, far: f32) -> Mat4 {
     let (_, tv) = half_tans();
     // The whole screen's half-height in tan units.
     let full = tv * SCREEN_H / (SCREEN_H - STRIP);
-    let fovy = 2.0 * full.atan();
+    let fovy = 2.0 * full.det_atan();
     let shift = STRIP / SCREEN_H;
     Mat4::from_translation(Vec3::new(0.0, shift, 0.0))
         * Mat4::perspective_rh(fovy, aspect, near, far)
@@ -94,9 +95,9 @@ pub const NEAR: f32 = 1.0;
 /// pitch looks down.
 pub fn look_dir(yaw: f32, pitch: f32) -> Vec3 {
     Vec3::new(
-        yaw.sin() * pitch.cos(),
-        pitch.sin(),
-        yaw.cos() * pitch.cos(),
+        yaw.det_sin() * pitch.det_cos(),
+        pitch.det_sin(),
+        yaw.det_cos() * pitch.det_cos(),
     )
 }
 
@@ -125,7 +126,7 @@ pub fn look_basis(dir: Vec3) -> (Vec3, Vec3, Vec3) {
 /// one CamLimitPlayerDpos tests with the feet.
 pub fn frustum_normals(look: Vec3, yaw: f32) -> [Vec3; 4] {
     // YawVec3((-1, 0, 0), -yaw).
-    let side = Vec3::new(-yaw.cos(), 0.0, yaw.sin());
+    let side = Vec3::new(-yaw.det_cos(), 0.0, yaw.det_sin());
     let c = look.cross(side);
     let (th, tv) = half_tans();
     let (h, v) = (side * th, c * tv);
@@ -864,7 +865,7 @@ impl Game {
     /// frustum of a camera `view_scale` back from the boss camera's attention
     /// point, along its look direction.
     pub(crate) fn boss_frustum(attn: Vec3, fwd: Vec3, view_scale: f32) -> Frustum {
-        let yaw = fwd.x.atan2(fwd.z);
+        let yaw = fwd.x.det_atan2(fwd.z);
         Frustum {
             eye: attn - fwd * view_scale,
             planes: frustum_normals(fwd, yaw),
@@ -898,7 +899,7 @@ mod tests {
         let (th, tv) = half_tans();
         assert!((th - 0.577_35).abs() < 1e-4);
         // hang = 2 atan(0.642857 tan 30) = 40.73 degrees.
-        assert!((2.0 * tv.atan() - 40.73f32.to_radians()).abs() < 1e-3);
+        assert!((2.0 * tv.det_atan() - 40.73f32.to_radians()).abs() < 1e-3);
         // The axis lands 1/7 above the screen centre; the window's top edge
         // at the screen's top.
         let p = projection(4.0 / 3.0, 1.0, 100.0);
@@ -1155,7 +1156,7 @@ impl Shake {
             return;
         }
         let a = SHAKE_FREQ * self.delay as f32;
-        let d = Vec3::new(self.rad * a.cos(), 0.0, self.rad * a.sin());
+        let d = Vec3::new(self.rad * a.det_cos(), 0.0, self.rad * a.det_sin());
         if self.kind != 1 {
             *at += d;
         }

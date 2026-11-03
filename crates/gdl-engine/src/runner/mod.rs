@@ -89,7 +89,11 @@ fn parse(args: &[String]) -> Result<Opts> {
     let mut it = args.iter();
     let mut spec = String::new();
     while let Some(a) = it.next() {
-        let mut val = || it.next().cloned().with_context(|| format!("{a} needs a value"));
+        let mut val = || {
+            it.next()
+                .cloned()
+                .with_context(|| format!("{a} needs a value"))
+        };
         match a.as_str() {
             "--run-level" => spec = val()?,
             "--runner-party" => {
@@ -116,8 +120,14 @@ fn parse(args: &[String]) -> Result<Opts> {
                     .split([',', ':'])
                     .map(|x| x.trim().parse())
                     .collect::<Result<_, _>>()?;
-                anyhow::ensure!(p.len() >= 6 && p.len() % 3 == 0, "--runner-probe x,y,z:x,y,z[:x,y,z...]");
-                let v: Vec<glam::Vec3> = p.chunks(3).map(|c| glam::Vec3::new(c[0], c[1], c[2])).collect();
+                anyhow::ensure!(
+                    p.len() >= 6 && p.len() % 3 == 0,
+                    "--runner-probe x,y,z:x,y,z[:x,y,z...]"
+                );
+                let v: Vec<glam::Vec3> = p
+                    .chunks(3)
+                    .map(|c| glam::Vec3::new(c[0], c[1], c[2]))
+                    .collect();
                 o.probe = Some((v[0], v[1..].to_vec()));
             }
             "--mute" => {}
@@ -128,7 +138,11 @@ fn parse(args: &[String]) -> Result<Opts> {
             other => anyhow::bail!("--run-level: unknown argument {other}\n{HELP}"),
         }
     }
-    o.levels = spec.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    o.levels = spec
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     anyhow::ensure!(!o.levels.is_empty(), "--run-level needs a level\n{HELP}");
     Ok(o)
 }
@@ -170,7 +184,8 @@ fn run(o: &Opts) -> Result<()> {
     for level in &levels {
         let t0 = std::time::Instant::now();
         let fsr = &fs;
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_level(fsr, o, level)));
+        let res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_level(fsr, o, level)));
         let r = match res {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => RunResult::failed(level, o, "load_error", format!("{e:#}"), t0),
@@ -189,7 +204,9 @@ fn run(o: &Opts) -> Result<()> {
             r.outcome_detail(),
             r.game_time,
             r.wall_secs,
-            r.god.as_ref().map_or(String::new(), |g| format!(" [god mode: {g}]"))
+            r.god
+                .as_ref()
+                .map_or(String::new(), |g| format!(" [god mode: {g}]"))
         );
         write_result(&o.out, &r)?;
     }
@@ -214,7 +231,11 @@ impl RunResult {
         }
     }
     fn outcome_tag(&self) -> String {
-        if let Some(t) = self.notes.first().filter(|n| *n == "crash" || *n == "load_error") {
+        if let Some(t) = self
+            .notes
+            .first()
+            .filter(|n| *n == "crash" || *n == "load_error")
+        {
             return t.clone();
         }
         let mut t = self.outcome.tag().to_string();
@@ -232,13 +253,20 @@ impl RunResult {
 }
 
 fn party_name(p: &[(String, String)]) -> String {
-    p.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>().join("+")
+    p.iter()
+        .map(|(c, _)| c.as_str())
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// Play one level to its end.
 pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
     let t0 = std::time::Instant::now();
-    let classes: Vec<(&str, &str)> = o.party.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let classes: Vec<(&str, &str)> = o
+        .party
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
     let mut g = match &o.state {
         Some(p) => crate::savestate::SaveState::read(p)?.load_game(fs)?,
         None => Game::new(fs, level, &classes)?,
@@ -266,7 +294,10 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
     let mut reports = Vec::new();
     let mut notes = Vec::new();
     if let Some(w) = g.wave {
-        let title = g.worlds.level(w).map_or(String::new(), |l| format!("{} {}", l.prep, l.title));
+        let title = g
+            .worlds
+            .level(w)
+            .map_or(String::new(), |l| format!("{} {}", l.prep, l.title));
         notes.push(format!("wave {w:#x} \"{}\"", title.trim()));
     }
     if g.boss.is_some() {
@@ -277,22 +308,21 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
     }
     let mut captured = 0;
     let n = g.players.len();
-    let dbg_from: Option<f32> = std::env::var("GDL_RUNNER_DEBUG").ok().and_then(|v| v.parse().ok());
+    let dbg_from: Option<f32> = std::env::var("GDL_RUNNER_DEBUG")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let save_at: Option<(f32, String)> = std::env::var("GDL_RUNNER_SAVE").ok().and_then(|v| {
         let (t, f) = v.split_once(':')?;
         Some((t.parse().ok()?, f.to_string()))
     });
     let outcome = loop {
         // A scroll's text box pauses the game until B.
-        if let Some(b) = &mut g.scroll_box {
-            let press = b.ticks >= 20;
+        if let Some(b) = &g.scroll_box {
             let inp = PlayerInput {
-                b_pressed: press,
+                b_pressed: b.ticks >= 20,
                 ..Default::default()
             };
-            if b.update(&vec![inp; n]) {
-                g.scroll_box = None;
-            }
+            g.update(&vec![inp; n]);
             continue;
         }
         let inputs = match bot.inputs(&mut g) {
@@ -314,7 +344,15 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
             crate::bugreport::event("runner", msg);
             if o.capture && captured < 4 {
                 captured += 1;
-                if let Ok(p) = capture(fs, &g, &mut bot, o, &level_dir, "boss not beaten", &["other"]) {
+                if let Ok(p) = capture(
+                    fs,
+                    &g,
+                    &mut bot,
+                    o,
+                    &level_dir,
+                    "boss not beaten",
+                    &["other"],
+                ) {
                     reports.push(p);
                 }
             }
@@ -347,7 +385,7 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
                 println!("saved state {f} at t={:.1}", g.time);
             }
         }
-        g.update(1.0 / 60.0, &inputs);
+        g.update(&inputs);
         rec.observe(&g, &inputs);
         for s in g.sfx.drain(..) {
             crate::bugreport::sound(&s);
@@ -382,7 +420,10 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
         }
     }
     if let Some(l) = bot.lectern_ok {
-        notes.push(format!("lectern: {}", if l { "hint menu opened" } else { "FAILED" }));
+        notes.push(format!(
+            "lectern: {}",
+            if l { "hint menu opened" } else { "FAILED" }
+        ));
     }
     if !bot.portals_reachable.is_empty() {
         notes.push(format!("portals: {}", bot.portals_reachable.join(" ")));
@@ -407,7 +448,7 @@ pub fn run_level(fs: &GameFs, o: &Opts, level: &str) -> Result<RunResult> {
 fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
     let ignore = nav::HashSet::default();
     g.players[0].pos = from;
-    g.update(1.0 / 60.0, &vec![PlayerInput::default(); g.players.len()]);
+    g.update(&vec![PlayerInput::default(); g.players.len()]);
     let start = g.players[0].pos;
     let w = nav::WalkWorld {
         col: &g.collision,
@@ -417,12 +458,17 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
         cracks: Default::default(),
     };
     // GDL_NAV_NODES=r: the nav nodes within r of the target and their edges.
-    if let Some(r) = std::env::var("GDL_NAV_NODES").ok().and_then(|v| v.parse::<f32>().ok()) {
+    if let Some(r) = std::env::var("GDL_NAV_NODES")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
         let mut nv = nav::Nav::new(g);
         let ids: Vec<u32> = (0..nv.nodes.len() as u32)
             .filter(|&n| {
                 let p = nv.nodes[n as usize].pos;
-                nv.nodes[n as usize].alive && nav::xz(p - to).length() < r && (p.y - to.y).abs() < 4.0
+                nv.nodes[n as usize].alive
+                    && nav::xz(p - to).length() < r
+                    && (p.y - to.y).abs() < 4.0
             })
             .collect();
         for n in ids {
@@ -435,7 +481,13 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
                     format!("({:.1},{:.1},{:.1})", q.x, q.y, q.z)
                 })
                 .collect();
-            println!("  node {n} ({:.2},{:.2},{:.2}) -> {}", p.x, p.y, p.z, e.join(" "));
+            println!(
+                "  node {n} ({:.2},{:.2},{:.2}) -> {}",
+                p.x,
+                p.y,
+                p.z,
+                e.join(" ")
+            );
         }
     }
     // GDL_NAV_HMAP=x0,z0,x1,z1: an ASCII map of the floor heights (the
@@ -471,12 +523,17 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
             let (a, b, c) = (nav::xz(t.v[0]), nav::xz(t.v[1]), nav::xz(t.v[2]));
             let s = |p0: glam::Vec2, p1: glam::Vec2| (p1 - p0).perp_dot(p - p0);
             let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
-            let inside = !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0));
+            let inside =
+                !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0));
             if inside {
                 println!(
                     "  tri {k} owner {} ({}) n {:?} enabled {} stairs {} v {:?}",
                     t.owner,
-                    g.level.worlds.world_objects.get(t.owner.max(0) as usize).map_or("?", |o| o.name.as_str()),
+                    g.level
+                        .worlds
+                        .world_objects
+                        .get(t.owner.max(0) as usize)
+                        .map_or("?", |o| o.name.as_str()),
                     t.n,
                     g.collision.enabled[k],
                     g.collision.stairs[k],
@@ -486,7 +543,10 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
         }
     }
     let sim = w.walk(start, to);
-    println!("probe: start {start:?} -> {to:?}; nav simulation ends at {sim:?} (walks: {})", w.walks(start, to));
+    println!(
+        "probe: start {start:?} -> {to:?}; nav simulation ends at {sim:?} (walks: {})",
+        w.walks(start, to)
+    );
     for t in 0..240 {
         let p = g.players[0].pos;
         let d = nav::xz(to - p);
@@ -497,9 +557,12 @@ fn probe(g: &mut Game, from: glam::Vec3, to: glam::Vec3) {
         let stick = g.stick_toward(d.normalize_or_zero());
         let mut inp = vec![PlayerInput::default(); g.players.len()];
         inp[0].stick = stick;
-        g.update(1.0 / 60.0, &inp);
+        g.update(&inp);
         if t % 10 == 0 {
-            println!("  tick {t}: {:?} act {}", g.players[0].pos, g.players[0].act.cur);
+            println!(
+                "  tick {t}: {:?} act {}",
+                g.players[0].pos, g.players[0].act.cur
+            );
         }
     }
     println!("probe: game ends at {:?}", g.players[0].pos);
@@ -542,7 +605,11 @@ fn capture(
     let dir = crate::bugreport::file(&bugs, &report, img.as_ref())?;
     std::fs::write(
         dir.join("runner.md"),
-        format!("# Level runner\n\n**{what}**\n\nParty {}\n\n{}", party_name(&o.party), bot.note(g)),
+        format!(
+            "# Level runner\n\n**{what}**\n\nParty {}\n\n{}",
+            party_name(&o.party),
+            bot.note(g)
+        ),
     )?;
     let st = crate::savestate::SaveState::capture(g, &[], &[], &progress);
     st.write(&dir.join("stuck.state"))?;
@@ -562,8 +629,14 @@ fn panels(party: &[(String, String)]) -> Vec<crate::hud::PanelInfo> {
         .map(|(slot, (c, col))| crate::hud::PanelInfo {
             slot,
             name: ["SAM", "BOB", "ANN", "JO"][slot % 4].into(),
-            colour: crate::select::COLOURS.iter().position(|k| k == col).unwrap_or(slot % 4),
-            class: crate::select::CLASSES.iter().position(|k| k == c).unwrap_or(0),
+            colour: crate::select::COLOURS
+                .iter()
+                .position(|k| k == col)
+                .unwrap_or(slot % 4),
+            class: crate::select::CLASSES
+                .iter()
+                .position(|k| k == c)
+                .unwrap_or(0),
             hidden: None,
         })
         .collect()
@@ -585,7 +658,11 @@ fn headless_gpu() -> Result<std::rc::Rc<crate::gpu::Gpu>> {
     }))?;
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
-    let gpu = std::rc::Rc::new(crate::gpu::Gpu::new(device, queue, wgpu::TextureFormat::Rgba8Unorm));
+    let gpu = std::rc::Rc::new(crate::gpu::Gpu::new(
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ));
     GPU.with(|c| *c.borrow_mut() = Some(gpu.clone()));
     Ok(gpu)
 }
@@ -597,11 +674,20 @@ fn render(fs: &GameFs, g: &Game, party: &[(String, String)]) -> Result<gdl_forma
     sc.sync(&gpu, g);
     let (w, h) = (960u32, 540u32);
     let globals = sc.globals(g, w as f32 / h as f32);
-    let hud = crate::hud::Hud::new(&gpu.device, &gpu.queue, gpu.color_format, crate::ui::UiAssets::load(fs));
+    let hud = crate::hud::Hud::new(
+        &gpu.device,
+        &gpu.queue,
+        gpu.color_format,
+        crate::ui::UiAssets::load(fs),
+    );
     let panels = panels(party);
     let draw_hud = |view: &wgpu::TextureView| {
         let mut canvas = crate::hud::Canvas::new(w, h);
-        crate::hud::build(&mut crate::screen::Scr::new(&mut canvas, &hud.ui, 100), g, &panels);
+        crate::hud::build(
+            &mut crate::screen::Scr::new(&mut canvas, &hud.ui, 100),
+            g,
+            &panels,
+        );
         hud.draw(&gpu.device, &gpu.queue, view, &canvas);
     };
     gpu.render_to_image(
@@ -618,7 +704,10 @@ fn render(fs: &GameFs, g: &Game, party: &[(String, String)]) -> Result<gdl_forma
 // ---- results ----------------------------------------------------------------
 
 fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\t', " ")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', " ")
 }
 
 fn write_result(out: &Path, r: &RunResult) -> Result<()> {
@@ -663,23 +752,39 @@ fn write_result(out: &Path, r: &RunResult) -> Result<()> {
 pub fn merge(out: &Path) -> Result<PathBuf> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut jsons = Vec::new();
-    let mut dirs: Vec<_> = std::fs::read_dir(out)?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    let mut dirs: Vec<_> = std::fs::read_dir(out)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
     dirs.sort();
     for d in dirs {
         let mut files: Vec<_> = std::fs::read_dir(&d)?.flatten().map(|e| e.path()).collect();
         files.sort();
         for f in files {
-            let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let name = f
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             if name.starts_with("result-") && name.ends_with(".tsv") {
                 let s = std::fs::read_to_string(&f)?;
-                rows.push(s.trim_end_matches('\n').split('\t').map(String::from).collect());
+                rows.push(
+                    s.trim_end_matches('\n')
+                        .split('\t')
+                        .map(String::from)
+                        .collect(),
+                );
             } else if name.starts_with("result-") && name.ends_with(".json") {
                 jsons.push(std::fs::read_to_string(&f)?.trim().to_string());
             }
         }
     }
     let ok = |r: &Vec<String>| r.get(2).is_some_and(|t| t.starts_with("completed"));
-    let clean = rows.iter().filter(|r| r.get(2).is_some_and(|t| t == "completed")).count();
+    let clean = rows
+        .iter()
+        .filter(|r| r.get(2).is_some_and(|t| t == "completed"))
+        .count();
     let mut md = format!(
         "# Level runner summary\n\n{} runs: {} completed ({} without god mode or debug kills), {} failed.\n\n| level | party | result | game s | objectives used | god mode | detail / notes | reports |\n|---|---|---|---|---|---|---|---|\n",
         rows.len(),
@@ -687,20 +792,41 @@ pub fn merge(out: &Path) -> Result<PathBuf> {
         clean,
         rows.iter().filter(|r| !ok(r)).count()
     );
-    let mut tsv = String::from("level\tparty\tresult\tgame_s\twall_s\tobjectives\tgod\tdetail\tnotes\treports\n");
+    let mut tsv = String::from(
+        "level\tparty\tresult\tgame_s\twall_s\tobjectives\tgod\tdetail\tnotes\treports\n",
+    );
     for r in &rows {
         let f = |i: usize| r.get(i).cloned().unwrap_or_default().replace('|', "/");
         let objs = f(5);
-        let objs = if objs.len() > 120 { format!("{}...", &objs[..objs.floor_char_boundary(120)]) } else { objs };
-        let detail = [f(7), f(8)].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("; ");
+        let objs = if objs.len() > 120 {
+            format!("{}...", &objs[..objs.floor_char_boundary(120)])
+        } else {
+            objs
+        };
+        let detail = [f(7), f(8)]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
         md += &format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
-            f(0), f(1), f(2), f(3), objs, f(6), detail, f(9)
+            f(0),
+            f(1),
+            f(2),
+            f(3),
+            objs,
+            f(6),
+            detail,
+            f(9)
         );
         tsv += &(r.join("\t") + "\n");
     }
     std::fs::write(out.join("summary.tsv"), tsv)?;
-    std::fs::write(out.join("summary.json"), format!("[\n{}\n]\n", jsons.join(",\n")))?;
+    std::fs::write(
+        out.join("summary.json"),
+        format!("[\n{}\n]\n", jsons.join(",\n")),
+    )?;
     let p = out.join("summary.md");
     std::fs::write(&p, md)?;
     Ok(p)
@@ -740,7 +866,7 @@ mod tests {
         let Some(fs) = data() else { return };
         let mut g = Game::new(&fs, "levelB1", &[("WAR", "RED")]).unwrap();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let from = g.players[0].pos;
         let to = from + glam::Vec3::new(6.0, 0.0, 0.0);
@@ -762,7 +888,7 @@ mod tests {
                 stick: g.stick_toward(d.normalize_or_zero()),
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, &[inp]);
+            g.update(&[inp]);
         }
         let game = g.players[0].pos;
         assert!(

@@ -281,7 +281,7 @@ impl Game {
             .and_then(|t| t.parse::<usize>().ok())
         {
             let p = &self.players[0];
-            let at = p.pos + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * 6.0;
+            let at = p.pos + Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos()) * 6.0;
             let dmg = 10.0 * self.tuning.trap_damage;
             self.start_explosion(at, ty, dmg);
             return true;
@@ -299,7 +299,7 @@ impl Game {
             return false;
         };
         let p = &self.players[0];
-        let at = p.pos + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * 4.0 + Vec3::Y * 2.0;
+        let at = p.pos + Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos()) * 4.0 + Vec3::Y * 2.0;
         let yaw = p.yaw;
         self.start_fx(row, at, yaw, 0.0).is_some()
     }
@@ -486,7 +486,7 @@ mod tests {
 
     fn tick(g: &mut Game, n: usize) {
         for _ in 0..n {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
     }
 

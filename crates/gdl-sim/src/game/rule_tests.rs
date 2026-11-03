@@ -105,13 +105,13 @@ fn only_a_locked_chest_takes_a_key() {
     };
     let (mut g, id) = by_a_chest(&fs, true);
     for _ in 0..5 {
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     assert!(opened(&g, id));
     assert_eq!(g.players[0].keys, 0);
     let (mut g, id) = by_a_chest(&fs, false);
     for _ in 0..5 {
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     assert!(!opened(&g, id));
     assert_eq!(g.players[0].keys, 1);
@@ -129,21 +129,121 @@ fn a_door_opens_only_for_a_hero_walking_toward_it() {
     };
     // Up against the gate at z=27.9 (see locked_gate_blocks_until_key).
     for _ in 0..400 {
-        g.update(1.0 / 60.0, &[walk(&g, 1.0)]);
+        g.update(&[walk(&g, 1.0)]);
     }
     let doors = g.entities.len();
     // Turned round (a hero walks along its facing) and stepping away.
     g.players[0].keys = 1;
     g.players[0].yaw = std::f32::consts::PI;
     for _ in 0..3 {
-        g.update(1.0 / 60.0, &[walk(&g, -1.0)]);
+        g.update(&[walk(&g, -1.0)]);
     }
     assert_eq!(g.entities.len(), doors, "walking away leaves it shut");
     assert_eq!(g.players[0].keys, 1);
     for _ in 0..60 {
-        g.update(1.0 / 60.0, &[walk(&g, 1.0)]);
+        g.update(&[walk(&g, 1.0)]);
     }
     assert_eq!(g.players[0].keys, 0, "walking back opens it");
+}
+
+#[test]
+fn the_altar_door_opens_to_a_hero_held_at_its_edge() {
+    // levelE1's door (bug report 20261023-233135): its cylinder keeps a hero's
+    // centre exactly its open radius away, so a strict `<` never opened it.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelE1", &[("JAC", "BLU")]).unwrap();
+    g.entities.retain(|e| matches!(e.kind, Kind::Door { .. }));
+    g.pending_enemies.clear();
+    let door = g.entities[0].pos;
+    let shut = |g: &Game| {
+        g.entities
+            .iter()
+            .any(|e| matches!(e.kind, Kind::Door { .. }))
+    };
+    g.players[0].pos = Vec3::new(-0.37, 0.02, 86.79);
+    g.players[0].keys = 1;
+    for _ in 0..120 {
+        let to = Vec2::new(door.x - g.players[0].pos.x, door.z - g.players[0].pos.z);
+        let input = PlayerInput {
+            stick: g.stick_toward(to.normalize()),
+            ..Default::default()
+        };
+        g.update(&[input]);
+        if !shut(&g) {
+            break;
+        }
+    }
+    let d = (g.players[0].pos - door).length();
+    assert!(
+        !shut(&g),
+        "the door stayed shut with the hero {d:.3} from it"
+    );
+    assert_eq!(g.players[0].keys, 0, "the key was used");
+}
+
+#[test]
+fn the_citadel_portal_rides_the_tower_lift_up() {
+    // Bug report 20261023-234746: with the 13th runestone banked, the tower
+    // raises the lift to the Citadel (ActivateSpecialTrigger(255, 1)) and the
+    // portal placed on that lift must come up with it, as every item put on a
+    // moving floor does (AddItemSub), or it stays buried under the hall floor.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelL1", &[("JAC", "BLU")]).unwrap();
+    g.pending_enemies.clear();
+    let portal = |g: &Game| {
+        g.entities
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    Kind::Exit {
+                        dest: Some(0x803),
+                        ..
+                    }
+                )
+            })
+            .map(|e| e.pos)
+            .unwrap()
+    };
+    let down = portal(&g);
+    assert!(
+        down.y < -37.0,
+        "the portal starts on the lowered lift: {down:?}"
+    );
+    g.shards = 0x1FFF;
+    g.enter_tower();
+    for _ in 0..200 {
+        g.update(&[PlayerInput::default()]);
+    }
+    let up = portal(&g);
+    assert!(
+        up.y > -29.5 && up.y < -28.0,
+        "the portal rode the lift up: {up:?}"
+    );
+    // A hero on the raised lift beside it is within its reach.
+    let hero = Vec3::new(2.19, -28.89, 67.69);
+    let Kind::Exit { radius, .. } = g
+        .entities
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                Kind::Exit {
+                    dest: Some(0x803),
+                    ..
+                }
+            )
+        })
+        .map(|e| &e.kind)
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let d = Vec2::new(hero.x - up.x, hero.z - up.z).length();
+    assert!(
+        d < *radius,
+        "the hall-level hero reaches the portal: {d:.2} < {radius}"
+    );
 }
 
 #[test]
@@ -235,10 +335,10 @@ fn at_chest(fs: &GameFs, at: Vec3) -> (Game, u64, Vec3) {
             .unwrap();
         let (id, pos) = (e.id, e.pos);
         let a = side as f32 * std::f32::consts::FRAC_PI_4;
-        let stand = pos + Vec3::new(a.cos(), 0.0, a.sin()) * 2.8;
+        let stand = pos + Vec3::new(a.det_cos(), 0.0, a.det_sin()) * 2.8;
         for _ in 0..30 {
             g.players[0].pos = stand;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         if Vec2::new(p.x - pos.x, p.z - pos.z).length() < 2.9 && (p.y - pos.y).abs() < 1.0 {
@@ -265,7 +365,7 @@ fn an_opened_chest_lifts_its_lid_then_leaves_its_item_to_take() {
     };
     let model = chest(&g).unwrap().0.unwrap();
     let active = g.models[model].sequence("ACTIVE").unwrap();
-    let step = |g: &mut Game| g.update(1.0 / 60.0, &[PlayerInput::default()]);
+    let step = |g: &mut Game| g.update(&[PlayerInput::default()]);
     step(&mut g);
     assert_eq!(g.players[0].keys, 0);
     let item = g
@@ -319,7 +419,7 @@ fn an_opened_gold_chest_gives_its_gold_on_touch() {
         }
     ));
     for _ in 0..300 {
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
     }
     assert_eq!(g.players[0].gold, 100, "TREAS_SILVER");
     assert!(!g.entities.iter().any(|e| e.id == id && e.alive));
@@ -327,4 +427,263 @@ fn an_opened_gold_chest_gives_its_gold_on_touch() {
         .entities
         .iter()
         .any(|e| matches!(e.kind, Kind::Pickup { .. })));
+}
+
+/// The tower's world object called `name`.
+fn object(g: &Game, name: &str) -> usize {
+    g.level
+        .worlds
+        .world_objects
+        .iter()
+        .position(|o| o.name == name)
+        .unwrap_or_else(|| panic!("no world object {name}"))
+}
+
+/// The mover of the trigger target `name`.
+fn mover<'a>(g: &'a Game, name: &str) -> &'a crate::triggers::Mover {
+    let o = object(g, name);
+    g.movers
+        .iter()
+        .find(|m| m.root == o)
+        .unwrap_or_else(|| panic!("no mover for {name}"))
+}
+
+/// The trigger entity with `id`.
+fn trigger(g: &Game, id: u8) -> &Entity {
+    g.entities
+        .iter()
+        .find(|e| matches!(e.kind, Kind::Trigger { id: t, .. } if t == id))
+        .unwrap_or_else(|| panic!("no trigger {id}"))
+}
+
+fn step(g: &mut Game, n: usize) {
+    for _ in 0..n {
+        g.update(&[PlayerInput::default()]);
+    }
+}
+
+#[test]
+fn the_dragon_gate_opens_through_its_trigger_chain() {
+    // "The dragon doors didn't open": the pad of the serpent gate (trigger
+    // 101) drives only an invisible wall; the statue's heads, wings and jaws
+    // hang off a chain of triggers named by nextid (LinkItemTriggers:
+    // 101 -> 71 -> ... -> 78 -> 20 -> ... -> 27), each with its own target.
+    // Setting off the head sets off the chain; a link target (flags 0x200)
+    // never fires for a hero walking into it on its own.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
+    g.pending_enemies.clear();
+    g.garg_items[0] = -1;
+    use crate::worldanim::wflags::{AT_END, FORWARD};
+    let parts = ["L1RSNAKEWA", "L1LSNAKEWD", "L1RSNAKERE", "L1LLSNAKET"];
+    step(&mut g, 5);
+    for p in parts {
+        assert!(!mover(&g, p).active, "{p} waits for the gate");
+    }
+    // A hero on a chained pad (trigger 71's) on its own: nothing.
+    g.players[0].pos = trigger(&g, 71).pos + Vec3::Y * 0.5;
+    step(&mut g, 10);
+    assert!(
+        !mover(&g, "L1RSNAKEWA").active,
+        "a link target is not set off by a hero on it"
+    );
+    // On the gate's own pad: the whole chain goes.
+    g.players[0].pos = trigger(&g, 101).pos + Vec3::Y * 0.5;
+    step(&mut g, 10);
+    assert!(
+        mover(&g, "L1TRAPWEASYA").active,
+        "the gate's own wall opens"
+    );
+    for p in parts {
+        let m = mover(&g, p);
+        assert!(m.active, "{p} is set off down the chain");
+        let f = g.world_anim.flags[m.root];
+        assert!(f & FORWARD != 0, "{p} plays forward: {f:#x}");
+    }
+    step(&mut g, 600);
+    for p in parts {
+        let f = g.world_anim.flags[mover(&g, p).root];
+        assert!(f & AT_END != 0, "{p} reaches its open pose: {f:#x}");
+    }
+}
+
+#[test]
+fn the_tower_starts_with_what_is_earned_already_in_place() {
+    // EnterTower uses ActivateSpecialTrigger(id, 1): a target already earned
+    // jumps to its finished state. The lion gate's lift and elevator must
+    // not ride down again every time the tower loads, and the Citadel lift
+    // and the statues' parts start at their ends.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
+    g.pending_enemies.clear();
+    let lift = object(&g, "L1LIFT01");
+    g.garg_items = [-1, -1, -1];
+    g.shards = 0x1FFF;
+    g.enter_tower();
+    step(&mut g, 2);
+    let dy = g.world_anim.delta(lift).w_axis.y;
+    assert!(
+        (-17.0..-16.0).contains(&dy),
+        "the lift is already down at the Battle floor: {dy}"
+    );
+    assert!(!mover(&g, "L1LIFT01").moving, "and not riding there");
+    let elev = mover(&g, "L1ELEV02");
+    assert!(
+        !elev.moving && (elev.offset - 1.0).abs() < 1e-3,
+        "the elevator sits at its raised height: {} moving {}",
+        elev.offset,
+        elev.moving
+    );
+    use crate::worldanim::wflags::AT_END;
+    for p in [
+        "L1ELEV669",
+        "L1RSNAKEWA",
+        "L1LEAGLEWA",
+        "L1LIONUARM",
+        "L1BLK669",
+    ] {
+        let m = mover(&g, p);
+        let f = g.world_anim.flags[m.root];
+        assert!(
+            m.active && !m.moving && f & AT_END != 0,
+            "{p} starts at its end: {f:#x} moving {}",
+            m.moving
+        );
+    }
+    // Nothing in the tower is still on its way anywhere.
+    step(&mut g, 60);
+    assert!(
+        g.movers.iter().all(|m| !m.moving),
+        "no target animates on entry"
+    );
+    let again = g.world_anim.delta(lift).w_axis.y;
+    assert!(
+        (again - dy).abs() < 1e-3,
+        "the lift stays put: {again} vs {dy}"
+    );
+}
+
+#[test]
+fn the_pad_in_a_swinging_lift_cabin_rides_with_it() {
+    // Bug report 20261024-025014 (levelG1, "platform won't move"): the
+    // lever on the pier swings the wooden lift cabin over, and the toggle
+    // pad in the cabin (every hero on it) sends it back. The cabin's
+    // animation starts it away from where it was modelled, so the pad was
+    // put down on nothing at load and stayed behind when the cabin came.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelG1", &[("WAR", "RED")]).unwrap();
+    g.pending_enemies.clear();
+    let arm = object(&g, "G1WOOD_ARM");
+    let floor = object(&g, "G1FLOOR#29");
+    let m = g.movers.iter().position(|m| m.root == arm).unwrap();
+    let pad = g
+        .entities
+        .iter()
+        .position(|e| {
+            matches!(e.kind, Kind::Trigger { mover: Some(mm), mode: TriggerMode::Toggle, .. } if mm == m)
+        })
+        .expect("the cabin's toggle pad");
+    let ride = g.entities[pad]
+        .ride
+        .expect("the pad is parented to the cabin floor");
+    assert_eq!(ride.obj, floor as i32);
+    let before = g.entities[pad].pos;
+    // The pier's lever brings the cabin over, pad and all.
+    g.movers[m].active = true;
+    step(&mut g, 240);
+    assert!(!g.movers[m].moving, "the cabin has arrived");
+    let after = g.entities[pad].pos;
+    assert!(
+        (after - before).length() > 8.0,
+        "the pad came over with the cabin: {before:?} -> {after:?}"
+    );
+    let cabin = g
+        .world_anim
+        .delta(floor)
+        .transform_point3(g.level.world_pos[floor].into());
+    assert!(
+        Vec2::new(after.x - cabin.x, after.z - cabin.z).length() < 4.0,
+        "the pad is in the cabin: {after:?} vs {cabin:?}"
+    );
+    // A hero standing on it in the cabin sends the cabin back.
+    for _ in 0..12 {
+        g.players[0].pos = after + Vec3::Y * 0.2;
+        g.update(&[PlayerInput::default()]);
+    }
+    assert!(!g.movers[m].active, "the pad toggled the cabin back");
+    step(&mut g, 120);
+    let back = g.entities[pad].pos;
+    assert!(
+        (back - after).length() > 2.0,
+        "the cabin is on its way back with its pad: {after:?} -> {back:?}"
+    );
+}
+
+#[test]
+fn random_contents_are_decided_when_the_level_is_placed() {
+    // "A bunch of empty chests in the first level": some of levelA1's chests
+    // and barrels hold a random row (item type -1), which the original
+    // rerolls into one of its candidates as it places the level
+    // (fn_8005E90C). Left as the random row, a container opened or broken
+    // gave nothing.
+    let Some(fs) = data() else { return };
+    let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
+    g.pending_enemies.clear();
+    g.entities
+        .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
+    let infos = &g.level.worlds.item_infos;
+    let random_rows: Vec<usize> = infos
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.item_type == ItemType::Random)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!random_rows.is_empty(), "the level has random rows");
+    let holders: Vec<(u64, Vec3)> = g
+        .entities
+        .iter()
+        .filter_map(|e| match e.kind {
+            Kind::Container { drop: Some(d), .. } => {
+                assert!(
+                    !random_rows.contains(&d),
+                    "{:?} holds a decided item",
+                    e.kind
+                );
+                Some((e.id, e.pos))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        holders.len() >= 10,
+        "containers with contents: {}",
+        holders.len()
+    );
+    // The chest placed with a random row (inst 44) opens to something.
+    let chest = g
+        .entities
+        .iter()
+        .find(|e| {
+            matches!(e.kind, Kind::Container { chest: true, .. })
+                && (e.pos - Vec3::new(109.5, 19.96, 9.5)).length() < 1.0
+        })
+        .map(|e| (e.id, e.pos))
+        .expect("the chest at (109.5, 19.96, 9.5)");
+    g.players[0].keys = 1;
+    let before: Vec<u64> = g.entities.iter().map(|e| e.id).collect();
+    for _ in 0..40 {
+        g.players[0].pos = chest.1 + Vec3::new(2.8, 0.3, 0.0);
+        g.update(&[PlayerInput::default()]);
+    }
+    for _ in 0..240 {
+        g.players[0].pos = chest.1 + Vec3::new(20.0, 0.3, 0.0);
+        g.update(&[PlayerInput::default()]);
+    }
+    assert_eq!(g.players[0].keys, 0, "the key opened it");
+    let out = g
+        .entities
+        .iter()
+        .filter(|e| e.alive && !before.contains(&e.id) && (e.pos - chest.1).length() < 6.0)
+        .count();
+    assert!(out >= 1, "something came out of the chest");
 }

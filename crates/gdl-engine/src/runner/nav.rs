@@ -201,7 +201,8 @@ impl WalkWorld<'_> {
             }
             match self.step(h, d / len, STEP.min(len)) {
                 Some(q) => {
-                    let still = xz(q.pos - h.pos).length() < 0.01 && (q.pos.y - h.pos.y).abs() < 0.01;
+                    let still =
+                        xz(q.pos - h.pos).length() < 0.01 && (q.pos.y - h.pos.y).abs() < 0.01;
                     h = q;
                     if still && h.on_ground {
                         break;
@@ -363,12 +364,17 @@ impl Nav {
             let mut top = top0;
             for _ in 0..MAX_LAYERS {
                 let at = Vec3::new(q.x, top, q.y);
-                let Some(y) = col.ground_height(at, top) else { break };
+                let Some(y) = col.ground_height(at, top) else {
+                    break;
+                };
                 top = y - 1.5;
                 if y <= self.min_y {
                     break;
                 }
-                if ids.iter().any(|&i| (self.nodes[i as usize].pos.y - y).abs() < 1.0) {
+                if ids
+                    .iter()
+                    .any(|&i| (self.nodes[i as usize].pos.y - y).abs() < 1.0)
+                {
                     continue;
                 }
                 let p0 = Vec3::new(q.x, y, q.y);
@@ -391,7 +397,10 @@ impl Nav {
                 if g.entities.iter().any(|e| matches!(e.kind, crate::game::Kind::Secret { radius, used: false, .. } if xz(e.pos - pos).length() < radius + PLAYER_RADIUS + 0.5 && (e.pos.y - pos.y).abs() < 4.0)) {
                     continue;
                 }
-                if ids.iter().any(|&i| (self.nodes[i as usize].pos.y - y2).abs() < 1.0) {
+                if ids
+                    .iter()
+                    .any(|&i| (self.nodes[i as usize].pos.y - y2).abs() < 1.0)
+                {
                     continue;
                 }
                 let id = self.nodes.len() as u32;
@@ -443,7 +452,11 @@ impl Nav {
                 for &i in ids {
                     let n = &self.nodes[i as usize];
                     let d = xz(n.pos - p).length();
-                    if n.alive && d <= r && (n.pos.y - p.y).abs() <= dy && best.is_none_or(|b| d < b.0) {
+                    if n.alive
+                        && d <= r
+                        && (n.pos.y - p.y).abs() <= dy
+                        && best.is_none_or(|b| d < b.0)
+                    {
                         best = Some((d, i));
                     }
                 }
@@ -564,9 +577,11 @@ impl Nav {
                 let was = &self.last_verts[i];
                 if t.v != *was || col.enabled[i] != self.last_enabled[i] {
                     self.streak[i] = self.streak[i].saturating_add(1);
-                    let e = per
-                        .entry(t.owner)
-                        .or_insert((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN), false));
+                    let e = per.entry(t.owner).or_insert((
+                        Vec2::splat(f32::MAX),
+                        Vec2::splat(f32::MIN),
+                        false,
+                    ));
                     for v in t.v.iter().chain(was.iter()) {
                         e.0 = e.0.min(xz(*v));
                         e.1 = e.1.max(xz(*v));
@@ -616,7 +631,11 @@ impl Nav {
         }
         let now = solid_set(g);
         for (id, p) in &now {
-            if self.last_solids.get(id).is_none_or(|q| q.distance(*p) > 0.3) {
+            if self
+                .last_solids
+                .get(id)
+                .is_none_or(|q| q.distance(*p) > 0.3)
+            {
                 boxes.push((xz(*p) - Vec2::splat(6.0), xz(*p) + Vec2::splat(6.0)));
                 if let Some(q) = self.last_solids.get(id) {
                     boxes.push((xz(*q) - Vec2::splat(6.0), xz(*q) + Vec2::splat(6.0)));
@@ -727,7 +746,10 @@ impl Nav {
                 break;
             }
             for e in self.all_edges(g, n) {
-                if closed.contains(&e.to) || !self.nodes[e.to as usize].alive || self.blocked.contains_key(&(n, e.to)) {
+                if closed.contains(&e.to)
+                    || !self.nodes[e.to as usize].alive
+                    || self.blocked.contains_key(&(n, e.to))
+                {
                     continue;
                 }
                 let ng = gc + e.cost;
@@ -777,7 +799,9 @@ impl Nav {
         for (i, &s) in self.streak.iter().enumerate() {
             if s >= 4 {
                 let t = &g.collision.tris[i];
-                let e = per.entry(t.owner).or_insert((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)));
+                let e = per
+                    .entry(t.owner)
+                    .or_insert((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)));
                 for v in t.v {
                     e.0 = e.0.min(v);
                     e.1 = e.1.max(v);

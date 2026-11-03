@@ -209,7 +209,7 @@ pub struct Bag {
 }
 
 /// The item state that rides along with the game.
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct ItemsState {
     pub blasts: Vec<Blast>,
     pub bags: Vec<Bag>,
@@ -233,8 +233,7 @@ pub struct ItemsState {
 /// gGameOptions.items (a debug option; GDL_ITEMS): a player count every item
 /// is placed for exactly, 0 for the real one.
 pub(super) fn items_option() -> usize {
-    std::env::var("GDL_ITEMS")
-        .ok()
+    crate::compat::sim_env("GDL_ITEMS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
 }
@@ -675,7 +674,12 @@ impl Game {
                 match owner {
                     Some(pi) => self.hit_entity(pi, t, power, push, false),
                     None => {
-                        let r = Self::apply_hit(&mut self.entities[t], power, push);
+                        let r = Self::apply_hit(
+                            &mut self.entities[t],
+                            power,
+                            push,
+                            self.magic_hit != 0,
+                        );
                         self.barrel_hit(t);
                         if let Some((pos, item)) = r.drop {
                             self.spawn_content(pos, item);
@@ -921,7 +925,7 @@ impl Game {
                 let Kind::Enemy { state: was, .. } = self.entities[t].kind else {
                     return;
                 };
-                let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+                let r = Self::apply_hit(&mut self.entities[t], dmg, push, self.magic_hit != 0);
                 if !r.hit {
                     return;
                 }
@@ -934,7 +938,7 @@ impl Game {
                 }
             }
             (Kind::Generator { .. }, _) => {
-                let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+                let r = Self::apply_hit(&mut self.entities[t], dmg, push, self.magic_hit != 0);
                 let mut dropped = r.killed;
                 if !r.killed {
                     let thr = 10.0 * self.tuning.gen_health;
@@ -999,7 +1003,7 @@ impl Game {
                 } else {
                     gyaw - std::f32::consts::FRAC_PI_2
                 });
-                at + Vec3::new(a.sin(), 0.0, a.cos()) * 3.5
+                at + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * 3.5
             }
             _ => at,
         };
@@ -1052,7 +1056,8 @@ impl Game {
     /// a blast's radius grows from a third of damageradius to all of it and
     /// its damage falls from 1.5x to nothing. Heroes are hit again once
     /// their fxhittime passes (half a second for gas), monsters and items
-    /// once theirs (about the rest of the effect), critters once.
+    /// once theirs (about the rest of the effect; in gas, every
+    /// `Rules::gas_tick` seconds when that is set), critters once.
     fn update_blasts(&mut self, dt: f32) {
         let mut blasts = std::mem::take(&mut self.items.blasts);
         for b in &mut blasts {
@@ -1199,6 +1204,10 @@ impl Game {
         for (i, id, push, critter) in hits {
             if critter {
                 b.hit.push(id);
+            } else if b.dtype & DmgType::POISON_GAS != 0 && self.rules.gas_tick > 0.0 {
+                // The remix: gas keeps hurting the monsters in it, as it
+                // does heroes.
+                self.items.fxhit.insert(id, self.time + self.rules.gas_tick);
             } else if dmg > 2.0 {
                 self.items.fxhit.insert(id, self.time + fade);
             }
@@ -1564,7 +1573,7 @@ mod tests {
 
     fn step(g: &mut Game, secs: f32) {
         for _ in 0..(secs * 60.0) as usize {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
     }
 
@@ -1674,7 +1683,7 @@ mod tests {
         let (sid, ..) = shell(&g).expect("its pieces are left to break apart");
         let mut frames = Vec::new();
         for _ in 0..240 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             let (id, seq, frame) = shell(&g).expect("a plain barrel's pieces stay");
             assert_eq!(id, sid);
             frames.push((seq, frame));
@@ -1776,7 +1785,7 @@ mod tests {
             let mut last = start;
             for _ in 0..(4 * 60) {
                 g.players[0].pos = Vec3::new(centre.x + d, at.y, centre.z);
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 if g.players[0].health < last {
                     hurts += 1;
                 }
@@ -1816,7 +1825,7 @@ mod tests {
         let mut last = g.players[0].health;
         for _ in 0..(6 * 60) {
             g.players[0].pos = at;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if g.players[0].health < last {
                 hurts += 1;
             }
@@ -1834,6 +1843,57 @@ mod tests {
                 matches!(e.kind, Kind::Pickup { kind: PickupKind::Food(v), .. } if v == -100.0)
             );
         }
+    }
+
+    /// How often a monster held in a poison cloud takes a real hit (more
+    /// than the fading tail's 2 points) over the cloud's life.
+    fn gas_hits_on_a_grunt(fs: &GameFs, rules: crate::rules::Rules) -> usize {
+        let mut g = quiet(fs, &[is_poi]);
+        g.rules = rules;
+        let at = g.players[0].pos;
+        let a = copy_item(&mut g, is_poi, at + Vec3::new(3.0, 0.0, 0.0)).expect("a poison barrel");
+        let spot = at + Vec3::new(4.0, 0.0, 2.0);
+        let mon = grunt(&mut g, fs, spot);
+        let t = g.entities.iter().position(|e| e.id == mon).unwrap();
+        if let Kind::Enemy { hp, .. } = &mut g.entities[t].kind {
+            *hp = 10_000.0;
+        }
+        let hp = |g: &Game| match g.entities.iter().find(|e| e.id == mon).map(|e| &e.kind) {
+            Some(Kind::Enemy { hp, .. }) => *hp,
+            _ => 0.0,
+        };
+        let b = g.entities.iter().position(|e| e.id == a).unwrap();
+        g.world_hit(None, b, 50.0, Vec2::X, 0);
+        assert_eq!(g.items.blasts.len(), 1);
+        let mut hits = 0;
+        let mut last = hp(&g);
+        for _ in 0..(7 * 60) {
+            g.players[0].pos = at - Vec3::new(20.0, 0.0, 0.0);
+            if let Some(e) = g.entities.iter_mut().find(|e| e.id == mon) {
+                e.pos = spot;
+            }
+            g.update(&[PlayerInput::default()]);
+            let now = hp(&g);
+            if last - now > 2.0 {
+                hits += 1;
+            }
+            last = now;
+        }
+        assert!(g.items.blasts.is_empty(), "the cloud is gone");
+        hits
+    }
+
+    #[test]
+    fn poison_gas_keeps_hurting_monsters_in_the_remix() {
+        // The original hits a monster once per phase of the cloud (its hit
+        // cooldown runs to the phase's end) and then only with the fading
+        // tail of 2 points or less; the remix's gas_tick hits it again every
+        // half second, as gas does heroes.
+        let Some(fs) = data() else { return };
+        let classic = gas_hits_on_a_grunt(&fs, crate::rules::Rules::classic());
+        let remix = gas_hits_on_a_grunt(&fs, crate::rules::Rules::remix());
+        assert!(classic <= 2, "classic: one hit per phase: {classic}");
+        assert!(remix >= 5, "remix: a hit every half second: {remix}");
     }
 
     #[test]
@@ -1928,7 +1988,7 @@ mod tests {
         g.damage_item(t, 10.0, DMG_EXPLODE, None);
         let mut blast = None;
         for _ in 0..180 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if let Some(b) = g.items.blasts.first() {
                 blast.get_or_insert((b.damage, b.radius));
             }
@@ -2113,7 +2173,7 @@ mod tests {
             _ => -1,
         };
         for _ in 0..10 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         // One egg laid (the left one): it waits.
         assert!(matches!(gen_of(&g, gen), Kind::Generator { chain, .. } if chain.flags == 1));
@@ -2126,7 +2186,7 @@ mod tests {
         assert!(matches!(gen_of(&g, gen), Kind::Generator { chain, .. }
             if chain.flags == 7 && chain.generated == 3));
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert_eq!(mode1(&g), 2, "hatched");
     }
@@ -2136,8 +2196,8 @@ mod tests {
         let Some(fs) = data() else { return };
         let mut g = quiet(&fs, &[]);
         let (gen, _) = generator(&mut g, &fs, 15);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         // generate_single: one lookout, at once and only one.
         let Kind::Generator { spawned, .. } = gen_of(&g, gen) else {
             panic!()
@@ -2147,7 +2207,7 @@ mod tests {
         let t = g.entities.iter().position(|e| e.id == id).unwrap();
         assert!(matches!(&g.entities[t].kind, Kind::Enemy { ai: 15, .. }));
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(matches!(gen_of(&g, gen), Kind::Generator { spawned, .. } if spawned.len() == 1));
         let t = g.entities.iter().position(|e| e.id == id).unwrap();

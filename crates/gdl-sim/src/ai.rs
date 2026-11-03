@@ -8,6 +8,7 @@
 //! ([`Out`]); the game commits the move and reports what stopped it back
 //! through [`Brain::after_move`], as do_enemy_move does.
 
+use crate::math::Det as _;
 use glam::Vec3;
 use std::f32::consts::{PI, TAU};
 
@@ -94,11 +95,11 @@ pub fn wrap(a: f32) -> f32 {
 
 /// get_yaw: the heading from `from` to `to`.
 pub fn yaw_to(to: Vec3, from: Vec3) -> f32 {
-    (to.x - from.x).atan2(to.z - from.z)
+    (to.x - from.x).det_atan2(to.z - from.z)
 }
 
 fn flat(a: Vec3, b: Vec3) -> f32 {
-    ((a.x - b.x).powi(2) + (a.z - b.z).powi(2)).sqrt()
+    ((a.x - b.x).det_powi(2) + (a.z - b.z).det_powi(2)).sqrt()
 }
 
 /// RandInt.
@@ -970,7 +971,7 @@ impl Paths {
             .filter(|l| l.kind == LocatorType::Milestone)
             .map(|l| {
                 let fwd = crate::character::ryp_matrix(l.rot).transform_vector3(Vec3::Z);
-                (Vec3::from(l.pos), wrap(PI + fwd.x.atan2(fwd.z)))
+                (Vec3::from(l.pos), wrap(PI + fwd.x.det_atan2(fwd.z)))
             })
             .collect();
         let lookouts = locators
@@ -1185,8 +1186,8 @@ impl Ctx<'_> {
             || self.b.coll_pnum.is_some()
         {
             let s = k * self.me.spd;
-            self.b.trans.x += s * ang.sin();
-            self.b.trans.z += s * ang.cos();
+            self.b.trans.x += s * ang.det_sin();
+            self.b.trans.z += s * ang.det_cos();
         }
     }
 
@@ -1207,7 +1208,7 @@ impl Ctx<'_> {
     /// One step ahead along `ang`, at the probe height.
     fn ahead(&self, ang: f32, dist: f32) -> Vec3 {
         let p = self.me.pos + Vec3::Y * (0.1 + self.me.rad);
-        p + Vec3::new(ang.sin(), 0.0, ang.cos()) * dist
+        p + Vec3::new(ang.det_sin(), 0.0, ang.det_cos()) * dist
     }
 
     /// FoundSuicideBomber: the running suicide grunt is within 10.
@@ -2189,7 +2190,7 @@ impl Ctx<'_> {
             let ang = self.b.ang;
             let s = self.me.spd;
             if a == act::ATTACK || a == act::ATTACK + 1 {
-                self.b.trans += Vec3::new(ang.sin(), 0.0, ang.cos()) * s;
+                self.b.trans += Vec3::new(ang.det_sin(), 0.0, ang.det_cos()) * s;
                 self.b.flag2 = self.dice.int(30) + 30;
             } else if a == act::ATTACK_PWR || a == act::ATTACK_PWR + 1 {
                 self.b.flag2 = self.dice.int(30) + 30;
@@ -2201,7 +2202,7 @@ impl Ctx<'_> {
                 });
             } else if a != act::START {
                 self.b.flag2 -= self.t();
-                self.b.trans += Vec3::new(ang.sin(), 0.0, ang.cos()) * s * 0.5;
+                self.b.trans += Vec3::new(ang.det_sin(), 0.0, ang.det_cos()) * s * 0.5;
             }
         }
         let a = self.b.ang;
@@ -2215,8 +2216,8 @@ impl Ctx<'_> {
 fn side_toward(yaw: f32, d: Vec3) -> i32 {
     let r = wrap(0.523_598_8 + yaw);
     let l = wrap(yaw - 0.523_598_8);
-    let (x1, z1) = (d.x + r.sin(), d.z + r.cos());
-    let (x2, z2) = (d.x + l.sin(), d.z + l.cos());
+    let (x1, z1) = (d.x + r.det_sin(), d.z + r.det_cos());
+    let (x2, z2) = (d.x + l.det_sin(), d.z + l.det_cos());
     if x2 * x2 + z2 * z2 <= x1 * x1 + z1 * z1 {
         -1
     } else {

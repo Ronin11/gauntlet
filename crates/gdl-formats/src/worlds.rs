@@ -262,14 +262,16 @@ fn rotate_by_quat(v: [f32; 3], q: [f32; 4]) -> [f32; 3] {
 /// Collision triangles store v1/v2 as 2D offsets in the triangle's plane; rotate
 /// them back into world space using the plane normal.
 fn plane_to_world(norm: [f32; 3], scale: f32, v0: [f32; 3], x: f32, z: f32) -> [f32; 3] {
-    let roll = norm[1].clamp(-1.0, 1.0).acos();
+    // libm, not the platform's: this decides where collision is, and peers on
+    // different machines must agree to the bit.
+    let roll = libm::acosf(norm[1].clamp(-1.0, 1.0));
     let yaw = if scale.is_finite() {
-        (-norm[0] * scale).atan2(-norm[2] * scale)
+        libm::atan2f(-norm[0] * scale, -norm[2] * scale)
     } else {
         0.0
     };
-    let (c0, c1) = ((yaw / 2.0).cos(), (roll / 2.0).cos());
-    let (s0, s1) = ((yaw / 2.0).sin(), (roll / 2.0).sin());
+    let (s0, c0) = libm::sincosf(yaw / 2.0);
+    let (s1, c1) = libm::sincosf(roll / 2.0);
     let q = [-c0 * s1, s0 * c1, s0 * s1, c0 * c1];
     let d = rotate_by_quat([x, 0.0, z], q);
     [v0[0] + d[0], v0[1] + d[1], v0[2] + d[2]]

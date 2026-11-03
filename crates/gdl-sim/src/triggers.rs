@@ -4,6 +4,7 @@
 
 use crate::collision::Collision;
 use crate::level::Level;
+use crate::math::Det as _;
 use crate::worldanim::{wflags, WorldAnims};
 use glam::Vec3;
 
@@ -189,9 +190,9 @@ pub fn trigger_camera(worlds: &gdl_formats::worlds::Worlds, id: u8) -> Option<(V
         .find(|l| l.kind == LocatorType::TriggerCamera && l.next == id as u16)?;
     let (pitch, yaw) = (l.rot[0], l.rot[1]);
     let dir = Vec3::new(
-        yaw.sin() * pitch.cos(),
-        -pitch.sin(),
-        yaw.cos() * pitch.cos(),
+        yaw.det_sin() * pitch.det_cos(),
+        -pitch.det_sin(),
+        yaw.det_cos() * pitch.det_cos(),
     );
     Some((Vec3::from(l.pos), dir, l.delay))
 }
@@ -246,7 +247,7 @@ pub fn tower_camera_index(id: u8) -> bool {
 }
 
 /// A world object (with its children) moved by triggers.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Mover {
     pub root: usize,
     pub objects: Vec<usize>,
@@ -334,6 +335,29 @@ impl Mover {
         self.offset = 0.0;
         if let Some(f) = wa.flags.get_mut(self.root) {
             *f |= wflags::REVERSE;
+        }
+    }
+
+    /// ActivateSpecialTrigger with flag 1: triggered, and already in its
+    /// finished state (an animated target at its last frame, a fading one
+    /// faded, a slider at its triggered height), with the collision there.
+    pub fn settle(&mut self, collision: &mut Collision, wa: &mut WorldAnims) {
+        self.active = true;
+        if self.animated {
+            wa.jump_to_end(self.root);
+        } else if self.fades() {
+            self.shown = self.fade_shown();
+            for &i in &self.owned {
+                collision.enabled[i] = self.shown;
+            }
+        } else {
+            self.offset = self.on;
+            if self.node {
+                wa.slide(self.root, self.offset);
+            }
+            for &(i, rest) in &self.tris {
+                collision.tris[i].v = rest.map(|v| v + Vec3::Y * self.offset);
+            }
         }
     }
 
@@ -500,7 +524,11 @@ impl Mover {
     /// for animated targets.
     pub fn end_state(&self, active: bool) -> Option<(Vec<(usize, [Vec3; 3])>, f32, Option<bool>)> {
         if self.fades() {
-            let shown = if self.flags8 & 0x20 != 0 { !active } else { active };
+            let shown = if self.flags8 & 0x20 != 0 {
+                !active
+            } else {
+                active
+            };
             let tris = self.owned.iter().map(|&i| (i, [Vec3::ZERO; 3])).collect();
             return Some((tris, 0.0, Some(shown)));
         }
@@ -551,7 +579,7 @@ impl Mover {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::game::{Game, Kind};
     use crate::input::PlayerInput;
@@ -564,11 +592,27 @@ mod tests {
     fn tick(g: &mut Game, n: usize) {
         let idle = vec![PlayerInput::default(); g.players.len()];
         for _ in 0..n {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
     }
 
     /// The first trigger matching `f` (flags, id): its entity index and position.
+    /// The pads feeding the chained trigger `gate` that a hero put on stays
+    /// on (the walls of the Chimera's arena push a hero off some of them).
+    pub(crate) fn standable_pads(g: &Game, gate: u64) -> Vec<Vec3> {
+        g.entities
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Trigger { next: Some(n), .. } if n == gate))
+            .map(|e| e.pos)
+            .filter(|&p| {
+                let mut t = g.clone();
+                t.players[0].pos = p + Vec3::Y * 0.2;
+                tick(&mut t, 3);
+                t.players[0].pos.distance(p) < 1.0
+            })
+            .collect()
+    }
+
     fn find_trigger(g: &Game, f: impl Fn(u16, u8) -> bool) -> (usize, Vec3) {
         let i = g
             .entities
@@ -647,10 +691,10 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..40 {
-            g.update(1.0 / 60.0, &[walk]);
+            g.update(&[walk]);
         }
         let moved = g.players[0].pos - start;
-        assert!(moved.x.hypot(moved.z) < 0.5, "controls held");
+        assert!(moved.x.det_hypot(moved.z) < 0.5, "controls held");
         assert_eq!(g.camera_view().0, eye);
         assert!(g.trigger_camera_view().is_some());
         tick(&mut g, 600);
@@ -665,13 +709,10 @@ mod tests {
         tick(g, 10);
         for _ in 0..n {
             let stick = g.stick_toward(dir);
-            g.update(
-                1.0 / 60.0,
-                &[PlayerInput {
-                    stick,
-                    ..Default::default()
-                }],
-            );
+            g.update(&[PlayerInput {
+                stick,
+                ..Default::default()
+            }]);
         }
     }
 
@@ -761,20 +802,44 @@ mod tests {
     #[test]
     fn all_heroes_pad_waits_for_everyone() {
         let Some(fs) = data() else { return };
+        // The Chimera's elevator trigger needs every hero; the pads around
+        // the arena feed it (LinkItemTriggers), and heroes on different pads
+        // count together.
         let mut g = Game::new(&fs, "levelA5", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
-        let (i, pos) = find_trigger(&g, |f, _| f & tflags::ALL_HEROES != 0);
-        let Kind::Trigger { mover: Some(m), .. } = g.entities[i].kind else {
-            panic!("pad has a target");
+        let (i, _) = find_trigger(&g, |f, _| f & tflags::ALL_HEROES != 0);
+        let Kind::Trigger {
+            mover: Some(m),
+            linked: true,
+            ..
+        } = g.entities[i].kind
+        else {
+            panic!("the pad has a target and is fed by others");
         };
-        g.players[0].pos = pos + Vec3::Y * 0.2;
-        g.players[1].pos = pos + Vec3::new(30.0, 0.2, 0.0);
-        g.msgs.shown = None;
+        let pads = standable_pads(&g, g.entities[i].id);
+        assert!(pads.len() >= 2, "pads around the arena: {}", pads.len());
+        g.players[0].pos = pads[0] + Vec3::Y * 0.2;
+        g.players[1].pos = pads[0] + Vec3::Y * 60.0;
         tick(&mut g, 10);
         assert!(!g.movers[m].active, "one hero is not enough");
-        assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(127));
-        g.players[1].pos = pos + Vec3::new(0.5, 0.2, 0.0);
-        tick(&mut g, 2);
+        g.players[1].pos = pads[1] + Vec3::Y * 0.2;
+        tick(&mut g, 3);
         assert!(g.movers[m].active, "both heroes set it off");
+        // A pad that itself needs everyone (the tower's) tells the first hero
+        // on it so (message 127).
+        let mut g = Game::new(&fs, "levelL3", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
+        let pos = g
+            .entities
+            .iter()
+            .find(|e| {
+                matches!(e.kind, Kind::Trigger { flags, linked: false, .. } if flags & tflags::ALL_HEROES != 0)
+            })
+            .map(|e| e.pos)
+            .expect("an all-heroes pad");
+        g.players[0].pos = pos + Vec3::Y * 0.2;
+        g.players[1].pos = pos + Vec3::Y * 60.0;
+        g.msgs.shown = None;
+        tick(&mut g, 10);
+        assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(127));
     }
 
     /// Item update case 5: a latching door switch (levelA1) posts the traps

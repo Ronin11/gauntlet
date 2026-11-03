@@ -192,13 +192,13 @@ impl Game {
                 // pw = 1.5 throw_str + 5 (throw_str is always 0 here); the
                 // bottle starts 2 ahead and 4 up, at 45 degrees.
                 let p = &self.players[pi];
-                let fwd = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
+                let fwd = Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos());
                 let pw = 1.5 * 0.0 + 5.0;
                 let at = pos + 2.0 * fwd + Vec3::Y * 4.0;
                 let vel = Vec3::new(fwd.x * 0.707, 0.707, fwd.z * 0.707) * pw;
                 let radius = 0.75 * power;
                 let model = self.magic_models.throw[c];
-                let entity = self.magic_entity(model, at, vel.x.atan2(vel.z), THROW_TIME, 1.0);
+                let entity = self.magic_entity(model, at, vel.x.det_atan2(vel.z), THROW_TIME, 1.0);
                 self.magic.push(MagicFx {
                     owner: pnum,
                     colour,
@@ -384,7 +384,7 @@ impl Game {
             .entity
             .and_then(|id| self.entities.iter_mut().find(|e| e.id == id))
         {
-            e.yaw = vel.x.atan2(vel.z);
+            e.yaw = vel.x.det_atan2(vel.z);
         }
         if burst {
             // The hit morph (fxhit = magicid): the MP blast, on the floor,
@@ -551,11 +551,11 @@ impl Game {
         let at = self.entities[t].pos;
         match fx.owner.filter(|&pi| pi < self.players.len()) {
             Some(pi) => {
-                MAGIC_HIT.with(|m| m.set(fx.colour as u32));
+                self.magic_hit = fx.colour as u32;
                 self.hit_from = Some(fx.pos);
                 self.hit_entity(pi, t, dmg * ELEMENT_BONUS, push.normalize_or_zero(), false);
                 self.hit_from = None;
-                MAGIC_HIT.with(|m| m.set(0));
+                self.magic_hit = 0;
                 if fx.heal {
                     if let Some(b) = before {
                         let after = hp(&self.entities[t]).unwrap_or(0.0).max(0.0);
@@ -676,7 +676,7 @@ mod tests {
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
         g.entities.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let class = g.classes.iter().position(|c| c.name == "GRU")?;
         let model = g.classes[class].model(1);
@@ -743,12 +743,12 @@ mod tests {
             magic_pressed: true,
             ..Default::default()
         };
-        g.update(1.0 / 60.0, &[press]);
+        g.update(&[press]);
         let mut thrown = None;
         let mut burst = None;
         let mut started = false;
         for f in 0..240 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             started |= g
                 .entities
                 .iter()
@@ -809,7 +809,7 @@ mod tests {
         let mut last = hp(&g, id);
         let mut t = 0.0;
         while !g.magic.is_empty() {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             t += 1.0 / 60.0;
             let now = hp(&g, id);
             if now < last {
@@ -847,7 +847,7 @@ mod tests {
         let mut hits = 0;
         let mut last = hp(&g, id);
         for _ in 0..200 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             let now = hp(&g, id);
             if now < last {
                 hits += 1;
@@ -876,7 +876,7 @@ mod tests {
             "MAGICHEALTH on the hero"
         );
         while !g.magic.is_empty() {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(g.players[0].health > 100.0, "{}", g.players[0].health);
     }

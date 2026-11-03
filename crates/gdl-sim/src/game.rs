@@ -5,6 +5,7 @@ use crate::collision::{Collision, Tri};
 use crate::fs::GameFs;
 use crate::input::PlayerInput;
 use crate::level::Level;
+use crate::math::Det as _;
 use crate::triggers::{trigger_flags, Mover, TriggerMode};
 use anyhow::Result;
 use gdl_formats::anim::Anim;
@@ -13,6 +14,7 @@ use gdl_formats::Objects;
 use glam::{Vec2, Vec3};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod digest;
 pub(crate) mod effect;
 mod exits;
 pub(crate) mod items;
@@ -21,6 +23,7 @@ mod particles;
 #[cfg(test)]
 mod rule_tests;
 pub mod savestate;
+pub mod setup;
 pub mod sounds;
 pub mod unlock;
 pub(crate) mod walls;
@@ -42,24 +45,33 @@ pub const PLAYER_HEIGHT: f32 = 5.0;
 pub const PLAYER_COL_HEIGHT: f32 = PLAYER_HEIGHT * 0.5;
 /// PlayerGetTarget: the farthest a target is looked for, and the melee reach
 /// (2 plus the player's radius, from the target's surface).
-const TARGET_RANGE: f32 = 30.0;
-const MELEE_REACH: f32 = 2.0 + PLAYER_RADIUS;
+pub(crate) const TARGET_RANGE: f32 = 30.0;
+pub(crate) const MELEE_REACH: f32 = 2.0 + PLAYER_RADIUS;
 /// The aim cone: dot >= 0.707 (0.5 on Easy).
-const AIM_CONE: f32 = 0.707;
+pub(crate) const AIM_CONE: f32 = 0.707;
 /// Turbo meter: fill per second, and the costs of the PWRB / PWRC moves.
-const TURBO_FILL: f32 = 2.0;
+pub(crate) const TURBO_FILL: f32 = 2.0;
 /// player_max_health: 100 per level above 1 plus 500, at most 9999. A new
 /// character starts full at level 1.
 pub fn max_health(level: u32) -> f32 {
     (100.0 * (level.max(1) - 1) as f32 + 500.0).min(9999.0)
 }
 /// Thrown weapons fly until they hit something; this only bounds strays.
-const PROJECTILE_LIFE: f32 = 3.0;
+pub(crate) const PROJECTILE_LIFE: f32 = 3.0;
+
+/// The length of a tick: the simulation runs at a fixed 60 Hz.
+pub const TICK: f32 = 1.0 / 60.0;
 
 /// Small deterministic RNG (xorshift) so simulations are reproducible.
 #[derive(Clone)]
 pub struct Rng(u64);
 impl Rng {
+    /// Mix a session's seed in. Zero leaves the sequence as it was.
+    pub fn mix(&mut self, seed: u64) {
+        let mixed = self.0 ^ seed;
+        // Xorshift never leaves an all-zero state.
+        self.0 = if mixed == 0 { self.0 } else { mixed };
+    }
     pub fn next_u32(&mut self) -> u32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -347,12 +359,6 @@ struct Spawn {
     height: f32,
 }
 
-thread_local! {
-    /// Set while a potion's effect is dealing its damage (DMG_MAGIC): its
-    /// element (1-4), else 0.
-    static MAGIC_HIT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
 /// What one hit did.
 #[derive(Clone, Copy, Debug, Default)]
 struct HitResult {
@@ -378,7 +384,7 @@ pub enum LevelEnd {
     SecretOver,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Player {
     pub model: usize,
     pub pos: Vec3,
@@ -776,7 +782,7 @@ pub(crate) struct PlyrSfx {
 
 /// An effect parented to a hero's model (DoPlyrSfx's SfxSetParent): it keeps
 /// its place in the hero's frame.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct FxFollow {
     id: u64,
     player: usize,
@@ -981,10 +987,15 @@ pub enum Kind {
         cam: Option<(Vec3, Vec3, u8)>,
         /// A door_switch (subtype 0x17): it posts the traps hint (message 5).
         door_switch: bool,
-        /// AddItemSub parented it to the moving floor object it was put on
-        /// (flag 0x1000): that object, the height it was put at and the
-        /// offset then of the mover sliding the object (if one does).
-        ride: Option<(i32, f32, f32)>,
+        /// LinkItemTriggers: the trigger this one sets off with itself (its
+        /// nextid, params byte 7, names it), so one pad can drive a chain of
+        /// targets.
+        next: Option<u64>,
+        /// A link target (flags 0x200): only its chain sets it off, never a
+        /// hero walking into it.
+        linked: bool,
+        /// The heroes' mask handed down the chain this frame.
+        fed: u32,
     },
     Prop,
     /// items.c obstacles 0x28/0x31/0x34/0x35: a rock that falls (or sinks)
@@ -1032,7 +1043,7 @@ pub enum Shape {
     },
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Entity {
     pub id: u64,
     pub solid: Option<Shape>,
@@ -1048,6 +1059,24 @@ pub struct Entity {
     pub alive: bool,
     /// 1 = fully shown, 0 = invisible (the tower's fade-ins).
     pub fade: f32,
+    /// AddItemSub parented a placed item to the moving floor object it was
+    /// put on (flag 0x1000). The item rides the floor: a pad on a lift, the
+    /// tower's Citadel portal on the lift the 13th runestone raises, the
+    /// pad in a swinging lift cabin.
+    pub ride: Option<Ride>,
+}
+
+/// How a placed item is parented to its moving floor (MBNodeSetParent in
+/// AddItemSub): the floor object, where the item sits in that object's own
+/// frame (so it goes wherever the object's node goes, an animated floor
+/// included), and for a floor a mover slides, the height it was put at and
+/// the mover's offset then.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ride {
+    pub obj: i32,
+    pub local: Vec3,
+    pub y: f32,
+    pub off: f32,
 }
 
 /// A monster type (`GRU`, `RAT`, ...) with a model per strength level.
@@ -1202,6 +1231,8 @@ pub struct Game {
     /// Damage-row re-hits waiting out their delay, by (player, target).
     damg_cooldown: BTreeMap<(usize, u64), f32>,
     /// 0 Easy, 1 Medium, 2 Hard.
+    /// The rules this game plays by (rules.rs): classic unless the app says.
+    pub rules: crate::rules::Rules,
     pub difficulty: usize,
     /// The Multiplayer option: 0 Normal (shots pass heroes), 1 Shots Stun,
     /// 2 Shots Hurt.
@@ -1268,6 +1299,9 @@ pub struct Game {
     pub wizard_model: Option<usize>,
     /// Where the hit being dealt landed (projectiles), for critter colnodes.
     pub(crate) hit_from: Option<Vec3>,
+    /// Set while a potion's effect is dealing its damage (DMG_MAGIC): its
+    /// element (1-4), else 0.
+    pub(crate) magic_hit: u32,
     /// Player.hit_streak: generator monsters each hero has killed since
     /// last destroying a generator (PlayerDamagedEnemy / PlayerDamagedItem).
     pub(crate) gen_streak: [u32; 4],
@@ -1395,7 +1429,7 @@ impl ItemCycle {
 
 /// A placed monster waiting to come into view (an ENE item before
 /// fn_80060114 turns it into an enemy).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct PendingEnemy {
     kind: Kind,
     model: Option<usize>,
@@ -1414,6 +1448,40 @@ pub(crate) struct AssetFile {
     objects: Objects,
     textures: Vec<u8>,
     anim: Option<Anim>,
+}
+
+/// InitPlayerMissiles (combat.c): the hero's thrown model. Under level 10 it
+/// is `<weapon>_THROW0`; from level 10 on, `<weapon>_THROW<level / 10>`
+/// (the Archer's BOW_THROW1..4 arrows), else `<weapon>_THROW1`. The hero's
+/// own file is searched first, then the class's SFX bank, where a throw
+/// model counts only if its name carries the hero's class or base class
+/// (the Warrior's bank also holds the Minotaur's MIN_THROW1). Returns
+/// whether it came from the SFX bank, and the object's name.
+fn throw_object(
+    model: &[gdl_formats::objects::ObjectDef],
+    sfx: &[gdl_formats::objects::ObjectDef],
+    classes: &[&str],
+    level: u32,
+) -> Option<(bool, String)> {
+    let find = |tag: &str| {
+        model
+            .iter()
+            .find(|d| d.name.contains(tag))
+            .map(|d| (false, d.name.clone()))
+            .or_else(|| {
+                sfx.iter()
+                    .find(|d| d.name.contains(tag) && classes.iter().any(|c| d.name.contains(c)))
+                    .map(|d| (true, d.name.clone()))
+            })
+    };
+    let tier = (level / 10).min(9);
+    if tier == 0 {
+        return find("_THROW0").or_else(|| find("_THROW1"));
+    }
+    (1..=tier)
+        .rev()
+        .find_map(|t| find(&format!("_THROW{t}")))
+        .or_else(|| find("_THROW0"))
 }
 
 fn load_asset(fs: &GameFs, dir: &str) -> Option<AssetFile> {
@@ -1525,54 +1593,44 @@ impl Game {
         }
     }
 
-    /// EnterTower: barriers whose crystals are done start open, and the tower's
-    /// orange crystals are gone once orange is done.
+    /// EnterTower: what the party has already earned starts in its finished
+    /// state (ActivateSpecialTrigger(id, 1): the target jumps to its end, it
+    /// does not animate there again): the barriers of the crystal colours
+    /// done, the statue gates of the gargoyle items done (the lion gate also
+    /// brings the lift and elevator down to the Battle realm's floor) and,
+    /// with the 13th runestone, the lift to the Citadel. The tower's orange
+    /// crystals are gone once orange is done.
     pub fn enter_tower(&mut self) {
         let crystals = self.crystals;
         let garg = self.garg_items;
-        let mut open = Vec::new();
-        for e in &mut self.entities {
-            match &e.kind {
-                Kind::Trigger {
-                    gate: Some(c),
-                    mover: Some(m),
-                    ..
-                } if (*c < 9 && crystals[*c] < 0)
-                    || ((101..=103).contains(c) && garg[*c - 101] < 0) =>
-                {
-                    open.push(*m)
+        if crystals[1] < 0 {
+            self.entities.retain(|e| {
+                !matches!(
+                    e.kind,
+                    Kind::Pickup {
+                        kind: PickupKind::Crystal(1),
+                        ..
+                    }
+                )
+            });
+        }
+        let mut ids: Vec<u8> = (1..=8)
+            .filter(|&c| crystals[c] < 0)
+            .map(|c| c as u8)
+            .collect();
+        for j in 0..3 {
+            if garg[j] < 0 {
+                ids.push(101 + j as u8);
+                if j == 2 {
+                    ids.extend([104, 199]);
                 }
-                Kind::Pickup {
-                    kind: PickupKind::Crystal(1),
-                    ..
-                } if crystals[1] < 0 => e.alive = false,
-                _ => {}
             }
         }
-        self.entities.retain(|e| e.alive);
-        // The lion gate also brings the lift and elevator down to the Battle
-        // realm's floor; the 13th shard opens the lift to the Citadel.
-        let extra: Vec<usize> = self
-            .entities
-            .iter()
-            .filter_map(|e| match e.kind {
-                Kind::Trigger {
-                    id: 104 | 199,
-                    mover: Some(m),
-                    ..
-                } if garg[2] < 0 => Some(m),
-                Kind::Trigger {
-                    id: 255,
-                    mover: Some(m),
-                    ..
-                } if self.shards & 0x1000 != 0 => Some(m),
-                _ => None,
-            })
-            .collect();
-        for m in open.into_iter().chain(extra) {
-            if let Some(m) = self.movers.get_mut(m) {
-                m.active = true;
-            }
+        if self.shards & 0x1000 != 0 {
+            ids.push(255);
+        }
+        for id in ids {
+            self.special_trigger(id, true);
         }
     }
 
@@ -1669,25 +1727,88 @@ impl Game {
         shown
     }
 
-    /// ActivateSpecialTrigger(id, 0): set off the mover of trigger `id`.
+    /// ActivateSpecialTrigger(id, 0): set off the triggers with `id` and
+    /// every trigger chained after them.
     pub fn activate_trigger(&mut self, id: u8) {
-        let movers: Vec<usize> = self
+        self.special_trigger(id, false);
+    }
+
+    /// ActivateSpecialTrigger: the triggers with `id`, and the chains they
+    /// head, set their targets off; with `settle` (flag 1) each target jumps
+    /// to its finished state instead of moving there.
+    fn special_trigger(&mut self, id: u8, settle: bool) {
+        let heads: Vec<usize> = self
             .entities
             .iter()
-            .filter_map(|e| match e.kind {
-                Kind::Trigger {
-                    id: i,
-                    mover: Some(m),
-                    ..
-                } if i == id => Some(m),
+            .enumerate()
+            .filter_map(|(i, e)| match e.kind {
+                Kind::Trigger { id: t, .. } if t == id => Some(i),
                 _ => None,
             })
             .collect();
-        for m in movers {
-            if let Some(m) = self.movers.get_mut(m) {
-                m.active = true;
+        let mut movers = Vec::new();
+        for h in heads {
+            for i in std::iter::once(h).chain(self.trigger_chain(h)) {
+                if let Kind::Trigger { mover: Some(m), .. } = self.entities[i].kind {
+                    movers.push(m);
+                }
             }
         }
+        for m in movers {
+            let Some(mv) = self.movers.get_mut(m) else {
+                continue;
+            };
+            if settle {
+                mv.settle(&mut self.collision, &mut self.world_anim);
+            } else {
+                mv.active = true;
+            }
+        }
+    }
+
+    /// LinkItemTriggers: connect each trigger naming a successor (nextid) to
+    /// the trigger with that id that is not a tower gate (flags 0x40), and
+    /// mark the successor a link target (flags 0x200). A link that would
+    /// close a loop is dropped.
+    fn link_triggers(&mut self, links: &[(u64, u8)]) {
+        for &(from, nextid) in links {
+            let Some(fi) = self.entities.iter().position(|e| e.id == from) else {
+                continue;
+            };
+            let Some(ti) = self.entities.iter().position(|e| {
+                e.id != from
+                    && matches!(e.kind, Kind::Trigger { id, flags, .. } if id == nextid && flags & 0x40 == 0)
+            }) else {
+                continue;
+            };
+            if self.trigger_chain(ti).contains(&fi) {
+                continue;
+            }
+            let to = self.entities[ti].id;
+            if let Kind::Trigger { next, .. } = &mut self.entities[fi].kind {
+                *next = Some(to);
+            }
+            if let Kind::Trigger { linked, .. } = &mut self.entities[ti].kind {
+                *linked = true;
+            }
+        }
+    }
+
+    /// The triggers chained after entity `head` (indices, in order).
+    fn trigger_chain(&self, head: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut i = head;
+        while let Kind::Trigger { next: Some(n), .. } = self.entities[i].kind {
+            let Some(j) = self.entities.iter().position(|e| e.id == n) else {
+                break;
+            };
+            if j == head || out.contains(&j) {
+                break;
+            }
+            out.push(j);
+            i = j;
+        }
+        out
     }
 
     /// Hide a world object (and its children) by name; false if there is none.
@@ -1822,6 +1943,7 @@ impl Game {
             time: 0.0,
             frame: 0,
             rng: Rng(0x9E37_79B9_7F4A_7C15),
+            rules: crate::rules::Rules::default(),
             wave: None,
             worlds: Default::default(),
             scrolls: Vec::new(),
@@ -1888,6 +2010,7 @@ impl Game {
             critter_wads: BTreeMap::new(),
             wizard_model: None,
             hit_from: None,
+            magic_hit: 0,
             gen_streak: [0; 4],
             nag: FollowNag::default(),
             effects: Default::default(),
@@ -2038,34 +2161,50 @@ impl Game {
                 class_unlock: 0,
             });
         }
-        // Ranged-attack projectile: the class's throw model, else its weapon.
+        // Ranged-attack projectile (InitPlayerMissiles): the class's throw
+        // model from the hero's own file or the class's SFX bank, else the
+        // weapon itself.
+        let mut sfx_banks: BTreeMap<String, Option<AssetFile>> = BTreeMap::new();
         for (i, (class, color)) in classes.iter().enumerate() {
             let dir = format!("PLAYERS/{class}/{}", model_dir(i).unwrap_or(color));
             let Some(asset) = load_asset(fs, &dir) else {
                 continue;
             };
-            let throw = asset
-                .objects
-                .object_defs
-                .iter()
-                .find(|d| d.name.contains("_THROW0"))
-                .or_else(|| {
-                    asset
-                        .objects
-                        .object_defs
-                        .iter()
-                        .find(|d| d.name.starts_with("WEAP_"))
-                })
-                .map(|d| d.name.clone());
-            if let Some(name) = throw {
-                if let Some(m) = Model::from_objects_anim(
-                    &asset.objects,
-                    &asset.textures,
-                    asset.anim.as_ref(),
-                    &[&name],
-                ) {
-                    game.players[i].proj_model = Some(game.add_model(m));
-                }
+            let ct = game.players[i].class_id;
+            let base = crate::heroes::CLASSES[if (8..16).contains(&ct) { ct - 8 } else { ct }];
+            let sfx_dir = format!("PLAYERS/{base}/SFX{}", color.get(..3).unwrap_or(color));
+            let sfx = sfx_banks
+                .entry(sfx_dir.clone())
+                .or_insert_with(|| load_asset(fs, &sfx_dir));
+            let no_defs = Vec::new();
+            let sfx_defs = sfx.as_ref().map_or(&no_defs, |a| &a.objects.object_defs);
+            let throw = throw_object(
+                &asset.objects.object_defs,
+                sfx_defs,
+                &[class, base],
+                game.players[i].level,
+            );
+            let (from_sfx, name) = match throw {
+                Some(t) => t,
+                None => match asset
+                    .objects
+                    .object_defs
+                    .iter()
+                    .find(|d| d.name.starts_with("WEAP_"))
+                {
+                    Some(d) => (false, d.name.clone()),
+                    None => continue,
+                },
+            };
+            let src = if from_sfx {
+                sfx.as_ref().unwrap()
+            } else {
+                &asset
+            };
+            if let Some(m) =
+                Model::from_objects_anim(&src.objects, &src.textures, src.anim.as_ref(), &[&name])
+            {
+                game.players[i].proj_model = Some(game.add_model(m));
             }
         }
         // PlayerSfxInitData: each record's effect from the hero's SFX tree
@@ -2536,7 +2675,7 @@ impl Game {
                 continue;
             }
             let a = sp.yaw + OCTANTS[d].to_radians();
-            let p = sp.pos + Vec3::new(a.sin(), 0.0, a.cos()) * dist;
+            let p = sp.pos + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * dist;
             let from = sp.pos + Vec3::Y * 2.0;
             if dist > 0.0 && self.collision.raycast(from, p + Vec3::Y * 2.0).is_some() {
                 continue;
@@ -2720,6 +2859,7 @@ impl Game {
             scale: 1.0,
             alive: true,
             fade: 1.0,
+            ride: None,
         });
         id
     }
@@ -2750,7 +2890,7 @@ impl Game {
                 }
                 Shape::Box { half } => {
                     // Work in the box's local frame.
-                    let (s, c) = e.yaw.sin_cos();
+                    let (s, c) = e.yaw.det_sin_cos();
                     let local = Vec2::new(d.x * c - d.y * s, d.x * s + d.y * c);
                     let clamped = local.clamp(-half, half);
                     let diff = local - clamped;
@@ -2863,6 +3003,8 @@ impl Game {
         let mut placing: (u32, u64) = (0, self.next_id);
         // Triggers AddItemSub puts on the floor.
         let mut on_floor: Vec<u64> = Vec::new();
+        // Triggers naming a successor (LinkItemTriggers): (trigger, nextid).
+        let mut links: Vec<(u64, u8)> = Vec::new();
         for (inst_idx, inst) in instances.iter().enumerate() {
             self.note_placed(placing);
             placing = (inst_idx as u32, self.next_id);
@@ -2875,13 +3017,11 @@ impl Game {
                 continue;
             };
             // Random items pick one of their candidates.
-            if info.item_type == ItemType::Random && !info.random_indices.is_empty() {
-                let pick =
-                    info.random_indices[self.rng.next_u32() as usize % info.random_indices.len()];
-                match infos.get(pick as usize) {
+            if info.item_type == ItemType::Random {
+                match self.decide_random(info_idx) {
                     Some(i) => {
-                        info = i.clone();
-                        info_idx = pick as usize;
+                        info_idx = i;
+                        info = infos[i].clone();
                     }
                     None => continue,
                 }
@@ -2891,7 +3031,7 @@ impl Game {
             // Placement rotations use the game's pitch/yaw/roll convention; items stand
             // upright, so reduce to the yaw that the rotation turns +z towards.
             let fwd = crate::character::ryp_matrix(inst.rot).transform_vector3(Vec3::Z);
-            let yaw = fwd.x.atan2(fwd.z);
+            let yaw = fwd.x.det_atan2(fwd.z);
             let p16 = |k: usize| i16::from_le_bytes([inst.params[k], inst.params[k + 1]]);
 
             match info.item_type {
@@ -3212,10 +3352,11 @@ impl Game {
                     if model.is_none() {
                         continue;
                     }
+                    // fn_8005E90C: what it holds, a random row decided now.
                     let drop = (info.item_type == ItemType::Container)
                         .then(|| i32::from_le_bytes(inst.params[0..4].try_into().unwrap()))
                         .filter(|&i| i >= 0)
-                        .map(|i| i as usize);
+                        .and_then(|i| self.decide_random(i as usize));
                     // fn_8005C1DC goes by the info's subtype (not SetItem case
                     // 10's params[0], which barrels set to 0x2B). A type-2
                     // barrel breaks rather than opening.
@@ -3272,7 +3413,7 @@ impl Game {
                     let model = self.item_model(fs, &mut cache, &mut known, &dirs, &info.name);
                     let dest = self.exit_dest(&inst.params);
                     let anim = Box::new(exits::ExitAnim::new(model.map(|m| &*self.models[m])));
-                    self.spawn(
+                    let id = self.spawn(
                         Kind::Exit {
                             radius: PLAYER_RADIUS + info.radius,
                             height: info.height + PLAYER_HEIGHT,
@@ -3284,6 +3425,9 @@ impl Game {
                         pos,
                         yaw,
                     );
+                    if info.coll_flags & 1 == 0 {
+                        on_floor.push(id);
+                    }
                 }
                 // SetItem case 8: damage = the placed value (or the item's) x
                 // trap_damage; a placed delay sets the off time to -3 x it.
@@ -3396,7 +3540,9 @@ impl Game {
                             })
                             .flatten(),
                             door_switch: info.subtype == 0x17,
-                            ride: None,
+                            next: None,
+                            linked: false,
+                            fed: 0,
                         },
                         model,
                         pos,
@@ -3404,6 +3550,9 @@ impl Game {
                     );
                     if info.coll_flags & 1 == 0 {
                         on_floor.push(id);
+                    }
+                    if inst.params[7] != 0 {
+                        links.push((id, inst.params[7]));
                     }
                 }
                 // SetItem case 13: a sound item with a music area selects it
@@ -3463,7 +3612,8 @@ impl Game {
             }
         }
         self.note_placed(placing);
-        self.put_triggers_on_floor(&on_floor);
+        self.link_triggers(&links);
+        self.put_items_on_floor(&on_floor);
         self.link_carried(&carriers);
         self.load_item_fx(fs, &mut cache, &mut known, &dirs);
         self.append_bigape_powerups(fs, &mut cache, &mut known);
@@ -3568,7 +3718,7 @@ impl Game {
     /// Camera-relative movement basis on the ground plane (forward, right), in game coordinates.
     pub fn camera_basis(&self) -> (Vec2, Vec2) {
         // Forward on the ground plane, and screen-right (accounting for the render-time X mirror).
-        let f = Vec2::new(-self.cam_yaw.sin(), -self.cam_yaw.cos());
+        let f = Vec2::new(-self.cam_yaw.det_sin(), -self.cam_yaw.det_cos());
         (f, Vec2::new(f.y, -f.x))
     }
 
@@ -3799,7 +3949,17 @@ impl Game {
         );
     }
 
-    pub fn update(&mut self, dt: f32, inputs: &[PlayerInput]) {
+    /// One tick of the game: every hero's input for it. The step is always
+    /// `TICK`, never the caller's choice, so no two peers can step differently.
+    pub fn update(&mut self, inputs: &[PlayerInput]) {
+        // A scroll being read stops the game until its reader presses B.
+        if let Some(b) = &mut self.scroll_box {
+            if b.update(inputs) {
+                self.scroll_box = None;
+            }
+            return;
+        }
+        let dt = TICK;
         // Rumbles are the caller's to take after each update.
         self.snd.rumble.clear();
         self.time += dt;
@@ -4148,7 +4308,7 @@ impl Game {
             let joymag = wish.length().min(1.0);
             p.exit.joymag = joymag;
             let joyang = if joymag > 0.0 {
-                wish.x.atan2(wish.y)
+                wish.x.det_atan2(wish.y)
             } else {
                 p.yaw
             };
@@ -4159,7 +4319,7 @@ impl Game {
             let fire = inp.fire_stick(prefs.control_style);
             let fire_w = fwd * fire.y + right * fire.x;
             let firemag = fire_w.length().min(1.0);
-            let fireang = fire_w.x.atan2(fire_w.y);
+            let fireang = fire_w.x.det_atan2(fire_w.y);
             let mut ctx = crate::paction::Ctx {
                 joymag,
                 stick_yaw: wrap_angle(joyang - p.yaw),
@@ -4177,7 +4337,7 @@ impl Game {
             };
             // A combo partner: the nearest free hero within 5 in a 45 degree
             // cone ahead, at about the same height.
-            let facing = Vec2::new(p.yaw.sin(), p.yaw.cos());
+            let facing = Vec2::new(p.yaw.det_sin(), p.yaw.det_cos());
             let candidate = if p.grab_partner.is_none()
                 && p.grab_pending.is_none()
                 && p.fx.special & 0x400 == 0
@@ -4233,7 +4393,7 @@ impl Game {
                 reaction = r;
                 // Hit from behind: the forward fall.
                 if r >= 10 && p.hit_force.length() > 0.0 {
-                    let from = (-p.hit_force.x).atan2(-p.hit_force.z);
+                    let from = (-p.hit_force.x).det_atan2(-p.hit_force.z);
                     if wrap_angle(from - p.yaw).abs() > std::f32::consts::FRAC_PI_2 {
                         reaction += 1;
                     }
@@ -4254,24 +4414,29 @@ impl Game {
             } else {
                 p.yaw
             };
-            let hdir = Vec2::new(heading.sin(), heading.cos());
-            let cone = if self.difficulty == 0 { 0.5 } else { 0.707 };
+            let hdir = Vec2::new(heading.det_sin(), heading.det_cos());
+            let cone = if self.difficulty == 0 {
+                0.5
+            } else {
+                self.rules.aim_cone
+            };
             let found = targets
                 .iter()
                 .filter(|(t, _, _, _)| (t.y - p.pos.y).abs() < 5.0)
                 .filter_map(|(t, r, short, bump)| {
                     let d = Vec2::new(t.x - p.pos.x, t.z - p.pos.z);
                     let surf = d.length() - r;
-                    (surf < TARGET_RANGE && (d.length() < 0.5 || d.normalize().dot(hdir) >= cone))
+                    (surf < self.rules.target_range
+                        && (d.length() < 0.5 || d.normalize().dot(hdir) >= cone))
                         .then_some((surf, d, *short, t.y - p.pos.y, *bump))
                 })
                 .min_by(|a, b| a.0.total_cmp(&b.0));
             let (tdist, attack_yaw, short) = match found {
-                Some((dist, d, short, _, _)) => (dist, d.x.atan2(d.y), short),
-                None => (TARGET_RANGE, p.yaw, false),
+                Some((dist, d, short, _, _)) => (dist, d.x.det_atan2(d.y), short),
+                None => (self.rules.target_range, p.yaw, false),
             };
             // PlayerGetTarget's attackDir climbs to the target.
-            let aim_rise = found.map(|(_, d, _, dy, _)| dy.atan2(d.length()));
+            let aim_rise = found.map(|(_, d, _, dy, _)| dy.det_atan2(d.length()));
             // Strafing and blocking keep the stick's direction, and with Auto
             // Aim on so does the fire stick (pmotion.c:1584).
             let attack_yaw = if p.act.hud & 0xC000 != 0
@@ -4370,9 +4535,9 @@ impl Game {
                     pos: p.pos,
                     yaw: p.yaw,
                     aim: Vec3::new(
-                        attack_yaw.sin() * rise.cos(),
-                        rise.sin(),
-                        attack_yaw.cos() * rise.cos(),
+                        attack_yaw.det_sin() * rise.det_cos(),
+                        rise.det_sin(),
+                        attack_yaw.det_cos() * rise.det_cos(),
                     ),
                     target: aim_rise.is_some(),
                     bits: bits_now,
@@ -4438,7 +4603,7 @@ impl Game {
             p.act.prev_frame = frame;
             // The meter fills while not in a turbo move; a charge drains it.
             if p.act.action < 11 {
-                p.power = (p.power + TURBO_FILL * dt).min(100.0);
+                p.power = (p.power + self.rules.turbo_fill * dt).min(100.0);
                 // pmotion.c:1755: with 15 or more monsters on screen, a full
                 // meter says to use turbo (msg 110); at 40 with partners, to
                 // try a combo (111).
@@ -4465,7 +4630,7 @@ impl Game {
                     let gw = fwd * gi.stick.y + right * gi.stick.x;
                     if gw.length() > 0.0 {
                         movement = gw.length().min(1.0);
-                        mdir = gw.x.atan2(gw.y);
+                        mdir = gw.x.det_atan2(gw.y);
                     }
                 }
             }
@@ -4513,7 +4678,7 @@ impl Game {
             p.trial_move = Vec3::ZERO;
             if moving {
                 let yaw = walk.unwrap_or(p.yaw);
-                let dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+                let dir = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
                 let mut target = p.pos + dir * speed * dt;
                 // PlayerCollideItems: walking into a monster stops the hero
                 // with Auto Attack on (to swing at it), else slides round
@@ -4563,7 +4728,7 @@ impl Game {
             }
             if !grabbed {
                 p.pos += p.knock_vel * dt;
-                p.knock_vel *= 0.667f32.powf(dt * 30.0);
+                p.knock_vel *= 0.667f32.det_powf(dt * 30.0);
                 p.trial_move = p.pos - start;
                 let (mut pos, wall) = Self::player_walls(&self.collision, p.pos);
                 // PlayerCollideFloor: a stairs floor up to 3 above the feet is
@@ -4725,7 +4890,7 @@ impl Game {
             damage *= 2.0;
             flags |= m::DMG_SUPER;
         }
-        let from = Vec3::new(t.yaw.sin(), 0.0, t.yaw.cos());
+        let from = Vec3::new(t.yaw.det_sin(), 0.0, t.yaw.det_cos());
         let mut dir = t.aim;
         let reach = m::modify_dpos(from, &mut dir, 0.0, ct, flags, t.target, charge);
         let hand = t.pos
@@ -4877,7 +5042,7 @@ impl Game {
                 },
                 model,
                 pt1,
-                v.x.atan2(v.z),
+                v.x.det_atan2(v.z),
             );
             if let Some(e) = self.entities.last_mut().filter(|e| e.id == id) {
                 e.scale = size;
@@ -4898,7 +5063,7 @@ impl Game {
         if tumble != 0.0 {
             pitch
         } else {
-            -vel.y.atan2(vel.x.hypot(vel.z))
+            -vel.y.det_atan2(vel.x.det_hypot(vel.z))
         }
     }
 
@@ -5097,7 +5262,7 @@ impl Game {
                     if combo_anim {
                         if self.players[i].act.hud & 0x20 == 0 {
                             let d = self.players[i].pos - self.players[partner].pos;
-                            self.players[partner].yaw = d.x.atan2(d.z);
+                            self.players[partner].yaw = d.x.det_atan2(d.z);
                             grab(self, i, partner);
                         }
                     } else if ph & 0x10 != 0 {
@@ -5140,7 +5305,7 @@ impl Game {
                     if cur == pa::COMBO_ACTIVE1 {
                         if self.players[i].act.hud & 0x20 == 0 {
                             let d = self.players[i].pos - self.players[partner].pos;
-                            self.players[partner].yaw = d.x.atan2(d.z);
+                            self.players[partner].yaw = d.x.det_atan2(d.z);
                             grab(self, i, partner);
                             self.players[i].act.hud |= 0x80;
                         }
@@ -5212,7 +5377,7 @@ impl Game {
     /// A swing lands (pmotion.c:2621): the one target in the facing cone within
     /// 3.5, for the melee damage times `mult` (x2 slow / step, x3 power).
     fn player_attack(&mut self, pi: usize, pos: Vec3, yaw: f32, mult: f32, bits: u32) {
-        let dir = Vec2::new(yaw.sin(), yaw.cos());
+        let dir = Vec2::new(yaw.det_sin(), yaw.det_cos());
         // PlayerGetTarget: the breakable wall the hero touches (its collision
         // item) comes before any monster.
         if let Some(w) = self.melee_wall(pi, pos, dir) {
@@ -5232,7 +5397,8 @@ impl Game {
                 let (at, r) = Self::aim_point(e, pos + Vec3::Y * 2.5)?;
                 let d = Vec2::new(at.x - pos.x, at.z - pos.z);
                 let surf = d.length() - r;
-                (surf < MELEE_REACH && (d.length() < 0.5 || d.normalize().dot(dir) >= AIM_CONE))
+                (surf < self.rules.melee_reach
+                    && (d.length() < 0.5 || d.normalize().dot(dir) >= self.rules.aim_cone))
                     .then_some((i, surf))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -5382,7 +5548,7 @@ impl Game {
         }
         let hand = p.pos + Vec3::Y * (PLAYER_HEIGHT * 0.5);
         let yaw = p.yaw;
-        let dir = |a: f32| Vec3::new((yaw + a).sin(), 0.0, (yaw + a).cos());
+        let dir = |a: f32| Vec3::new((yaw + a).det_sin(), 0.0, (yaw + a).det_cos());
         let sf = row.startframe as f32;
         let ef = if row.endframe < 0 || row.flags & 0x80 != 0 {
             sf
@@ -5485,7 +5651,7 @@ impl Game {
         }
         if row.kind == 2 && row.speed_min > 0.0 {
             let spd = 0.5 * (row.speed_max - row.speed_min) + row.speed_min;
-            let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+            let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
             // Level: the floor's slope (field_8BC) is not tracked. Flag 8's
             // PitchVec3 is set by no shipped row.
             let vel = if row.flags & 4 != 0 { fwd } else { fwd * spd };
@@ -5513,7 +5679,7 @@ impl Game {
             if let Some(e) = ei.map(|i| &mut self.entities[i]) {
                 let first = match e.kind {
                     Kind::Effect { life } => life,
-                    _ => PROJECTILE_LIFE,
+                    _ => self.rules.projectile_life,
                 };
                 e.kind = Kind::Projectile {
                     owner: pi,
@@ -5529,13 +5695,13 @@ impl Game {
                     hold: row.mintime,
                     morph,
                 };
-                e.yaw = vel.x.atan2(vel.z);
+                e.yaw = vel.x.det_atan2(vel.z);
                 e.pitch = Self::missile_pitch(vel, 0.0, 0.0);
             }
             return;
         }
         let at = fx.pos;
-        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
         let delay = row.delay.max(1.0 / 60.0);
         let hits: Vec<(usize, Vec2)> = self
             .entities
@@ -5789,7 +5955,7 @@ impl Game {
             } => Some((*hp, *strength == 2)),
             _ => None,
         };
-        let r = Self::apply_hit(&mut self.entities[t], dmg, push);
+        let r = Self::apply_hit(&mut self.entities[t], dmg, push, self.magic_hit != 0);
         // AudioPlayEvt101: Death dies.
         if r.killed && r.tier == crate::enemies::DEATH && !r.generator {
             self.sfx_id(0x65);
@@ -5800,7 +5966,7 @@ impl Game {
         // without it the hero hears it can't be hurt (msg 0).
         if let (Some((hp, tier2)), true) = (death, r.hit) {
             let p = &mut self.players[pi];
-            if MAGIC_HIT.with(|m| m.get()) != 0 {
+            if self.magic_hit != 0 {
                 if p.level > 75 {
                     let k = 0.032 * (p.level - 75) as f32 + 0.2;
                     let cap = max_health(p.level);
@@ -5821,7 +5987,7 @@ impl Game {
         // damage_enemy's burst by the hit's element (the potion's, the
         // weapon's, or what the caller dealt).
         let dtype = self.effects.hit_dtype.take().unwrap_or_else(|| {
-            let magic = MAGIC_HIT.with(|m| m.get());
+            let magic = self.magic_hit;
             if magic != 0 {
                 magic | DmgType::MAGIC
             } else {
@@ -5945,7 +6111,7 @@ impl Game {
         }
         let (_, node) = c.surface(from, pos, yaw);
         let (part, colnode) = node.unwrap_or((0, usize::MAX));
-        let element = MAGIC_HIT.with(|m| m.get());
+        let element = self.magic_hit;
         let magic = element != 0;
         let mut flags = if magic {
             // The potion's element, for this critter's own affinity.
@@ -6353,7 +6519,7 @@ impl Game {
         };
         if let Some((_, scale)) = react.filter(|r| r.1 > 0.0) {
             *pushed += dir * scale;
-            *pushang = dir.x.atan2(dir.z) + std::f32::consts::PI;
+            *pushang = dir.x.det_atan2(dir.z) + std::f32::consts::PI;
             if *pushang > std::f32::consts::PI {
                 *pushang -= std::f32::consts::TAU;
             }
@@ -6406,7 +6572,7 @@ impl Game {
     }
 
     /// Damage one entity (fn_8004DC2C's reaction and push: `enemy_react`).
-    fn apply_hit(e: &mut Entity, dmg: f32, _push: Vec2) -> HitResult {
+    fn apply_hit(e: &mut Entity, dmg: f32, _push: Vec2, magic: bool) -> HitResult {
         let mut r = HitResult::default();
         match &mut e.kind {
             Kind::Enemy {
@@ -6419,7 +6585,7 @@ impl Game {
                 if *etype == crate::enemies::IT {
                     return r;
                 }
-                let dmg = if *etype == crate::enemies::DEATH && MAGIC_HIT.with(|m| m.get()) == 0 {
+                let dmg = if *etype == crate::enemies::DEATH && !magic {
                     1.0
                 } else if *etype == crate::enemies::DEATH {
                     999.0
@@ -6479,7 +6645,29 @@ impl Game {
     }
 
     /// A chest or breakable's content: the placed item, or nothing.
+    /// fn_8005E90C's reroll: a random item row (type -1) stands for one of
+    /// its candidates, chosen here (the original: ((sItemRandSeed >> 5) +
+    /// item) % n, the seed stepping by 439); a chain of random rows is
+    /// followed to a real one. None for an index with no row, or a random
+    /// row with nothing to choose from.
+    pub(crate) fn decide_random(&mut self, mut idx: usize) -> Option<usize> {
+        for _ in 0..8 {
+            let info = self.level.worlds.item_infos.get(idx)?;
+            if info.item_type != ItemType::Random {
+                return Some(idx);
+            }
+            if info.random_indices.is_empty() {
+                return None;
+            }
+            let pick =
+                info.random_indices[self.rng.next_u32() as usize % info.random_indices.len()];
+            idx = usize::try_from(pick).ok()?;
+        }
+        None
+    }
+
     fn spawn_content(&mut self, pos: Vec3, item: Option<usize>) {
+        let item = item.and_then(|i| self.decide_random(i));
         let Some(info) = item
             .and_then(|i| self.level.worlds.item_infos.get(i))
             .cloned()
@@ -6582,6 +6770,8 @@ impl Game {
             .count();
         type Fired = (Vec3, u16, Option<usize>, Option<(Vec3, Vec3, u8)>, bool);
         let mut trigger_fired: Vec<Fired> = Vec::new();
+        // Chain heads set off this frame and their heroes, for their chains.
+        let mut chain_feed: Vec<(u64, u32)> = Vec::new();
         let mut door_hint = false;
         let mut trap_hits: Vec<(usize, f32, u32, Vec3, i32, u64)> = Vec::new();
         let mut fallers_started: Vec<(i32, Option<(usize, usize)>)> = Vec::new();
@@ -6926,7 +7116,7 @@ impl Game {
                         if pushed.x * pushed.x + pushed.z * pushed.z > 0.1 {
                             e.yaw = *pushang;
                         }
-                        *pushed *= 0.8f32.powf(dt * 30.0);
+                        *pushed *= 0.8f32.det_powf(dt * 30.0);
                         for c in [&mut pushed.x, &mut pushed.y, &mut pushed.z] {
                             if c.abs() < 0.01 {
                                 *c = 0.0;
@@ -7456,14 +7646,19 @@ impl Game {
                     }
                 }
                 // fn_8005D730 case 7: a door opens (or says it needs a key,
-                // msg 1) only for a hero not moving away from it.
+                // msg 1) only for a hero not moving away from it. The door's
+                // own cylinder holds a hero's centre exactly `radius` away
+                // (its radius plus the hero's), so contact is `<=`, with a
+                // little slack for the collision push-out's rounding; a
+                // strict `<` left the levelE1 altar door shut to a hero
+                // with a key.
                 Kind::Door { radius, coll } => {
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                         let mv = self.players[pi].trial_move;
                         let toward = Vec2::new(mv.x, mv.z)
                             .dot(Vec2::new(e.pos.x - pp.x, e.pos.z - pp.z))
                             >= 0.0;
-                        let touching = *alive && toward && (*pp - e.pos).length() < *radius;
+                        let touching = *alive && toward && (*pp - e.pos).length() <= *radius + 0.05;
                         if touching && self.players[pi].keys == 0 {
                             posts.push((1, pi));
                         }
@@ -7489,6 +7684,9 @@ impl Game {
                     flags,
                     cam,
                     door_switch,
+                    next,
+                    linked,
+                    fed,
                     ..
                 } => {
                     use crate::triggers::tflags;
@@ -7511,8 +7709,11 @@ impl Game {
                     let root = mover.and_then(|m| self.movers.get(m)).map(|m| m.root);
                     let objs = &self.level.worlds.world_objects;
                     let mut mask = 0u32;
+                    // A link target (flags 0x200) has no reach of its own
+                    // (item collision case 5: keep = 0).
                     for (pi, (pp, alive)) in player_pos.iter().enumerate() {
                         if *shoot
+                            || *linked
                             || !*alive
                             || Vec2::new(pp.x - pos.x, pp.z - pos.z).length()
                                 >= reach + PLAYER_RADIUS + 0.6
@@ -7538,6 +7739,20 @@ impl Game {
                         }
                         mask |= 1 << pi;
                     }
+                    // The chain ahead of it hands down its heroes; flag 0x100
+                    // on a link target keeps only those standing on its target
+                    // (item update case 5).
+                    mask |= *fed;
+                    *fed = 0;
+                    if let (true, true, Some(r)) = (*linked, *flags & tflags::ON_TARGET != 0, root)
+                    {
+                        for pi in 0..player_pos.len().min(32) {
+                            let floor = trigger_floors.get(pi).copied().flatten();
+                            if !crate::triggers::on_target(objs, r, floor) {
+                                mask &= !(1 << pi);
+                            }
+                        }
+                    }
                     // Flag 0x400: nothing until every hero in play is on it.
                     if *flags & tflags::ALL_HEROES != 0 && mask != all_heroes {
                         mask = 0;
@@ -7548,6 +7763,11 @@ impl Game {
                         barrier_touches.extend(*gate);
                     }
                     let touched = !locked && contact;
+                    // The chain after it gets the same heroes (a locked gate
+                    // hands down none).
+                    if next.is_some() && touched {
+                        chain_feed.push((e.id, mask | *hit as u32));
+                    }
                     *hit = false;
                     let mut active = None;
                     if let Some(m) = mover.and_then(|m| self.movers.get_mut(m)) {
@@ -7742,7 +7962,7 @@ impl Game {
                         e.alive = false;
                     } else {
                         e.pos = to;
-                        e.yaw = vel.x.atan2(vel.z);
+                        e.yaw = vel.x.det_atan2(vel.z);
                         e.pitch = Self::missile_pitch(*vel, *tumble, e.pitch + *tumble * dt);
                         proj_hits.push((
                             ei,
@@ -7818,7 +8038,7 @@ impl Game {
                                     < *radius + PLAYER_RADIUS
                                 && (pp.y - e.pos.y).abs() < 4.0
                             {
-                                let fwd = Vec3::new(e.yaw.sin(), 0.0, e.yaw.cos());
+                                let fwd = Vec3::new(e.yaw.det_sin(), 0.0, e.yaw.det_cos());
                                 trap_hits.push((
                                     pi,
                                     *dmg,
@@ -7846,6 +8066,16 @@ impl Game {
         }
 
         self.barrier_touches = barrier_touches;
+        for (head, mask) in chain_feed {
+            let Some(h) = self.entities.iter().position(|e| e.id == head) else {
+                continue;
+            };
+            for i in self.trigger_chain(h) {
+                if let Kind::Trigger { fed, .. } = &mut self.entities[i].kind {
+                    *fed |= mask;
+                }
+            }
+        }
         // (Not in the attract flyby: MODE_GROUP_ATTRACT.)
         if door_hint && self.fixed_camera.is_none() {
             self.post(5, None, &[]);
@@ -8198,7 +8428,7 @@ impl Game {
                 self.sfx.push(format!("S_ELVSTONESTP{w}|S_STONEGATESTOP"));
             }
         }
-        self.slide_riding_triggers();
+        self.slide_riding_items();
 
         for pi in chest_used {
             self.players[pi].keys -= 1;
@@ -8243,7 +8473,7 @@ impl Game {
                 // Hand of Death turns the blow back on the monster; Health Vampire
                 // does that too and heals the player by it.
                 if let Some(e) = self.entities.get_mut(ei) {
-                    Self::apply_hit(e, dmg, Vec2::ZERO);
+                    Self::apply_hit(e, dmg, Vec2::ZERO, self.magic_hit != 0);
                 }
                 if special & pu::S_VAMPIRE != 0 {
                     let p = &mut self.players[pi];
@@ -8416,7 +8646,7 @@ impl Game {
                 },
                 model,
                 from + dir * 3.0,
-                dir.x.atan2(dir.z),
+                dir.x.det_atan2(dir.z),
             );
         }
         // The suicide grunt's blast (enemy_dies: SuicideExplosion at its
@@ -8706,11 +8936,30 @@ impl Game {
                 h = h.wrapping_mul(0x100000001b3);
             }
         };
-        let f = |v: f32| v.to_bits().to_le_bytes();
+        // x86 and ARM give NaNs different sign bits; a NaN is a NaN.
+        let f = |v: f32| {
+            (if v.is_nan() { f32::NAN } else { v })
+                .to_bits()
+                .to_le_bytes()
+        };
         let v3 = |v: Vec3| [f(v.x), f(v.y), f(v.z)].concat();
+        put(&self.rules.digest().to_le_bytes());
         put(&self.frame.to_le_bytes());
         put(&self.rng.0.to_le_bytes());
         put(&f(self.time));
+        put(&self.rules.digest().to_le_bytes());
+        put(&(self.friendly_fire as u32).to_le_bytes());
+        put(&[self.debug_god as u8]);
+        for c in self.crystals.iter().chain(&self.garg_items) {
+            put(&c.to_le_bytes());
+        }
+        for v in [self.shards, self.runes, self.boss_runes, self.legend_held] {
+            put(&v.to_le_bytes());
+        }
+        for c in &self.controls {
+            put(&(c.control_style as u32).to_le_bytes());
+            put(&[c.rumble as u8, c.auto_aim as u8, c.auto_attack as u8]);
+        }
         put(&(self.players.len() as u32).to_le_bytes());
         for p in &self.players {
             put(&v3(p.pos));
@@ -8772,7 +9021,7 @@ mod tests {
         g.entities.clear();
         // Let the player settle on the ground, facing +z.
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let class = g
@@ -8802,7 +9051,7 @@ mod tests {
                 attack_pressed: true,
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, &[fire]);
+            g.update(&[fire]);
             if !g.entities.iter().any(|e| e.id == id) {
                 break;
             }
@@ -8820,7 +9069,7 @@ mod tests {
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
         g.entities.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
@@ -8843,7 +9092,7 @@ mod tests {
         use crate::paction::p as pa;
         let mut seen = Vec::new();
         for _ in 0..90 {
-            g.update(1.0 / 60.0, &[hold]);
+            g.update(&[hold]);
             let cur = g.players[0].act.cur;
             if seen.last() != Some(&cur) {
                 seen.push(cur);
@@ -8861,7 +9110,7 @@ mod tests {
         g.entities.clear();
         g.pending_enemies.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
@@ -8907,7 +9156,7 @@ mod tests {
             }
             assert!((pushed.z - push).abs() < 1e-3, "{dtype:x}: {pushed}");
             for _ in 0..30 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             let moved = g.entities[t].pos.z - start.z;
             assert!(moved >= least, "{dtype:x}: moved {moved}");
@@ -8959,7 +9208,7 @@ mod tests {
             g.entities.clear();
             g.pending_enemies.clear();
             for _ in 0..30 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             let model = g.classes[class].model(1);
             let mut kind = g.new_enemy(class, tier, EnemyState::Chase);
@@ -8989,7 +9238,7 @@ mod tests {
         g.players[0].level = 10;
         let hp = g.players[0].health;
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = &g.players[0];
         assert!(p.level < 10, "drained a level away: {} {}", p.level, p.exp);
@@ -9014,7 +9263,7 @@ mod tests {
         let mut faded = false;
         let y0 = g.entities[t].pos.y;
         for _ in 0..120 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if let Some(e) = g.entities.iter().find(|e| e.id == id) {
                 rose |= e.pos.y > y0 + 3.0;
                 faded |= e.fade < 0.5 && e.fade > 0.0;
@@ -9059,7 +9308,7 @@ mod tests {
         let mut at = None;
         for f in 0..(48 * 60) {
             g.msgs.shown = None;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if g.sfx.iter().any(|s| s.contains("S_FOLLOW")) {
                 assert!(at.is_none(), "once per quiet stretch");
                 at = Some(f);
@@ -9122,11 +9371,16 @@ mod tests {
             if let Kind::Enemy { cooldown, .. } = &mut kind {
                 *cooldown = 99.0;
             }
-            g.spawn(kind, model, p + Vec3::new(a.sin(), 0.0, a.cos()) * 7.0, 0.0);
+            g.spawn(
+                kind,
+                model,
+                p + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * 7.0,
+                0.0,
+            );
         }
         g.msgs = crate::messages::Messages::new(g.msgs.text.clone());
         g.players[0].power = 100.0;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         assert_eq!(g.msgs.shown.as_ref().map(|s| s.index), Some(110));
         // A swing at a breakable wall (the nameless obstacle 0x2A) the hero
         // stands against (A1SHOOTW#1, to the +x): it takes multiple hits (20).
@@ -9157,15 +9411,15 @@ mod tests {
         g.pending_enemies.clear();
         let idle = [PlayerInput::default()];
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
         use crate::paction::p as pa;
         let p0 = g.players[0].pos;
         g.damage_player(0, 10.0, 0);
-        g.update(1.0 / 60.0, &idle);
+        g.update(&idle);
         assert_eq!(g.players[0].act.cur, pa::HIT_REACT);
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
         // Knocked down from behind (the hero faces +z): the forward fall, a push
         // forward, then up again.
@@ -9173,7 +9427,7 @@ mod tests {
         g.damage_player(0, 10.0, DmgType::KNOCKDOWN);
         let mut seen = vec![];
         for _ in 0..180 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
             let c = g.players[0].act.cur;
             if seen.last() != Some(&c) {
                 seen.push(c);
@@ -9194,7 +9448,7 @@ mod tests {
         g.pending_enemies.clear();
         let idle = [PlayerInput::default(), PlayerInput::default()];
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
         // The Wizard faces +z with the Warrior 3 ahead.
         let base = g.players[0].pos;
@@ -9212,7 +9466,7 @@ mod tests {
         let mut partner_anims = vec![];
         let mut linked = false;
         for _ in 0..240 {
-            g.update(1.0 / 60.0, &z);
+            g.update(&z);
             linked |= g.players[1].grab_partner == Some(0);
             let c = g.players[1].act.cur;
             if partner_anims.last() != Some(&c) {
@@ -9236,7 +9490,7 @@ mod tests {
         g.pending_enemies.clear();
         let idle = [PlayerInput::default(), PlayerInput::default()];
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &idle);
+            g.update(&idle);
         }
         let base = g.players[0].pos;
         g.players[0].yaw = 0.0;
@@ -9252,7 +9506,7 @@ mod tests {
         use crate::paction::p as pa;
         let mut seen = vec![];
         for _ in 0..600 {
-            g.update(1.0 / 60.0, &z);
+            g.update(&z);
             let c = g.players[1].act.cur;
             if seen.last() != Some(&c) {
                 seen.push(c);
@@ -9353,7 +9607,7 @@ mod tests {
             for _ in 0..30 {
                 g.players[0].pos.x = at.x;
                 g.players[0].pos.z = at.z;
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             let e = g.entities.iter().find(|e| e.id == id).unwrap();
             assert!(
@@ -9400,7 +9654,7 @@ mod tests {
         for _ in 0..600 {
             g.players[0].pos.x = pos.x;
             g.players[0].pos.z = pos.z;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             if g.players[0].health < last {
                 hits += 1;
             }
@@ -9439,7 +9693,7 @@ mod tests {
             for _ in 0..1200 {
                 g.players[0].pos.x = pos.x;
                 g.players[0].pos.z = pos.z;
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 if let Some(Kind::Hazard { cycle, .. }) =
                     g.entities.iter().find(|e| e.id == id).map(|e| &e.kind)
                 {
@@ -9473,7 +9727,7 @@ mod tests {
         };
         let mut throws = 0;
         for _ in 0..300 {
-            g.update(1.0 / 60.0, &[hold]);
+            g.update(&[hold]);
             throws += g.sfx.drain(..).filter(|s| s.ends_with("THROW")).count();
         }
         // THROW1S cut at frame 2, THROW1, THROW1R, all rate 24 (37.5 frames a
@@ -9507,12 +9761,12 @@ mod tests {
         // Run into the lever.
         g.players[0].pos = lever + Vec3::new(0.0, 0.5, 1.2);
         for _ in 0..10 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(g.movers[wall].active, "lever pulled");
         g.players[0].pos = lever + Vec3::new(0.0, 0.5, 30.0);
         for _ in 0..120 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         // door_switch latches: the wall sinks 4 units and stays down.
         assert!(
@@ -9559,7 +9813,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..400 {
-            g.update(1.0 / 60.0, &[walk(&g)]);
+            g.update(&[walk(&g)]);
         }
         assert!(
             g.players[0].pos.z < 27.0,
@@ -9568,7 +9822,7 @@ mod tests {
         );
         g.players[0].keys = 1;
         for _ in 0..200 {
-            g.update(1.0 / 60.0, &[walk(&g)]);
+            g.update(&[walk(&g)]);
         }
         assert!(
             g.players[0].pos.z > 29.0,
@@ -9590,9 +9844,9 @@ mod tests {
             magic_pressed: true,
             ..Default::default()
         };
-        g.update(1.0 / 60.0, &[magic]);
+        g.update(&[magic]);
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let after = g.entities.iter().filter(|e| near(e)).count();
         assert_eq!(g.players[0].potions, 0);
@@ -9632,7 +9886,7 @@ mod tests {
                 ..Default::default()
             };
             for _ in 0..ticks {
-                g.update(1.0 / 60.0, &[inp]);
+                g.update(&[inp]);
             }
         };
         g.players[0].pos = Vec3::new(0.0, 0.0, 55.0);
@@ -9728,7 +9982,7 @@ mod tests {
         };
         let step = |g: &mut Game, n: usize| {
             for _ in 0..n {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
         };
         let mut g = Game::new(&fs, "levelL1", &[("WAR", "RED")]).unwrap();
@@ -9806,14 +10060,14 @@ mod tests {
         let mut g = Game::new(fs, "levelA1", &[(class, "RED")]).unwrap();
         g.entities.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = &g.players[0];
         let t = Throw {
             pi: 0,
             pos: p.pos,
             yaw: p.yaw,
-            aim: Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()),
+            aim: Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos()),
             target: false,
             bits: crate::paction::act::THROW,
             since_swing: 1.0,
@@ -9839,7 +10093,7 @@ mod tests {
         g.sfx.clear();
         let mut heard = false;
         for _ in 0..240 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             heard |= g.sfx.drain(..).any(|s| s == "S_WEAPONHITSTON");
         }
         assert!(missiles(&g).is_empty() && heard);
@@ -9878,7 +10132,7 @@ mod tests {
         let want = p
             + Vec3::Y * 2.5
             + crate::missile::rotate_offset([-0.5, 0.5, 1.5], yaw)
-            + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 2.0;
+            + Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos()) * 2.0;
         assert!((m[0].0 - want).length() < 1e-3, "{:?} vs {want:?}", m[0].0);
         // Lobbed: rising, at the clamped missile speed across.
         let speed = g.players[0].derived.missile_speed.clamp(1.0, 100.0);
@@ -9887,7 +10141,7 @@ mod tests {
         let start = m[0].0;
         let (mut top, mut last) = (start.y, start);
         for _ in 0..180 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             match missiles(&g).first() {
                 Some(&(pos, _v, _)) => {
                     top = top.max(pos.y);
@@ -9915,12 +10169,12 @@ mod tests {
             .powerups
             .add(crate::powerups::WEAPON, crate::powerups::W_5WAY, 0.0, 45.0);
         g.players[0].powerups.slots[0].state = crate::powerups::ON;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let yaw = g.players[0].yaw;
         g.player_start_missile(Throw { yaw, ..t });
         let mut turns: Vec<i32> = missiles(&g)
             .iter()
-            .map(|(_, v, _)| wrap_angle(v.x.atan2(v.z) - yaw).to_degrees().round() as i32)
+            .map(|(_, v, _)| wrap_angle(v.x.det_atan2(v.z) - yaw).to_degrees().round() as i32)
             .collect();
         turns.sort();
         assert_eq!(turns, [-30, -15, 0, 15, 30]);
@@ -9954,13 +10208,13 @@ mod tests {
             45.0,
         );
         g.players[0].powerups.slots[0].state = crate::powerups::ON;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let yaw = g.players[0].yaw;
         g.player_start_missile(Throw { yaw, ..t });
         let mut bounced = false;
         for _ in 0..120 {
             let before = missiles(&g);
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             let after = missiles(&g);
             if let (Some(b), Some(a)) = (before.first(), after.first()) {
                 bounced |= b.1.y < 0.0 && a.1.y > 0.0;
@@ -9992,7 +10246,7 @@ mod tests {
         };
         let mut most = 0;
         for _ in 0..40 {
-            g.update(1.0 / 60.0, &[attack]);
+            g.update(&[attack]);
             let n = g
                 .entities
                 .iter()
@@ -10015,7 +10269,7 @@ mod tests {
             .map(|e| e.pos)
             .expect("A6 has a secret icon");
         g.players[0].pos = icon;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         // S3 (Space) is the secret realm's third level.
         assert_eq!(g.level_end, Some(LevelEnd::Secret(0xC02)));
         let s = Game::new(&fs, "levelS3", &[("WAR", "RED")]).unwrap();
@@ -10035,7 +10289,7 @@ mod tests {
         g.sfx.clear();
         let mut heard = Vec::new();
         for _ in 0..(10 * 60) {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             heard.extend(
                 g.sfx
                     .drain(..)
@@ -10093,7 +10347,7 @@ mod tests {
         let mut walked = BTreeSet::new();
         let mut last: BTreeMap<u64, Vec3> = BTreeMap::new();
         for _ in 0..900 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             for e in &g.entities {
                 if let Kind::Enemy { brain, .. } = &e.kind {
                     *algs.entry(brain.alg()).or_default() += 1;
@@ -10135,13 +10389,13 @@ mod tests {
             else {
                 continue;
             };
-            g.players[0].pos = pos + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 15.0 + Vec3::Y;
+            g.players[0].pos = pos + Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos()) * 15.0 + Vec3::Y;
             let hp = g.players[0].health;
             let mut ran = false;
             let mut gone = false;
             let mut seen = None;
             for _ in 0..900 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 let grunt = g.entities.iter().find(|e| {
                     e.alive && matches!(&e.kind, Kind::Enemy { strength: 6, brain, .. } if brain.alg() == 18)
                 });
@@ -10178,7 +10432,7 @@ mod tests {
             .retain(|e| !matches!(e.kind, Kind::Enemy { .. } | Kind::Generator { .. }));
         g.pending_enemies.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let class = g.classes.iter().position(|c| c.name == "DEM").unwrap();
         // A level-3 generator's demon (gen ai 0): move_logic30.
@@ -10188,7 +10442,7 @@ mod tests {
         let p = g.players[0].pos;
         let (at, yaw) = (0..16)
             .map(|k| k as f32 * std::f32::consts::TAU / 16.0)
-            .map(|a| (p + Vec3::new(a.sin(), 0.0, a.cos()) * 16.0, a))
+            .map(|a| (p + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * 16.0, a))
             .find(|(q, _)| {
                 (1..=16).all(|s| {
                     let r = p + (*q - p) * (s as f32 / 16.0);
@@ -10205,7 +10459,7 @@ mod tests {
         let mut shots = 0;
         let mut closest = f32::MAX;
         for _ in 0..600 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             shots += g
                 .entities
                 .iter()
@@ -10248,10 +10502,10 @@ mod tests {
             };
             // Stand 12 units in front of it.
             let (pos, yaw) = archer;
-            g.players[0].pos = pos + Vec3::new(yaw.sin(), 0.0, yaw.cos()) * 12.0 + Vec3::Y;
+            g.players[0].pos = pos + Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos()) * 12.0 + Vec3::Y;
             let mut shots = 0;
             for _ in 0..600 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
                 shots += g
                     .entities
                     .iter()
@@ -10407,7 +10661,7 @@ mod tests {
         };
         // 30 along the facing, from (0, 1, 5) in the hero's frame; a super
         // (pass-through) shot of radius hitrad 10 with no hit record.
-        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
         assert!((*vel - fwd * 30.0).length() < 1e-3);
         assert!((e.pos - (p + Vec3::Y + fwd * 5.0)).length() < 1e-3);
         assert_eq!((*radius, pierced.is_some()), (10.0, true));
@@ -10452,7 +10706,7 @@ mod tests {
         // PlyrSfxWrapTime: frames 16, 19, 21, 23 and 25; the angle shrinks
         // to the facing.
         assert_eq!(dirs.len(), 5);
-        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
         assert!(dirs[0].dot(fwd).abs() < 0.05, "first goes out sideways");
         assert!(dirs.last().unwrap().dot(fwd) > 0.9, "last nearly ahead");
     }
@@ -10470,7 +10724,7 @@ mod tests {
         g.entities.retain(|e| e.id == gid);
         g.pending_enemies.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let e = g.entities.iter_mut().find(|e| e.id == gid).unwrap();
@@ -10511,7 +10765,7 @@ mod tests {
             let sf = row.startframe as f32;
             g.fire_damage_row(0, &row, sf - 1.0, sf, None);
             for _ in 0..60 {
-                g.update(1.0 / 60.0, &[PlayerInput::default()]);
+                g.update(&[PlayerInput::default()]);
             }
             let hp = generator_hp(&g, gid).unwrap();
             assert!(
@@ -10541,7 +10795,7 @@ mod tests {
                     attack_pressed: f == 5,
                     ..Default::default()
                 };
-                g.update(1.0 / 60.0, &[inp]);
+                g.update(&[inp]);
                 acts.push(g.players[0].act.cur);
             }
             assert!(acts.contains(&act), "turbo move {act} played");
@@ -10567,7 +10821,7 @@ mod tests {
                     slow_pressed: f % 60 == 30,
                     ..Default::default()
                 };
-                g.update(1.0 / 60.0, &[inp]);
+                g.update(&[inp]);
                 heard.extend(g.sfx.drain(..).filter(|s| s.contains("TURBO")));
             }
             assert!(!heard.is_empty(), "{class}: no turbo sounds");
@@ -10595,18 +10849,18 @@ mod tests {
         g.players[0].pos = s.pos + Vec3::new(s.radius + 6.0, 0.0, 0.0);
         g.players[0].health = 10_000.0;
         for _ in 0..300 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(waiting(&g), "still a statue beside a hero");
         g.players[0].pos = s.pos;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         assert!(!waiting(&g), "bumped awake");
         // In view, Death takes the statue's place.
         let death = |e: &Entity| matches!(e.kind, Kind::Enemy { etype, .. } if etype == crate::enemies::DEATH);
         let mut made = false;
         for _ in 0..240 {
             g.players[0].pos = s.pos;
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
             made |= g.entities.iter().any(death);
         }
         assert!(made, "Death made");
@@ -10622,7 +10876,7 @@ mod tests {
         g.entities.clear();
         g.pending_enemies.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         let p = g.players[0].pos;
         let class = g.classes.iter().position(|c| c.name == "GRU").unwrap();
@@ -10665,7 +10919,7 @@ mod tests {
                 .unwrap()
                 .pos;
             for _ in 0..90 {
-                g.update(1.0 / 60.0, &[walk]);
+                g.update(&[walk]);
                 let cur = g.players[0].act.cur;
                 swung |= matches!(cur, pa::QUICK | pa::KICK | pa::STEP);
                 passed |= g.players[0].pos.z > grunt.z + 0.5;
@@ -10687,13 +10941,13 @@ mod tests {
         };
         // The Default style ignores the C-stick.
         for _ in 0..20 {
-            g.update(1.0 / 60.0, &[fire]);
+            g.update(&[fire]);
         }
         assert!(g.players[0].yaw.abs() < 0.1, "default: still facing +z");
         g.controls[0].control_style = crate::input::TWIN_STICK;
         let mut swung = false;
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[fire]);
+            g.update(&[fire]);
             swung |= g.players[0].act.motion == 0x0F;
         }
         assert!(
@@ -10709,7 +10963,7 @@ mod tests {
         };
         let mut strafed = false;
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[both]);
+            g.update(&[both]);
             strafed |= (0x11..=0x14).contains(&g.players[0].act.motion);
         }
         assert!(strafed, "strafing attack");
@@ -10735,7 +10989,7 @@ mod tests {
                 ..Default::default()
             };
             for _ in 0..10 {
-                g.update(1.0 / 60.0, &[atk]);
+                g.update(&[atk]);
             }
             let turned = g.players[0].yaw > 0.2;
             assert_eq!(turned, aim, "auto aim {aim}");
@@ -10748,6 +11002,48 @@ mod tests {
     }
 
     #[test]
+    fn archers_throw_arrows_not_their_bows() {
+        let Some(fs) = data() else {
+            eprintln!("game data not found; skipping");
+            return;
+        };
+        let defs = |dir: &str| load_asset(&fs, dir).unwrap().objects.object_defs;
+        let (arc, arc_sfx) = (defs("PLAYERS/ARC/BLU"), defs("PLAYERS/ARC/SFXBLU"));
+        assert_eq!(
+            throw_object(&arc, &arc_sfx, &["ARC", "ARC"], 1),
+            Some((true, "BOW_THROW1ARC_A".into())),
+            "the Archer's arrow comes from her SFX bank"
+        );
+        assert_eq!(
+            throw_object(&arc, &arc_sfx, &["ARC", "ARC"], 23),
+            Some((true, "BOW_THROW2ARC_A".into())),
+            "a higher arrow from level 20"
+        );
+        let (tig, _) = (defs("PLAYERS/TIG/BLU"), ());
+        assert_eq!(
+            throw_object(&tig, &arc_sfx, &["TIG", "ARC"], 1),
+            Some((true, "BOW_THROW1ARC_A".into())),
+            "the Tigress shares the Archer's arrows"
+        );
+        let (war, war_sfx) = (defs("PLAYERS/WAR/RED"), defs("PLAYERS/WAR/SFXRED"));
+        assert_eq!(
+            throw_object(&war, &war_sfx, &["WAR", "WAR"], 1),
+            Some((false, "AXE_THROW0GROUP".into())),
+            "the Warrior's axe is in his own file"
+        );
+        assert_eq!(
+            throw_object(&war, &war_sfx, &["WAR", "WAR"], 30),
+            Some((false, "AXE_THROW0GROUP".into())),
+            "the Minotaur's MIN_THROW1 in the shared bank is not the Warrior's"
+        );
+        let mut g = Game::new(&fs, "levelA1", &[("ARC", "BLU")]).unwrap();
+        assert!(g.players[0].proj_model.is_some());
+        for _ in 0..30 {
+            g.update(&[PlayerInput::default()]);
+        }
+    }
+
+    #[test]
     fn a_clone_keeps_running_as_the_original_does() {
         let Some(fs) = data() else {
             eprintln!("game data not found; skipping");
@@ -10756,7 +11052,7 @@ mod tests {
         let mut a = Game::new(&fs, "levelA1", &[("WAR", "RED"), ("VAL", "BLU")]).unwrap();
         for _ in 0..240 {
             let inputs = bot_inputs(&a);
-            a.update(1.0 / 60.0, &inputs);
+            a.update(&inputs);
         }
         let mut b = a.clone();
         assert_eq!(a.fingerprint(), b.fingerprint(), "a fresh clone matches");
@@ -10764,8 +11060,8 @@ mod tests {
             let ia = bot_inputs(&a);
             let ib = bot_inputs(&b);
             assert_eq!(ia, ib, "frame {frame}: the bots see the same game");
-            a.update(1.0 / 60.0, &ia);
-            b.update(1.0 / 60.0, &ib);
+            a.update(&ia);
+            b.update(&ib);
             if frame % 60 == 59 {
                 assert_eq!(
                     a.fingerprint(),
@@ -10794,8 +11090,8 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint(), "fresh games match");
         for frame in 0..900 {
             let inputs = bot_inputs(&a);
-            a.update(1.0 / 60.0, &inputs);
-            b.update(1.0 / 60.0, &inputs);
+            a.update(&inputs);
+            b.update(&inputs);
             if frame % 60 == 59 {
                 assert_eq!(
                     a.fingerprint(),

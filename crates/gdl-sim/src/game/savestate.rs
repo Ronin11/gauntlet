@@ -502,9 +502,11 @@ impl Game {
             self.world_anim
                 .restore_rotator(r.target, r.curang, r.on, r.done, r.node);
         }
-        // Pose the world at the restored frames, and its collision with it.
+        // Pose the world at the restored frames, and its collision with it,
+        // and the items parented to its moving floors where it puts them.
         self.world_anim.update(&mut self.collision, 0.0);
         self.collision.refit_dynamic();
+        self.pose_riding_items();
     }
 
     fn apply_placed(&mut self, i: usize, p: &Placed) {
@@ -595,7 +597,7 @@ impl Game {
         for r in 1..=24 {
             for k in 0..16 {
                 let a = k as f32 * std::f32::consts::TAU / 16.0;
-                let q = pos + Vec3::new(a.cos() * r as f32, 0.0, a.sin() * r as f32);
+                let q = pos + Vec3::new(a.det_cos() * r as f32, 0.0, a.det_sin() * r as f32);
                 for dy in [0.0, 3.0, -3.0, 6.0] {
                     if let Some(p) = ok(q + Vec3::Y * dy) {
                         return p;
@@ -1607,7 +1609,7 @@ mover root=2 active=1
         let mut g = Game::new(&fs, "levelA1", &[("WAR", "RED")]).unwrap();
         for _ in 0..2400 {
             let inp = g.bot_input(0);
-            g.update(1.0 / 60.0, &[inp]);
+            g.update(&[inp]);
             g.scroll_box = None;
         }
         // Make sure something changed: take a placed pickup and kill a
@@ -1623,7 +1625,7 @@ mover root=2 active=1
             m.active = true;
         }
         for _ in 0..120 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         g.players[0].gold = 777;
         g.players[0].keys = 4;

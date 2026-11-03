@@ -353,17 +353,17 @@ mod tests {
         g.players[0].pos = exit_pos(&g, 0);
         // DoExit: 6 ticks stood still before waiting.
         for _ in 0..EXIT_STILL_TICKS - 1 {
-            g.update(1.0 / 60.0, &idle(1));
+            g.update(&idle(1));
         }
         assert!(!g.players[0].exit.waiting);
-        g.update(1.0 / 60.0, &idle(1));
+        g.update(&idle(1));
         assert!(g.players[0].exit.waiting);
         assert!(g.players[0].state.active());
         // Alone on it, the exit is already open (ACTIVE3 counts as open
         // while it plays): the hero sinks within a tick or two.
         let mut sank = false;
         for _ in 0..3 {
-            g.update(1.0 / 60.0, &idle(1));
+            g.update(&idle(1));
             if matches!(g.players[0].state, PlayerState::Exiting { .. }) {
                 sank = true;
                 break;
@@ -371,7 +371,7 @@ mod tests {
         }
         assert!(sank, "the hero sinks once the exit is open");
         for _ in 0..80 {
-            g.update(1.0 / 60.0, &idle(1));
+            g.update(&idle(1));
         }
         assert_eq!(g.level_end, Some(LevelEnd::Exit(None)));
     }
@@ -387,7 +387,7 @@ mod tests {
         };
         for _ in 0..200 {
             g.players[0].pos = at;
-            g.update(1.0 / 60.0, &[walk]);
+            g.update(&[walk]);
         }
         assert!(g.players[0].exit.touch.is_some());
         assert!(!g.players[0].exit.waiting);
@@ -405,7 +405,7 @@ mod tests {
         let mut same_exit = false;
         for _ in 0..300 {
             g.players[1].pos = away;
-            g.update(1.0 / 60.0, &idle(2));
+            g.update(&idle(2));
             same_exit |= g.msgs.shown.as_ref().is_some_and(|s| s.index == 11);
         }
         assert!(g.players[0].exit.waiting);
@@ -421,12 +421,12 @@ mod tests {
         // ticks after the last arrives.
         let mut ticks = 0;
         while g.players.iter().all(|p| p.state.active()) && ticks < 200 {
-            g.update(1.0 / 60.0, &idle(2));
+            g.update(&idle(2));
             ticks += 1;
         }
         assert!(ticks > 45, "sank after {ticks}");
         for _ in 0..80 {
-            g.update(1.0 / 60.0, &idle(2));
+            g.update(&idle(2));
         }
         assert_eq!(g.level_end, Some(LevelEnd::Exit(None)));
     }
@@ -439,7 +439,7 @@ mod tests {
         for _ in 0..300 {
             g.players[0].pos = a;
             g.players[1].pos = b;
-            g.update(1.0 / 60.0, &idle(2));
+            g.update(&idle(2));
         }
         assert!(g.players.iter().all(|p| p.exit.waiting));
         assert!(g.players.iter().all(|p| p.state.active()));
@@ -453,7 +453,7 @@ mod tests {
         g.players[0].pos = exit_pos(&g, 0);
         for _ in 0..300 {
             let inp = vec![g.bot_input(0)];
-            g.update(1.0 / 60.0, &inp);
+            g.update(&inp);
         }
         assert_eq!(g.level_end, Some(LevelEnd::Exit(None)));
     }
@@ -475,13 +475,13 @@ mod tests {
         for _ in 0..60 {
             g.players[0].pos = at;
             g.players[1].pos = at + Vec3::new(30.0, 0.0, 0.0);
-            g.update(1.0 / 60.0, &idle(2));
+            g.update(&idle(2));
         }
         // One of two on it: open to ACTIVE2 and hold.
         assert_eq!(action(&g), 3);
         for _ in 0..120 {
             g.players[0].pos = at + Vec3::new(-30.0, 0.0, 0.0);
-            g.update(1.0 / 60.0, &idle(2));
+            g.update(&idle(2));
         }
         assert_eq!(action(&g), 0, "closed again");
     }

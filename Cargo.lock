@@ -830,6 +830,7 @@ name = "gdl-formats"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libm",
  "png 0.17.16",
 ]
 
@@ -851,6 +852,7 @@ dependencies = [
  "gcdisc",
  "gdl-formats",
  "glam",
+ "libm",
  "log",
 ]
 
@@ -939,6 +941,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
 dependencies = [
  "bytemuck",
+ "libm",
 ]
 
 [[package]]

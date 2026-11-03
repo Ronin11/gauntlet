@@ -10,6 +10,13 @@ use std::path::PathBuf;
 
 struct Args {
     data: Option<PathBuf>,
+    /// --assets: asset packs layered over the game data, first wins.
+    assets: Vec<PathBuf>,
+    /// --no-assets: ignore GDL_ASSETS and asset-packs/ folders.
+    no_assets: bool,
+    compat: bool,
+    /// --rules: the preset the game plays by (classic unless asked).
+    rules: gdl_engine::rules::Rules,
     level: String,
     players: Vec<(String, String)>,
     snapshot: Option<PathBuf>,
@@ -71,6 +78,11 @@ USAGE: gauntlet [OPTIONS]
 
   --data <ISO|DIR>      Game disc image or extracted folder (default: auto-detect,
                         or $GDL_DATA)
+  --assets <DIR>        An asset pack laid over the game data (repeatable; the first
+                        wins). Without flags, $GDL_ASSETS and every folder in an
+                        asset-packs/ directory beside the data, the executable or
+                        here apply, in name order. --no-assets plays the disc alone.
+  --rules <preset>      The rules to play by: classic (the original, default) or remix
   --level <name>        Level to start in (default levelA1)
   --mute                No music or sound (also: GDL_MUTE=1)
   --players <list>      Comma list of CLASS[/COLOR], e.g. WAR,VAL/BLU (default WAR)
@@ -80,6 +92,7 @@ Controls: left stick / WASD move, A / J attack, X / Shift turbo,
           F11 fullscreen, Esc quit.
 
 Testing:
+  --compat              Print what two copies must share to play together, and exit
   --snapshot <png>      Render one frame headless and exit
   --screen <name>       Snapshot a screen: title, titlemenu, select, loading, pause,
                         select:load|save|result|char (memory card screens),
@@ -120,6 +133,10 @@ Testing:
 fn parse_args() -> Result<Args> {
     let mut a = Args {
         data: None,
+        assets: Vec::new(),
+        no_assets: false,
+        compat: false,
+        rules: gdl_engine::rules::Rules::default(),
         level: "levelA1".into(),
         players: Vec::new(),
         snapshot: None,
@@ -161,6 +178,14 @@ fn parse_args() -> Result<Args> {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "--data" => a.data = Some(val()?.into()),
+            "--assets" => a.assets.push(val()?.into()),
+            "--no-assets" => a.no_assets = true,
+            "--compat" => a.compat = true,
+            "--rules" => {
+                let v = val()?;
+                a.rules = gdl_engine::rules::Rules::named(&v)
+                    .with_context(|| format!("--rules {v}: classic or remix"))?;
+            }
             "--level" => a.level = val()?,
             "--players" => {
                 a.players = val()?
@@ -227,10 +252,17 @@ fn parse_args() -> Result<Args> {
 }
 
 fn open_fs(args: &Args) -> Result<fs::GameFs> {
-    match &args.data {
-        Some(p) => fs::GameFs::open(p),
-        None => fs::GameFs::discover(),
+    let mut fs = match &args.data {
+        Some(p) => fs::GameFs::open(p)?,
+        None => fs::GameFs::discover()?,
+    };
+    for a in &args.assets {
+        fs.add_pack(a);
     }
+    if !args.no_assets {
+        fs.add_default_packs(&[]);
+    }
+    Ok(fs)
 }
 
 fn headless_gpu() -> Result<gpu::Gpu> {
@@ -428,6 +460,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
         None => game::Game::new(&fs, &args.level, &classes)?,
     };
+    g.rules = args.rules.clone();
     // --save-state [frame:]spec: when, and where to.
     let save_at: Option<(Option<u32>, PathBuf)> = args.save_state.as_ref().map(|v| {
         let (f, spec) = match v.split_once(':') {
@@ -453,8 +486,8 @@ fn snapshot_game(args: &Args) -> Result<()> {
         }
     }
     // GDL_SUMNER=welcome | runes=..,shards=..,banked_runes=..,banked_shards=..,
-    // beaten=..,exp=..: the tower with Sumner, as the app would enter it (masks
-    // in hex, exp in decimal).
+    // beaten=..,exp=..,crystals=..,garg=..: the tower with Sumner, as the app
+    // would enter it (masks in hex, exp in decimal).
     // GDL_BOX_CLOSE=n presses B n ticks into each message box page.
     if let Ok(spec) = std::env::var("GDL_SUMNER") {
         let mut entry = gdl_engine::tower::Entry::default();
@@ -476,6 +509,14 @@ fn snapshot_game(args: &Args) -> Result<()> {
                     })
                 }
                 "crystals" => g.crystals[1] = n as i32,
+                // garg=<bits>: the gargoyle items (fangs, feathers, claws) done.
+                "garg" => {
+                    for j in 0..3 {
+                        if n & (1 << j) != 0 {
+                            g.garg_items[j] = -1;
+                        }
+                    }
+                }
                 _ => anyhow::bail!("GDL_SUMNER: unknown key {k}"),
             }
         }
@@ -646,7 +687,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
             let (eye, at) = cam.view();
             g.fixed_camera = Some((eye, at));
-            g.update(1.0 / 60.0, &[input::PlayerInput::default()]);
+            g.update(&[input::PlayerInput::default()]);
             g.cam_focus = at;
             g.sfx.clear();
             if f % 300 == 0 {
@@ -657,15 +698,12 @@ fn snapshot_game(args: &Args) -> Result<()> {
         if args.kill_boss_at == Some(f) {
             g.kill_boss();
         }
-        if let Some(b) = &mut g.scroll_box {
-            let press = box_close.is_some_and(|n| b.ticks + 1 >= n);
+        if let Some(b) = &g.scroll_box {
             let inp = input::PlayerInput {
-                b_pressed: press,
+                b_pressed: box_close.is_some_and(|n| b.ticks + 1 >= n),
                 ..Default::default()
             };
-            if b.update(&vec![inp; g.players.len()]) {
-                g.scroll_box = None;
-            }
+            g.update(&vec![inp; g.players.len()]);
             continue;
         }
         if args.magic_at == Some(f) {
@@ -710,7 +748,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
             }
         }
         let ended = g.level_end.is_some();
-        g.update(1.0 / 60.0, &inputs);
+        g.update(&inputs);
         bugs.observe(&g, &inputs);
         for s in &g.sfx {
             gdl_engine::bugreport::sound(s);
@@ -819,7 +857,7 @@ fn snapshot_game(args: &Args) -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
     {
-        g.update(1.0 / 60.0, &[input::PlayerInput::default()]);
+        g.update(&[input::PlayerInput::default()]);
         let t0 = std::time::Instant::now();
         sc.sync(&gpu, &g);
         let t1 = std::time::Instant::now();
@@ -1265,6 +1303,11 @@ fn main() -> Result<()> {
         };
     }
     let fs = open_fs(&args)?;
+    if args.compat {
+        let local = gdl_sim::compat::Compat::local(&fs, &args.rules, gdl_engine::bugreport::BUILD)?;
+        println!("{local}");
+        return Ok(());
+    }
     app::run(app::Config {
         fs,
         level: args.level,
@@ -1272,6 +1315,7 @@ fn main() -> Result<()> {
         mute: args.mute,
         save_dir: gdl_engine::save::MemCard::default_dir(),
         load_state: args.load_state,
+        rules: args.rules,
     })
 }
 

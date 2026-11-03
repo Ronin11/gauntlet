@@ -2,6 +2,7 @@
 //! (combat.c) and ModifyPlayerDpos (pmotion.c). The flight itself (gravity,
 //! tumble, walls) is the missile half of ProcessEffects, in game.rs.
 
+use crate::math::Det as _;
 use glam::Vec3;
 
 /// MissileInfo (combat.c), the fields the player path reads.
@@ -149,7 +150,7 @@ pub fn lifetime(damage_type: u32) -> f32 {
 
 /// MulVecMat3 by the player matrix: x along its right, z along its facing.
 pub fn rotate_offset(offset: [f32; 3], yaw: f32) -> Vec3 {
-    let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+    let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
     let side = Vec3::new(fwd.z, 0.0, -fwd.x);
     side * offset[0] + Vec3::Y * offset[1] + fwd * offset[2]
 }
@@ -180,7 +181,7 @@ pub fn modify_dpos(
     charge: f32,
 ) -> f32 {
     let dot = from.x * dpos.x + from.z * dpos.z;
-    let mag = dpos.x.hypot(dpos.z);
+    let mag = dpos.x.det_hypot(dpos.z);
     let mut slope = slope.min(0.707);
     if char_type == 4 {
         slope += 0.2;
@@ -226,7 +227,7 @@ pub fn launch_velocity(
     let mut d = dir;
     if damage_type & DMG_SUPER == 0 && speed_arg > 0.0 {
         d *= speed_arg;
-        let horiz = d.x.hypot(d.z);
+        let horiz = d.x.det_hypot(d.z);
         let hn = if horiz > 0.001 { 1.0 / horiz } else { 1.0 };
         d.x *= hn;
         d.z *= hn;
@@ -354,7 +355,7 @@ mod tests {
         assert_eq!(shot_count(0), 1);
         let v = spread(Vec3::new(0.0, 1.0, 10.0), 1);
         // +15 degrees about y keeps the fall.
-        assert!((v.x.atan2(v.z).to_degrees() - 15.0).abs() < 0.1);
+        assert!((v.x.det_atan2(v.z).to_degrees() - 15.0).abs() < 0.1);
         assert_eq!(v.y, 1.0);
         assert_eq!(lifetime(DMG_3WAY), 2.0);
         assert_eq!(lifetime(0), 3.0);

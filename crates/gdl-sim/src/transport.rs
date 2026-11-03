@@ -7,7 +7,7 @@
 use glam::{Vec2, Vec3};
 
 /// One placed transporter (transdata).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Pad {
     pub pos: Vec3,
     pub radius: f32,
@@ -38,7 +38,7 @@ pub enum Step {
     Arrive(Vec3),
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Transport {
     pub pads: Vec<Pad>,
     pub heroes: Vec<HeroTransport>,
@@ -326,7 +326,7 @@ mod tests {
         let mut faded = false;
         let mut left = false;
         for _ in 0..120 {
-            g.update(1.0 / 60.0, &input);
+            g.update(&input);
             faded |= g.transport.alpha(0) < 0.2;
             let p = g.players[0].pos;
             if Vec2::new(p.x - to.x, p.z - to.z).length() < 0.5 {
@@ -334,7 +334,7 @@ mod tests {
                 break;
             }
         }
-        g.update(1.0 / 60.0, &input);
+        g.update(&input);
         assert!(faded, "faded out");
         assert!(left, "hero at {} not on the far pad {to}", g.players[0].pos);
         assert!(

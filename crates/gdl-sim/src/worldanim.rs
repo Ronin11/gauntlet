@@ -13,6 +13,7 @@
 use crate::character::{pyr_matrix, ryp_matrix};
 use crate::collision::Collision;
 use crate::level::Level;
+use crate::math::Det as _;
 use gdl_formats::anim::Track;
 use glam::{Mat4, Vec3};
 
@@ -43,7 +44,7 @@ pub mod wflags {
 use wflags::*;
 
 /// One `struct worldanim` and its run state.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Anim {
     obj: usize,
     nframes: i16,
@@ -54,7 +55,7 @@ struct Anim {
 }
 
 /// A rotator item (items.c rotdata): turns its target's node about Y.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Rotator {
     target: usize,
     /// Radians per 60 Hz tick.
@@ -73,7 +74,7 @@ struct Rotator {
     radius: f32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct WorldAnims {
     /// Live WorldObj.flags.
     pub flags: Vec<u32>,
@@ -320,13 +321,14 @@ impl WorldAnims {
     }
 
     /// ActivateSpecialTrigger with `flag`, items.c SetItem's tower case:
-    /// jump a trigger target's animation to its last frame.
+    /// jump a trigger target's animation to its last frame, pointed forward
+    /// so it holds there.
     pub fn jump_to_end(&mut self, o: usize) {
         if let Some(a) = self.anims.iter_mut().find(|a| a.obj == o) {
             a.curframe = (a.nframes - 1) as f32;
         }
         if let Some(f) = self.flags.get_mut(o) {
-            *f |= FORWARD | AT_END;
+            *f = (*f | FORWARD | AT_END) & !REVERSE;
         }
     }
 
@@ -593,7 +595,7 @@ impl WorldAnims {
         }
         let to = m.transform_point3(at);
         let f = m.transform_vector3(Vec3::Z);
-        Some((to, f.x.atan2(f.z)))
+        Some((to, f.x.det_atan2(f.z)))
     }
 }
 
@@ -632,26 +634,39 @@ impl crate::game::Game {
     }
 
     /// AddItemSub (items.c), once every item is set and fn_80062A00 has put
-    /// the trigger targets at their starting heights: a trigger item
-    /// (iteminfo colflags bit 0 clear) is put 0.1 (sItemFloorYOffset) above
-    /// the floor FloorPos finds under it (radius 1, from 4 above to 10
-    /// below), and is parented to that floor's node if the floor object
-    /// moves (flag 0x1000): a pad on a lift that starts lowered sits on the
-    /// lowered deck and rides with it. (The original does this for every
-    /// item; only triggers are put down here.)
-    pub(crate) fn put_triggers_on_floor(&mut self, ids: &[u64]) {
-        use crate::game::Kind;
+    /// the trigger targets at their starting heights: an item without
+    /// collision of its own (iteminfo colflags bit 0 clear) is put 0.1
+    /// (sItemFloorYOffset) above the floor FloorPos finds under it (radius
+    /// 1, from 4 above to 10 below), and is parented to that floor's node if
+    /// the floor object moves (flag 0x1000): a pad on a lift that starts
+    /// lowered sits on the lowered deck and rides with it, and the tower's
+    /// Citadel portal rides the lift the 13th runestone raises. (The
+    /// original does this for every item; triggers and exits are put down
+    /// here.)
+    pub(crate) fn put_items_on_floor(&mut self, ids: &[u64]) {
+        // The world posed at its animations' first frames, as it is when
+        // the original adds its items: a lift cabin whose animation starts
+        // it away from where it was modelled has its pad put down in the
+        // cabin, not on the water where the cabin was modelled.
+        self.world_anim.update(&mut self.collision, 0.0);
         for e in self.entities.iter_mut().filter(|e| ids.contains(&e.id)) {
-            let Kind::Trigger { ride, .. } = &mut e.kind else {
-                continue;
-            };
             let hit = self.collision.floor_collide(e.pos, 1.0, 4.0, -10.0, true);
             e.pos.y = hit.map_or(e.pos.y, |h| h.at.y) + 0.1;
-            *ride = hit
+            e.ride = hit
                 .filter(|h| self.collision.obj_flags[h.tri] & NODE != 0)
                 .map(|h| {
                     let off = Self::sliding(&self.movers, h.owner).map_or(0.0, |m| m.offset);
-                    (h.owner, e.pos.y, off)
+                    let world = usize::try_from(h.owner)
+                        .ok()
+                        .and_then(|o| self.world_anim.world.get(o))
+                        .copied()
+                        .unwrap_or(Mat4::IDENTITY);
+                    crate::game::Ride {
+                        obj: h.owner,
+                        local: world.inverse().transform_point3(e.pos),
+                        y: e.pos.y,
+                        off,
+                    }
                 });
         }
     }
@@ -664,20 +679,39 @@ impl crate::game::Game {
             .find(|m| !m.animated && !m.fades() && m.objects.contains(&o))
     }
 
-    /// Triggers parented to a slid floor (see put_triggers_on_floor) go up
-    /// and down with it.
-    pub(crate) fn slide_riding_triggers(&mut self) {
-        use crate::game::Kind;
+    /// Items parented to a slid floor (see put_items_on_floor) go up and
+    /// down with it.
+    pub(crate) fn slide_riding_items(&mut self) {
         for e in &mut self.entities {
-            if let Kind::Trigger {
-                ride: Some((o, y, off)),
-                ..
-            } = e.kind
-            {
-                if let Some(m) = Self::sliding(&self.movers, o) {
-                    e.pos.y = y + m.offset - off;
+            if let Some(r) = e.ride {
+                if let Some(m) = Self::sliding(&self.movers, r.obj) {
+                    e.pos.y = r.y + m.offset - r.off;
                 }
             }
+        }
+    }
+
+    /// Items parented to a floor whose node moves (an animated lift, a
+    /// rotator's deck) sit where its node now puts them, turned as it
+    /// turned this frame.
+    pub(crate) fn pose_riding_items(&mut self) {
+        for e in &mut self.entities {
+            let Some(r) = e.ride else {
+                continue;
+            };
+            if Self::sliding(&self.movers, r.obj).is_some() {
+                continue;
+            }
+            let Some(world) = usize::try_from(r.obj)
+                .ok()
+                .and_then(|o| self.world_anim.world.get(o))
+            else {
+                continue;
+            };
+            if let Some((_, turn)) = self.world_anim.carry(r.obj, e.pos) {
+                e.yaw += turn;
+            }
+            e.pos = world.transform_point3(r.local);
         }
     }
 
@@ -734,21 +768,8 @@ impl crate::game::Game {
                 e.yaw += turn;
             }
         }
-        // Triggers parented to an animated floor (put_triggers_on_floor).
-        for e in &mut self.entities {
-            if let Kind::Trigger {
-                ride: Some((o, _, _)),
-                ..
-            } = e.kind
-            {
-                if Self::sliding(&self.movers, o).is_none() {
-                    if let Some((to, turn)) = self.world_anim.carry(o, e.pos) {
-                        e.pos = to;
-                        e.yaw += turn;
-                    }
-                }
-            }
-        }
+        // Items parented to an animated floor (put_items_on_floor).
+        self.pose_riding_items();
         for (kind, _) in sounds {
             let id = if kind == 0 {
                 self.realm_sound(&ROTATE_SFX)
@@ -907,7 +928,7 @@ mod tests {
             .unwrap();
         let v0 = g.collision.tris[tri].v;
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         let v1 = g.collision.tris[tri].v;
         let moved = (0..3).map(|k| (v1[k] - v0[k]).length()).fold(0.0, f32::max);
@@ -938,16 +959,16 @@ mod tests {
             .unwrap();
         let v0 = g.collision.tris[tri].v;
         for _ in 0..60 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         // 0.5 degrees a tick: 30 degrees in a second, about the node.
         let d = g.world_anim.delta(o);
         let f = d.transform_vector3(Vec3::Z);
-        let turned = f.x.atan2(f.z).abs().to_degrees();
+        let turned = f.x.det_atan2(f.z).abs().to_degrees();
         assert!((turned - 30.0).abs() < 1.0, "turned {turned}");
         // Each vertex keeps its distance from the node (which its elevator
-        // trigger may also have slid).
-        let r0 = (v0[0] - g.world_anim.rest[o]).length();
+        // trigger may also have slid; the world is posed from load).
+        let r0 = (v0[0] - g.world_anim.world[o].w_axis.truncate()).length();
         let v1 = g.collision.tris[tri].v;
         let r1 = (v1[0] - g.world_anim.world[o].w_axis.truncate()).length();
         assert!((r1 - r0).abs() < 1e-3, "{r0} {r1}");
@@ -973,7 +994,7 @@ mod tests {
         // hero standing under them, and the invisible G2BLOCKER1 box around
         // the cart faces outward, so it only keeps heroes from walking in).
         for _ in 0..10 {
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            g.update(&[crate::input::PlayerInput::default()]);
         }
         let mid = |t: &crate::collision::Tri| (t.v[0] + t.v[1] + t.v[2]) / 3.0;
         let tri = g
@@ -1005,7 +1026,7 @@ mod tests {
         g.players[0].vy = 0.0;
         let input = [crate::input::PlayerInput::default()];
         for _ in 0..5 {
-            g.update(1.0 / 60.0, &input);
+            g.update(&input);
         }
         // Where the hero stands on the deck, in the deck's own frame.
         let local = |g: &crate::game::Game| {
@@ -1015,7 +1036,7 @@ mod tests {
         };
         let l0 = local(&g);
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &input);
+            g.update(&input);
         }
         let c1 = centre(&g);
         assert!(

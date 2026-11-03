@@ -385,7 +385,7 @@ pub(crate) fn calc_target_dir(
     gravity: f32,
     lift: f32,
 ) {
-    let horizontal = v.x.hypot(v.z);
+    let horizontal = v.x.det_hypot(v.z);
     let norm = if horizontal > 0.001 {
         1.0 / horizontal
     } else {
@@ -623,7 +623,7 @@ impl Game {
             opacity(95)
         } else if special & pu::S_INVISIBLE != 0 {
             let v = if !(0.0..=3.0).contains(&alpha_time) || (8.0 * alpha_time) as i32 & 1 != 0 {
-                160 + (16.0 * (std::f32::consts::TAU * alpha_time).sin()) as i32
+                160 + (16.0 * (std::f32::consts::TAU * alpha_time).det_sin()) as i32
             } else {
                 0
             };
@@ -907,7 +907,7 @@ impl Game {
             .get(p.model)
             .map_or([0.0; 3], |d| d.fam_proj_offset);
         let hit = p.pos + m::rotate_offset((Vec3::from(offset) * p.worn.scale).into(), p.yaw);
-        let from = Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos());
+        let from = Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos());
         let mut dir = aim;
         let reach = m::modify_dpos(
             from,
@@ -952,7 +952,7 @@ impl Game {
             },
             model,
             hit,
-            v.x.atan2(v.z),
+            v.x.det_atan2(v.z),
         );
     }
 
@@ -1114,7 +1114,7 @@ mod tests {
         let mut g = Game::new(&fs, "levelA1", &[(class, "RED")]).ok()?;
         g.entities.clear();
         for _ in 0..30 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         Some(g)
     }
@@ -1137,7 +1137,7 @@ mod tests {
             pi: 0,
             pos: p.pos,
             yaw: p.yaw,
-            aim: Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()),
+            aim: Vec3::new(p.yaw.det_sin(), 0.0, p.yaw.det_cos()),
             target: false,
             bits: crate::paction::act::THROW,
             since_swing: 1.0,
@@ -1161,7 +1161,7 @@ mod tests {
     fn the_phoenix_rides_along_and_answers_a_throw() {
         let Some(mut g) = game("WAR") else { return };
         switch_on(&mut g, pu::SPECIAL, pu::S_PHOENIX, 0.0, 60.0);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let phoenix = g.worn_models.phoenix;
         assert!(phoenix.is_some());
         let f = g.players[0].worn.familiar.as_ref().unwrap();
@@ -1169,15 +1169,15 @@ mod tests {
         assert!(g.worn_draws(0).iter().any(|d| Some(d.0) == phoenix));
         let fball = g.worn_models.fball;
         g.player_start_missile(throw(&g));
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         // The throw's frame: the Phoenix plays ATTACK; it shoots the next.
         assert_eq!(g.players[0].worn.familiar.as_ref().unwrap().anim.seq, 1);
         assert!(shots_of(&g, fball).is_empty());
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let shots = shots_of(&g, fball);
         assert_eq!(shots.len(), 1, "one PHOENIX_FBALL");
         let (vel, damage, life) = shots[0];
-        assert!((vel.x.hypot(vel.z) - 35.0).abs() < 0.5, "{vel}");
+        assert!((vel.x.det_hypot(vel.z) - 35.0).abs() < 0.5, "{vel}");
         assert!((damage - 10.0 * ELEMENT_BONUS).abs() < 1e-4);
         assert!(life <= 3.0);
     }
@@ -1186,12 +1186,12 @@ mod tests {
     fn the_level_30_familiar_spits_too() {
         let Some(mut g) = game("WAR") else { return };
         g.players[0].level = 50;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         assert!(g.players[0].worn.pet.is_some(), "FAMILIAR1 at 30");
         let spit = g.worn_models.spit[0];
         g.player_start_missile(throw(&g));
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let shots = shots_of(&g, spit);
         assert_eq!(shots.len(), 1);
         assert!((shots[0].1 - 5.0).abs() < 1e-4, "0.1 x 25 + 2.5");
@@ -1201,7 +1201,7 @@ mod tests {
     fn pojo_hides_the_hero_spits_fireballs_and_breathes_on_its_meter() {
         let Some(mut g) = game("WAR") else { return };
         switch_on(&mut g, pu::SPECIAL, pu::S_POJO, 0.0, 60.0);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let w = &g.players[0].worn;
         assert!(w.hide_body);
         assert_eq!(w.familiar.as_ref().map(|f| f.model), g.worn_models.pojo);
@@ -1222,7 +1222,7 @@ mod tests {
         // Switched off: the hero is back, with fn_8009D5A0's sound.
         g.players[0].powerups.clear();
         g.sfx.clear();
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         assert!(!g.players[0].worn.hide_body);
         assert!(g.sfx.iter().any(|s| s == "#63"));
     }
@@ -1231,7 +1231,7 @@ mod tests {
     fn the_hammer_rings_once_a_use() {
         let Some(mut g) = game("WAR") else { return };
         switch_on(&mut g, pu::WEAPON, pu::W_HAMMER, 3.0, -1.0);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         // HAMMER_HD in the hand puts the weapon away.
         assert!(g.players[0].worn.hide_weapon);
         g.sfx.clear();
@@ -1247,7 +1247,7 @@ mod tests {
         let Some(mut g) = game("WAR") else { return };
         switch_on(&mut g, pu::SPECIAL, pu::S_MIKEY, 0.0, 30.0);
         let at = g.players[0].pos;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         let m = &g.players[0].worn.mikey;
         assert_eq!(m.state, 2);
         assert_eq!(m.pos, at);
@@ -1255,21 +1255,21 @@ mod tests {
         assert!(g.entities.iter().any(|e| e.id == id && e.alive));
         assert_eq!(g.players[0].powerups.slots[0].state, pu::FRESH);
         for _ in 0..297 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert!(g.players[0].worn.mikey.out());
         for _ in 0..3 {
-            g.update(1.0 / 60.0, &[PlayerInput::default()]);
+            g.update(&[PlayerInput::default()]);
         }
         assert_eq!(g.players[0].worn.mikey.state, 0);
         assert!(!g.entities.iter().any(|e| e.id == id && e.alive));
         // Again, and switched on while out it comes straight back.
         g.players[0].powerups.slots[0].state = pu::ON;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         assert_eq!(g.players[0].worn.mikey.state, 2);
         g.players[0].powerups.slots[0].state = pu::ON;
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
-        g.update(1.0 / 60.0, &[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
+        g.update(&[PlayerInput::default()]);
         assert_eq!(g.players[0].worn.mikey.state, 0);
     }
 

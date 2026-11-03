@@ -9,6 +9,7 @@
 
 use crate::fs::GameFs;
 use crate::game::{Game, Kind, PlayerState, ScrollBox, CRYSTALS_NEEDED, GARG_NEEDED};
+use crate::math::Det as _;
 use gdl_formats::text::TextRom;
 use gdl_formats::worlds::LocatorType;
 use glam::Vec3;
@@ -96,9 +97,9 @@ pub fn locator_cam(g: &Game, id: u16) -> Option<(Vec3, Vec3)> {
         .find(|l| l.kind == LocatorType::TriggerCamera && l.next == id)?;
     let (pitch, yaw) = (l.rot[0], l.rot[1]);
     let dir = Vec3::new(
-        yaw.sin() * pitch.cos(),
-        -pitch.sin(),
-        yaw.cos() * pitch.cos(),
+        yaw.det_sin() * pitch.det_cos(),
+        -pitch.det_sin(),
+        yaw.det_cos() * pitch.det_cos(),
     );
     Some((Vec3::from(l.pos), dir))
 }
@@ -171,7 +172,7 @@ const TEMPLE_PORTAL: u32 = 0x500;
 const HELL_PORTAL: u32 = 0x600;
 const CITADEL_PORTAL: u32 = 0x803;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Sumner {
     /// The resident Sumner at the lectern, and his idle sequence (lbl_80344C90).
     gwiz: Option<u64>,
@@ -995,17 +996,11 @@ mod tests {
 
     fn run(g: &mut Game, ticks: u32) {
         for _ in 0..ticks {
-            if let Some(b) = &mut g.scroll_box {
-                let inp = crate::input::PlayerInput {
-                    b_pressed: b.ticks >= 20,
-                    ..Default::default()
-                };
-                if b.update(&[inp]) {
-                    g.scroll_box = None;
-                }
-                continue;
-            }
-            g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+            let inp = crate::input::PlayerInput {
+                b_pressed: g.scroll_box.as_ref().is_some_and(|b| b.ticks >= 20),
+                ..Default::default()
+            };
+            g.update(&[inp]);
         }
     }
 
@@ -1139,7 +1134,7 @@ mod tests {
                 stick,
                 ..Default::default()
             };
-            g.update(1.0 / 60.0, &[inp]);
+            g.update(&[inp]);
             top = top.max(g.players[0].pos.y);
             if g.sumner.as_ref().unwrap().gwiz_seq == 3 {
                 break;

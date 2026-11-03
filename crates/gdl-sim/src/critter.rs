@@ -17,6 +17,7 @@
 
 use crate::character::{Animator, Model};
 use crate::game::{Game, Kind};
+use crate::math::Det as _;
 use gdl_formats::critter::{CritterWad, Damage, Move, Vis};
 use glam::{Mat4, Vec2, Vec3};
 use std::sync::Arc;
@@ -297,13 +298,13 @@ fn wrap(mut a: f32) -> f32 {
 
 /// YawVec3(v, -a) in the game's convention: turn a direction by +a.
 fn turn(v: Vec3, a: f32) -> Vec3 {
-    let (s, c) = a.sin_cos();
+    let (s, c) = a.det_sin_cos();
     Vec3::new(v.x * c + v.z * s, v.y, v.z * c - v.x * s)
 }
 
 /// PitchVec3: positive pitch tips the direction down.
 fn pitch(v: Vec3, p: f32) -> Vec3 {
-    let (s, c) = p.sin_cos();
+    let (s, c) = p.det_sin_cos();
     Vec3::new(
         s * v.x * v.y + v.x * c,
         v.y * c - s * (v.x * v.x + v.z * v.z),
@@ -312,12 +313,15 @@ fn pitch(v: Vec3, p: f32) -> Vec3 {
 }
 
 fn yaw_dir(yaw: f32) -> Vec3 {
-    Vec3::new(yaw.sin(), 0.0, yaw.cos())
+    Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos())
 }
 
 /// GetYawPitch.
 fn yaw_pitch(v: Vec3) -> (f32, f32) {
-    (v.x.atan2(v.z), v.y.atan2(Vec2::new(v.x, v.z).length()))
+    (
+        v.x.det_atan2(v.z),
+        v.y.det_atan2(Vec2::new(v.x, v.z).length()),
+    )
 }
 
 /// ExtractPYR (ml_fmath.c) on a node's local matrix. It undoes
@@ -326,7 +330,7 @@ fn yaw_pitch(v: Vec3) -> (f32, f32) {
 pub fn extract_pyr(m: Mat4) -> [f32; 3] {
     let m = m.to_cols_array();
     if (1.0 - m[2].abs()).abs() < 1e-4 {
-        let a0 = m[9].atan2(m[5]);
+        let a0 = m[9].det_atan2(m[5]);
         let a1 = if m[2] > 0.0 {
             -std::f32::consts::FRAC_PI_2
         } else {
@@ -334,19 +338,19 @@ pub fn extract_pyr(m: Mat4) -> [f32; 3] {
         };
         return [a0, a1, 0.0];
     }
-    let a0 = (-m[6]).atan2(m[10]);
-    let c0 = a0.cos();
+    let a0 = (-m[6]).det_atan2(m[10]);
+    let c0 = a0.det_cos();
     if c0 == 0.0 {
         let (a1, a2) = if a0 > 0.0 {
-            ((-m[2]).atan2(-m[6]), (-m[8]).atan2(-m[9]))
+            ((-m[2]).det_atan2(-m[6]), (-m[8]).det_atan2(-m[9]))
         } else {
-            ((-m[2]).atan2(m[6]), m[8].atan2(m[9]))
+            ((-m[2]).det_atan2(m[6]), m[8].det_atan2(m[9]))
         };
         return [a0, a1, a2];
     }
     let mag = m[10] / c0;
-    let a1 = (-m[2]).atan2(mag);
-    let a2 = (-m[1] / mag).atan2(m[0] / mag);
+    let a1 = (-m[2]).det_atan2(mag);
+    let a2 = (-m[1] / mag).det_atan2(m[0] / mag);
     [a0, a1, a2]
 }
 
@@ -2009,7 +2013,7 @@ impl Game {
             7 if phase == 2 => self.critter_release(c, pi, d, amount, yaw),
             9 if active => {
                 let v = pitch(turn(yaw_dir(c.init_yaw), d.angle), d.pitch) * d.speed_min;
-                let spread = d.arc.clamp(-1.0, 1.0).acos();
+                let spread = d.arc.clamp(-1.0, 1.0).det_acos();
                 let at = c.parts[pi].node_pos;
                 self.boss_spew_coins(at, v, spread);
             }
@@ -2248,7 +2252,7 @@ impl Game {
             },
             model,
             origin,
-            vel.x.atan2(vel.z),
+            vel.x.det_atan2(vel.z),
         );
     }
 
@@ -2279,7 +2283,7 @@ impl Game {
         let g = c.parts[pi].grab;
         c.parts[pi].grab = -1;
         if g >= 0 {
-            let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+            let fwd = Vec3::new(yaw.det_sin(), 0.0, yaw.det_cos());
             self.damage_from = self.players.get(g as usize).map(|p| p.pos - fwd);
             self.critter_hits_player(
                 c,
@@ -2478,9 +2482,9 @@ impl Game {
         } else if p.tgt >= 0 && m.turn > 0.0 {
             let tp = players[p.tgt as usize].col - pos;
             if t0.flags & 0x400 != 0 {
-                tp.x.atan2(tp.z) - yaw
+                tp.x.det_atan2(tp.z) - yaw
             } else {
-                let a = wrap(tp.x.atan2(tp.z) - c.init_yaw).clamp(-t0.maxyaw, t0.maxyaw);
+                let a = wrap(tp.x.det_atan2(tp.z) - c.init_yaw).clamp(-t0.maxyaw, t0.maxyaw);
                 c.init_yaw + a - yaw
             }
         } else {
@@ -2848,7 +2852,7 @@ impl Game {
         for ring in [0.5 * R, R] {
             for k in 0..8 {
                 let a = k as f32 * std::f32::consts::FRAC_PI_4;
-                probe(pos + Vec3::new(a.sin(), 0.0, a.cos()) * ring);
+                probe(pos + Vec3::new(a.det_sin(), 0.0, a.det_cos()) * ring);
             }
         }
         best
@@ -3113,7 +3117,7 @@ mod tests {
                     if let Some(e) = g.entities.iter().find(|e| e.id == id) {
                         g.players[0].pos = e.pos + yaw_dir(e.yaw) * 5.0;
                     }
-                    g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                    g.update(&[crate::input::PlayerInput::default()]);
                     hurt += 500.0 - g.players[0].health;
                     if let Some(Kind::Critter(c)) =
                         g.entities.iter().find(|e| e.id == id).map(|e| &e.kind)
@@ -3157,7 +3161,7 @@ mod tests {
                     .count();
                 for _ in 0..600 {
                     g.players[0].health = 500.0;
-                    g.update(1.0 / 60.0, &[crate::input::PlayerInput::default()]);
+                    g.update(&[crate::input::PlayerInput::default()]);
                 }
                 assert!(
                     g.entities.iter().all(|e| e.id != id),

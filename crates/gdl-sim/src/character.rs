@@ -2,6 +2,7 @@
 //! object animations that swap whole meshes per frame (grunts, barrels, ...).
 
 use crate::fs::GameFs;
+use crate::math::Det as _;
 use crate::mesh::{MeshBuilder, MeshData, PartFx, TexBank};
 use crate::texanim::{self, SeqState};
 use anyhow::{Context, Result};
@@ -12,9 +13,9 @@ use glam::{Mat4, Vec3};
 /// The game's `CreateRYPMatrix` (ml_fmath.c): rotation from pitch/yaw/roll.
 #[rustfmt::skip]
 pub fn ryp_matrix(a: [f32; 3]) -> Mat4 {
-    let (c0, s0) = (a[0].cos(), -a[0].sin());
-    let (c1, s1) = (a[1].cos(), -a[1].sin());
-    let (c2, s2) = (a[2].cos(), -a[2].sin());
+    let (c0, s0) = (a[0].det_cos(), -a[0].det_sin());
+    let (c1, s1) = (a[1].det_cos(), -a[1].det_sin());
+    let (c2, s2) = (a[2].det_cos(), -a[2].det_sin());
     let aa = -c2 * s1;
     let b = -s2 * s1;
     Mat4::from_cols_array(&[
@@ -28,9 +29,9 @@ pub fn ryp_matrix(a: [f32; 3]) -> Mat4 {
 /// The game's `CreatePYRMatrix`.
 #[rustfmt::skip]
 pub fn pyr_matrix(a: [f32; 3]) -> Mat4 {
-    let (c0, s0) = (a[0].cos(), -a[0].sin());
-    let (c1, s1) = (a[1].cos(), -a[1].sin());
-    let (c2, s2) = (a[2].cos(), -a[2].sin());
+    let (c0, s0) = (a[0].det_cos(), -a[0].det_sin());
+    let (c1, s1) = (a[1].det_cos(), -a[1].det_sin());
+    let (c2, s2) = (a[2].det_cos(), -a[2].det_sin());
     let aa = s0 * s1;
     let b = c0 * s1;
     Mat4::from_cols_array(&[
