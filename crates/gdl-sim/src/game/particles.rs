@@ -86,6 +86,16 @@ impl Game {
             p.tex = self.psys_texture(&rec.tex_name, None);
         }
         p.node = self.world_object_matrix(i);
+        log::debug!(
+            "WorldPsysActivate {} at {:?}: tex {:?} preset {} flags {:#x} -> node_flags {:#x} draw {:?}",
+            self.level.worlds.world_objects[i].name,
+            self.level.world_pos.get(i),
+            rec.tex_name,
+            rec.preset,
+            rec.flags,
+            p.node_flags,
+            p.draw_state()
+        );
         self.particles.add(Owner::World(i), p);
     }
 

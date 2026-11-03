@@ -79,7 +79,19 @@ const COMPASS_ALPHA: f32 = 127.0 / 255.0;
 
 impl Scene {
     pub fn new(gpu: &Gpu, game: &Game) -> Result<Scene> {
-        let world = gpu.upload_mesh(&game.level.world_mesh(&Self::not_static(game)))?;
+        let mut skip = Self::not_static(game);
+        // GDL_HIDE=a,b,c leaves out world objects whose name contains any of
+        // the comma-separated substrings (a debugging aid).
+        if let Ok(hide) = std::env::var("GDL_HIDE") {
+            let subs: Vec<&str> = hide.split(',').filter(|s| !s.is_empty()).collect();
+            let named = game.level.worlds.world_objects.iter().enumerate();
+            skip.extend(
+                named
+                    .filter(|(_, o)| subs.iter().any(|h| o.name.contains(h)))
+                    .map(|(i, _)| i),
+            );
+        }
+        let world = gpu.upload_mesh(&game.level.world_mesh(&skip))?;
         let mut world_inst = gpu.new_instance(&world);
         world_inst.transform = mirror();
         let animated: std::collections::HashSet<usize> =

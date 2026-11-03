@@ -4,6 +4,7 @@ use crate::fs::GameFs;
 use crate::mesh::{MeshBuilder, MeshData, TexBank};
 use anyhow::{Context, Result};
 use gdl_formats::anim::{Anim, TexMod};
+use gdl_formats::worlds::world_flags;
 use gdl_formats::{Objects, Worlds};
 use glam::{Mat4, Vec3};
 use std::collections::HashSet;
@@ -94,6 +95,11 @@ impl Level {
             if !want(i) {
                 continue;
             }
+            // A PSYS<id> object's model is the editor's emitter marker (a card
+            // or a cross); the game shows its particles, never the marker.
+            if wo.flags & world_flags::PARTICLE_SYSTEM != 0 {
+                continue;
+            }
             if let Some(obj) = self.objects.object_by_name(&wo.name) {
                 b.additive = wo.mb_flags & (1 << 23) != 0;
                 b.add_object(obj, Mat4::from_translation(Vec3::from(*pos)));
@@ -118,6 +124,9 @@ impl Level {
             else {
                 continue;
             };
+            if wo.flags & world_flags::PARTICLE_SYSTEM != 0 {
+                continue;
+            }
             if let Some(obj) = self.objects.object_by_name(&wo.name) {
                 b.additive = wo.mb_flags & (1 << 23) != 0;
                 b.add_part(obj, Mat4::from_translation(Vec3::from(*pos)), k as u16);

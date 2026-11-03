@@ -322,9 +322,10 @@ fn main() -> Result<()> {
             };
             for (o, p) in w.world_objects.iter().zip(&pos).take(wo_limit) {
                 println!(
-                    "wo {:16} flags {:#010x} pos {:?} abs {:?} child {} next {} tris {}@{}",
+                    "wo {:16} flags {:#010x} mb {:#010x} pos {:?} abs {:?} child {} next {} tris {}@{}",
                     o.name,
                     o.flags,
+                    o.mb_flags,
                     o.pos,
                     p,
                     o.child_index,
