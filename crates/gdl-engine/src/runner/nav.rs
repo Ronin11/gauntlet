@@ -703,6 +703,20 @@ impl Nav {
         time: f32,
         max_expand: usize,
     ) -> Option<(Vec<u32>, f32)> {
+        self.path_until(g, start, goals, time, max_expand, None)
+    }
+
+    /// [`Nav::path`], giving up at `deadline`. What it learned about the map
+    /// stays, so the next try gets further in the same time.
+    pub fn path_until(
+        &mut self,
+        g: &Game,
+        start: u32,
+        goals: &[Goal],
+        time: f32,
+        max_expand: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<(Vec<u32>, f32)> {
         if goals.is_empty() {
             return None;
         }
@@ -743,6 +757,9 @@ impl Nav {
             }
             expanded += 1;
             if expanded > max_expand {
+                break;
+            }
+            if expanded % 8 == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 break;
             }
             for e in self.all_edges(g, n) {

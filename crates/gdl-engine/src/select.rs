@@ -288,6 +288,33 @@ impl Select {
         s
     }
 
+    /// The loyal follower joins, ready as this hero; the people choose theirs.
+    pub fn add_companion(&mut self, class: usize, colour: usize) {
+        let Some(col) = self.join(Source::Companion) else {
+            return;
+        };
+        if let Some(p) = self.players[col].as_mut() {
+            p.colour = colour;
+            p.character = class;
+            p.class = class;
+            p.in_tower = true;
+            p.saved = 0;
+            p.hero = HeroSave::new(&p.name, p.character, p.colour);
+            p.open_character_menu(DONE);
+            p.state = State::Ready;
+        }
+    }
+
+    /// The loyal follower needs no asking.
+    pub fn companion_ready(mut self) -> Select {
+        for p in self.players.iter_mut().flatten() {
+            if p.source == Source::Companion {
+                p.state = State::Ready;
+            }
+        }
+        self
+    }
+
     /// The memory card, and each column's carried state, save image and the
     /// party's progress.
     pub fn with_party(mut self, party: Party) -> Select {
@@ -597,7 +624,13 @@ impl Select {
             self.update_player(col, &inp);
         }
         let animating = self.serve();
-        let joined = self.players.iter().flatten().count();
+        // The follower doesn't play alone.
+        let joined = self
+            .players
+            .iter()
+            .flatten()
+            .filter(|p| p.source != Source::Companion)
+            .count();
         if joined == 0 {
             self.leave = true;
             return None;
@@ -1876,6 +1909,25 @@ mod tests {
         // Release everything so the next press is a new edge.
         sel.update(&[(Source::Keyboard, PlayerInput::default())])
             .or(r)
+    }
+
+    #[test]
+    fn the_follower_needs_no_asking_and_never_plays_alone() {
+        let mut sel = Select::with_first(Source::Keyboard);
+        sel.add_companion(1, 2);
+        assert_eq!(sel.sources(), [Source::Keyboard, Source::Companion]);
+        let f = sel.players[1].as_ref().unwrap();
+        assert_eq!((f.state, f.character, f.colour), (State::Ready, 1, 2));
+        // Its hero is the hero the game gets.
+        let panels = sel.panels();
+        assert_eq!((panels[1].class, panels[1].colour), (1, 2));
+        // Back from a level, it is still ready; without the people, nobody stays.
+        let mut back = Select::from_game(&panels, &[Source::Keyboard, Source::Companion]);
+        back = back.companion_ready();
+        assert_eq!(back.players[1].as_ref().unwrap().state, State::Ready);
+        back.players[0] = None;
+        assert!(back.update(&[]).is_none());
+        assert!(back.leave);
     }
 
     #[test]

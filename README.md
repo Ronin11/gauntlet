@@ -44,6 +44,24 @@ counts as a controller (Enter). In the tower, a new controller can join with Sta
 Other options: `--level levelB1` to start elsewhere, `--players WAR,VAL/BLU` to skip the
 join screen, `--mute`. See `gauntlet --help`. Sound starts at 20% of the original's level (the Audio options scale on top); `GDL_VOLUME=0.5` sets another level.
 
+## Playing with a loyal follower
+
+```sh
+gauntlet --companion VAL                       # Title screen as usual; it joins you, ready
+gauntlet --players WAR --companion VAL/BLU     # Straight into a level
+```
+
+A computer-played hero, for when there is nobody else to play with. It has no powers you lack:
+it sees the game and presses the same buttons, so a game with it records and replays like any
+other, and it can run out of health like you can. It stays close, fights what comes near you,
+and leaves the loot to you, except food when it is hurt worse than you are. It goes to an exit
+only once you are waiting on one, and never takes a secret level by itself. If you fall and it
+is still standing, it makes for the nearest exit so the party can go on.
+
+It doesn't solve the level for you: keys, doors and levers are yours. Heroes can't walk out of
+the camera's view, so if it ever gets cut off (a lift it missed), go back for it. It can't be
+added from the menus yet.
+
 ## Asset packs
 
 The disc is the original game. An **asset pack** is a folder laid out like the disc's
@@ -90,6 +108,16 @@ gauntlet --compat
 # Every level, the whole state, twice over.
 cargo test -p gdl-sim --release -- --ignored every_level
 ```
+
+### The session
+
+Everything from the party's first level to game over runs in `gdl_sim::session::Session`:
+the party and what it carries, level ends, the shop, the map and movie timing, secret levels
+and the freeze of a pause. It moves only on one tick's inputs and on recorded decisions, it can
+be cloned, and `Session::digest` fingerprints it, so peers walking the same road stay the same.
+The engine draws what it reads back and acts on the events the session reports. Player select
+and the pause menu stay in the engine, since they read a player's own memory card and options;
+they report what was chosen as decisions.
 
 ## Replays
 

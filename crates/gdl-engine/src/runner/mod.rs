@@ -9,6 +9,7 @@
 //! per-level results (scripts/run-levels.sh runs levels in parallel).
 
 pub mod bot;
+pub mod companion;
 pub mod nav;
 
 use crate::fs::GameFs;
@@ -892,6 +893,7 @@ mod tests {
             capture: false,
             state: None,
             probe: None,
+            snap: None,
         }
     }
 
