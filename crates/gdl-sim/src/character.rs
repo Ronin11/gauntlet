@@ -174,6 +174,12 @@ impl TexmodLinks {
 }
 
 /// Object names are limited to 15 characters, so compare against a truncated name.
+/// `NULL`, `NULL1`, `NULL12`: a marker node, not a drawn part.
+fn is_null_node(name: &str) -> bool {
+    name.strip_prefix("NULL")
+        .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn name_matches(object: &str, full: &str) -> bool {
     let full = if full.len() > 15 { &full[..15] } else { full };
     object.eq_ignore_ascii_case(full)
@@ -377,6 +383,12 @@ impl Model {
             if node.anim_type == ANIM_OBJECT {
                 continue;
             }
+            // A `NULL<n>` node is a placeholder (a chest's NULL1 marks where
+            // its contents rise); its object is a blank card the game never
+            // shows.
+            if is_null_node(&node.name) {
+                continue;
+            }
             let full = format!("{prefix}{}", node.name);
             if let Some((oi, _)) = defs
                 .iter()
@@ -555,14 +567,17 @@ impl Model {
     ) -> Option<Self> {
         let texmods = anim.map_or(&[][..], |a| &a.texmods);
         let mut b = MeshBuilder::new(objects, textures).with_texmods(texmods, &[]);
-        let mut any = false;
+        // The part is named after the first object found, so a replacement
+        // part is looked up by the name that is in the bank (`GEN_ZOM0`,
+        // not the `GEN_ZOM0L1` tried first).
+        let mut found = None;
         for n in names {
             if let Some(obj) = objects.object_by_name(n) {
                 b.add_part(obj, Mat4::IDENTITY, 0);
-                any = true;
+                found.get_or_insert(n.to_string());
             }
         }
-        any.then(|| Model {
+        found.map(|name| Model {
             mesh: b.finish(),
             skeleton: ATree {
                 name: names.first().map(|s| s.to_string()).unwrap_or_default(),
@@ -577,7 +592,7 @@ impl Model {
             runs: Vec::new(),
             alt_parts: Vec::new(),
             part_count: 1,
-            part_names: names.first().map(|s| s.to_string()).into_iter().collect(),
+            part_names: vec![name],
             texmods: None,
             psys: Vec::new(),
         })
