@@ -694,7 +694,7 @@ struct Running {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     gpu: Gpu,
-    depth: wgpu::TextureView,
+    depth: crate::gpu::Depth,
     screen: Screen,
     /// The attract sequence, kept across visits to the title screen.
     attract: Attract,

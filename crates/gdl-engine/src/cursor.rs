@@ -47,7 +47,7 @@ impl Cursor {
         &mut self,
         gpu: &Gpu,
         target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        depth: &crate::gpu::Depth,
         viewport: [f32; 4],
         (x, y, angle): (f32, f32, f32),
     ) {

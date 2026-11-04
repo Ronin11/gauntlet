@@ -13,6 +13,23 @@ use wgpu::util::DeviceExt;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// `GDL_MSAA=<1|2|4|8>`: samples per pixel of the scene (default 4).
+fn msaa_samples() -> u32 {
+    match std::env::var("GDL_MSAA").ok().and_then(|s| s.trim().parse().ok()) {
+        Some(n @ (1 | 2 | 4 | 8)) => n,
+        _ => 4,
+    }
+}
+
+/// A frame's depth buffer (and multisampled colour buffer), sized like the
+/// target it is drawn with; see [`Gpu::depth_view`].
+pub struct Depth {
+    view: wgpu::TextureView,
+    /// Single-sampled depth for [`Gpu::render_over`] (`None` when not multisampling).
+    plain: Option<wgpu::TextureView>,
+    msaa: Option<wgpu::TextureView>,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Globals {
@@ -60,9 +77,12 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub color_format: wgpu::TextureFormat,
-    opaque: wgpu::RenderPipeline,
-    blend: wgpu::RenderPipeline,
-    additive: wgpu::RenderPipeline,
+    /// Samples per pixel of the scene passes (`GDL_MSAA`, 1 = off).
+    pub samples: u32,
+    /// Scene pipelines (opaque, alpha blended, additive) at `samples`.
+    main: [wgpu::RenderPipeline; 3],
+    /// The same, single-sampled, for drawing straight over a finished frame.
+    over: [wgpu::RenderPipeline; 3],
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
@@ -301,7 +321,8 @@ impl Gpu {
             },
             alpha: wgpu::BlendComponent::OVER,
         };
-        let make = |fs: &str, blend: Option<wgpu::BlendState>| {
+        let samples = msaa_samples();
+        let make = |fs: &str, blend: Option<wgpu::BlendState>, count: u32| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
                 layout: Some(&layout),
@@ -337,14 +358,30 @@ impl Gpu {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: Default::default(),
+                multisample: wgpu::MultisampleState {
+                    count,
+                    // Cut-out cards (grass, moss, fences) get their edges
+                    // from coverage instead of a hard alpha test.
+                    alpha_to_coverage_enabled: count > 1 && blend.is_none(),
+                    ..Default::default()
+                },
                 multiview: None,
                 cache: None,
             })
         };
-        let opaque = make("fs_opaque", None);
-        let blend = make("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING));
-        let additive = make("fs_blend", Some(additive_state));
+        let set = |count: u32| {
+            [
+                make(
+                    if count > 1 { "fs_opaque_aa" } else { "fs_opaque" },
+                    None,
+                    count,
+                ),
+                make("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), count),
+                make("fs_blend", Some(additive_state), count),
+            ]
+        };
+        let main = set(samples);
+        let over = set(1);
 
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -440,7 +477,10 @@ impl Gpu {
                                 stencil: Default::default(),
                                 bias: Default::default(),
                             }),
-                            multisample: Default::default(),
+                            multisample: wgpu::MultisampleState {
+                                count: samples,
+                                ..Default::default()
+                            },
                             multiview: None,
                             cache: None,
                         }),
@@ -455,9 +495,9 @@ impl Gpu {
             device,
             queue,
             color_format,
-            opaque,
-            blend,
-            additive,
+            samples,
+            main,
+            over,
             globals_buf,
             globals_bg,
             material_layout,
@@ -735,30 +775,44 @@ impl Gpu {
         std::sync::Arc::new(self.material(&view))
     }
 
-    pub fn depth_view(&self, width: u32, height: u32) -> wgpu::TextureView {
-        self.device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("depth"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            })
-            .create_view(&Default::default())
+    /// The buffers a frame of `width` x `height` is drawn with: its depth,
+    /// and when multisampling the colour buffer the scene passes render
+    /// into before resolving onto the target.
+    pub fn depth_view(&self, width: u32, height: u32) -> Depth {
+        let tex = |label, format, sample_count| {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        Depth {
+            view: tex("depth", DEPTH_FORMAT, self.samples),
+            plain: if self.samples > 1 {
+                Some(tex("depth 1x", DEPTH_FORMAT, 1))
+            } else {
+                None
+            },
+            msaa: (self.samples > 1).then(|| tex("msaa colour", self.color_format, self.samples)),
+        }
     }
 
     /// Render `draws` into `target`.
     pub fn render(
         &self,
         target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        depth: &Depth,
         globals: &Globals,
         clear: [f64; 3],
         draws: &[(&GpuMesh, &Instance)],
@@ -771,12 +825,12 @@ impl Gpu {
     pub fn render_over(
         &self,
         target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        depth: &Depth,
         globals: &Globals,
         draws: &[(&GpuMesh, &Instance)],
         viewport: [f32; 4],
     ) {
-        self.render_pass(target, depth, globals, None, draws, Some(viewport), None);
+        self.render_pass(target, depth, globals, None, draws, Some(viewport), None, true);
     }
 
     /// As [`Gpu::render`], drawing the scene only into `viewport` (x, y, w, h in
@@ -785,7 +839,7 @@ impl Gpu {
     pub fn render_viewport(
         &self,
         target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        depth: &Depth,
         globals: &Globals,
         clear: [f64; 3],
         draws: &[(&GpuMesh, &Instance)],
@@ -800,6 +854,7 @@ impl Gpu {
             draws,
             viewport,
             sprites,
+            false,
         );
     }
 
@@ -807,13 +862,25 @@ impl Gpu {
     fn render_pass(
         &self,
         target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        depth: &Depth,
         globals: &Globals,
         clear: Option<[f64; 3]>,
         draws: &[(&GpuMesh, &Instance)],
         viewport: Option<[f32; 4]>,
         sprites: Option<&SpriteLayer>,
+        over: bool,
     ) {
+        // Over a finished frame the scene draws straight onto the target
+        // (a multisampled buffer could not start from the target's pixels).
+        let (colour, resolve, depth_view, pipelines) = match (&depth.msaa, over) {
+            (Some(msaa), false) => (msaa, Some(target), &depth.view, &self.main),
+            _ => (
+                target,
+                None,
+                depth.plain.as_ref().unwrap_or(&depth.view),
+                &self.over,
+            ),
+        };
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(globals));
         for (mesh, inst) in draws {
@@ -847,8 +914,8 @@ impl Gpu {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
+                    view: colour,
+                    resolve_target: resolve,
                     ops: wgpu::Operations {
                         load: match clear {
                             Some(c) => wgpu::LoadOp::Clear(wgpu::Color {
@@ -863,7 +930,7 @@ impl Gpu {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth,
+                    view: depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -879,11 +946,7 @@ impl Gpu {
             pass.set_bind_group(0, &self.globals_bg, &[]);
             // 0 = opaque (alpha test), 1 = alpha blended, 2 = additive.
             for pass_kind in 0..3u8 {
-                pass.set_pipeline(match pass_kind {
-                    0 => &self.opaque,
-                    1 => &self.blend,
-                    _ => &self.additive,
-                });
+                pass.set_pipeline(&pipelines[pass_kind as usize]);
                 for (mesh, inst) in draws {
                     if !inst.visible {
                         continue;

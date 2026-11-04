@@ -226,7 +226,7 @@ impl SaverModels {
         saver: &Saver,
         gpu: &Gpu,
         target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        depth: &crate::gpu::Depth,
         viewport: [f32; 4],
     ) {
         let blank = crate::gpu::globals(Mat4::IDENTITY, Vec3::ZERO, [0.0; 3], 0.0);

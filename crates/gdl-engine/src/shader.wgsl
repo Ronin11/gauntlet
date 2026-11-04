@@ -142,6 +142,19 @@ fn fs_opaque(v: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(c.rgb, 1.0);
 }
 
+// Multisampled: the alpha test becomes coverage. The alpha is sharpened to
+// the width of a pixel so a cut-out's edge stays crisp at every mip level
+// and takes its anti-aliasing from the samples.
+@fragment
+fn fs_opaque_aa(v: VsOut) -> @location(0) vec4<f32> {
+    let c = shade(v);
+    let a = clamp((c.a - 0.5) / max(fwidth(c.a), 1e-4) + 0.5, 0.0, 1.0);
+    if (a <= 0.0) {
+        discard;
+    }
+    return vec4<f32>(c.rgb, a);
+}
+
 @fragment
 fn fs_blend(v: VsOut) -> @location(0) vec4<f32> {
     return shade(v);
