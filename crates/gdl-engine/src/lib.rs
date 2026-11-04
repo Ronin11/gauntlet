@@ -31,4 +31,5 @@ pub mod screen;
 pub mod screensaver;
 pub mod select;
 pub mod shop;
+pub mod smooth;
 pub mod ui;
