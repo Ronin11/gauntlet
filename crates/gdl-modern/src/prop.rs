@@ -138,3 +138,188 @@ impl Prop {
             * Mat4::from_translation(-grip)
     }
 }
+
+/// A prop whose pieces move: a glTF whose nodes each carry a piece and whose
+/// one animation moves them (a barrel's break-apart sequence). Read once,
+/// posed per game frame with [`AnimProp::pose`].
+pub struct AnimProp {
+    nodes: Vec<AnimNode>,
+    pub texture: Option<Texture>,
+}
+
+struct AnimNode {
+    parent: Option<usize>,
+    rest: (Vec3, Quat, Vec3),
+    translation: Track<Vec3>,
+    rotation: Track<Quat>,
+    scale: Track<Vec3>,
+    /// The node's mesh in its own frame: positions, normals, uvs, indices.
+    mesh: Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>, Vec<u32>)>,
+}
+
+#[derive(Clone, Default)]
+struct Track<T> {
+    times: Vec<f32>,
+    values: Vec<T>,
+}
+
+impl<T: Copy> Track<T> {
+    /// The value at `t`, `lerp`ed between the keyframes around it.
+    fn at(&self, t: f32, lerp: impl Fn(T, T, f32) -> T) -> Option<T> {
+        let (first, last) = (*self.times.first()?, *self.times.last()?);
+        if t <= first || self.times.len() == 1 {
+            return self.values.first().copied();
+        }
+        if t >= last {
+            return self.values.last().copied();
+        }
+        let i = self.times.partition_point(|&k| k <= t) - 1;
+        let (t0, t1) = (self.times[i], self.times[i + 1]);
+        let w = ((t - t0) / (t1 - t0).max(1e-6)).clamp(0.0, 1.0);
+        Some(lerp(self.values[i], self.values[i + 1], w))
+    }
+}
+
+impl AnimProp {
+    /// Keyframe spacing the pieces are sampled at: frame `k` is `k / 30` s.
+    pub const FPS: f32 = 30.0;
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let (doc, buffers, images) =
+            gltf::import(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut parent = vec![None; doc.nodes().len()];
+        for n in doc.nodes() {
+            for c in n.children() {
+                parent[c.index()] = Some(n.index());
+            }
+        }
+        let mut texture = None;
+        let mut nodes = Vec::new();
+        for n in doc.nodes() {
+            let (t, r, s) = n.transform().decomposed();
+            let mut mesh = None;
+            if let Some(m) = n.mesh() {
+                let (mut pos, mut nrm, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for prim in m.primitives() {
+                    let rd = prim.reader(|b| Some(&buffers[b.index()]));
+                    let base = pos.len() as u32;
+                    let p: Vec<[f32; 3]> = rd.read_positions().context("no positions")?.collect();
+                    let count = p.len();
+                    pos.extend(p.into_iter().map(Vec3::from));
+                    match rd.read_normals() {
+                        Some(ns) => nrm.extend(ns.map(Vec3::from)),
+                        None => nrm.extend(std::iter::repeat_n(Vec3::Y, count)),
+                    }
+                    match rd.read_tex_coords(0) {
+                        Some(ts) => uv.extend(ts.into_f32().map(Vec2::from)),
+                        None => uv.extend(std::iter::repeat_n(Vec2::ZERO, count)),
+                    }
+                    match rd.read_indices() {
+                        Some(ix) => idx.extend(ix.into_u32().map(|i| base + i)),
+                        None => idx.extend(base..base + count as u32),
+                    }
+                    if texture.is_none() {
+                        if let Some(t) = prim
+                            .material()
+                            .pbr_metallic_roughness()
+                            .base_color_texture()
+                        {
+                            texture = crate::rgba8(&images[t.texture().source().index()]);
+                        }
+                    }
+                }
+                mesh = Some((pos, nrm, uv, idx));
+            }
+            nodes.push(AnimNode {
+                parent: parent[n.index()],
+                rest: (t.into(), Quat::from_array(r), s.into()),
+                translation: Track::default(),
+                rotation: Track::default(),
+                scale: Track::default(),
+                mesh,
+            });
+        }
+        // Every animation's channels count (an exporter may write one per
+        // piece); a node's later channels replace its earlier ones.
+        for anim in doc.animations() {
+            for ch in anim.channels() {
+                let node = &mut nodes[ch.target().node().index()];
+                let rd = ch.reader(|b| Some(&buffers[b.index()]));
+                let times: Vec<f32> = rd.read_inputs().context("no keyframe times")?.collect();
+                match rd.read_outputs().context("no keyframe values")? {
+                    gltf::animation::util::ReadOutputs::Translations(it) => {
+                        node.translation = Track {
+                            times,
+                            values: it.map(Vec3::from).collect(),
+                        }
+                    }
+                    gltf::animation::util::ReadOutputs::Rotations(it) => {
+                        node.rotation = Track {
+                            times,
+                            values: it.into_f32().map(Quat::from_array).collect(),
+                        }
+                    }
+                    gltf::animation::util::ReadOutputs::Scales(it) => {
+                        node.scale = Track {
+                            times,
+                            values: it.map(Vec3::from).collect(),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(AnimProp { nodes, texture })
+    }
+
+    /// The pieces as one rigid mesh, posed at animation frame `frame`
+    /// (`frame / FPS` seconds in).
+    pub fn pose(&self, frame: usize) -> Prop {
+        let t = frame as f32 / Self::FPS;
+        let local: Vec<Mat4> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let tr = n.translation.at(t, |a, b, w| a.lerp(b, w)).unwrap_or(n.rest.0);
+                let ro = n.rotation.at(t, |a, b, w| a.slerp(b, w)).unwrap_or(n.rest.1);
+                let sc = n.scale.at(t, |a, b, w| a.lerp(b, w)).unwrap_or(n.rest.2);
+                Mat4::from_scale_rotation_translation(sc, ro, tr)
+            })
+            .collect();
+        let mut world = vec![None; self.nodes.len()];
+        fn resolve(i: usize, nodes: &[AnimNode], local: &[Mat4], world: &mut [Option<Mat4>]) -> Mat4 {
+            if let Some(w) = world[i] {
+                return w;
+            }
+            let w = match nodes[i].parent {
+                Some(p) => resolve(p, nodes, local, world) * local[i],
+                None => local[i],
+            };
+            world[i] = Some(w);
+            w
+        }
+        let mut prop = Prop {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: Vec::new(),
+            texture: self.texture.clone(),
+        };
+        for i in 0..self.nodes.len() {
+            let Some((pos, nrm, uv, idx)) = &self.nodes[i].mesh else {
+                continue;
+            };
+            let m = resolve(i, &self.nodes, &local, &mut world);
+            let nm = m.inverse().transpose();
+            let base = prop.positions.len() as u32;
+            prop.positions
+                .extend(pos.iter().map(|&p| m.transform_point3(p)));
+            prop.normals
+                .extend(nrm.iter().map(|&n| nm.transform_vector3(n).normalize_or_zero()));
+            prop.uvs.extend_from_slice(uv);
+            prop.indices.extend(idx.iter().map(|&i| base + i));
+        }
+        prop
+    }
+}

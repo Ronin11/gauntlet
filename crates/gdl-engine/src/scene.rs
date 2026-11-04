@@ -91,7 +91,7 @@ impl Scene {
                     .map(|(i, _)| i),
             );
         }
-        let world = gpu.upload_mesh(&game.level.world_mesh(&skip))?;
+        let world = gpu.upload_mesh(&Self::world_mesh(game, skip))?;
         let mut world_inst = gpu.new_instance(&world);
         world_inst.transform = mirror();
         let animated: std::collections::HashSet<usize> =
@@ -255,7 +255,7 @@ impl Scene {
         // World objects hidden during play (SafeRockSetup's dirt mound and
         // glow): rebuild the world mesh without them.
         if game.hidden.len() != self.hidden_count {
-            if let Ok(world) = gpu.upload_mesh(&game.level.world_mesh(&Self::not_static(game))) {
+            if let Ok(world) = gpu.upload_mesh(&Self::world_mesh(game, Self::not_static(game))) {
                 let mut inst = gpu.new_instance(&world);
                 inst.transform = mirror();
                 self.world = world;
@@ -634,6 +634,19 @@ impl Scene {
         inst.transform = mirror() * s.transform;
         inst.tint = Vec4::new(1.0, 1.0, 1.0, alpha);
         inst.visible = alpha > 0.0;
+    }
+
+    /// The static world without the objects in `skip`, with the override
+    /// directory's replacement models standing in for the objects that have
+    /// one.
+    fn world_mesh(game: &Game, mut skip: std::collections::HashSet<usize>) -> gdl_sim::mesh::MeshData {
+        let props = crate::overrides::world_prop_sources(&game.level);
+        let moving = skip.clone();
+        skip.extend(props.iter().map(|(i, _)| *i));
+        let mut mesh = game.level.world_mesh(&skip);
+        crate::smooth::smooth_world(&mut mesh, crate::smooth::settings());
+        crate::overrides::append_world_props(&mut mesh, &game.level, &props, &moving);
+        mesh
     }
 
     /// World objects left out of the static world mesh: trigger movers,
